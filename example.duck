@@ -1,0 +1,19 @@
+pub let global = true
+pub var counter = 0
+
+pub struct Point:
+	x: f32
+	y: f32
+
+pub fn add(a: i32, b: i32) -> i32:
+	return a + b
+
+# Entry point
+pub fn main():
+	let a = 1
+	let b = 2
+	let c = add(a, b)
+	for i in [1, 2, 3]:
+		continue
+	while true:
+		break
