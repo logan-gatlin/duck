@@ -46,6 +46,8 @@ pub struct Global {
     pub ty: ValType,
     pub mutable: bool,
     pub init: Const,
+    /// Export name, set for `pub let` and `pub var`.
+    pub export: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -532,10 +532,10 @@ impl Checker {
     /// Checks and folds global initializers in declaration order.
     fn define_globals(&mut self, module: &parse::Module) {
         let decls = module.items.iter().filter_map(|item| match &item.kind {
-            ItemKind::Binding(b) => Some(b),
+            ItemKind::Binding(b) => Some((item, b)),
             _ => None,
         });
-        for (index, decl) in decls.enumerate() {
+        for (index, (item, decl)) in decls.enumerate() {
             let (ty, value) = Body::new(self, Ty::Unit).binding_value(decl);
             let mutable = decl.mutability == Mutability::Var;
             let mut inits = Vec::new();
@@ -561,6 +561,7 @@ impl Checker {
             for (i, (name, vt)) in leaves.into_iter().enumerate() {
                 slots.push(GlobalId(self.ir_globals.len() as u32));
                 self.ir_globals.push(ir::Global {
+                    export: item.is_pub.then(|| name.clone()),
                     name,
                     ty: vt,
                     mutable,
@@ -1000,6 +1001,7 @@ impl<'c> Body<'c> {
                 Ty::Prim(Prim::Bool),
                 scalar(ValType::I32, Expr::Const(Const::I32(*b as i32))),
             ),
+            ExprKind::Unit => (Ty::Unit, Value::default()),
             ExprKind::Str(_) => self.unsupported("strings", expr.span),
             ExprKind::List(_) | ExprKind::Index(..) => self.unsupported("arrays", expr.span),
             ExprKind::Name(name) => self.name(name, expr.span),
@@ -2542,6 +2544,55 @@ fn f() -> i32:
                     to: "unit".into()
                 },
                 invalid_operand("-", "unit"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unit_literals() {
+        let src = "\
+let g = ()
+fn u() -> unit:
+    return ()
+fn f():
+    let a = ()
+    let b: unit = a
+    return b
+";
+        let module = lower(src);
+        assert!(module.globals.is_empty());
+        assert!(module.funcs[1].locals.is_empty());
+        assert_eq!(body(&module, "u"), "(return )");
+        assert_eq!(body(&module, "f"), "(return )");
+        assert_eq!(
+            errors("fn f():\n    let a = () == ()\n    let b: i32 = ()\n"),
+            vec![invalid_operand("==", "unit"), mismatch("i32", "unit")]
+        );
+    }
+
+    #[test]
+    fn pub_globals_are_exported() {
+        let src = "\
+struct P:
+    x: i32
+    y: i32
+pub let a = 1
+pub var origin = P(x: 0, y: 0)
+let hidden = 2
+";
+        let exports: Vec<_> = lower(src)
+            .globals
+            .into_iter()
+            .map(|g| (g.name, g.export))
+            .collect();
+        let named = |name: &str| (name.to_string(), Some(name.to_string()));
+        assert_eq!(
+            exports,
+            vec![
+                named("a"),
+                named("origin.x"),
+                named("origin.y"),
+                ("hidden".to_string(), None)
             ]
         );
     }

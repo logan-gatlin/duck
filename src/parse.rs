@@ -138,6 +138,8 @@ pub enum ExprKind {
     Float(f64),
     Str(String),
     Bool(bool),
+    /// `()`
+    Unit,
     Name(String),
     List(Vec<Expr>),
     Unary(UnaryOp, Box<Expr>),
@@ -640,6 +642,12 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => ExprKind::Name(name.clone()),
             TokenKind::LParen => {
                 self.bump();
+                if self.eat(TokenKind::RParen) {
+                    return Ok(Expr {
+                        kind: ExprKind::Unit,
+                        span: self.span_from(token.span),
+                    });
+                }
                 let inner = self.expr()?;
                 self.expect(TokenKind::RParen)?;
                 return Ok(Expr {
@@ -872,6 +880,7 @@ mod tests {
             ExprKind::Float(x) => x.to_string(),
             ExprKind::Str(s) => format!("{s:?}"),
             ExprKind::Bool(b) => b.to_string(),
+            ExprKind::Unit => "()".to_string(),
             ExprKind::Name(name) => name.clone(),
             ExprKind::List(items) => format!("[{}]", list(items)),
             ExprKind::Unary(op, e) => format!("({op:?} {})", sexpr(e)),
@@ -1028,6 +1037,8 @@ mod tests {
 
     #[test]
     fn literals() {
+        assert_eq!(expr("()"), "()");
+        assert_eq!(expr("f((), ( ))"), "(call f () ())");
         assert_eq!(expr("[]"), "[]");
         assert_eq!(expr("[1, 2,]"), "[1 2]");
         assert_eq!(
