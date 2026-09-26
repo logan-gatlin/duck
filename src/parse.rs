@@ -142,9 +142,18 @@ pub enum ExprKind {
     List(Vec<Expr>),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
-    Call(Box<Expr>, Vec<Expr>),
+    Call(Box<Expr>, Vec<Arg>),
     Index(Box<Expr>, Box<Expr>),
     Field(Box<Expr>, Ident),
+    /// `value as Type`
+    Cast(Box<Expr>, Type),
+}
+
+/// A call argument, optionally labelled as in `f(name: value)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Arg {
+    pub label: Option<Ident>,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,7 +530,7 @@ impl<'a> Parser<'a> {
                 span: self.span_from(start),
             }
         } else {
-            self.unary()?
+            self.cast()?
         };
         while let Some((op, prec)) = binary_op(&self.peek().kind) {
             if prec < min_prec {
@@ -543,6 +552,21 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(lhs)
+    }
+
+    /// A unary expression followed by any `as Type` casts, which bind tighter
+    /// than binary operators but looser than unary ones.
+    fn cast(&mut self) -> PResult<Expr> {
+        let mut expr = self.unary()?;
+        while self.eat(TokenKind::As) {
+            let ty = self.ty()?;
+            let span = self.span_from(expr.span);
+            expr = Expr {
+                kind: ExprKind::Cast(Box::new(expr), ty),
+                span,
+            };
+        }
+        Ok(expr)
     }
 
     fn unary(&mut self) -> PResult<Expr> {
@@ -567,7 +591,7 @@ impl<'a> Parser<'a> {
             let kind = match self.peek().kind {
                 TokenKind::LParen => {
                     self.bump();
-                    let args = self.comma_list(TokenKind::RParen, Self::expr)?;
+                    let args = self.comma_list(TokenKind::RParen, Self::arg)?;
                     ExprKind::Call(Box::new(expr), args)
                 }
                 TokenKind::LBracket => {
@@ -588,6 +612,21 @@ impl<'a> Parser<'a> {
                 span: self.span_from(start),
             };
         }
+    }
+
+    /// `value` or `label: value`
+    fn arg(&mut self) -> PResult<Arg> {
+        let labelled = matches!(self.peek().kind, TokenKind::Ident(_))
+            && self.peek_second().kind == TokenKind::Colon;
+        let label = if labelled {
+            let label = self.ident()?;
+            self.expect(TokenKind::Colon)?;
+            Some(label)
+        } else {
+            None
+        };
+        let value = self.expr()?;
+        Ok(Arg { label, value })
     }
 
     fn primary(&mut self) -> PResult<Expr> {
@@ -698,6 +737,11 @@ impl<'a> Parser<'a> {
 
     fn peek(&self) -> &'a Token {
         &self.tokens[self.pos]
+    }
+
+    /// The token after [`Self::peek`], or `Eof` at the end.
+    fn peek_second(&self) -> &'a Token {
+        &self.tokens[(self.pos + 1).min(self.tokens.len() - 1)]
     }
 
     fn at(&self, kind: TokenKind) -> bool {
@@ -832,9 +876,27 @@ mod tests {
             ExprKind::List(items) => format!("[{}]", list(items)),
             ExprKind::Unary(op, e) => format!("({op:?} {})", sexpr(e)),
             ExprKind::Binary(op, l, r) => format!("({op:?} {} {})", sexpr(l), sexpr(r)),
-            ExprKind::Call(f, args) => format!("(call {} {})", sexpr(f), list(args)),
+            ExprKind::Call(f, args) => {
+                let args = args
+                    .iter()
+                    .map(|arg| match &arg.label {
+                        Some(label) => format!("{}:{}", label.name, sexpr(&arg.value)),
+                        None => sexpr(&arg.value),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("(call {} {args})", sexpr(f))
+            }
             ExprKind::Index(e, i) => format!("(index {} {})", sexpr(e), sexpr(i)),
             ExprKind::Field(e, field) => format!("(. {} {})", sexpr(e), field.name),
+            ExprKind::Cast(e, ty) => format!("(as {} {})", sexpr(e), render_ty(ty)),
+        }
+    }
+
+    fn render_ty(ty: &Type) -> String {
+        match &ty.kind {
+            TypeKind::Named(name) => name.clone(),
+            TypeKind::Array(elem) => format!("[{}]", render_ty(elem)),
         }
     }
 
@@ -908,14 +970,13 @@ mod tests {
         assert_eq!(main.ret, None);
         assert_eq!(
             stmt_kinds(&main.body),
-            vec!["binding", "binding", "binding", "for", "while"]
+            vec!["binding", "binding", "binding", "binding", "while", "while"]
         );
-        let StmtKind::For { var, iter, body } = &main.body[3].kind else {
+        let StmtKind::While { cond, body } = &main.body[4].kind else {
             panic!()
         };
-        assert_eq!(var.name, "i");
-        assert_eq!(sexpr(iter), "[1 2 3]");
-        assert_eq!(stmt_kinds(body), vec!["continue"]);
+        assert_eq!(sexpr(cond), "(Lt i 3)");
+        assert_eq!(stmt_kinds(body), vec!["assign", "continue"]);
     }
 
     #[test]
@@ -946,6 +1007,23 @@ mod tests {
         assert_eq!(expr("-f(x, 1).y[0]"), "(Neg (index (. (call f x 1) y) 0))");
         assert_eq!(expr("~-a"), "(BitNot (Neg a))");
         assert_eq!(expr("f()()"), "(call (call f ) )");
+    }
+
+    #[test]
+    fn casts() {
+        assert_eq!(expr("-x as i64"), "(as (Neg x) i64)");
+        assert_eq!(expr("a + b as i64"), "(Add a (as b i64))");
+        assert_eq!(expr("a * b as i64"), "(Mul a (as b i64))");
+        assert_eq!(expr("x as i64 as f32"), "(as (as x i64) f32)");
+        assert_eq!(expr("not x as bool"), "(Not (as x bool))");
+        assert_eq!(expr("f(x).y as u8"), "(as (. (call f x) y) u8)");
+    }
+
+    #[test]
+    fn labelled_args() {
+        assert_eq!(expr("Point(x: 1, y: 2)"), "(call Point x:1 y:2)");
+        assert_eq!(expr("f(1, b: c)"), "(call f 1 b:c)");
+        assert_eq!(expr("f(a == b)"), "(call f (Eq a b))");
     }
 
     #[test]
@@ -981,15 +1059,9 @@ mod tests {
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        fn render(ty: &Type) -> String {
-            match &ty.kind {
-                TypeKind::Named(name) => name.clone(),
-                TypeKind::Array(elem) => format!("[{}]", render(elem)),
-            }
-        }
-        assert_eq!(render(&f.params[0].ty), "[[i32]]");
-        assert_eq!(render(&f.params[1].ty), "u8");
-        assert_eq!(render(f.ret.as_ref().unwrap()), "[f32]");
+        assert_eq!(render_ty(&f.params[0].ty), "[[i32]]");
+        assert_eq!(render_ty(&f.params[1].ty), "u8");
+        assert_eq!(render_ty(f.ret.as_ref().unwrap()), "[f32]");
 
         let module = parse_src("let x: i32 = 1").unwrap();
         let ItemKind::Binding(x) = &module.items[0].kind else {

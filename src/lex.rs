@@ -44,6 +44,7 @@ pub enum TokenKind {
     Not,
     True,
     False,
+    As,
 
     // Delimiters
     LParen,
@@ -150,6 +151,7 @@ impl fmt::Display for TokenKind {
             Self::Not => "not",
             Self::True => "true",
             Self::False => "false",
+            Self::As => "as",
             Self::LParen => "(",
             Self::RParen => ")",
             Self::LBracket => "[",
@@ -420,6 +422,7 @@ impl<'a> Lexer<'a> {
             "not" => TokenKind::Not,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "as" => TokenKind::As,
             name => TokenKind::Ident(name.to_string()),
         }
     }
@@ -651,14 +654,25 @@ mod tests {
         let src = include_str!("../example.duck");
         #[rustfmt::skip]
         let expected = vec![
-            Pub, Fn, ident("add"), LParen, ident("a"), Colon, ident("i32"), Comma,
+            Pub, Let, ident("global"), Eq, True, Newline,
+            Pub, Var, ident("counter"), Eq, Int(0), Newline,
+            Pub, Struct, ident("Point"), Colon, Newline,
+            Indent, ident("x"), Colon, ident("f32"), Newline,
+            ident("y"), Colon, ident("f32"), Newline,
+            Dedent, Pub, Fn, ident("add"), LParen, ident("a"), Colon, ident("i32"), Comma,
                 ident("b"), Colon, ident("i32"), RParen, Arrow, ident("i32"), Colon, Newline,
             Indent, Return, ident("a"), Plus, ident("b"), Newline,
             Dedent, Pub, Fn, ident("main"), LParen, RParen, Colon, Newline,
             Indent, Let, ident("a"), Eq, Int(1), Newline,
             Let, ident("b"), Eq, Int(2), Newline,
             Let, ident("c"), Eq, ident("add"), LParen, ident("a"), Comma, ident("b"), RParen, Newline,
-            Dedent, Eof,
+            Var, ident("i"), Eq, Int(0), Newline,
+            While, ident("i"), Lt, Int(3), Colon, Newline,
+            Indent, ident("i"), PlusEq, Int(1), Newline,
+            Continue, Newline,
+            Dedent, While, True, Colon, Newline,
+            Indent, Break, Newline,
+            Dedent, Dedent, Eof,
         ];
         assert_eq!(kinds(src), expected);
     }
