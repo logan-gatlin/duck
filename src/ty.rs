@@ -75,6 +75,7 @@ macro_rules! fold_float_binary {
     }};
 }
 
+/// A primitive stored as exactly one wasm value. `unit` is [`Ty::Unit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
     I8,
@@ -98,7 +99,8 @@ pub struct StructId(u32);
 pub enum Ty {
     Prim(Prim),
     Struct(StructId),
-    /// The type of functions without a return type.
+    /// `unit`, the return type of functions without one. Its values have no
+    /// scalars, so they take no storage in wasm.
     Unit,
     /// The type of an expression that already failed to check. Compatible
     /// with everything, so one mistake is reported once.
@@ -611,6 +613,8 @@ impl Checker {
             TypeKind::Named(name) => {
                 if let Some(prim) = Prim::from_name(name) {
                     Ty::Prim(prim)
+                } else if name == "unit" {
+                    Ty::Unit
                 } else if let Some(Item::Struct(id)) = self.items.get(name) {
                     Ty::Struct(*id)
                 } else {
@@ -629,7 +633,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
-            Ty::Unit => "()".to_string(),
+            Ty::Unit => "unit".to_string(),
             Ty::Error => "{error}".to_string(),
         }
     }
@@ -2390,7 +2394,7 @@ fn f(a: u32, p: P) -> i32:
                 IntOutOfRange("i8".into()),
                 invalid_operand("-", "u8"),
                 mismatch("bool", "i32"),
-                mismatch("i32", "()"),
+                mismatch("i32", "unit"),
                 mismatch("i32", "bool"),
             ]
         );
@@ -2507,5 +2511,38 @@ let p = P(y: g, x: 2.0)
 ";
         let inits: Vec<_> = lower(src).globals.iter().map(|g| konst(g.init)).collect();
         assert_eq!(inits, vec!["1f32", "2f32", "1f32"]);
+    }
+
+    #[test]
+    fn unit_is_a_primitive_without_storage() {
+        let src = "\
+fn u():
+    pass
+fn g(a: unit, b: i32) -> unit:
+    return a
+fn f() -> i32:
+    let x: unit = u()
+    let y = g(x, 1)
+    return 1
+";
+        let module = lower(src);
+        assert_eq!(module.funcs[1].params, vec![ValType::I32]);
+        assert_eq!(module.funcs[1].results, vec![]);
+        assert_eq!(body(&module, "g"), "(return )");
+        assert_eq!(
+            body(&module, "f"),
+            "(call u [] -> []) (call g [1] -> []) (return 1)"
+        );
+        assert_eq!(
+            errors("fn u():\n    let a = u() == u()\n    let b = 1 as unit\n    let c = -u()\n"),
+            vec![
+                invalid_operand("==", "unit"),
+                TypeErrorKind::InvalidCast {
+                    from: "i32".into(),
+                    to: "unit".into()
+                },
+                invalid_operand("-", "unit"),
+            ]
+        );
     }
 }
