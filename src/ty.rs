@@ -1230,6 +1230,10 @@ impl<'c> Body<'c> {
             (Some(a), Some(b)) => (a, b),
             _ => (Expr::Const(zero(vt)), Expr::Const(zero(vt))),
         };
+        let b = match ir_op {
+            IrBinOp::Shl | IrBinOp::ShrS | IrBinOp::ShrU => wrap_shift_amount(prim, b),
+            _ => b,
+        };
         let mut expr = binary(vt, ir_op, a, b);
         if matches!(
             ir_op,
@@ -1623,6 +1627,25 @@ fn normalize(prim: Prim, expr: Expr) -> Expr {
         Prim::U8 => mask(0xff),
         Prim::U16 => mask(0xffff),
         _ => expr,
+    }
+}
+
+/// Wraps a shift amount to the bit width of a narrow `prim`, so every integer
+/// type shifts by its amount modulo its width, as wasm does for 32 and 64 bits.
+fn wrap_shift_amount(prim: Prim, amount: Expr) -> Expr {
+    let mask = match prim {
+        Prim::I8 | Prim::U8 => 7,
+        Prim::I16 | Prim::U16 => 15,
+        _ => return amount,
+    };
+    match amount {
+        Expr::Const(Const::I32(n)) => Expr::Const(Const::I32(n & mask)),
+        amount => binary(
+            ValType::I32,
+            IrBinOp::And,
+            amount,
+            Expr::Const(Const::I32(mask)),
+        ),
     }
 }
 
@@ -2594,6 +2617,27 @@ let hidden = 2
                 named("origin.y"),
                 ("hidden".to_string(), None)
             ]
+        );
+    }
+
+    #[test]
+    fn narrow_shift_amounts_wrap_at_their_width() {
+        let src = "\
+let g: u8 = 1 << 9
+fn f(a: i16, b: i16, c: u8, d: i32):
+    let s = a << b
+    let t = c >> 9
+    let u = a >> b
+    let v = d << d
+";
+        let module = lower(src);
+        assert_eq!(module.globals[0].init, Const::I32(2));
+        assert_eq!(
+            body(&module, "f"),
+            "(set s (I32.Extend16S (I32.Shl a (I32.And b 15)))) \
+             (set t (I32.ShrU c 1)) \
+             (set u (I32.ShrS a (I32.And b 15))) \
+             (set v (I32.Shl d d))"
         );
     }
 }
