@@ -1,9 +1,13 @@
+mod files;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use duck_compiler::file::FileId;
+use duck_compiler::file::FileManager;
+
+use crate::files::Files;
 
 #[derive(Parser)]
 #[command(version, about = "The duck programming language")]
@@ -15,42 +19,32 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Compile a source file to a WebAssembly module
-    Build {
-        /// The `.duck` file to compile
-        input: PathBuf,
-        /// Where to write the module [default: the input with a `.wasm` extension]
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
+    Build,
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Build { input, output } => build(input, output),
+        Command::Build => build(),
     }
 }
 
-fn build(input: PathBuf, output: Option<PathBuf>) -> ExitCode {
-    let src = match fs::read_to_string(&input) {
-        Ok(src) => src,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {e}", input.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let bytes = match duck_compiler::compile(FileId::new(0), &src) {
+fn build() -> ExitCode {
+    let mut files = Files::new();
+    let entry = files.entry_point();
+    let src = files.contents(entry);
+    let bytes = match duck_compiler::compile(files.entry_point(), &src) {
         Ok(bytes) => bytes,
         Err(errors) => {
             for error in &errors {
                 let (line, col) = line_col(&src, error.span().start);
-                eprintln!("{}:{line}:{col}: error: {error}", input.display());
+                eprintln!("{}:{line}:{col}: error: {error}", files.display_name(entry));
             }
             return ExitCode::FAILURE;
         }
     };
-    let output = output.unwrap_or_else(|| input.with_extension("wasm"));
+    let output = "build/main.wasm";
     if let Err(e) = fs::write(&output, bytes) {
-        eprintln!("error: cannot write {}: {e}", output.display());
+        eprintln!("error: cannot write {}: {e}", output);
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
