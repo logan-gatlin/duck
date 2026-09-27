@@ -15,6 +15,13 @@ pub trait FileManager {
 
 pub(crate) struct DummyManager;
 
+impl FileId {
+    /// The id a [`FileManager`] assigns to its `index`th file.
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+}
+
 impl DummyManager {
     pub fn new() -> Self {
         Self
