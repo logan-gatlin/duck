@@ -1,9 +1,10 @@
 //! The lowered program handed to codegen.
 //!
 //! Everything here is already resolved and type checked, and shaped after
-//! wasm: values are the four wasm value types, structs have been split into
-//! one local or global per scalar field, and control flow is wasm's structured
-//! `block`/`loop`/`if` with branch targets given as label depths.
+//! wasm: values are the four numeric wasm value types and `externref`, structs
+//! have been split into one local or global per scalar field, and control flow
+//! is wasm's structured `block`/`loop`/`if` with branch targets given as label
+//! depths.
 
 /// A wasm function index: [`Module::imports`] come first, then
 /// [`Module::funcs`].
@@ -40,6 +41,8 @@ pub enum ValType {
     I64,
     F32,
     F64,
+    /// An opaque reference from the host. Nothing constant has this type.
+    ExternRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

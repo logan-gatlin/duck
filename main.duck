@@ -1,8 +1,1 @@
-extern:
-	fn log(i: *i32)
-
-pub fn _start():
-	var i: *i32 = 0
-	while (i as i32) < 10:
-		log(i)
-		i += 1
+let a 

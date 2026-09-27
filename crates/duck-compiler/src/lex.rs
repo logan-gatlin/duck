@@ -641,7 +641,7 @@ mod tests {
     use crate::file::{DummyManager, FileManager};
 
     fn lex(src: &str) -> Result<Vec<Token>, LexError> {
-        tokenize(DummyManager::entry_point(), src)
+        tokenize(DummyManager::new().entry_point(), src)
     }
 
     fn kinds(src: &str) -> Vec<TokenKind> {
@@ -821,7 +821,7 @@ mod tests {
 
     #[test]
     fn spans() {
-        let file = DummyManager::entry_point();
+        let file = DummyManager::new().entry_point();
         let tokens = tokenize(file, "let x").unwrap();
         assert_eq!(
             tokens[0].span,

@@ -107,6 +107,8 @@ pub struct Type {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeKind {
     Named(String),
+    /// `()`
+    Unit,
     /// `[T]`
     Array(Box<Type>),
     /// `*T`
@@ -476,6 +478,11 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => {
                 self.bump();
                 TypeKind::Named(name.clone())
+            }
+            TokenKind::LParen => {
+                self.bump();
+                self.expect(TokenKind::RParen)?;
+                TypeKind::Unit
             }
             TokenKind::LBracket => {
                 self.bump();
@@ -968,7 +975,7 @@ mod tests {
     use crate::lex::tokenize;
 
     fn parse_src(src: &str) -> Result<Module, Vec<ParseError>> {
-        let tokens = tokenize(DummyManager::entry_point(), src).unwrap();
+        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
         parse(&tokens)
     }
 
@@ -1030,6 +1037,7 @@ mod tests {
     fn render_ty(ty: &Type) -> String {
         match &ty.kind {
             TypeKind::Named(name) => name.clone(),
+            TypeKind::Unit => "()".to_string(),
             TypeKind::Array(elem) => format!("[{}]", render_ty(elem)),
             TypeKind::Pointer(pointee) => format!("*{}", render_ty(pointee)),
         }
@@ -1235,6 +1243,14 @@ mod tests {
         assert_eq!(render_ty(&f.sig.params[0].ty), "[[i32]]");
         assert_eq!(render_ty(&f.sig.params[1].ty), "u8");
         assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "[f32]");
+
+        let module = parse_src("fn f(a: (), b: *()) -> ():\n\tpass").unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(f.sig.params[0].ty.kind, TypeKind::Unit);
+        assert_eq!(render_ty(&f.sig.params[1].ty), "*()");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "()");
 
         let module = parse_src("let x: i32 = 1").unwrap();
         let ItemKind::Binding(x) = &module.items[0].kind else {

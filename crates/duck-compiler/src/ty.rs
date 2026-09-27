@@ -86,7 +86,7 @@ const MEMORY_EXPORT: &str = "memory";
 /// The module that `extern` blocks without one import from.
 const DEFAULT_IMPORT_MODULE: &str = "env";
 
-/// A primitive stored as exactly one wasm value. `unit` is [`Ty::Unit`].
+/// A primitive stored as exactly one wasm value. `()` is [`Ty::Unit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
     I8,
@@ -116,7 +116,11 @@ pub enum Ty {
     Struct(StructId),
     /// `*T`, an address in linear memory, stored as an `i32`.
     Ptr(PtrId),
-    /// `unit`, the return type of functions without one. Its values have no
+    /// `externref`, an opaque reference that only the host can create. It
+    /// can't be stored in linear memory, so nothing that holds one has a
+    /// pointer type.
+    ExternRef,
+    /// `()`, the return type of functions without one. Its values have no
     /// scalars, so they take no storage in wasm.
     Unit,
     /// The type of an expression that already failed to check. Compatible
@@ -162,6 +166,8 @@ pub enum TypeErrorKind {
     NotAssignable,
     /// `&` applied to something not behind a pointer, such as a local.
     NotAddressable,
+    /// A pointer to a type holding an `externref`, which can't be in memory.
+    NotStorable(String),
     ImmutableAssign(String),
     MissingArg(String),
     UnknownLabel(String),
@@ -192,6 +198,9 @@ struct Checker {
     /// The pointee of each pointer type.
     pointees: Vec<Ty>,
     ptr_ids: HashMap<Ty, PtrId>,
+    /// Whether every struct's fields are known, so pointer types can be
+    /// checked for storability as they are resolved.
+    structs_defined: bool,
     /// Every function, indexed by [`FuncId`].
     funcs: Vec<FuncSig>,
     /// How many of `funcs` are imported. They come first.
@@ -311,6 +320,8 @@ struct Cell {
     ty: ValType,
     load: LoadOp,
     store: StoreOp,
+    /// Whether the cell holds a `bool`, which may be any byte in memory.
+    bool: bool,
 }
 
 /// Why a global initializer could not be folded.
@@ -442,6 +453,7 @@ impl fmt::Display for TypeErrorKind {
             Self::NoField { ty, field } => write!(f, "`{ty}` has no field `{field}`"),
             Self::NotAssignable => write!(f, "invalid assignment target"),
             Self::NotAddressable => write!(f, "only memory behind a pointer has an address"),
+            Self::NotStorable(ty) => write!(f, "`{ty}` can't be stored in memory"),
             Self::ImmutableAssign(name) => write!(f, "can't assign to immutable `{name}`"),
             Self::MissingArg(name) => write!(f, "missing argument `{name}`"),
             Self::UnknownLabel(name) => write!(f, "no parameter named `{name}`"),
@@ -582,6 +594,28 @@ impl Checker {
         let mut visits = vec![Visit::New; self.structs.len()];
         for id in 0..self.structs.len() {
             self.break_cycles(id, &mut visits);
+        }
+        self.check_field_pointers();
+        self.structs_defined = true;
+    }
+
+    /// Reports pointer fields whose pointee can't be stored in memory, which
+    /// `resolve_ty` couldn't know before every struct was defined, and gives
+    /// them the error type.
+    fn check_field_pointers(&mut self) {
+        for id in 0..self.structs.len() {
+            for i in 0..self.structs[id].fields.len() {
+                let mut ty = self.structs[id].fields[i].ty;
+                while let Ty::Ptr(ptr) = ty {
+                    ty = self.pointee(ptr);
+                    if !self.storable(ty) {
+                        let kind = TypeErrorKind::NotStorable(self.ty_name(ty));
+                        self.error(kind, self.structs[id].fields[i].span);
+                        self.structs[id].fields[i].ty = Ty::Error;
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -726,8 +760,8 @@ impl Checker {
             TypeKind::Named(name) => {
                 if let Some(prim) = Prim::from_name(name) {
                     Ty::Prim(prim)
-                } else if name == "unit" {
-                    Ty::Unit
+                } else if name == "externref" {
+                    Ty::ExternRef
                 } else if let Some(Item::Struct(id)) = self.items.get(name) {
                     Ty::Struct(*id)
                 } else {
@@ -735,14 +769,33 @@ impl Checker {
                     Ty::Error
                 }
             }
+            TypeKind::Unit => Ty::Unit,
             TypeKind::Array(_) => {
                 self.error(TypeErrorKind::Unsupported("arrays"), ty.span);
                 Ty::Error
             }
             TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
+                // Struct fields are checked once every struct is defined.
+                pointee if self.structs_defined && !self.storable(pointee) => {
+                    let kind = TypeErrorKind::NotStorable(self.ty_name(pointee));
+                    self.error(kind, ty.span);
+                    Ty::Error
+                }
                 pointee => self.ptr_to(pointee),
             },
+        }
+    }
+
+    /// Whether `ty` can live in linear memory: it holds no `externref`.
+    fn storable(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::ExternRef => false,
+            Ty::Struct(id) => self.structs[id.0 as usize]
+                .fields
+                .iter()
+                .all(|field| self.storable(field.ty)),
+            Ty::Prim(_) | Ty::Ptr(_) | Ty::Unit | Ty::Error => true,
         }
     }
 
@@ -765,7 +818,8 @@ impl Checker {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
             Ty::Ptr(id) => format!("*{}", self.ty_name(self.pointee(id))),
-            Ty::Unit => "unit".to_string(),
+            Ty::ExternRef => "externref".to_string(),
+            Ty::Unit => "()".to_string(),
             Ty::Error => "{error}".to_string(),
         }
     }
@@ -782,6 +836,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => out.push((name, prim.val_type())),
             Ty::Ptr(_) => out.push((name, ValType::I32)),
+            Ty::ExternRef => out.push((name, ValType::ExternRef)),
             Ty::Struct(id) => {
                 for field in &self.structs[id.0 as usize].fields {
                     self.push_leaves(field.ty, format!("{name}.{}", field.name), out);
@@ -795,7 +850,8 @@ impl Checker {
         self.leaves(ty, "").into_iter().map(|(_, vt)| vt).collect()
     }
 
-    /// The primitive type of each scalar leaf of `ty`, or `None` for pointers.
+    /// The primitive type of each scalar leaf of `ty`, or `None` for pointers
+    /// and `externref`s.
     fn leaf_prims(&self, ty: Ty) -> Vec<Option<Prim>> {
         let mut out = Vec::new();
         self.push_leaf_prims(ty, &mut out);
@@ -805,7 +861,7 @@ impl Checker {
     fn push_leaf_prims(&self, ty: Ty, out: &mut Vec<Option<Prim>>) {
         match ty {
             Ty::Prim(prim) => out.push(Some(prim)),
-            Ty::Ptr(_) => out.push(None),
+            Ty::Ptr(_) | Ty::ExternRef => out.push(None),
             Ty::Struct(id) => {
                 for field in &self.structs[id.0 as usize].fields {
                     self.push_leaf_prims(field.ty, out);
@@ -848,7 +904,9 @@ impl Checker {
                 let (_, size, align) = self.struct_layout(id);
                 (size, align)
             }
-            Ty::Unit | Ty::Error => (0, 1),
+            // Never in memory, but a struct holding one still has a layout
+            // that `field` asks for.
+            Ty::ExternRef | Ty::Unit | Ty::Error => (0, 1),
         }
     }
 
@@ -882,12 +940,14 @@ impl Checker {
                 ty: prim.val_type(),
                 load: prim.load(),
                 store: prim.store(),
+                bool: prim == Prim::Bool,
             }),
             Ty::Ptr(_) => out.push(Cell {
                 offset,
                 ty: ValType::I32,
                 load: LoadOp::Load,
                 store: StoreOp::Store,
+                bool: false,
             }),
             Ty::Struct(id) => {
                 let offsets = self.struct_layout(id).0;
@@ -896,6 +956,7 @@ impl Checker {
                     self.push_cells(field.ty, offset + field_offset, out);
                 }
             }
+            Ty::ExternRef => unreachable!("`externref` has no pointer type"),
             Ty::Unit | Ty::Error => {}
         }
     }
@@ -1167,8 +1228,8 @@ impl<'c> Body<'c> {
                         }
                     },
                 };
-                // Fields are reached through one pointer.
-                if let Ty::Ptr(id) = place.ty {
+                // Fields are reached through any number of pointers.
+                while let Ty::Ptr(id) = place.ty {
                     let ptr = self.read_place(&place);
                     let mut deref = self.deref_place(ptr, self.ck.pointee(id));
                     place.pre.append(&mut deref.pre);
@@ -1304,17 +1365,22 @@ impl<'c> Body<'c> {
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expected, expr.span),
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
             ExprKind::Field(inner, field) => {
-                let (ty, value) = self.expr(inner, None);
-                match ty {
-                    // Fields are reached through one pointer.
-                    Ty::Ptr(id) => match self.ck.field(self.ck.pointee(id), field) {
-                        Some((ty, _, offset)) => (ty, self.load(value, offset, ty)),
-                        None => (Ty::Error, Value::default()),
-                    },
-                    _ => match self.ck.field(ty, field) {
-                        Some((ty, range, _)) => (ty, self.project(value, range)),
-                        None => (Ty::Error, Value::default()),
-                    },
+                let (mut ty, mut value) = self.expr(inner, None);
+                // Fields are reached through any number of pointers.
+                while let Ty::Ptr(id) = ty {
+                    let pointee = self.ck.pointee(id);
+                    if !matches!(pointee, Ty::Ptr(_)) {
+                        return match self.ck.field(pointee, field) {
+                            Some((ty, _, offset)) => (ty, self.load(value, offset, ty)),
+                            None => (Ty::Error, Value::default()),
+                        };
+                    }
+                    value = self.load(value, 0, pointee);
+                    ty = pointee;
+                }
+                match self.ck.field(ty, field) {
+                    Some((ty, range, _)) => (ty, self.project(value, range)),
+                    None => (Ty::Error, Value::default()),
                 }
             }
             ExprKind::Deref(inner) => {
@@ -1499,7 +1565,7 @@ impl<'c> Body<'c> {
         let prim = match ty {
             Ty::Prim(prim) => prim,
             // Pointers compare as unsigned addresses.
-            Ty::Ptr(_) if matches!(op, BinOp::Eq | BinOp::NotEq) => Prim::U32,
+            Ty::Ptr(_) if is_comparison(op) => Prim::U32,
             _ => return self.invalid_operand(binop_symbol(op), ty, span),
         };
         if matches!(op, BinOp::And | BinOp::Or) {
@@ -1592,13 +1658,14 @@ impl<'c> Body<'c> {
         let (from, value) = self.expr(operand, expected);
         match (from, to) {
             (Ty::Error, _) | (_, Ty::Error) => (Ty::Error, Value::default()),
+            // Any type casts to itself.
+            (from, to) if from == to => (to, value),
             (Ty::Prim(from), Ty::Prim(to)) if convertible(from, to) => (
                 Ty::Prim(to),
                 map1(value, to.val_type(), |e| convert(from, to, e)),
             ),
-            (Ty::Ptr(_) | Ty::Prim(Prim::U32), Ty::Ptr(_)) | (Ty::Ptr(_), Ty::Prim(Prim::U32)) => {
-                (to, value)
-            }
+            (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
+            | (Ty::Ptr(_), Ty::Prim(Prim::U32)) => (to, value),
             _ => {
                 let kind = TypeErrorKind::InvalidCast {
                     from: self.ck.ty_name(from),
@@ -1684,7 +1751,7 @@ impl<'c> Body<'c> {
                     for ((_, scalar), prim) in scalars.iter_mut().zip(prims) {
                         if let Some(prim) = prim {
                             let expr = mem::replace(scalar, Expr::Const(Const::I32(0)));
-                            *scalar = from_host(prim, expr);
+                            *scalar = into_range(prim, expr);
                         }
                     }
                 }
@@ -1833,6 +1900,11 @@ impl<'c> Body<'c> {
                     offset: offset + cell.offset,
                     addr: Box::new(addr.clone()),
                 };
+                // Any nonzero byte is `true`.
+                let load = match cell.bool {
+                    true => into_range(Prim::Bool, load),
+                    false => load,
+                };
                 (cell.ty, load)
             })
             .collect();
@@ -1980,7 +2052,8 @@ fn binary(ty: ValType, op: IrBinOp, a: Expr, b: Expr) -> Expr {
 
 fn zero(ty: ValType) -> Const {
     match ty {
-        ValType::I32 => Const::I32(0),
+        // Only after a type error: nothing constant has this type.
+        ValType::I32 | ValType::ExternRef => Const::I32(0),
         ValType::I64 => Const::I64(0),
         ValType::F32 => Const::F32(0.0),
         ValType::F64 => Const::F64(0.0),
@@ -2016,9 +2089,9 @@ fn normalize(prim: Prim, expr: Expr) -> Expr {
     }
 }
 
-/// Brings a value of type `prim` returned by the host into range, as the host
-/// may return any `i32` for a narrow integer or `bool`.
-fn from_host(prim: Prim, expr: Expr) -> Expr {
+/// Brings a value of type `prim` returned by the host or loaded from memory
+/// into range, as either may hold any `i32` for a narrow integer or `bool`.
+fn into_range(prim: Prim, expr: Expr) -> Expr {
     match prim {
         Prim::Bool => binary(ValType::I32, IrBinOp::Ne, expr, Expr::Const(Const::I32(0))),
         prim => normalize(prim, expr),
@@ -2044,19 +2117,16 @@ fn wrap_shift_amount(prim: Prim, amount: Expr) -> Expr {
     }
 }
 
-/// Whether `from as to` is allowed: any numeric conversion, and `bool` to an
-/// integer.
+/// Whether `from as to` is allowed between distinct primitives: any numeric
+/// conversion, and `bool` to an integer.
 fn convertible(from: Prim, to: Prim) -> bool {
-    from == to || (from.is_numeric() && to.is_numeric()) || (from == Prim::Bool && to.is_int())
+    (from.is_numeric() && to.is_numeric()) || (from == Prim::Bool && to.is_int())
 }
 
 /// Lowers `expr as to`. Float to integer conversions saturate.
 fn convert(from: Prim, to: Prim, expr: Expr) -> Expr {
     let (fvt, tvt) = (from.val_type(), to.val_type());
     let unary = |op, e| Expr::Unary(fvt, op, Box::new(e));
-    if from == to {
-        return expr;
-    }
     if from.is_float() && to.is_float() {
         let op = if from == Prim::F32 {
             IrUnOp::Promote
@@ -2299,7 +2369,7 @@ mod tests {
     use crate::lex::tokenize;
 
     fn check_src(src: &str) -> Result<Module, Vec<TypeError>> {
-        let tokens = tokenize(DummyManager::entry_point(), src).unwrap();
+        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
         check(&parse::parse(&tokens).unwrap())
     }
 
@@ -2701,6 +2771,27 @@ fn f(a: u8, b: i8, c: i64, x: f32):
     }
 
     #[test]
+    fn every_type_casts_to_itself() {
+        let src = "\
+struct S:
+    a: i32
+    e: externref
+fn u():
+    pass
+fn f(b: bool, p: *i32, e: externref, s: S):
+    let b2 = b as bool
+    let p2 = p as *i32
+    let e2 = e as externref
+    let s2 = s as S
+    let u2 = u() as ()
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set b2 b) (set p2 p) (set e2 e) (set s2.a s.a) (set s2.e s.e) (call u [] -> [])"
+        );
+    }
+
+    #[test]
     fn literals_take_the_expected_type() {
         let src = "\
 fn f(x: i64, y: f32):
@@ -2980,7 +3071,7 @@ fn f(a: u32, p: P) -> i32:
                 IntOutOfRange("i8".into()),
                 invalid_operand("-", "u8"),
                 mismatch("bool", "i32"),
-                mismatch("i32", "unit"),
+                mismatch("i32", "()"),
                 mismatch("i32", "bool"),
             ]
         );
@@ -3104,10 +3195,10 @@ let p = P(y: g, x: 2.0)
         let src = "\
 fn u():
     pass
-fn g(a: unit, b: i32) -> unit:
+fn g(a: (), b: i32) -> ():
     return a
 fn f() -> i32:
-    let x: unit = u()
+    let x: () = u()
     let y = g(x, 1)
     return 1
 ";
@@ -3120,14 +3211,14 @@ fn f() -> i32:
             "(call u [] -> []) (call g [1] -> []) (return 1)"
         );
         assert_eq!(
-            errors("fn u():\n    let a = u() == u()\n    let b = 1 as unit\n    let c = -u()\n"),
+            errors("fn u():\n    let a = u() == u()\n    let b = 1 as ()\n    let c = -u()\n"),
             vec![
-                invalid_operand("==", "unit"),
+                invalid_operand("==", "()"),
                 TypeErrorKind::InvalidCast {
                     from: "i32".into(),
-                    to: "unit".into()
+                    to: "()".into()
                 },
-                invalid_operand("-", "unit"),
+                invalid_operand("-", "()"),
             ]
         );
     }
@@ -3136,11 +3227,11 @@ fn f() -> i32:
     fn unit_literals() {
         let src = "\
 let g = ()
-fn u() -> unit:
+fn u() -> ():
     return ()
 fn f():
     let a = ()
-    let b: unit = a
+    let b: () = a
     return b
 ";
         let module = lower(src);
@@ -3149,8 +3240,12 @@ fn f():
         assert_eq!(body(&module, "u"), "(return )");
         assert_eq!(body(&module, "f"), "(return )");
         assert_eq!(
-            errors("fn f():\n    let a = () == ()\n    let b: i32 = ()\n"),
-            vec![invalid_operand("==", "unit"), mismatch("i32", "unit")]
+            errors("fn f():\n    let a = () == ()\n    let b: i32 = ()\n    let c: unit = ()\n"),
+            vec![
+                invalid_operand("==", "()"),
+                mismatch("i32", "()"),
+                TypeErrorKind::UnknownType("unit".into()),
+            ]
         );
     }
 
@@ -3188,12 +3283,15 @@ struct P:
     x: f64
 var null = 0 as *u32
 let top = 4294967295 as **P
-pub fn f(p: *P, a: u32) -> *u32:
+pub fn f(p: *P, a: u32, n: i32) -> *u32:
     let q = a as *P
     let b = p as u32
     let c = p as *u32
     let d = p == q
     let e = p != q
+    let g = p < q
+    let h = p >= q
+    let r = n as *P
     return c
 ";
         let module = lower(src);
@@ -3212,17 +3310,21 @@ pub fn f(p: *P, a: u32) -> *u32:
                 (ValType::I32, Const::I32(-1))
             ]
         );
-        assert_eq!(module.funcs[0].params, vec![ValType::I32, ValType::I32]);
+        assert_eq!(
+            module.funcs[0].params,
+            vec![ValType::I32, ValType::I32, ValType::I32]
+        );
         assert_eq!(module.funcs[0].results, vec![ValType::I32]);
         assert_eq!(
             body(&module, "f"),
-            "(set q a) (set b p) (set c p) (set d (I32.Eq p q)) (set e (I32.Ne p q)) (return c)"
+            "(set q a) (set b p) (set c p) (set d (I32.Eq p q)) (set e (I32.Ne p q)) \
+             (set g (I32.LtU p q)) (set h (I32.GeU p q)) (set r n) (return c)"
         );
         let src = "\
-fn f(p: *u8, q: *i8, a: i32):
+fn f(p: *u8, q: *i8, a: i64):
     let b = p as *i8 == q
     let c = p == q
-    let d = p < p
+    let d = p < q
     let e = p + 1
     let g = a as *u8
     let h = p as i32
@@ -3236,10 +3338,10 @@ fn f(p: *u8, q: *i8, a: i32):
             errors(src),
             vec![
                 mismatch("*u8", "*i8"),
-                invalid_operand("<", "*u8"),
+                mismatch("*u8", "*i8"),
                 mismatch("*u8", "i32"),
                 invalid_operand("+", "*u8"),
-                cast("i32", "*u8"),
+                cast("i64", "*u8"),
                 cast("*u8", "i32"),
                 cast("*u8", "u64"),
             ]
@@ -3259,7 +3361,7 @@ struct S:
     next: *S
     k: i8
     u: u16
-fn f(p: *S, q: *unit) -> f64:
+fn f(p: *S, q: *()) -> f64:
     let flag = p.flag
     let n = p.n
     let b = p.inner.b
@@ -3271,13 +3373,13 @@ fn f(p: *S, q: *unit) -> f64:
 ";
         assert_eq!(
             body(&lower(src), "f"),
-            "(set flag (I32.Load8U offset=0 p)) \
+            "(set flag (I32.Ne (I32.Load8U offset=0 p) 0)) \
              (set n (I32.Load16S offset=2 p)) \
              (set b (F64.Load offset=16 p)) \
              (set k (I32.Load8S offset=28 (I32.Load offset=24 p))) \
              (set u (I32.Load16U offset=30 p)) \
              (set tmp7 (I32.Load offset=24 p)) \
-             (set s.flag (I32.Load8U offset=0 tmp7)) \
+             (set s.flag (I32.Ne (I32.Load8U offset=0 tmp7) 0)) \
              (set s.n (I32.Load16S offset=2 tmp7)) \
              (set s.inner.a (I32.Load8U offset=8 tmp7)) \
              (set s.inner.b (F64.Load offset=16 tmp7)) \
@@ -3289,18 +3391,36 @@ fn f(p: *S, q: *unit) -> f64:
         let src = "\
 struct S:
     x: i32
-fn f(p: **S, a: i32):
-    let b = p.x
-    let c = p.*.x
+    next: **S
+fn f(p: ***S) -> i32:
+    let a = p.x
+    let b = p.*.x
+    return p.next.x
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set a (I32.Load offset=0 (I32.Load offset=0 (I32.Load offset=0 p)))) \
+             (set b (I32.Load offset=0 (I32.Load offset=0 (I32.Load offset=0 p)))) \
+             (return (I32.Load offset=0 (I32.Load offset=0 (I32.Load offset=4 \
+             (I32.Load offset=0 (I32.Load offset=0 p))))))"
+        );
+        let src = "\
+struct S:
+    x: i32
+fn f(p: **S, q: **i32, a: i32):
+    let b = p.y
+    let c = q.x
     let d = a.*
 ";
+        let no_field = |ty: &str, field: &str| TypeErrorKind::NoField {
+            ty: ty.into(),
+            field: field.into(),
+        };
         assert_eq!(
             errors(src),
             vec![
-                TypeErrorKind::NoField {
-                    ty: "*S".into(),
-                    field: "x".into()
-                },
+                no_field("S", "y"),
+                no_field("i32", "x"),
                 invalid_operand(".*", "i32"),
             ]
         );
@@ -3327,6 +3447,7 @@ fn f(p: *P, pp: **P):
     p.x += tick()
     p.x += make().x
     q.x = 1
+    pp.z = 2
 ";
         assert_eq!(
             body(&lower(src), "f"),
@@ -3339,7 +3460,8 @@ fn f(p: *P, pp: **P):
              (I32.Store offset=0 p (I32.Add (I32.Load offset=0 p) (call tick ))) \
              (set tmp7 (I32.Load offset=0 p)) (call make [] -> [tmp4 tmp5 tmp6]) \
              (I32.Store offset=0 p (I32.Add tmp7 tmp4)) \
-             (set tmp8 @q) (I32.Store offset=0 tmp8 1)"
+             (set tmp8 @q) (I32.Store offset=0 tmp8 1) \
+             (set tmp9 (I32.Load offset=0 pp)) (I64.Store offset=8 tmp9 2i64)"
         );
     }
 
@@ -3353,18 +3475,20 @@ struct Node:
 struct Pair:
     a: u8
     b: i64
-fn f(n: *Node) -> *i64:
+fn f(n: *Node, nn: **Node) -> *i64:
     let p = &n.pair.b
     let q = &n.*
     let r = &n.next.val
     let s = &n.*.pair
+    let t = &nn.pair
     return p
 ";
         assert_eq!(
             body(&lower(src), "f"),
             "(set p (I32.Add n 16)) (set q n) \
-             (set tmp3 (I32.Load offset=24 n)) (set r tmp3) \
-             (set s (I32.Add n 8)) (return p)"
+             (set tmp4 (I32.Load offset=24 n)) (set r tmp4) \
+             (set s (I32.Add n 8)) \
+             (set tmp7 (I32.Load offset=0 nn)) (set t (I32.Add tmp7 8)) (return p)"
         );
         let src = "\
 struct P:
@@ -3377,7 +3501,6 @@ fn f(a: i32, p: P, pp: **P):
     let e = &(a + 1)
     let h: *i32 = &pp.*
     a.* = 1
-    pp.x = 1
 ";
         use TypeErrorKind::*;
         assert_eq!(
@@ -3389,10 +3512,6 @@ fn f(a: i32, p: P, pp: **P):
                 NotAddressable,
                 mismatch("*i32", "**P"),
                 invalid_operand(".*", "i32"),
-                NoField {
-                    ty: "*P".into(),
-                    field: "x".into()
-                },
             ]
         );
     }
@@ -3435,6 +3554,88 @@ fn f(a: i16, b: i16, c: u8, d: i32):
              (set t (I32.ShrU c 1)) \
              (set u (I32.ShrS a (I32.And b 15))) \
              (set v (I32.Shl d d))"
+        );
+    }
+
+    #[test]
+    fn externrefs_pass_through_locals_and_structs() {
+        let src = "\
+struct Handle:
+    el: externref
+    id: i32
+extern:
+    fn get(id: i32) -> externref
+    fn put(el: externref)
+    fn wrap(h: Handle) -> Handle
+pub fn f(a: externref) -> Handle:
+    var b = get(1)
+    put(b)
+    b = a
+    let h = wrap(Handle(el: b, id: 2))
+    return Handle(el: h.el, id: 3)
+";
+        let module = lower(src);
+        assert_eq!(module.imports[0].results, vec![ValType::ExternRef]);
+        assert_eq!(
+            module.imports[2].params,
+            vec![ValType::ExternRef, ValType::I32]
+        );
+        assert_eq!(module.funcs[0].params, vec![ValType::ExternRef]);
+        assert_eq!(
+            module.funcs[0].results,
+            vec![ValType::ExternRef, ValType::I32]
+        );
+        assert_eq!(
+            body(&module, "f"),
+            "(set b (call get 1)) (call put [b] -> []) (set b a) \
+             (call wrap [b 2] -> [tmp2 tmp3]) (set h.el tmp2) (set h.id tmp3) \
+             (return h.el 3)"
+        );
+    }
+
+    #[test]
+    fn externrefs_are_opaque_and_never_in_memory() {
+        let src = "\
+struct S:
+    e: externref
+struct T:
+    p: **S
+    q: *U
+    r: *T
+struct U:
+    s: S
+extern:
+    fn get() -> externref
+let g = get()
+fn f(a: externref, p: *externref):
+    let b = a == a
+    let c = a + a
+    let d = -a
+    let e: externref = 0
+    let h = a as i32
+    let i = 0 as externref
+    let j = 1 as *S
+";
+        let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        let not_storable = |ty: &str| TypeErrorKind::NotStorable(ty.into());
+        assert_eq!(
+            errors(src),
+            vec![
+                not_storable("S"),
+                not_storable("U"),
+                not_storable("externref"),
+                TypeErrorKind::NotConstant,
+                invalid_operand("==", "externref"),
+                invalid_operand("+", "externref"),
+                invalid_operand("-", "externref"),
+                mismatch("externref", "i32"),
+                cast("externref", "i32"),
+                cast("i32", "externref"),
+                not_storable("S"),
+            ]
         );
     }
 }

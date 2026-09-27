@@ -456,6 +456,7 @@ fn val_type(ty: ValType) -> wasm_encoder::ValType {
         ValType::I64 => wasm_encoder::ValType::I64,
         ValType::F32 => wasm_encoder::ValType::F32,
         ValType::F64 => wasm_encoder::ValType::F64,
+        ValType::ExternRef => wasm_encoder::ValType::EXTERNREF,
     }
 }
 
@@ -468,7 +469,7 @@ mod tests {
 
     /// Compiles `src` and checks that the output is a valid module.
     fn emit_src(src: &str) -> Vec<u8> {
-        let tokens = tokenize(DummyManager::entry_point(), src).unwrap();
+        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
         let module = match ty::check(&parse::parse(&tokens).unwrap()) {
             Ok(module) => module,
             Err(errors) => panic!("unexpected type errors: {errors:#?}"),
@@ -614,6 +615,33 @@ fn c(y: i32) -> i64:
             ]
         );
         assert!(wat.contains("(func $c (;2;) (type 0)"), "{wat}");
+    }
+
+    #[test]
+    fn externrefs_are_reference_values() {
+        let src = "\
+struct Handle:
+    el: externref
+    id: i32
+extern:
+    fn get(id: i32) -> externref
+    fn put(el: externref)
+pub fn f(a: externref) -> Handle:
+    var b = get(1)
+    put(b)
+    b = a
+    return Handle(el: b, id: 2)
+";
+        let wat = wat(&emit_src(src));
+        assert!(
+            wat.contains("(type (;0;) (func (param i32) (result externref)))"),
+            "{wat}"
+        );
+        assert!(
+            wat.contains("(func $f (;2;) (type 2) (param $a externref) (result externref i32)"),
+            "{wat}"
+        );
+        assert!(wat.contains("(local $b externref)"), "{wat}");
     }
 
     #[test]
