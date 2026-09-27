@@ -1,3 +1,7 @@
+extern:
+	fn logi(num: i32)
+	fn logf(num: f32) = "log_f32"
+
 pub let global = true
 pub var counter = 0
 
@@ -13,6 +17,8 @@ pub fn main():
 	let a = 1
 	let b = 2
 	let c = add(a, b)
+	logi(c)
+	logf(1.5)
 	var i = 0
 	while i < 3:
 		i += 1

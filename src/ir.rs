@@ -5,7 +5,8 @@
 //! one local or global per scalar field, and control flow is wasm's structured
 //! `block`/`loop`/`if` with branch targets given as label depths.
 
-/// Index into [`Module::funcs`].
+/// A wasm function index: [`Module::imports`] come first, then
+/// [`Module::funcs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
 
@@ -21,6 +22,7 @@ pub struct LocalId(pub u32);
 pub struct Module {
     pub memory: Memory,
     pub globals: Vec<Global>,
+    pub imports: Vec<Import>,
     pub funcs: Vec<Func>,
 }
 
@@ -57,6 +59,17 @@ pub struct Global {
     pub init: Const,
     /// Export name, set for `pub let` and `pub var`.
     pub export: Option<String>,
+}
+
+/// A function supplied by the host, imported as `module`.`field`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Import {
+    /// Source name, for debugging.
+    pub name: String,
+    pub module: String,
+    pub field: String,
+    pub params: Vec<ValType>,
+    pub results: Vec<ValType>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

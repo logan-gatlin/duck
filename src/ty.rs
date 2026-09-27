@@ -1,7 +1,8 @@
 //! Name resolution, type checking, and lowering to [`crate::ir`].
 //!
 //! All three happen in one walk over each function body. Signatures are
-//! collected first so items can be used before they are declared.
+//! collected first so items can be used before they are declared. Functions
+//! imported from `extern` blocks come first in the function index space.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -13,7 +14,10 @@ use crate::ir::{
     UnOp as IrUnOp, ValType,
 };
 use crate::lex::Span;
-use crate::parse::{self, Arg, BinOp, ExprKind, ItemKind, Mutability, StmtKind, TypeKind, UnaryOp};
+use crate::parse::{
+    self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability,
+    StmtKind, TypeKind, UnaryOp,
+};
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
 /// signed type `$s` and unsigned counterpart `$u`. Returns from the enclosing
@@ -78,6 +82,9 @@ macro_rules! fold_float_binary {
 
 /// The export name of the module's memory, which no item may take.
 const MEMORY_EXPORT: &str = "memory";
+
+/// The module that `extern` blocks without one import from.
+const DEFAULT_IMPORT_MODULE: &str = "env";
 
 /// A primitive stored as exactly one wasm value. `unit` is [`Ty::Unit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,7 +192,10 @@ struct Checker {
     /// The pointee of each pointer type.
     pointees: Vec<Ty>,
     ptr_ids: HashMap<Ty, PtrId>,
+    /// Every function, indexed by [`FuncId`].
     funcs: Vec<FuncSig>,
+    /// How many of `funcs` are imported. They come first.
+    import_count: u32,
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
     ir_globals: Vec<ir::Global>,
@@ -472,6 +482,7 @@ pub fn check(module: &parse::Module) -> Result<ir::Module, Vec<TypeError>> {
     ck.define_structs(module);
     ck.define_funcs(module);
     ck.define_globals(module);
+    let imports = ck.lower_imports(module);
     let funcs = ck.lower_funcs(module);
     if ck.errors.is_empty() {
         Ok(ir::Module {
@@ -480,6 +491,7 @@ pub fn check(module: &parse::Module) -> Result<ir::Module, Vec<TypeError>> {
                 export: MEMORY_EXPORT.to_string(),
             },
             globals: ck.ir_globals,
+            imports,
             funcs,
         })
     } else {
@@ -494,6 +506,15 @@ impl Checker {
 
     /// Registers every item's name, so bodies can refer to later items.
     fn declare(&mut self, module: &parse::Module) {
+        self.import_count = extern_fns(module).count() as u32;
+        self.funcs = fn_sigs(module)
+            .map(|sig| FuncSig {
+                name: sig.name.name.clone(),
+                params: Vec::new(),
+                ret: Ty::Unit,
+            })
+            .collect();
+        let (mut next_import, mut next_def) = (0, self.import_count);
         for item in &module.items {
             let (name, entry) = match &item.kind {
                 ItemKind::Struct(s) => {
@@ -505,27 +526,33 @@ impl Checker {
                     (&s.name, Item::Struct(id))
                 }
                 ItemKind::Fn(f) => {
-                    let id = FuncId(self.funcs.len() as u32);
-                    self.funcs.push(FuncSig {
-                        name: f.name.name.clone(),
-                        params: Vec::new(),
-                        ret: Ty::Unit,
-                    });
-                    (&f.name, Item::Func(id))
+                    next_def += 1;
+                    (&f.sig.name, Item::Func(FuncId(next_def - 1)))
+                }
+                ItemKind::Extern(block) => {
+                    for f in &block.fns {
+                        self.declare_name(&f.sig.name, Item::Func(FuncId(next_import)));
+                        next_import += 1;
+                    }
+                    continue;
                 }
                 ItemKind::Binding(b) => {
                     self.globals.push(None);
                     (&b.name, Item::Global(self.globals.len() - 1))
                 }
             };
-            if self.items.contains_key(&name.name) {
-                self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
-            } else {
-                self.items.insert(name.name.clone(), entry);
-            }
+            self.declare_name(name, entry);
             if item.is_pub && name.name == MEMORY_EXPORT {
                 self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
             }
+        }
+    }
+
+    fn declare_name(&mut self, name: &Ident, entry: Item) {
+        if self.items.contains_key(&name.name) {
+            self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
+        } else {
+            self.items.insert(name.name.clone(), entry);
         }
     }
 
@@ -584,11 +611,7 @@ impl Checker {
     }
 
     fn define_funcs(&mut self, module: &parse::Module) {
-        let decls = module.items.iter().filter_map(|item| match &item.kind {
-            ItemKind::Fn(f) => Some(f),
-            _ => None,
-        });
-        for (id, decl) in decls.enumerate() {
+        for (id, decl) in fn_sigs(module).enumerate() {
             let mut params: Vec<(String, Ty)> = Vec::new();
             for param in &decl.params {
                 if params.iter().any(|(name, _)| *name == param.name.name) {
@@ -645,14 +668,30 @@ impl Checker {
         }
     }
 
+    fn lower_imports(&self, module: &parse::Module) -> Vec<ir::Import> {
+        let imports = extern_fns(module).zip(&self.funcs);
+        imports
+            .map(|((block, decl), sig)| ir::Import {
+                name: sig.name.clone(),
+                module: block
+                    .module
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_IMPORT_MODULE.to_string()),
+                field: decl.import_name.clone().unwrap_or_else(|| sig.name.clone()),
+                params: sig
+                    .params
+                    .iter()
+                    .flat_map(|(_, ty)| self.val_types(*ty))
+                    .collect(),
+                results: self.val_types(sig.ret),
+            })
+            .collect()
+    }
+
     fn lower_funcs(&mut self, module: &parse::Module) -> Vec<ir::Func> {
-        let decls = module.items.iter().filter_map(|item| match &item.kind {
-            ItemKind::Fn(f) => Some((item, f)),
-            _ => None,
-        });
         let mut funcs = Vec::new();
-        for (id, (item, decl)) in decls.enumerate() {
-            let sig = self.funcs[id].clone();
+        for (i, (item, decl)) in fn_decls(module).enumerate() {
+            let sig = self.funcs[self.import_count as usize + i].clone();
             let mut body = Body::new(self, sig.ret);
             for (name, ty) in &sig.params {
                 let slots = body.alloc(name, *ty);
@@ -754,6 +793,26 @@ impl Checker {
 
     fn val_types(&self, ty: Ty) -> Vec<ValType> {
         self.leaves(ty, "").into_iter().map(|(_, vt)| vt).collect()
+    }
+
+    /// The primitive type of each scalar leaf of `ty`, or `None` for pointers.
+    fn leaf_prims(&self, ty: Ty) -> Vec<Option<Prim>> {
+        let mut out = Vec::new();
+        self.push_leaf_prims(ty, &mut out);
+        out
+    }
+
+    fn push_leaf_prims(&self, ty: Ty, out: &mut Vec<Option<Prim>>) {
+        match ty {
+            Ty::Prim(prim) => out.push(Some(prim)),
+            Ty::Ptr(_) => out.push(None),
+            Ty::Struct(id) => {
+                for field in &self.structs[id.0 as usize].fields {
+                    self.push_leaf_prims(field.ty, out);
+                }
+            }
+            Ty::Unit | Ty::Error => {}
+        }
     }
 
     /// The type of `field` in `ty`, the range of `ty`'s leaves it covers, and
@@ -1603,7 +1662,7 @@ impl<'c> Body<'c> {
                 let results = self.ck.val_types(sig.ret);
                 let mut pre = value.pre;
                 let args = exprs(value.scalars);
-                let scalars = if let [result] = results[..] {
+                let mut scalars = if let [result] = results[..] {
                     vec![(result, Expr::Call(id, args))]
                 } else {
                     let dests: Vec<_> = results.iter().map(|vt| self.temp(*vt)).collect();
@@ -1619,6 +1678,16 @@ impl<'c> Body<'c> {
                     });
                     scalars
                 };
+                // The host may return any `i32` for a narrow integer or `bool`.
+                if id.0 < self.ck.import_count {
+                    let prims = self.ck.leaf_prims(sig.ret);
+                    for ((_, scalar), prim) in scalars.iter_mut().zip(prims) {
+                        if let Some(prim) = prim {
+                            let expr = mem::replace(scalar, Expr::Const(Const::I32(0)));
+                            *scalar = from_host(prim, expr);
+                        }
+                    }
+                }
                 (sig.ret, Value { pre, scalars })
             }
             Ok(Item::Struct(id)) => {
@@ -1947,6 +2016,15 @@ fn normalize(prim: Prim, expr: Expr) -> Expr {
     }
 }
 
+/// Brings a value of type `prim` returned by the host into range, as the host
+/// may return any `i32` for a narrow integer or `bool`.
+fn from_host(prim: Prim, expr: Expr) -> Expr {
+    match prim {
+        Prim::Bool => binary(ValType::I32, IrBinOp::Ne, expr, Expr::Const(Const::I32(0))),
+        prim => normalize(prim, expr),
+    }
+}
+
 /// Wraps a shift amount to the bit width of a narrow `prim`, so every integer
 /// type shifts by its amount modulo its width, as wasm does for 32 and 64 bits.
 fn wrap_shift_amount(prim: Prim, amount: Expr) -> Expr {
@@ -2059,6 +2137,29 @@ fn is_stable(expr: &Expr) -> bool {
         } => is_stable(cond) && is_stable(then_expr) && is_stable(else_expr),
         Expr::Global(_) | Expr::Call(..) | Expr::Load { .. } | Expr::Seq(..) => false,
     }
+}
+
+/// Every imported function, with the block that declares it.
+fn extern_fns(module: &parse::Module) -> impl Iterator<Item = (&ExternBlock, &ExternFn)> {
+    let blocks = module.items.iter().filter_map(|item| match &item.kind {
+        ItemKind::Extern(block) => Some(block),
+        _ => None,
+    });
+    blocks.flat_map(|block| block.fns.iter().map(move |f| (block, f)))
+}
+
+/// Every defined function, with the item that declares it.
+fn fn_decls(module: &parse::Module) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
+    module.items.iter().filter_map(|item| match &item.kind {
+        ItemKind::Fn(f) => Some((item, f)),
+        _ => None,
+    })
+}
+
+/// Every function signature in [`FuncId`] order: imports, then definitions.
+fn fn_sigs(module: &parse::Module) -> impl Iterator<Item = &FnSig> {
+    let imports = extern_fns(module).map(|(_, f)| &f.sig);
+    imports.chain(fn_decls(module).map(|(_, f)| &f.sig))
 }
 
 /// Whether control can never reach the end of `block`.
@@ -2223,6 +2324,15 @@ mod tests {
         stmts(module, func, &func.body)
     }
 
+    /// The source name of an imported or defined function.
+    fn func_name(module: &Module, id: FuncId) -> &str {
+        let index = id.0 as usize;
+        match module.imports.get(index) {
+            Some(import) => &import.name,
+            None => &module.funcs[index - module.imports.len()].name,
+        }
+    }
+
     fn stmts(module: &Module, func: &Func, body: &[Stmt]) -> String {
         body.iter()
             .map(|s| stmt(module, func, s))
@@ -2246,7 +2356,7 @@ mod tests {
             Stmt::Drop(v) => format!("(drop {})", e(v)),
             Stmt::Call { func, args, dests } => {
                 let dests: Vec<_> = dests.iter().map(|d| local(f, *d)).collect();
-                let name = &m.funcs[func.0 as usize].name;
+                let name = func_name(m, *func);
                 format!("(call {name} [{}] -> [{}])", list(args), dests.join(" "))
             }
             Stmt::Block(b) => format!("(block {})", stmts(m, f, b)),
@@ -2284,11 +2394,7 @@ mod tests {
             Expr::Binary(ty, op, a, b) => format!("({ty:?}.{op:?} {} {})", ex(a), ex(b)),
             Expr::Call(func, args) => {
                 let args: Vec<_> = args.iter().map(ex).collect();
-                format!(
-                    "(call {} {})",
-                    m.funcs[func.0 as usize].name,
-                    args.join(" ")
-                )
+                format!("(call {} {})", func_name(m, *func), args.join(" "))
             }
             Expr::If {
                 cond,
@@ -2323,6 +2429,20 @@ mod tests {
         let exports: Vec<_> = module.funcs.iter().map(|f| f.export.as_deref()).collect();
         assert_eq!(exports, vec![Some("add"), Some("main")]);
         assert_eq!(body(&module, "add"), "(return (I32.Add a b))");
+        let imports: Vec<_> = module
+            .imports
+            .iter()
+            .map(|i| (i.name.as_str(), i.module.as_str(), i.field.as_str()))
+            .collect();
+        assert_eq!(
+            imports,
+            vec![("logi", "env", "logi"), ("logf", "env", "log_f32")]
+        );
+        let main = body(&module, "main");
+        assert!(
+            main.contains("(call logi [c] -> []) (call logf [1.5f32] -> [])"),
+            "{main}"
+        );
         let globals: Vec<_> = module
             .globals
             .iter()
@@ -2407,6 +2527,83 @@ fn f() -> f32:
             body(&module, "f"),
             "(call make [1f32] -> [tmp0 tmp1]) (set p.x tmp0) (set p.y tmp1) \
              (call make [3f32] -> [tmp4 tmp5]) (return (F32.Add tmp4 (call get p.x p.y)))"
+        );
+    }
+
+    #[test]
+    fn imports_come_first() {
+        let src = "\
+struct P:
+    x: f32
+    y: i64
+fn first() -> i32:
+    return now(scale: 2) + second()
+extern \"js\":
+    fn now(scale: i32) -> i32 = \"Date.now\"
+fn second() -> i32:
+    return 0
+extern:
+    fn put(p: *P, value: P) -> P
+";
+        let module = lower(src);
+        let imports: Vec<_> = module
+            .imports
+            .iter()
+            .map(|i| {
+                let (params, results) = (i.params.clone(), i.results.clone());
+                (
+                    i.name.as_str(),
+                    i.module.as_str(),
+                    i.field.as_str(),
+                    params,
+                    results,
+                )
+            })
+            .collect();
+        use ValType::*;
+        assert_eq!(
+            imports,
+            vec![
+                ("now", "js", "Date.now", vec![I32], vec![I32]),
+                ("put", "env", "put", vec![I32, F32, I64], vec![F32, I64]),
+            ]
+        );
+        let funcs: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(funcs, vec!["first", "second"]);
+        assert_eq!(
+            body(&module, "first"),
+            "(return (I32.Add (call now 2) (call second )))"
+        );
+    }
+
+    #[test]
+    fn host_results_are_brought_into_range() {
+        let src = "\
+struct S:
+    a: u8
+    b: *i8
+    c: bool
+extern:
+    fn u() -> u8
+    fn i() -> i16
+    fn b() -> bool
+    fn p() -> *u8
+    fn s() -> S
+fn f():
+    let x = u()
+    let y = i()
+    let z = b()
+    let w = p()
+    let v = s()
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set x (I32.And (call u ) 255)) \
+             (set y (I32.Extend16S (call i ))) \
+             (set z (I32.Ne (call b ) 0)) \
+             (set w (call p )) \
+             (call s [] -> [tmp4 tmp5 tmp6]) \
+             (set v.a (I32.And tmp4 255)) (set v.b tmp5) (set v.c (I32.Ne tmp6 0))"
         );
     }
 
@@ -2666,6 +2863,37 @@ fn f(x: i32) -> i32:
 
     fn invalid_operand(op: &'static str, ty: &str) -> TypeErrorKind {
         TypeErrorKind::InvalidOperand { op, ty: ty.into() }
+    }
+
+    #[test]
+    fn imports_share_the_item_namespace() {
+        use TypeErrorKind::*;
+        let src = "\
+fn a():
+    pass
+extern:
+    fn a()
+    fn b(x: i32, x: Nope)
+    fn b() = \"b2\"
+    fn c(x: i32)
+fn f():
+    c(y: 1)
+";
+        let errors = check_src(src).unwrap_err();
+        let kinds: Vec<_> = errors.iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DuplicateItem("a".into()),
+                DuplicateItem("b".into()),
+                DuplicateParam("x".into()),
+                UnknownType("Nope".into()),
+                UnknownLabel("y".into()),
+                MissingArg("x".into()),
+            ]
+        );
+        // The later declaration, the import, is the duplicate.
+        assert_eq!(errors[0].span.start, src.find("a()\n    fn b").unwrap());
     }
 
     #[test]

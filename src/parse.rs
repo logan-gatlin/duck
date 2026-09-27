@@ -18,16 +18,40 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ItemKind {
     Fn(FnDecl),
+    Extern(ExternBlock),
     Struct(StructDecl),
     Binding(Binding),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
+    pub sig: FnSig,
+    pub body: Block,
+}
+
+/// `fn name(params) -> ret`, shared by definitions and imports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnSig {
     pub name: Ident,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
-    pub body: Block,
+}
+
+/// `extern "module":` and the host functions it imports. The module name is
+/// optional.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternBlock {
+    pub module: Option<String>,
+    pub fns: Vec<ExternFn>,
+}
+
+/// A bodyless `fn` in an `extern` block, optionally followed by `= "name"` to
+/// import it under a different name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternFn {
+    pub sig: FnSig,
+    pub import_name: Option<String>,
+    pub span: Span,
 }
 
 /// A `name: Type` function parameter.
@@ -201,10 +225,19 @@ pub struct ParseError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseErrorKind {
-    Expected { expected: String, found: TokenKind },
+    Expected {
+        expected: String,
+        found: TokenKind,
+    },
     UnexpectedIndent,
     ChainedComparison,
     InvalidAssignTarget,
+    /// A `fn` with no body outside an `extern` block.
+    MissingFnBody,
+    /// A `fn` with a body inside an `extern` block.
+    ExternFnBody,
+    /// `pub` on an `extern` block or on a function in one.
+    PubExtern,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -230,6 +263,9 @@ impl fmt::Display for ParseErrorKind {
             Self::UnexpectedIndent => write!(f, "unexpected indentation"),
             Self::ChainedComparison => write!(f, "comparison operators cannot be chained"),
             Self::InvalidAssignTarget => write!(f, "invalid assignment target"),
+            Self::MissingFnBody => write!(f, "functions outside `extern` blocks need a body"),
+            Self::ExternFnBody => write!(f, "functions in `extern` blocks cannot have a body"),
+            Self::PubExtern => write!(f, "`extern` blocks and their functions cannot be `pub`"),
         }
     }
 }
@@ -278,6 +314,12 @@ impl<'a> Parser<'a> {
         let is_pub = self.eat(TokenKind::Pub);
         let kind = match self.peek().kind {
             TokenKind::Fn => ItemKind::Fn(self.fn_decl()?),
+            TokenKind::Extern => {
+                if is_pub {
+                    self.error(ParseErrorKind::PubExtern, start);
+                }
+                ItemKind::Extern(self.extern_block()?)
+            }
             TokenKind::Struct => ItemKind::Struct(self.struct_decl()?),
             TokenKind::Let | TokenKind::Var => ItemKind::Binding(self.binding()?),
             _ => return Err(self.unexpected("item")),
@@ -290,6 +332,17 @@ impl<'a> Parser<'a> {
     }
 
     fn fn_decl(&mut self) -> PResult<FnDecl> {
+        let start = self.peek().span;
+        let sig = self.fn_sig()?;
+        // `=` would name an import, which only `extern` blocks have.
+        if self.at(TokenKind::Newline) || self.at(TokenKind::Eq) {
+            return Err(self.error_from(ParseErrorKind::MissingFnBody, start));
+        }
+        let body = self.block()?;
+        Ok(FnDecl { sig, body })
+    }
+
+    fn fn_sig(&mut self) -> PResult<FnSig> {
         self.expect(TokenKind::Fn)?;
         let name = self.ident()?;
         self.expect(TokenKind::LParen)?;
@@ -299,12 +352,49 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = self.block()?;
-        Ok(FnDecl {
-            name,
-            params,
-            ret,
-            body,
+        Ok(FnSig { name, params, ret })
+    }
+
+    fn extern_block(&mut self) -> PResult<ExternBlock> {
+        self.expect(TokenKind::Extern)?;
+        let module = if matches!(self.peek().kind, TokenKind::Str(_)) {
+            Some(self.string()?)
+        } else {
+            None
+        };
+        let fns = self.indented(|p| {
+            if p.eat(TokenKind::Pass) {
+                p.expect(TokenKind::Newline)?;
+                return Ok(None);
+            }
+            p.extern_fn().map(Some)
+        })?;
+        Ok(ExternBlock {
+            module,
+            fns: fns.into_iter().flatten().collect(),
+        })
+    }
+
+    fn extern_fn(&mut self) -> PResult<ExternFn> {
+        let start = self.peek().span;
+        if self.eat(TokenKind::Pub) {
+            self.error(ParseErrorKind::PubExtern, start);
+        }
+        let sig = self.fn_sig()?;
+        let import_name = if self.eat(TokenKind::Eq) {
+            Some(self.string()?)
+        } else {
+            None
+        };
+        if self.at(TokenKind::Colon) {
+            return Err(self.error_from(ParseErrorKind::ExternFnBody, start));
+        }
+        let span = self.span_from(start);
+        self.expect(TokenKind::Newline)?;
+        Ok(ExternFn {
+            sig,
+            import_name,
+            span,
         })
     }
 
@@ -517,10 +607,7 @@ impl<'a> Parser<'a> {
             target.kind,
             ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Deref(_)
         ) {
-            self.errors.push(ParseError {
-                kind: ParseErrorKind::InvalidAssignTarget,
-                span: target.span,
-            });
+            self.error(ParseErrorKind::InvalidAssignTarget, target.span);
         }
         let value = self.expr()?;
         self.expect(TokenKind::Newline)?;
@@ -557,10 +644,7 @@ impl<'a> Parser<'a> {
             };
             if prec == CMP_PREC && binary_op(&self.peek().kind).is_some_and(|(_, p)| p == CMP_PREC)
             {
-                self.errors.push(ParseError {
-                    kind: ParseErrorKind::ChainedComparison,
-                    span: self.peek().span,
-                });
+                self.error(ParseErrorKind::ChainedComparison, self.peek().span);
             }
         }
         Ok(lhs)
@@ -706,6 +790,16 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
+    fn string(&mut self) -> PResult<String> {
+        match &self.peek().kind {
+            TokenKind::Str(value) => {
+                self.bump();
+                Ok(value.clone())
+            }
+            _ => Err(self.unexpected("string")),
+        }
+    }
+
     fn ident(&mut self) -> PResult<Ident> {
         let token = self.peek();
         match &token.kind {
@@ -815,6 +909,19 @@ impl<'a> Parser<'a> {
         ParseError {
             kind,
             span: token.span,
+        }
+    }
+
+    /// Records an error that doesn't stop the current line from parsing.
+    fn error(&mut self, kind: ParseErrorKind, span: Span) {
+        self.errors.push(ParseError { kind, span });
+    }
+
+    /// An error spanning from `start` to the end of the last consumed token.
+    fn error_from(&self, kind: ParseErrorKind, start: Span) -> ParseError {
+        ParseError {
+            kind,
+            span: self.span_from(start),
         }
     }
 
@@ -952,10 +1059,23 @@ mod tests {
     #[test]
     fn example_program() {
         let module = parse_src(include_str!("../example.duck")).unwrap();
-        let [global, counter, point, add, main] = &module.items[..] else {
-            panic!("expected 5 items, got {:#?}", module.items);
+        let [host, global, counter, point, add, main] = &module.items[..] else {
+            panic!("expected 6 items, got {:#?}", module.items);
         };
-        assert!(module.items.iter().all(|item| item.is_pub));
+        assert!(!host.is_pub);
+        assert!(module.items[1..].iter().all(|item| item.is_pub));
+
+        let ItemKind::Extern(host) = &host.kind else {
+            panic!()
+        };
+        assert_eq!(host.module, None);
+        let fns: Vec<_> = host
+            .fns
+            .iter()
+            .map(|f| (f.sig.name.name.as_str(), f.import_name.as_deref()))
+            .collect();
+        assert_eq!(fns, vec![("logi", None), ("logf", Some("log_f32"))]);
+        assert_eq!(host.fns[0].sig.params[0].ty.kind, named("i32"));
 
         let ItemKind::Binding(global) = &global.kind else {
             panic!()
@@ -984,9 +1104,9 @@ mod tests {
         let ItemKind::Fn(add) = &add.kind else {
             panic!()
         };
-        assert_eq!(add.name.name, "add");
-        assert_eq!(add.params.len(), 2);
-        assert_eq!(add.ret.as_ref().unwrap().kind, named("i32"));
+        assert_eq!(add.sig.name.name, "add");
+        assert_eq!(add.sig.params.len(), 2);
+        assert_eq!(add.sig.ret.as_ref().unwrap().kind, named("i32"));
         let StmtKind::Return(Some(sum)) = &add.body[0].kind else {
             panic!()
         };
@@ -995,12 +1115,14 @@ mod tests {
         let ItemKind::Fn(main) = &main.kind else {
             panic!()
         };
-        assert_eq!(main.ret, None);
+        assert_eq!(main.sig.ret, None);
         assert_eq!(
             stmt_kinds(&main.body),
-            vec!["binding", "binding", "binding", "binding", "while", "while"]
+            vec![
+                "binding", "binding", "binding", "expr", "expr", "binding", "while", "while"
+            ]
         );
-        let StmtKind::While { cond, body } = &main.body[4].kind else {
+        let StmtKind::While { cond, body } = &main.body[6].kind else {
             panic!()
         };
         assert_eq!(sexpr(cond), "(Lt i 3)");
@@ -1059,8 +1181,8 @@ mod tests {
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(&f.params[0].ty), "*P");
-        assert_eq!(render_ty(f.ret.as_ref().unwrap()), "*[i32]");
+        assert_eq!(render_ty(&f.sig.params[0].ty), "*P");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "*[i32]");
         assert_eq!(stmt_kinds(&f.body), vec!["assign", "assign", "assign"]);
         assert_eq!(
             errors("fn f():\n    &p = 1\n"),
@@ -1110,9 +1232,9 @@ mod tests {
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(&f.params[0].ty), "[[i32]]");
-        assert_eq!(render_ty(&f.params[1].ty), "u8");
-        assert_eq!(render_ty(f.ret.as_ref().unwrap()), "[f32]");
+        assert_eq!(render_ty(&f.sig.params[0].ty), "[[i32]]");
+        assert_eq!(render_ty(&f.sig.params[1].ty), "u8");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "[f32]");
 
         let module = parse_src("let x: i32 = 1").unwrap();
         let ItemKind::Binding(x) = &module.items[0].kind else {
@@ -1204,6 +1326,85 @@ fn f():
             panic!()
         };
         assert!(unit.fields.is_empty());
+    }
+
+    #[test]
+    fn extern_blocks() {
+        let src = "\
+extern \"js\":
+    fn now() -> f64
+    fn log(p: *u8, len: i32) = \"console.log\"
+extern:
+    pass
+extern \"\":
+    fn f() = \"\"
+";
+        let module = parse_src(src).unwrap();
+        let blocks: Vec<_> = module
+            .items
+            .iter()
+            .map(|item| match &item.kind {
+                ItemKind::Extern(block) => block,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(blocks[0].module.as_deref(), Some("js"));
+        let [now, log] = &blocks[0].fns[..] else {
+            panic!()
+        };
+        assert_eq!(now.sig.name.name, "now");
+        assert_eq!(render_ty(now.sig.ret.as_ref().unwrap()), "f64");
+        assert_eq!(now.import_name, None);
+        assert_eq!(&src[now.span.start..now.span.end], "fn now() -> f64");
+        assert_eq!(log.sig.params.len(), 2);
+        assert_eq!(log.import_name.as_deref(), Some("console.log"));
+        assert_eq!(
+            &src[log.span.start..log.span.end],
+            "fn log(p: *u8, len: i32) = \"console.log\""
+        );
+        assert_eq!(blocks[1].module, None);
+        assert!(blocks[1].fns.is_empty());
+        assert_eq!(blocks[2].module.as_deref(), Some(""));
+        assert_eq!(blocks[2].fns[0].import_name.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn extern_errors() {
+        let src = "\
+extern:
+    fn a():
+        pass
+    pub fn b()
+    let c = 1
+    fn d() = e
+pub extern:
+    fn f()
+fn g()
+fn g2() = \"x\"
+fn h() -> i32:
+    return 1
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                ParseErrorKind::ExternFnBody,
+                ParseErrorKind::PubExtern,
+                expected("`fn`", TokenKind::Let),
+                expected("string", TokenKind::Ident("e".into())),
+                ParseErrorKind::PubExtern,
+                ParseErrorKind::MissingFnBody,
+                ParseErrorKind::MissingFnBody,
+            ]
+        );
+        let spans: Vec<_> = parse_src(src)
+            .unwrap_err()
+            .iter()
+            .map(|e| &src[e.span.start..e.span.end])
+            .collect();
+        assert_eq!(
+            spans,
+            ["fn a()", "pub", "let", "e", "pub", "fn g()", "fn g2()"]
+        );
     }
 
     #[test]
