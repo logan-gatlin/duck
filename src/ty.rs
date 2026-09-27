@@ -9,7 +9,8 @@ use std::mem;
 use std::ops::Range;
 
 use crate::ir::{
-    self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LocalId, Stmt, UnOp as IrUnOp, ValType,
+    self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
+    UnOp as IrUnOp, ValType,
 };
 use crate::lex::Span;
 use crate::parse::{self, Arg, BinOp, ExprKind, ItemKind, Mutability, StmtKind, TypeKind, UnaryOp};
@@ -75,6 +76,9 @@ macro_rules! fold_float_binary {
     }};
 }
 
+/// The export name of the module's memory, which no item may take.
+const MEMORY_EXPORT: &str = "memory";
+
 /// A primitive stored as exactly one wasm value. `unit` is [`Ty::Unit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
@@ -95,10 +99,16 @@ pub enum Prim {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StructId(u32);
 
+/// Index of an interned pointer type, which records the pointee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PtrId(u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     Prim(Prim),
     Struct(StructId),
+    /// `*T`, an address in linear memory, stored as an `i32`.
+    Ptr(PtrId),
     /// `unit`, the return type of functions without one. Its values have no
     /// scalars, so they take no storage in wasm.
     Unit,
@@ -143,6 +153,8 @@ pub enum TypeErrorKind {
         field: String,
     },
     NotAssignable,
+    /// `&` applied to something not behind a pointer, such as a local.
+    NotAddressable,
     ImmutableAssign(String),
     MissingArg(String),
     UnknownLabel(String),
@@ -161,6 +173,8 @@ pub enum TypeErrorKind {
     NotConstant,
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
+    /// A `pub` item whose export name is taken by the module itself.
+    ReservedExport(String),
     Unsupported(&'static str),
 }
 
@@ -168,6 +182,9 @@ pub enum TypeErrorKind {
 struct Checker {
     items: HashMap<String, Item>,
     structs: Vec<StructDef>,
+    /// The pointee of each pointer type.
+    pointees: Vec<Ty>,
+    ptr_ids: HashMap<Ty, PtrId>,
     funcs: Vec<FuncSig>,
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
@@ -239,17 +256,27 @@ enum Label {
     Other,
 }
 
-/// A variable, or a field of one, that can be assigned.
+/// A variable, a field of one, or memory behind a pointer, that can be
+/// assigned.
 struct Place {
     name: String,
     ty: Ty,
     mutable: bool,
+    /// Computes the address of a `Slots::Memory` place. Runs before anything
+    /// else in the assignment.
+    pre: Vec<Stmt>,
     slots: Slots,
 }
 
 enum Slots {
     Local(Vec<LocalId>),
     Global(Vec<GlobalId>),
+    /// `offset` bytes past `addr`, which is a local or constant so that it
+    /// can be reused.
+    Memory {
+        addr: Expr,
+        offset: u32,
+    },
 }
 
 /// A lowered expression: run `pre`, then evaluate `scalars` in order, one per
@@ -265,6 +292,15 @@ enum Visit {
     New,
     Active,
     Done,
+}
+
+/// Where one scalar leaf of a type lives in memory.
+struct Cell {
+    /// Bytes from the start of the value.
+    offset: u32,
+    ty: ValType,
+    load: LoadOp,
+    store: StoreOp,
 }
 
 /// Why a global initializer could not be folded.
@@ -332,6 +368,34 @@ impl Prim {
         self != Self::Bool
     }
 
+    /// Size in memory, which is also its alignment.
+    fn size(self) -> u32 {
+        match self {
+            Self::I8 | Self::U8 | Self::Bool => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::I64 | Self::U64 | Self::F64 => 8,
+        }
+    }
+
+    fn load(self) -> LoadOp {
+        match self {
+            Self::I8 => LoadOp::Load8S,
+            Self::U8 | Self::Bool => LoadOp::Load8U,
+            Self::I16 => LoadOp::Load16S,
+            Self::U16 => LoadOp::Load16U,
+            _ => LoadOp::Load,
+        }
+    }
+
+    fn store(self) -> StoreOp {
+        match self.size() {
+            1 => StoreOp::Store8,
+            2 => StoreOp::Store16,
+            _ => StoreOp::Store,
+        }
+    }
+
     /// Inclusive bounds of an integer type.
     fn range(self) -> (i128, i128) {
         match self {
@@ -367,6 +431,7 @@ impl fmt::Display for TypeErrorKind {
             Self::IntOutOfRange(ty) => write!(f, "literal out of range for `{ty}`"),
             Self::NoField { ty, field } => write!(f, "`{ty}` has no field `{field}`"),
             Self::NotAssignable => write!(f, "invalid assignment target"),
+            Self::NotAddressable => write!(f, "only memory behind a pointer has an address"),
             Self::ImmutableAssign(name) => write!(f, "can't assign to immutable `{name}`"),
             Self::MissingArg(name) => write!(f, "missing argument `{name}`"),
             Self::UnknownLabel(name) => write!(f, "no parameter named `{name}`"),
@@ -383,6 +448,7 @@ impl fmt::Display for TypeErrorKind {
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
             Self::NotConstant => write!(f, "global initializers must be constant"),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
+            Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
             Self::Unsupported(what) => write!(f, "{what} are not supported yet"),
         }
     }
@@ -409,6 +475,10 @@ pub fn check(module: &parse::Module) -> Result<ir::Module, Vec<TypeError>> {
     let funcs = ck.lower_funcs(module);
     if ck.errors.is_empty() {
         Ok(ir::Module {
+            memory: ir::Memory {
+                min_pages: 1,
+                export: MEMORY_EXPORT.to_string(),
+            },
             globals: ck.ir_globals,
             funcs,
         })
@@ -452,6 +522,9 @@ impl Checker {
                 self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
             } else {
                 self.items.insert(name.name.clone(), entry);
+            }
+            if item.is_pub && name.name == MEMORY_EXPORT {
+                self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
             }
         }
     }
@@ -627,13 +700,32 @@ impl Checker {
                 self.error(TypeErrorKind::Unsupported("arrays"), ty.span);
                 Ty::Error
             }
+            TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
+                Ty::Error => Ty::Error,
+                pointee => self.ptr_to(pointee),
+            },
         }
+    }
+
+    /// The interned type `*pointee`.
+    fn ptr_to(&mut self, pointee: Ty) -> Ty {
+        let next = PtrId(self.pointees.len() as u32);
+        let id = *self.ptr_ids.entry(pointee).or_insert(next);
+        if id == next {
+            self.pointees.push(pointee);
+        }
+        Ty::Ptr(id)
+    }
+
+    fn pointee(&self, id: PtrId) -> Ty {
+        self.pointees[id.0 as usize]
     }
 
     fn ty_name(&self, ty: Ty) -> String {
         match ty {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
+            Ty::Ptr(id) => format!("*{}", self.ty_name(self.pointee(id))),
             Ty::Unit => "unit".to_string(),
             Ty::Error => "{error}".to_string(),
         }
@@ -650,6 +742,7 @@ impl Checker {
     fn push_leaves(&self, ty: Ty, name: String, out: &mut Vec<(String, ValType)>) {
         match ty {
             Ty::Prim(prim) => out.push((name, prim.val_type())),
+            Ty::Ptr(_) => out.push((name, ValType::I32)),
             Ty::Struct(id) => {
                 for field in &self.structs[id.0 as usize].fields {
                     self.push_leaves(field.ty, format!("{name}.{}", field.name), out);
@@ -663,15 +756,16 @@ impl Checker {
         self.leaves(ty, "").into_iter().map(|(_, vt)| vt).collect()
     }
 
-    /// The type of `field` in `ty`, and the range of `ty`'s leaves it covers.
-    /// `None` after reporting an error.
-    fn field(&mut self, ty: Ty, field: &parse::Ident) -> Option<(Ty, Range<usize>)> {
+    /// The type of `field` in `ty`, the range of `ty`'s leaves it covers, and
+    /// its offset in memory. `None` after reporting an error.
+    fn field(&mut self, ty: Ty, field: &parse::Ident) -> Option<(Ty, Range<usize>, u32)> {
         if let Ty::Struct(id) = ty {
             let mut start = 0;
-            for def in &self.structs[id.0 as usize].fields {
+            let offsets = self.struct_layout(id).0;
+            for (def, offset) in self.structs[id.0 as usize].fields.iter().zip(offsets) {
                 let len = self.val_types(def.ty).len();
                 if def.name == field.name {
-                    return Some((def.ty, start..start + len));
+                    return Some((def.ty, start..start + len, offset));
                 }
                 start += len;
             }
@@ -684,6 +778,67 @@ impl Checker {
             self.error(kind, field.span);
         }
         None
+    }
+
+    /// Size and alignment of `ty` in memory.
+    fn layout(&self, ty: Ty) -> (u32, u32) {
+        match ty {
+            Ty::Prim(prim) => (prim.size(), prim.size()),
+            Ty::Ptr(_) => (4, 4),
+            Ty::Struct(id) => {
+                let (_, size, align) = self.struct_layout(id);
+                (size, align)
+            }
+            Ty::Unit | Ty::Error => (0, 1),
+        }
+    }
+
+    /// Field offsets, size, and alignment of a struct, laid out as C would:
+    /// fields in order, each at a multiple of its alignment, and the whole
+    /// padded to a multiple of the largest.
+    fn struct_layout(&self, id: StructId) -> (Vec<u32>, u32, u32) {
+        let (mut size, mut align) = (0u32, 1);
+        let mut offsets = Vec::new();
+        for field in &self.structs[id.0 as usize].fields {
+            let (field_size, field_align) = self.layout(field.ty);
+            size = size.next_multiple_of(field_align);
+            offsets.push(size);
+            size += field_size;
+            align = align.max(field_align);
+        }
+        (offsets, size.next_multiple_of(align), align)
+    }
+
+    /// Where each scalar leaf of `ty` lives in memory, in leaf order.
+    fn cells(&self, ty: Ty) -> Vec<Cell> {
+        let mut out = Vec::new();
+        self.push_cells(ty, 0, &mut out);
+        out
+    }
+
+    fn push_cells(&self, ty: Ty, offset: u32, out: &mut Vec<Cell>) {
+        match ty {
+            Ty::Prim(prim) => out.push(Cell {
+                offset,
+                ty: prim.val_type(),
+                load: prim.load(),
+                store: prim.store(),
+            }),
+            Ty::Ptr(_) => out.push(Cell {
+                offset,
+                ty: ValType::I32,
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            }),
+            Ty::Struct(id) => {
+                let offsets = self.struct_layout(id).0;
+                for (field, field_offset) in self.structs[id.0 as usize].fields.iter().zip(offsets)
+                {
+                    self.push_cells(field.ty, offset + field_offset, out);
+                }
+            }
+            Ty::Unit | Ty::Error => {}
+        }
     }
 
     /// Evaluates a lowered global initializer at compile time.
@@ -709,7 +864,9 @@ impl Checker {
                 Const::I32(0) => self.fold(else_expr),
                 _ => self.fold(then_expr),
             },
-            Expr::Local(_) | Expr::Call(..) | Expr::Seq(..) => Err(Fold::NotConstant),
+            Expr::Local(_) | Expr::Call(..) | Expr::Load { .. } | Expr::Seq(..) => {
+                Err(Fold::NotConstant)
+            }
         }
     }
 }
@@ -801,10 +958,11 @@ impl<'c> Body<'c> {
                 self.bind(&binding.name.name, ty, mutable, slots);
             }
             StmtKind::Assign { target, op, value } => {
-                let Some(place) = self.place(target) else {
+                let Some(mut place) = self.place(target) else {
                     self.expr(value, None);
                     return;
                 };
+                out.append(&mut place.pre);
                 if !place.mutable {
                     self.error(
                         TypeErrorKind::ImmutableAssign(place.name.clone()),
@@ -819,7 +977,7 @@ impl<'c> Body<'c> {
                         self.binary_values(*op, place.ty, current, rhs, stmt.span).1
                     }
                 };
-                self.assign(&place.slots, value, out);
+                self.assign(&place, value, out);
             }
             StmtKind::Expr(expr) => {
                 let value = self.expr(expr, None).1;
@@ -911,6 +1069,7 @@ impl<'c> Body<'c> {
                         name: name.clone(),
                         ty: var.ty,
                         mutable: var.mutable,
+                        pre: Vec::new(),
                         slots: Slots::Local(var.slots.clone()),
                     });
                 }
@@ -921,6 +1080,7 @@ impl<'c> Body<'c> {
                             name: name.clone(),
                             ty: global.ty,
                             mutable: global.mutable,
+                            pre: Vec::new(),
                             slots: Slots::Global(global.slots.clone()),
                         })
                     }
@@ -935,14 +1095,47 @@ impl<'c> Body<'c> {
                 }
             }
             ExprKind::Field(inner, field) => {
-                let place = self.place(inner)?;
-                let (ty, range) = self.ck.field(place.ty, field)?;
+                let mut place = match &inner.kind {
+                    ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Deref(_) => {
+                        self.place(inner)?
+                    }
+                    _ => match self.expr(inner, None) {
+                        (Ty::Ptr(id), ptr) => self.deref_place(ptr, self.ck.pointee(id)),
+                        (Ty::Error, _) => return None,
+                        _ => {
+                            self.error(TypeErrorKind::NotAssignable, target.span);
+                            return None;
+                        }
+                    },
+                };
+                // Fields are reached through one pointer.
+                if let Ty::Ptr(id) = place.ty {
+                    let ptr = self.read_place(&place);
+                    let mut deref = self.deref_place(ptr, self.ck.pointee(id));
+                    place.pre.append(&mut deref.pre);
+                    place = Place {
+                        pre: place.pre,
+                        ..deref
+                    };
+                }
+                let (ty, range, field_offset) = self.ck.field(place.ty, field)?;
                 let slots = match place.slots {
                     Slots::Local(slots) => Slots::Local(slots[range].to_vec()),
                     Slots::Global(slots) => Slots::Global(slots[range].to_vec()),
+                    Slots::Memory { addr, offset } => Slots::Memory {
+                        addr,
+                        offset: offset + field_offset,
+                    },
                 };
                 Some(Place { ty, slots, ..place })
             }
+            ExprKind::Deref(inner) => match self.expr(inner, None) {
+                (Ty::Ptr(id), ptr) => Some(self.deref_place(ptr, self.ck.pointee(id))),
+                (ty, _) => {
+                    self.invalid_operand(".*", ty, target.span);
+                    None
+                }
+            },
             ExprKind::Index(..) => {
                 self.error(TypeErrorKind::Unsupported("arrays"), target.span);
                 None
@@ -954,23 +1147,55 @@ impl<'c> Body<'c> {
         }
     }
 
-    fn read_place(&self, place: &Place) -> Value {
+    /// The memory a pointer points to, as a place.
+    fn deref_place(&mut self, ptr: Value, pointee: Ty) -> Place {
+        let (pre, addr) = self.reusable_addr(ptr);
+        Place {
+            name: String::new(),
+            ty: pointee,
+            mutable: true,
+            pre,
+            slots: Slots::Memory { addr, offset: 0 },
+        }
+    }
+
+    /// Splits a pointer value into its prelude and an address that can be
+    /// evaluated more than once, moving it into a temporary if needed.
+    fn reusable_addr(&mut self, ptr: Value) -> (Vec<Stmt>, Expr) {
+        let (mut pre, addr) = split1(ptr);
+        if matches!(addr, Expr::Local(_) | Expr::Const(_)) {
+            return (pre, addr);
+        }
+        let tmp = self.temp(ValType::I32);
+        pre.push(Stmt::SetLocal(tmp, addr));
+        (pre, Expr::Local(tmp))
+    }
+
+    /// Reads a place, not including its `pre`.
+    fn read_place(&mut self, place: &Place) -> Value {
         let reads = match &place.slots {
             Slots::Local(slots) => slots.iter().map(|l| Expr::Local(*l)).collect(),
             Slots::Global(slots) => slots.iter().map(|g| Expr::Global(*g)).collect(),
+            Slots::Memory { addr, offset } => {
+                let ptr = scalar(ValType::I32, addr.clone());
+                return self.load(ptr, *offset, place.ty);
+            }
         };
         self.scalars(place.ty, reads)
     }
 
-    fn assign(&mut self, slots: &Slots, mut value: Value, out: &mut Vec<Stmt>) {
+    fn assign(&mut self, place: &Place, mut value: Value, out: &mut Vec<Stmt>) {
         // Every scalar is read before any slot is written, so `p = Point(x:
-        // p.y, y: p.x)` swaps.
+        // p.y, y: p.x)` swaps. Stores can't change locals.
         if value.scalars.len() > 1 {
-            self.spill(&mut value, |e| matches!(e, Expr::Const(_)));
+            match place.slots {
+                Slots::Memory { .. } => self.spill(&mut value, is_stable),
+                _ => self.spill(&mut value, |e| matches!(e, Expr::Const(_))),
+            }
         }
         out.extend(value.pre);
         let scalars = exprs(value.scalars);
-        match slots {
+        match &place.slots {
             Slots::Local(slots) => {
                 for (slot, scalar) in slots.iter().zip(scalars) {
                     out.push(Stmt::SetLocal(*slot, scalar));
@@ -979,6 +1204,17 @@ impl<'c> Body<'c> {
             Slots::Global(slots) => {
                 for (slot, scalar) in slots.iter().zip(scalars) {
                     out.push(Stmt::SetGlobal(*slot, scalar));
+                }
+            }
+            Slots::Memory { addr, offset } => {
+                for (cell, scalar) in self.ck.cells(place.ty).into_iter().zip(scalars) {
+                    out.push(Stmt::Store {
+                        ty: cell.ty,
+                        op: cell.store,
+                        offset: offset + cell.offset,
+                        addr: addr.clone(),
+                        value: scalar,
+                    });
                 }
             }
         }
@@ -1010,12 +1246,30 @@ impl<'c> Body<'c> {
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
             ExprKind::Field(inner, field) => {
                 let (ty, value) = self.expr(inner, None);
-                match self.ck.field(ty, field) {
-                    Some((ty, range)) => (ty, self.project(value, range)),
-                    None => (Ty::Error, Value::default()),
+                match ty {
+                    // Fields are reached through one pointer.
+                    Ty::Ptr(id) => match self.ck.field(self.ck.pointee(id), field) {
+                        Some((ty, _, offset)) => (ty, self.load(value, offset, ty)),
+                        None => (Ty::Error, Value::default()),
+                    },
+                    _ => match self.ck.field(ty, field) {
+                        Some((ty, range, _)) => (ty, self.project(value, range)),
+                        None => (Ty::Error, Value::default()),
+                    },
+                }
+            }
+            ExprKind::Deref(inner) => {
+                let (ty, value) = self.expr(inner, None);
+                match ty {
+                    Ty::Ptr(id) => {
+                        let pointee = self.ck.pointee(id);
+                        (pointee, self.load(value, 0, pointee))
+                    }
+                    _ => self.invalid_operand(".*", ty, expr.span),
                 }
             }
             ExprKind::Cast(inner, ty) => self.cast(inner, ty, expr.span),
+            ExprKind::AddrOf(inner) => self.addr_of(inner, expr.span),
         }
     }
 
@@ -1182,10 +1436,13 @@ impl<'c> Body<'c> {
         rhs: Value,
         span: Span,
     ) -> (Ty, Value) {
-        let Ty::Prim(prim) = ty else {
-            return self.invalid_operand(binop_symbol(op), ty, span);
-        };
         let bool = Ty::Prim(Prim::Bool);
+        let prim = match ty {
+            Ty::Prim(prim) => prim,
+            // Pointers compare as unsigned addresses.
+            Ty::Ptr(_) if matches!(op, BinOp::Eq | BinOp::NotEq) => Prim::U32,
+            _ => return self.invalid_operand(binop_symbol(op), ty, span),
+        };
         if matches!(op, BinOp::And | BinOp::Or) {
             if prim != Prim::Bool {
                 return self.invalid_operand(binop_symbol(op), ty, span);
@@ -1271,13 +1528,18 @@ impl<'c> Body<'c> {
 
     fn cast(&mut self, operand: &parse::Expr, ty: &parse::Type, span: Span) -> (Ty, Value) {
         let to = self.ck.resolve_ty(ty);
-        let (from, value) = self.expr(operand, None);
+        // An integer literal cast to a pointer is an address.
+        let expected = matches!(to, Ty::Ptr(_)).then_some(Ty::Prim(Prim::U32));
+        let (from, value) = self.expr(operand, expected);
         match (from, to) {
             (Ty::Error, _) | (_, Ty::Error) => (Ty::Error, Value::default()),
             (Ty::Prim(from), Ty::Prim(to)) if convertible(from, to) => (
                 Ty::Prim(to),
                 map1(value, to.val_type(), |e| convert(from, to, e)),
             ),
+            (Ty::Ptr(_) | Ty::Prim(Prim::U32), Ty::Ptr(_)) | (Ty::Ptr(_), Ty::Prim(Prim::U32)) => {
+                (to, value)
+            }
             _ => {
                 let kind = TypeErrorKind::InvalidCast {
                     from: self.ck.ty_name(from),
@@ -1287,6 +1549,38 @@ impl<'c> Body<'c> {
                 (Ty::Error, Value::default())
             }
         }
+    }
+
+    /// `&place`, the address of memory reached through a pointer.
+    fn addr_of(&mut self, inner: &parse::Expr, span: Span) -> (Ty, Value) {
+        if !matches!(inner.kind, ExprKind::Field(..) | ExprKind::Deref(_)) {
+            self.error(TypeErrorKind::NotAddressable, span);
+            return (Ty::Error, Value::default());
+        }
+        let Some(place) = self.place(inner) else {
+            return (Ty::Error, Value::default());
+        };
+        let Slots::Memory { addr, offset } = place.slots else {
+            self.error(TypeErrorKind::NotAddressable, span);
+            return (Ty::Error, Value::default());
+        };
+        if place.ty == Ty::Error {
+            return (Ty::Error, Value::default());
+        }
+        let addr = match offset {
+            0 => addr,
+            _ => binary(
+                ValType::I32,
+                IrBinOp::Add,
+                addr,
+                Expr::Const(Const::I32(offset as i32)),
+            ),
+        };
+        let value = Value {
+            pre: place.pre,
+            scalars: vec![(ValType::I32, addr)],
+        };
+        (self.ck.ptr_to(place.ty), value)
     }
 
     fn call(&mut self, callee: &parse::Expr, args: &[Arg], span: Span) -> (Ty, Value) {
@@ -1451,6 +1745,29 @@ impl<'c> Body<'c> {
             }
         }
         binding
+    }
+
+    /// Reads a `ty` at `offset` bytes past the address in `ptr`.
+    fn load(&mut self, ptr: Value, offset: u32, ty: Ty) -> Value {
+        let cells = self.ck.cells(ty);
+        let (pre, addr) = if cells.len() > 1 {
+            self.reusable_addr(ptr)
+        } else {
+            split1(ptr)
+        };
+        let scalars = cells
+            .into_iter()
+            .map(|cell| {
+                let load = Expr::Load {
+                    ty: cell.ty,
+                    op: cell.load,
+                    offset: offset + cell.offset,
+                    addr: Box::new(addr.clone()),
+                };
+                (cell.ty, load)
+            })
+            .collect();
+        Value { pre, scalars }
     }
 
     /// Keeps the scalars in `range`, preserving the side effects of the rest.
@@ -1714,7 +2031,7 @@ fn convert(from: Prim, to: Prim, expr: Expr) -> Expr {
 fn is_pure(expr: &Expr) -> bool {
     match expr {
         Expr::Const(_) | Expr::Local(_) | Expr::Global(_) => true,
-        Expr::Unary(_, _, x) => is_pure(x),
+        Expr::Unary(_, _, x) | Expr::Load { addr: x, .. } => is_pure(x),
         Expr::Binary(_, _, a, b) => is_pure(a) && is_pure(b),
         Expr::If {
             cond,
@@ -1727,8 +2044,8 @@ fn is_pure(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` is pure and its value can't be changed by side effects, so
-/// it may be evaluated later than written. Calls can change globals but not
-/// the caller's locals.
+/// it may be evaluated later than written. Calls can change globals and memory
+/// but not the caller's locals.
 fn is_stable(expr: &Expr) -> bool {
     match expr {
         Expr::Const(_) | Expr::Local(_) => true,
@@ -1740,7 +2057,7 @@ fn is_stable(expr: &Expr) -> bool {
             else_expr,
             ..
         } => is_stable(cond) && is_stable(then_expr) && is_stable(else_expr),
-        Expr::Global(_) | Expr::Call(..) | Expr::Seq(..) => false,
+        Expr::Global(_) | Expr::Call(..) | Expr::Load { .. } | Expr::Seq(..) => false,
     }
 }
 
@@ -1919,6 +2236,13 @@ mod tests {
         match s {
             Stmt::SetLocal(l, v) => format!("(set {} {})", local(f, *l), e(v)),
             Stmt::SetGlobal(g, v) => format!("(set @{} {})", m.globals[g.0 as usize].name, e(v)),
+            Stmt::Store {
+                ty,
+                op,
+                offset,
+                addr,
+                value,
+            } => format!("({ty:?}.{op:?} offset={offset} {} {})", e(addr), e(value)),
             Stmt::Drop(v) => format!("(drop {})", e(v)),
             Stmt::Call { func, args, dests } => {
                 let dests: Vec<_> = dests.iter().map(|d| local(f, *d)).collect();
@@ -1951,6 +2275,12 @@ mod tests {
             Expr::Local(l) => local(f, *l),
             Expr::Global(g) => format!("@{}", m.globals[g.0 as usize].name),
             Expr::Unary(ty, op, x) => format!("({ty:?}.{op:?} {})", ex(x)),
+            Expr::Load {
+                ty,
+                op,
+                offset,
+                addr,
+            } => format!("({ty:?}.{op:?} offset={offset} {})", ex(addr)),
             Expr::Binary(ty, op, a, b) => format!("({ty:?}.{op:?} {} {})", ex(a), ex(b)),
             Expr::Call(func, args) => {
                 let args: Vec<_> = args.iter().map(ex).collect();
@@ -2371,6 +2701,9 @@ fn P():
                 NotAValue("f".into()),
                 NotCallable("a".into()),
                 NotAssignable,
+                MissingArg("a".into()),
+                MissingArg("a".into()),
+                MissingArg("t".into()),
                 NotAssignable,
                 NoField {
                     ty: "i32".into(),
@@ -2616,6 +2949,242 @@ let hidden = 2
                 named("origin.x"),
                 named("origin.y"),
                 ("hidden".to_string(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn pointers_are_i32_addresses() {
+        let src = "\
+struct P:
+    x: f64
+var null = 0 as *u32
+let top = 4294967295 as **P
+pub fn f(p: *P, a: u32) -> *u32:
+    let q = a as *P
+    let b = p as u32
+    let c = p as *u32
+    let d = p == q
+    let e = p != q
+    return c
+";
+        let module = lower(src);
+        assert_eq!(
+            module.memory,
+            ir::Memory {
+                min_pages: 1,
+                export: "memory".to_string()
+            }
+        );
+        let globals: Vec<_> = module.globals.iter().map(|g| (g.ty, g.init)).collect();
+        assert_eq!(
+            globals,
+            vec![
+                (ValType::I32, Const::I32(0)),
+                (ValType::I32, Const::I32(-1))
+            ]
+        );
+        assert_eq!(module.funcs[0].params, vec![ValType::I32, ValType::I32]);
+        assert_eq!(module.funcs[0].results, vec![ValType::I32]);
+        assert_eq!(
+            body(&module, "f"),
+            "(set q a) (set b p) (set c p) (set d (I32.Eq p q)) (set e (I32.Ne p q)) (return c)"
+        );
+        let src = "\
+fn f(p: *u8, q: *i8, a: i32):
+    let b = p as *i8 == q
+    let c = p == q
+    let d = p < p
+    let e = p + 1
+    let g = a as *u8
+    let h = p as i32
+    let i = p as u64
+";
+        let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                mismatch("*u8", "*i8"),
+                invalid_operand("<", "*u8"),
+                mismatch("*u8", "i32"),
+                invalid_operand("+", "*u8"),
+                cast("i32", "*u8"),
+                cast("*u8", "i32"),
+                cast("*u8", "u64"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_through_pointers_load_from_c_layout() {
+        let src = "\
+struct Inner:
+    a: u8
+    b: f64
+struct S:
+    flag: bool
+    n: i16
+    inner: Inner
+    next: *S
+    k: i8
+    u: u16
+fn f(p: *S, q: *unit) -> f64:
+    let flag = p.flag
+    let n = p.n
+    let b = p.inner.b
+    let k = p.next.k
+    let u = p.u
+    let s = p.next.*
+    let v = q.*
+    return p.*.inner.b
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set flag (I32.Load8U offset=0 p)) \
+             (set n (I32.Load16S offset=2 p)) \
+             (set b (F64.Load offset=16 p)) \
+             (set k (I32.Load8S offset=28 (I32.Load offset=24 p))) \
+             (set u (I32.Load16U offset=30 p)) \
+             (set tmp7 (I32.Load offset=24 p)) \
+             (set s.flag (I32.Load8U offset=0 tmp7)) \
+             (set s.n (I32.Load16S offset=2 tmp7)) \
+             (set s.inner.a (I32.Load8U offset=8 tmp7)) \
+             (set s.inner.b (F64.Load offset=16 tmp7)) \
+             (set s.next (I32.Load offset=24 tmp7)) \
+             (set s.k (I32.Load8S offset=28 tmp7)) \
+             (set s.u (I32.Load16U offset=30 tmp7)) \
+             (return (F64.Load offset=16 p))"
+        );
+        let src = "\
+struct S:
+    x: i32
+fn f(p: **S, a: i32):
+    let b = p.x
+    let c = p.*.x
+    let d = a.*
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::NoField {
+                    ty: "*S".into(),
+                    field: "x".into()
+                },
+                invalid_operand(".*", "i32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_through_pointers_store_left_to_right() {
+        let src = "\
+struct P:
+    x: i32
+    y: u8
+    z: i64
+var q = 0 as *P
+fn make() -> P:
+    return P(x: 1, y: 2, z: 3)
+fn tick() -> i32:
+    return 1
+fn f(p: *P, pp: **P):
+    p.x = 1
+    p.y += 1
+    p.z = 5
+    p.* = P(x: p.y as i32, y: 3, z: 6)
+    pp.*.x = tick()
+    p.x += tick()
+    p.x += make().x
+    q.x = 1
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(I32.Store offset=0 p 1) \
+             (I32.Store8 offset=4 p (I32.And (I32.Add (I32.Load8U offset=4 p) 1) 255)) \
+             (I64.Store offset=8 p 5i64) \
+             (set tmp2 (I32.Load8U offset=4 p)) \
+             (I32.Store offset=0 p tmp2) (I32.Store8 offset=4 p 3) (I64.Store offset=8 p 6i64) \
+             (set tmp3 (I32.Load offset=0 pp)) (I32.Store offset=0 tmp3 (call tick )) \
+             (I32.Store offset=0 p (I32.Add (I32.Load offset=0 p) (call tick ))) \
+             (set tmp7 (I32.Load offset=0 p)) (call make [] -> [tmp4 tmp5 tmp6]) \
+             (I32.Store offset=0 p (I32.Add tmp7 tmp4)) \
+             (set tmp8 @q) (I32.Store offset=0 tmp8 1)"
+        );
+    }
+
+    #[test]
+    fn address_of_memory_behind_a_pointer() {
+        let src = "\
+struct Node:
+    val: i32
+    pair: Pair
+    next: *Node
+struct Pair:
+    a: u8
+    b: i64
+fn f(n: *Node) -> *i64:
+    let p = &n.pair.b
+    let q = &n.*
+    let r = &n.next.val
+    let s = &n.*.pair
+    return p
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set p (I32.Add n 16)) (set q n) \
+             (set tmp3 (I32.Load offset=24 n)) (set r tmp3) \
+             (set s (I32.Add n 8)) (return p)"
+        );
+        let src = "\
+struct P:
+    x: i32
+var g = P(x: 1)
+fn f(a: i32, p: P, pp: **P):
+    let b = &a
+    let c = &p.x
+    let d = &g.x
+    let e = &(a + 1)
+    let h: *i32 = &pp.*
+    a.* = 1
+    pp.x = 1
+";
+        use TypeErrorKind::*;
+        assert_eq!(
+            errors(src),
+            vec![
+                NotAddressable,
+                NotAddressable,
+                NotAddressable,
+                NotAddressable,
+                mismatch("*i32", "**P"),
+                invalid_operand(".*", "i32"),
+                NoField {
+                    ty: "*P".into(),
+                    field: "x".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_export_name_is_reserved() {
+        let src = "\
+pub fn memory():
+    pass
+pub let memory = 1
+let hidden = 2
+fn f():
+    let memory = 3
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ReservedExport("memory".into()),
+                TypeErrorKind::DuplicateItem("memory".into()),
+                TypeErrorKind::ReservedExport("memory".into()),
             ]
         );
     }

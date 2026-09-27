@@ -85,6 +85,8 @@ pub enum TypeKind {
     Named(String),
     /// `[T]`
     Array(Box<Type>),
+    /// `*T`
+    Pointer(Box<Type>),
 }
 
 pub type Block = Vec<Stmt>;
@@ -147,6 +149,10 @@ pub enum ExprKind {
     Call(Box<Expr>, Vec<Arg>),
     Index(Box<Expr>, Box<Expr>),
     Field(Box<Expr>, Ident),
+    /// `pointer.*`
+    Deref(Box<Expr>),
+    /// `&place`
+    AddrOf(Box<Expr>),
     /// `value as Type`
     Cast(Box<Expr>, Type),
 }
@@ -387,6 +393,10 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::RBracket)?;
                 TypeKind::Array(Box::new(elem))
             }
+            TokenKind::Star => {
+                self.bump();
+                TypeKind::Pointer(Box::new(self.ty()?))
+            }
             _ => return Err(self.unexpected("type")),
         };
         Ok(Type {
@@ -505,7 +515,7 @@ impl<'a> Parser<'a> {
         self.bump();
         if !matches!(
             target.kind,
-            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..)
+            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Deref(_)
         ) {
             self.errors.push(ParseError {
                 kind: ParseErrorKind::InvalidAssignTarget,
@@ -572,20 +582,22 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> PResult<Expr> {
-        let op = match self.peek().kind {
-            TokenKind::Minus => UnaryOp::Neg,
-            TokenKind::Tilde => UnaryOp::BitNot,
+        let wrap: fn(Box<Expr>) -> ExprKind = match self.peek().kind {
+            TokenKind::Minus => |e| ExprKind::Unary(UnaryOp::Neg, e),
+            TokenKind::Tilde => |e| ExprKind::Unary(UnaryOp::BitNot, e),
+            TokenKind::Amp => ExprKind::AddrOf,
             _ => return self.postfix(),
         };
         let start = self.bump().span;
         let operand = self.unary()?;
         Ok(Expr {
-            kind: ExprKind::Unary(op, Box::new(operand)),
+            kind: wrap(Box::new(operand)),
             span: self.span_from(start),
         })
     }
 
-    /// A primary expression followed by any calls, indexing, or field access.
+    /// A primary expression followed by any calls, indexing, field access, or
+    /// dereferences.
     fn postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.primary()?;
         loop {
@@ -606,6 +618,10 @@ impl<'a> Parser<'a> {
                     self.bump();
                     let field = self.ident()?;
                     ExprKind::Field(Box::new(expr), field)
+                }
+                TokenKind::DotStar => {
+                    self.bump();
+                    ExprKind::Deref(Box::new(expr))
                 }
                 _ => return Ok(expr),
             };
@@ -898,6 +914,8 @@ mod tests {
             }
             ExprKind::Index(e, i) => format!("(index {} {})", sexpr(e), sexpr(i)),
             ExprKind::Field(e, field) => format!("(. {} {})", sexpr(e), field.name),
+            ExprKind::Deref(e) => format!("(.* {})", sexpr(e)),
+            ExprKind::AddrOf(e) => format!("(& {})", sexpr(e)),
             ExprKind::Cast(e, ty) => format!("(as {} {})", sexpr(e), render_ty(ty)),
         }
     }
@@ -906,6 +924,7 @@ mod tests {
         match &ty.kind {
             TypeKind::Named(name) => name.clone(),
             TypeKind::Array(elem) => format!("[{}]", render_ty(elem)),
+            TypeKind::Pointer(pointee) => format!("*{}", render_ty(pointee)),
         }
     }
 
@@ -1026,6 +1045,27 @@ mod tests {
         assert_eq!(expr("x as i64 as f32"), "(as (as x i64) f32)");
         assert_eq!(expr("not x as bool"), "(Not (as x bool))");
         assert_eq!(expr("f(x).y as u8"), "(as (. (call f x) y) u8)");
+    }
+
+    #[test]
+    fn pointers() {
+        assert_eq!(expr("p.*"), "(.* p)");
+        assert_eq!(expr("p.*.x.*"), "(.* (. (.* p) x))");
+        assert_eq!(expr("&p.x"), "(& (. p x))");
+        assert_eq!(expr("-&p.* as u32"), "(as (Neg (& (.* p))) u32)");
+        assert_eq!(expr("0 as **u32"), "(as 0 **u32)");
+        let src = "fn f(p: *P) -> *[i32]:\n    p.* = 1\n    p.*.x += 1\n    p.*= 2\n";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(render_ty(&f.params[0].ty), "*P");
+        assert_eq!(render_ty(f.ret.as_ref().unwrap()), "*[i32]");
+        assert_eq!(stmt_kinds(&f.body), vec!["assign", "assign", "assign"]);
+        assert_eq!(
+            errors("fn f():\n    &p = 1\n"),
+            vec![ParseErrorKind::InvalidAssignTarget]
+        );
     }
 
     #[test]

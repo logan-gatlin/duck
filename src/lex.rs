@@ -56,6 +56,8 @@ pub enum TokenKind {
     Comma,
     Colon,
     Dot,
+    /// `.*`, lexed as one token so that `p.*= 1` isn't `p.` then `*=`.
+    DotStar,
     Arrow,
 
     // Operators
@@ -161,6 +163,7 @@ impl fmt::Display for TokenKind {
             Self::Comma => ",",
             Self::Colon => ":",
             Self::Dot => ".",
+            Self::DotStar => ".*",
             Self::Arrow => "->",
             Self::Plus => "+",
             Self::Minus => "-",
@@ -280,6 +283,7 @@ impl<'a> Lexer<'a> {
 
                 ',' => TokenKind::Comma,
                 ':' => TokenKind::Colon,
+                '.' if self.eat('*') => TokenKind::DotStar,
                 '.' => TokenKind::Dot,
                 '&' => TokenKind::Amp,
                 '|' => TokenKind::Pipe,

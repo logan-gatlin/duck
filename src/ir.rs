@@ -19,8 +19,17 @@ pub struct LocalId(pub u32);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
+    pub memory: Memory,
     pub globals: Vec<Global>,
     pub funcs: Vec<Func>,
+}
+
+/// The module's one linear memory, which pointers address. It has no maximum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Memory {
+    /// Initial size in 64 KiB pages.
+    pub min_pages: u32,
+    pub export: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -75,6 +84,15 @@ pub struct Local {
 pub enum Stmt {
     SetLocal(LocalId, Expr),
     SetGlobal(GlobalId, Expr),
+    /// `<ty>.<op> offset=<offset>`, writing `value` to `addr + offset` with
+    /// the natural alignment of the access. `addr` is evaluated first.
+    Store {
+        ty: ValType,
+        op: StoreOp,
+        offset: u32,
+        addr: Expr,
+        value: Expr,
+    },
     /// Evaluates `expr` and discards its value.
     Drop(Expr),
     /// A call whose results (zero, or more than one) are stored to `dests`
@@ -112,6 +130,14 @@ pub enum Expr {
     /// The instruction `<ty>.<op>`, where `ty` is the operand type.
     Binary(ValType, BinOp, Box<Expr>, Box<Expr>),
     Call(FuncId, Vec<Expr>),
+    /// `<ty>.<op> offset=<offset>`, reading from `addr + offset` with the
+    /// natural alignment of the access.
+    Load {
+        ty: ValType,
+        op: LoadOp,
+        offset: u32,
+        addr: Box<Expr>,
+    },
     /// `if (result ty)`. A label, but nothing inside can branch.
     If {
         ty: ValType,
@@ -152,6 +178,24 @@ pub enum UnOp {
     Demote,
     /// `f64.promote_f32`
     Promote,
+}
+
+/// Load instructions, named as in wasm. Narrow loads extend to their `ValType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOp {
+    Load,
+    Load8S,
+    Load8U,
+    Load16S,
+    Load16U,
+}
+
+/// Store instructions, named as in wasm. Narrow stores keep the low bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOp {
+    Store,
+    Store8,
+    Store16,
 }
 
 /// Binary instructions, named as in wasm. Unsuffixed comparisons and `Div`
