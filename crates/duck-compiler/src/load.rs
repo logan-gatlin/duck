@@ -108,7 +108,7 @@ mod tests {
     use crate::file::Settings;
     use crate::ir::Const;
     use crate::lex::TokenKind;
-    use crate::parse::ParseErrorKind;
+    use crate::parse::{ParseErrorKind, PatternKind};
     use crate::ty;
 
     /// Files named by the paths that import them; the first is the entry
@@ -160,7 +160,10 @@ mod tests {
         let module = load(files).unwrap();
         let name = |item: &Item| match &item.kind {
             ItemKind::Fn(f) => f.sig.name.name.clone(),
-            ItemKind::Binding(b) => b.name.name.clone(),
+            ItemKind::Binding(b) => match &b.pattern.kind {
+                PatternKind::Name(name) => name.clone(),
+                _ => unreachable!(),
+            },
             _ => unreachable!(),
         };
         module

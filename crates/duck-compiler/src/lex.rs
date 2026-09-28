@@ -265,6 +265,7 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
                 '"' => self.string(start)?,
+                '0'..='9' if self.after(TokenKind::Dot) => self.tuple_index(start)?,
                 '0'..='9' => self.number(start)?,
                 c if is_ident_start(c) => self.ident(start),
 
@@ -491,6 +492,23 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Lexes the index in `tuple.0`, which is plain decimal without leading
+    /// zeros, so that `t.0.1` isn't `t.` then `0.1`. The first digit has
+    /// already been consumed.
+    fn tuple_index(&mut self, start: usize) -> Result<TokenKind, LexError> {
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.bump();
+        }
+        let digits = &self.src[start..self.pos];
+        if (digits.len() > 1 && digits.starts_with('0'))
+            || self.peek().is_some_and(is_ident_continue)
+        {
+            self.skip_ident_chars();
+            return Err(self.error(LexErrorKind::InvalidNumber, start));
+        }
+        self.parse_int(digits, 10, start)
+    }
+
     fn parse_int(&self, digits: &str, radix: u32, start: usize) -> Result<TokenKind, LexError> {
         use std::num::IntErrorKind;
         u64::from_str_radix(digits, radix)
@@ -614,6 +632,11 @@ impl<'a> Lexer<'a> {
             start,
             end: self.pos,
         }
+    }
+
+    /// Whether the last token pushed is `kind`.
+    fn after(&self, kind: TokenKind) -> bool {
+        self.tokens.last().is_some_and(|t| t.kind == kind)
     }
 
     fn push(&mut self, kind: TokenKind, start: usize) {
@@ -777,6 +800,29 @@ mod tests {
         assert_eq!(error("123abc"), LexErrorKind::InvalidNumber);
         assert_eq!(error("0x"), LexErrorKind::InvalidNumber);
         assert_eq!(error("99999999999999999999"), LexErrorKind::IntTooLarge);
+    }
+
+    #[test]
+    fn tuple_indices() {
+        assert_eq!(
+            kinds("t.0.1 t.10 1.5"),
+            vec![
+                ident("t"),
+                Dot,
+                Int(0),
+                Dot,
+                Int(1),
+                ident("t"),
+                Dot,
+                Int(10),
+                Float(1.5),
+                Newline,
+                Eof
+            ]
+        );
+        for src in ["t.01", "t.1_0", "t.0x1", "t.1e3", "t.1a"] {
+            assert_eq!(error(src), LexErrorKind::InvalidNumber, "{src}");
+        }
     }
 
     #[test]

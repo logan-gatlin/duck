@@ -81,13 +81,30 @@ pub struct Field {
     pub span: Span,
 }
 
-/// `let name: Type = value` or `var name: Type = value`. The type is optional.
+/// `let pattern: Type = value` or `var pattern: Type = value`. The type is
+/// optional.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
     pub mutability: Mutability,
-    pub name: Ident,
+    pub pattern: Pattern,
     pub ty: Option<Type>,
     pub value: Expr,
+}
+
+/// What a binding assigns its value to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternKind {
+    Name(String),
+    /// `_`, which binds nothing.
+    Discard,
+    /// `(a, b)`, which takes a tuple apart. `()` is the empty tuple.
+    Tuple(Vec<Pattern>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +130,8 @@ pub enum TypeKind {
     Named(String),
     /// `()`
     Unit,
+    /// `(A, B)`, with at least two elements.
+    Tuple(Vec<Type>),
     /// `[T]`
     Array(Box<Type>),
     /// `*T`
@@ -173,6 +192,8 @@ pub enum ExprKind {
     /// `()`
     Unit,
     Name(String),
+    /// `(a, b)`, with at least two elements.
+    Tuple(Vec<Expr>),
     List(Vec<Expr>),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
@@ -246,6 +267,8 @@ pub enum ParseErrorKind {
     PubExtern,
     /// `pub` on an `import`, which has no names of its own to export.
     PubImport,
+    /// `(x,)`, which would be a tuple of one element.
+    OneElementTuple,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -258,6 +281,16 @@ struct Parser<'a> {
     /// don't stretch over trailing newlines and dedents.
     last_end: usize,
     errors: Vec<ParseError>,
+}
+
+/// What a parenthesized list turned out to be.
+enum Parens<T> {
+    /// `()`
+    Empty,
+    /// `(x)`
+    Group(T),
+    /// `(x, y)`
+    Tuple(Vec<T>),
 }
 
 /// Precedence of `not`, which sits between `and` and the comparisons.
@@ -275,6 +308,7 @@ impl fmt::Display for ParseErrorKind {
             Self::ExternFnBody => write!(f, "functions in `extern` blocks cannot have a body"),
             Self::PubExtern => write!(f, "`extern` blocks and their functions cannot be `pub`"),
             Self::PubImport => write!(f, "`import` cannot be `pub`"),
+            Self::OneElementTuple => write!(f, "tuples must have at least two elements"),
         }
     }
 }
@@ -471,7 +505,7 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::Var)?;
             Mutability::Var
         };
-        let name = self.ident()?;
+        let pattern = self.pattern()?;
         let ty = if self.eat(TokenKind::Colon) {
             Some(self.ty()?)
         } else {
@@ -482,9 +516,35 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Newline)?;
         Ok(Binding {
             mutability: kind,
-            name,
+            pattern,
             ty,
             value,
+        })
+    }
+
+    fn pattern(&mut self) -> PResult<Pattern> {
+        let token = self.peek();
+        let kind = match &token.kind {
+            TokenKind::Ident(name) => {
+                self.bump();
+                match name.as_str() {
+                    "_" => PatternKind::Discard,
+                    _ => PatternKind::Name(name.clone()),
+                }
+            }
+            TokenKind::LParen => {
+                self.bump();
+                match self.parens(token.span, Self::pattern)? {
+                    Parens::Empty => PatternKind::Tuple(Vec::new()),
+                    Parens::Group(inner) => inner.kind,
+                    Parens::Tuple(items) => PatternKind::Tuple(items),
+                }
+            }
+            _ => return Err(self.unexpected("pattern")),
+        };
+        Ok(Pattern {
+            kind,
+            span: self.span_from(token.span),
         })
     }
 
@@ -497,8 +557,11 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.bump();
-                self.expect(TokenKind::RParen)?;
-                TypeKind::Unit
+                match self.parens(token.span, Self::ty)? {
+                    Parens::Empty => TypeKind::Unit,
+                    Parens::Group(inner) => inner.kind,
+                    Parens::Tuple(items) => TypeKind::Tuple(items),
+                }
             }
             TokenKind::LBracket => {
                 self.bump();
@@ -723,7 +786,7 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Dot => {
                     self.bump();
-                    let field = self.ident()?;
+                    let field = self.field_name()?;
                     ExprKind::Field(Box::new(expr), field)
                 }
                 TokenKind::DotStar => {
@@ -765,16 +828,13 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => ExprKind::Name(name.clone()),
             TokenKind::LParen => {
                 self.bump();
-                if self.eat(TokenKind::RParen) {
-                    return Ok(Expr {
-                        kind: ExprKind::Unit,
-                        span: self.span_from(token.span),
-                    });
-                }
-                let inner = self.expr()?;
-                self.expect(TokenKind::RParen)?;
+                let kind = match self.parens(token.span, Self::expr)? {
+                    Parens::Empty => ExprKind::Unit,
+                    Parens::Group(inner) => inner.kind,
+                    Parens::Tuple(items) => ExprKind::Tuple(items),
+                };
                 return Ok(Expr {
-                    kind: inner.kind,
+                    kind,
                     span: self.span_from(token.span),
                 });
             }
@@ -793,6 +853,30 @@ impl<'a> Parser<'a> {
             kind,
             span: token.span,
         })
+    }
+
+    /// Parses the rest of a parenthesized list after the `(` at `start`. A
+    /// trailing comma makes a tuple, except after a single item.
+    fn parens<T>(
+        &mut self,
+        start: Span,
+        mut item: impl FnMut(&mut Self) -> PResult<T>,
+    ) -> PResult<Parens<T>> {
+        if self.eat(TokenKind::RParen) {
+            return Ok(Parens::Empty);
+        }
+        let first = item(self)?;
+        if !self.eat(TokenKind::Comma) {
+            self.expect(TokenKind::RParen)?;
+            return Ok(Parens::Group(first));
+        }
+        let mut items = vec![first];
+        items.extend(self.comma_list(TokenKind::RParen, &mut item)?);
+        if items.len() == 1 {
+            self.error(ParseErrorKind::OneElementTuple, self.span_from(start));
+            return Ok(Parens::Group(items.pop().unwrap()));
+        }
+        Ok(Parens::Tuple(items))
     }
 
     /// Parses `item, item, ... close` after the opening bracket. A trailing
@@ -834,6 +918,21 @@ impl<'a> Parser<'a> {
                 })
             }
             _ => Err(self.unexpected("identifier")),
+        }
+    }
+
+    /// The name after a `.`: a struct field, or the index of a tuple element.
+    fn field_name(&mut self) -> PResult<Ident> {
+        let token = self.peek();
+        match &token.kind {
+            TokenKind::Int(index) => {
+                self.bump();
+                Ok(Ident {
+                    name: index.to_string(),
+                    span: token.span,
+                })
+            }
+            _ => self.ident(),
         }
     }
 
@@ -1028,6 +1127,7 @@ mod tests {
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Unit => "()".to_string(),
             ExprKind::Name(name) => name.clone(),
+            ExprKind::Tuple(items) => format!("(tuple {})", list(items)),
             ExprKind::List(items) => format!("[{}]", list(items)),
             ExprKind::Unary(op, e) => format!("({op:?} {})", sexpr(e)),
             ExprKind::Binary(op, l, r) => format!("({op:?} {} {})", sexpr(l), sexpr(r)),
@@ -1054,6 +1154,10 @@ mod tests {
         match &ty.kind {
             TypeKind::Named(name) => name.clone(),
             TypeKind::Unit => "()".to_string(),
+            TypeKind::Tuple(elems) => {
+                let elems: Vec<_> = elems.iter().map(render_ty).collect();
+                format!("({})", elems.join(", "))
+            }
             TypeKind::Array(elem) => format!("[{}]", render_ty(elem)),
             TypeKind::Pointer(pointee) => format!("*{}", render_ty(pointee)),
         }
@@ -1105,7 +1209,7 @@ mod tests {
             panic!()
         };
         assert_eq!(global.mutability, Mutability::Let);
-        assert_eq!(global.name.name, "global");
+        assert_eq!(global.pattern.kind, PatternKind::Name("global".to_string()));
         assert_eq!(global.value.kind, ExprKind::Bool(true));
 
         let ItemKind::Binding(counter) = &counter.kind else {
@@ -1230,6 +1334,70 @@ mod tests {
         assert_eq!(
             expr(r#"[1.5, "hi", true, false]"#),
             r#"[1.5 "hi" true false]"#
+        );
+    }
+
+    #[test]
+    fn tuples() {
+        assert_eq!(expr("(1, 2)"), "(tuple 1 2)");
+        assert_eq!(expr("(a, (b, c),)"), "(tuple a (tuple b c))");
+        assert_eq!(expr("(a)"), "a");
+        assert_eq!(expr("t.0.1"), "(. (. t 0) 1)");
+        assert_eq!(expr("f(x).10"), "(. (call f x) 10)");
+        assert_eq!(expr("p.*.0"), "(. (.* p) 0)");
+        let src = "fn f(t: (i32, (f32, *u8))) -> ((i32), ()):\n    t.1.0 = 1.0\n";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(render_ty(&f.sig.params[0].ty), "(i32, (f32, *u8))");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "(i32, ())");
+        assert_eq!(stmt_kinds(&f.body), vec!["assign"]);
+        assert_eq!(
+            errors("let _ = (1,)\nfn f(t: (i32,)):\n    pass\n"),
+            vec![ParseErrorKind::OneElementTuple; 2]
+        );
+        assert_eq!(
+            errors("fn f():\n    (a, b) = (b, a)\n"),
+            vec![ParseErrorKind::InvalidAssignTarget]
+        );
+    }
+
+    #[test]
+    fn patterns() {
+        let pattern = |src: &str| {
+            let module = parse_src(src).unwrap();
+            let ItemKind::Binding(binding) = &module.items[0].kind else {
+                panic!()
+            };
+            binding.pattern.clone()
+        };
+        let render = |p: &Pattern| -> String {
+            fn go(p: &Pattern) -> String {
+                match &p.kind {
+                    PatternKind::Name(name) => name.clone(),
+                    PatternKind::Discard => "_".to_string(),
+                    PatternKind::Tuple(elems) => {
+                        let elems: Vec<_> = elems.iter().map(go).collect();
+                        format!("({})", elems.join(" "))
+                    }
+                }
+            }
+            go(p)
+        };
+        assert_eq!(render(&pattern("let x = 1\n")), "x");
+        assert_eq!(render(&pattern("let _ = 1\n")), "_");
+        assert_eq!(render(&pattern("var (a, _) = t\n")), "(a _)");
+        assert_eq!(render(&pattern("let ((a, b), (c)) = t\n")), "((a b) c)");
+        assert_eq!(render(&pattern("let () = t\n")), "()");
+        assert_eq!(render(&pattern("let (a, b): (u8, u8) = t\n")), "(a b)");
+        assert_eq!(
+            errors("let (a,) = t\n"),
+            vec![ParseErrorKind::OneElementTuple]
+        );
+        assert_eq!(
+            errors("let 1 = t\n"),
+            vec![expected("pattern", TokenKind::Int(1))]
         );
     }
 
@@ -1471,7 +1639,7 @@ let d = 1
         assert_eq!(
             errors(src),
             vec![
-                expected("identifier", TokenKind::Eq),
+                expected("pattern", TokenKind::Eq),
                 expected("newline", TokenKind::Int(3)),
                 expected("`:`", TokenKind::Ident("x".into())),
                 expected("identifier", TokenKind::Colon),

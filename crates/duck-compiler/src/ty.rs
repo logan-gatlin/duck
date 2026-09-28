@@ -16,8 +16,8 @@ use crate::ir::{
 };
 use crate::lex::Span;
 use crate::parse::{
-    self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability,
-    StmtKind, TypeKind, UnaryOp,
+    self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
+    PatternKind, StmtKind, TypeKind, UnaryOp,
 };
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
@@ -111,12 +111,18 @@ pub struct StructId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PtrId(u32);
 
+/// Index of an interned tuple type, which records the element types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TupleId(u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     Prim(Prim),
     Struct(StructId),
     /// `*T`, an address in linear memory, stored as an `i32`.
     Ptr(PtrId),
+    /// `(A, B)`, which is laid out like a struct with a field per element.
+    Tuple(TupleId),
     /// `externref`, an opaque reference that only the host can create. It
     /// can't be stored in linear memory, so nothing that holds one has a
     /// pointer type.
@@ -146,6 +152,8 @@ pub enum TypeErrorKind {
     DuplicateItem(String),
     DuplicateField(String),
     DuplicateParam(String),
+    /// A name bound twice by one pattern.
+    DuplicateBinding(String),
     /// A struct that contains itself by value.
     RecursiveStruct(String),
     Mismatch {
@@ -204,6 +212,9 @@ struct Checker {
     /// The pointee of each pointer type.
     pointees: Vec<Ty>,
     ptr_ids: HashMap<Ty, PtrId>,
+    /// The element types of each tuple type.
+    tuples: Vec<Vec<Ty>>,
+    tuple_ids: HashMap<Vec<Ty>, TupleId>,
     /// Whether every struct's fields are known, so pointer types can be
     /// checked for storability as they are resolved.
     structs_defined: bool,
@@ -250,6 +261,15 @@ struct GlobalDef {
     mutable: bool,
     /// One wasm global per scalar leaf of `ty`.
     slots: Vec<GlobalId>,
+}
+
+/// A name bound by a pattern.
+struct Bound<'p> {
+    name: &'p str,
+    span: Span,
+    ty: Ty,
+    /// The leaves of the pattern's value that the name covers.
+    leaves: Range<usize>,
 }
 
 /// State for checking and lowering one function body, or one global
@@ -449,6 +469,7 @@ impl fmt::Display for TypeErrorKind {
             Self::DuplicateItem(name) => write!(f, "`{name}` is already defined"),
             Self::DuplicateField(name) => write!(f, "duplicate field `{name}`"),
             Self::DuplicateParam(name) => write!(f, "duplicate parameter `{name}`"),
+            Self::DuplicateBinding(name) => write!(f, "`{name}` is bound more than once"),
             Self::RecursiveStruct(name) => write!(f, "struct `{name}` contains itself"),
             Self::Mismatch { expected, found } => {
                 write!(f, "expected `{expected}`, found `{found}`")
@@ -573,16 +594,24 @@ impl Checker {
                     continue;
                 }
                 ItemKind::Binding(b) => {
-                    self.globals.push(None);
-                    (&b.name, Item::Global(self.globals.len() - 1))
+                    for name in pattern_names(&b.pattern) {
+                        self.globals.push(None);
+                        self.declare_item(item, &name, Item::Global(self.globals.len() - 1));
+                    }
+                    continue;
                 }
                 // Replaced by the imported items when loading.
                 ItemKind::Import(_) => continue,
             };
-            self.declare_name(name, entry);
-            if item.is_pub && name.name == MEMORY_EXPORT {
-                self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
-            }
+            self.declare_item(item, name, entry);
+        }
+    }
+
+    /// Declares a name defined by `item`, which may export it.
+    fn declare_item(&mut self, item: &parse::Item, name: &Ident, entry: Item) {
+        self.declare_name(name, entry);
+        if item.is_pub && name.name == MEMORY_EXPORT {
+            self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
         }
     }
 
@@ -631,17 +660,31 @@ impl Checker {
     fn check_field_pointers(&mut self) {
         for id in 0..self.structs.len() {
             for i in 0..self.structs[id].fields.len() {
-                let mut ty = self.structs[id].fields[i].ty;
-                while let Ty::Ptr(ptr) = ty {
-                    ty = self.pointee(ptr);
-                    if !self.storable(ty) {
-                        let kind = TypeErrorKind::NotStorable(self.ty_name(ty));
-                        self.error(kind, self.structs[id].fields[i].span);
-                        self.structs[id].fields[i].ty = Ty::Error;
-                        break;
-                    }
+                if let Some(ty) = self.unstorable_pointee(self.structs[id].fields[i].ty) {
+                    let kind = TypeErrorKind::NotStorable(self.ty_name(ty));
+                    self.error(kind, self.structs[id].fields[i].span);
+                    self.structs[id].fields[i].ty = Ty::Error;
                 }
             }
+        }
+    }
+
+    /// The first type behind a pointer in `ty` that can't be stored in
+    /// memory, not counting the fields of structs, which are checked on their
+    /// own.
+    fn unstorable_pointee(&self, ty: Ty) -> Option<Ty> {
+        match ty {
+            Ty::Ptr(ptr) => {
+                let pointee = self.pointee(ptr);
+                match self.storable(pointee) {
+                    true => self.unstorable_pointee(pointee),
+                    false => Some(pointee),
+                }
+            }
+            Ty::Tuple(id) => self.tuples[id.0 as usize]
+                .iter()
+                .find_map(|elem| self.unstorable_pointee(*elem)),
+            _ => None,
         }
     }
 
@@ -653,21 +696,37 @@ impl Checker {
         }
         visits[id] = Visit::Active;
         for i in 0..self.structs[id].fields.len() {
-            let Ty::Struct(StructId(child)) = self.structs[id].fields[i].ty else {
-                continue;
-            };
-            let child = child as usize;
-            match visits[child] {
-                Visit::Active => {
-                    let kind = TypeErrorKind::RecursiveStruct(self.structs[id].name.clone());
-                    self.error(kind, self.structs[id].fields[i].span);
-                    self.structs[id].fields[i].ty = Ty::Error;
+            let mut children = Vec::new();
+            self.push_inline_structs(self.structs[id].fields[i].ty, &mut children);
+            for StructId(child) in children {
+                let child = child as usize;
+                match visits[child] {
+                    Visit::Active => {
+                        let kind = TypeErrorKind::RecursiveStruct(self.structs[id].name.clone());
+                        self.error(kind, self.structs[id].fields[i].span);
+                        self.structs[id].fields[i].ty = Ty::Error;
+                        break;
+                    }
+                    Visit::New => self.break_cycles(child, visits),
+                    Visit::Done => {}
                 }
-                Visit::New => self.break_cycles(child, visits),
-                Visit::Done => {}
             }
         }
         visits[id] = Visit::Done;
+    }
+
+    /// The structs that a value of type `ty` holds directly, rather than
+    /// behind a pointer.
+    fn push_inline_structs(&self, ty: Ty, out: &mut Vec<StructId>) {
+        match ty {
+            Ty::Struct(id) => out.push(id),
+            Ty::Tuple(id) => {
+                for elem in &self.tuples[id.0 as usize] {
+                    self.push_inline_structs(*elem, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn define_funcs(&mut self, module: &parse::Module) {
@@ -691,7 +750,8 @@ impl Checker {
             ItemKind::Binding(b) => Some((item, b)),
             _ => None,
         });
-        for (index, (item, decl)) in decls.enumerate() {
+        let mut index = 0;
+        for (item, decl) in decls {
             let (ty, value) = Body::new(self, Ty::Unit).binding_value(decl);
             let mutable = decl.mutability == Mutability::Var;
             let mut inits = Vec::new();
@@ -712,19 +772,24 @@ impl Checker {
             } else {
                 self.error(TypeErrorKind::NotConstant, decl.value.span);
             }
-            let mut slots = Vec::new();
-            let leaves = self.leaves(ty, &decl.name.name);
-            for (i, (name, vt)) in leaves.into_iter().enumerate() {
-                slots.push(GlobalId(self.ir_globals.len() as u32));
-                self.ir_globals.push(ir::Global {
-                    export: item.is_pub.then(|| name.clone()),
-                    name,
-                    ty: vt,
-                    mutable,
-                    init: inits.get(i).copied().unwrap_or(zero(vt)),
-                });
+            // Each name gets its own globals, in the order `declare` gave them.
+            for bound in self.destructure(&decl.pattern, ty) {
+                let mut slots = Vec::new();
+                let leaves = self.leaves(bound.ty, bound.name);
+                for ((name, vt), i) in leaves.into_iter().zip(bound.leaves) {
+                    slots.push(GlobalId(self.ir_globals.len() as u32));
+                    self.ir_globals.push(ir::Global {
+                        export: item.is_pub.then(|| name.clone()),
+                        name,
+                        ty: vt,
+                        mutable,
+                        init: inits.get(i).copied().unwrap_or(zero(vt)),
+                    });
+                }
+                let ty = bound.ty;
+                self.globals[index] = Some(GlobalDef { ty, mutable, slots });
+                index += 1;
             }
-            self.globals[index] = Some(GlobalDef { ty, mutable, slots });
         }
     }
 
@@ -815,6 +880,13 @@ impl Checker {
                 }
             }
             TypeKind::Unit => Ty::Unit,
+            TypeKind::Tuple(elems) => {
+                let elems: Vec<_> = elems.iter().map(|elem| self.resolve_ty(elem)).collect();
+                match elems.contains(&Ty::Error) {
+                    true => Ty::Error,
+                    false => self.tuple_of(elems),
+                }
+            }
             TypeKind::Array(_) => {
                 self.error(TypeErrorKind::Unsupported("arrays"), ty.span);
                 Ty::Error
@@ -836,12 +908,36 @@ impl Checker {
     fn storable(&self, ty: Ty) -> bool {
         match ty {
             Ty::ExternRef => false,
+            Ty::Struct(_) | Ty::Tuple(_) => self
+                .members(ty)
+                .into_iter()
+                .all(|member| self.storable(member)),
+            Ty::Prim(_) | Ty::Ptr(_) | Ty::Unit | Ty::Error => true,
+        }
+    }
+
+    /// The types of a struct's fields or a tuple's elements, in order. Empty
+    /// for any other type.
+    fn members(&self, ty: Ty) -> Vec<Ty> {
+        match ty {
             Ty::Struct(id) => self.structs[id.0 as usize]
                 .fields
                 .iter()
-                .all(|field| self.storable(field.ty)),
-            Ty::Prim(_) | Ty::Ptr(_) | Ty::Unit | Ty::Error => true,
+                .map(|field| field.ty)
+                .collect(),
+            Ty::Tuple(id) => self.tuples[id.0 as usize].clone(),
+            _ => Vec::new(),
         }
+    }
+
+    /// The interned tuple type with elements `elems`.
+    fn tuple_of(&mut self, elems: Vec<Ty>) -> Ty {
+        let next = TupleId(self.tuples.len() as u32);
+        let id = *self.tuple_ids.entry(elems.clone()).or_insert(next);
+        if id == next {
+            self.tuples.push(elems);
+        }
+        Ty::Tuple(id)
     }
 
     /// The interned type `*pointee`.
@@ -863,6 +959,13 @@ impl Checker {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
             Ty::Ptr(id) => format!("*{}", self.ty_name(self.pointee(id))),
+            Ty::Tuple(id) => {
+                let elems: Vec<_> = self.tuples[id.0 as usize]
+                    .iter()
+                    .map(|elem| self.ty_name(*elem))
+                    .collect();
+                format!("({})", elems.join(", "))
+            }
             Ty::ExternRef => "externref".to_string(),
             Ty::Unit => "()".to_string(),
             Ty::Error => "{error}".to_string(),
@@ -870,7 +973,7 @@ impl Checker {
     }
 
     /// The scalar leaves of `ty` in field order, each named `prefix` followed
-    /// by its `.field` path.
+    /// by its `.field` path. Tuple elements are named by index.
     fn leaves(&self, ty: Ty, prefix: &str) -> Vec<(String, ValType)> {
         let mut out = Vec::new();
         self.push_leaves(ty, prefix.to_string(), &mut out);
@@ -885,6 +988,11 @@ impl Checker {
             Ty::Struct(id) => {
                 for field in &self.structs[id.0 as usize].fields {
                     self.push_leaves(field.ty, format!("{name}.{}", field.name), out);
+                }
+            }
+            Ty::Tuple(id) => {
+                for (i, elem) in self.tuples[id.0 as usize].iter().enumerate() {
+                    self.push_leaves(*elem, format!("{name}.{i}"), out);
                 }
             }
             Ty::Unit | Ty::Error => {}
@@ -907,9 +1015,9 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => out.push(Some(prim)),
             Ty::Ptr(_) | Ty::ExternRef => out.push(None),
-            Ty::Struct(id) => {
-                for field in &self.structs[id.0 as usize].fields {
-                    self.push_leaf_prims(field.ty, out);
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                for member in self.members(ty) {
+                    self.push_leaf_prims(member, out);
                 }
             }
             Ty::Unit | Ty::Error => {}
@@ -917,18 +1025,30 @@ impl Checker {
     }
 
     /// The type of `field` in `ty`, the range of `ty`'s leaves it covers, and
-    /// its offset in memory. `None` after reporting an error.
+    /// its offset in memory. A tuple's fields are its indices. `None` after
+    /// reporting an error.
     fn field(&mut self, ty: Ty, field: &parse::Ident) -> Option<(Ty, Range<usize>, u32)> {
-        if let Ty::Struct(id) = ty {
-            let mut start = 0;
-            let offsets = self.struct_layout(id).0;
-            for (def, offset) in self.structs[id.0 as usize].fields.iter().zip(offsets) {
-                let len = self.val_types(def.ty).len();
-                if def.name == field.name {
-                    return Some((def.ty, start..start + len, offset));
-                }
-                start += len;
-            }
+        let index = match ty {
+            Ty::Struct(id) => self.structs[id.0 as usize]
+                .fields
+                .iter()
+                .position(|def| def.name == field.name),
+            Ty::Tuple(id) => field
+                .name
+                .parse()
+                .ok()
+                .filter(|i| *i < self.tuples[id.0 as usize].len()),
+            _ => None,
+        };
+        if let Some(index) = index {
+            let members = self.members(ty);
+            let start = members[..index]
+                .iter()
+                .map(|member| self.val_types(*member).len())
+                .sum::<usize>();
+            let len = self.val_types(members[index]).len();
+            let offset = self.aggregate_layout(ty).0[index];
+            return Some((members[index], start..start + len, offset));
         }
         if ty != Ty::Error {
             let kind = TypeErrorKind::NoField {
@@ -940,13 +1060,65 @@ impl Checker {
         None
     }
 
+    /// The names `pattern` binds when it takes apart a value of type `ty`, in
+    /// source order. A pattern that doesn't fit `ty` is reported, and its
+    /// names get the error type.
+    fn destructure<'p>(&mut self, pattern: &'p Pattern, ty: Ty) -> Vec<Bound<'p>> {
+        let mut out = Vec::new();
+        self.push_bounds(pattern, ty, 0, &mut out);
+        out
+    }
+
+    /// Pushes the names `pattern` binds, given that the value it matches
+    /// starts at leaf `start`.
+    fn push_bounds<'p>(
+        &mut self,
+        pattern: &'p Pattern,
+        ty: Ty,
+        start: usize,
+        out: &mut Vec<Bound<'p>>,
+    ) {
+        match &pattern.kind {
+            PatternKind::Name(name) => out.push(Bound {
+                name,
+                span: pattern.span,
+                ty,
+                leaves: start..start + self.val_types(ty).len(),
+            }),
+            PatternKind::Discard => {}
+            PatternKind::Tuple(elems) => {
+                let members = match ty {
+                    Ty::Tuple(id) if self.tuples[id.0 as usize].len() == elems.len() => {
+                        self.members(ty)
+                    }
+                    Ty::Unit if elems.is_empty() => Vec::new(),
+                    _ => {
+                        if ty != Ty::Error {
+                            let kind = TypeErrorKind::Mismatch {
+                                expected: format!("({})", vec!["_"; elems.len()].join(", ")),
+                                found: self.ty_name(ty),
+                            };
+                            self.error(kind, pattern.span);
+                        }
+                        vec![Ty::Error; elems.len()]
+                    }
+                };
+                let mut start = start;
+                for (elem, member) in elems.iter().zip(members) {
+                    self.push_bounds(elem, member, start, out);
+                    start += self.val_types(member).len();
+                }
+            }
+        }
+    }
+
     /// Size and alignment of `ty` in memory.
     fn layout(&self, ty: Ty) -> (u32, u32) {
         match ty {
             Ty::Prim(prim) => (prim.size(), prim.size()),
             Ty::Ptr(_) => (4, 4),
-            Ty::Struct(id) => {
-                let (_, size, align) = self.struct_layout(id);
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                let (_, size, align) = self.aggregate_layout(ty);
                 (size, align)
             }
             // Never in memory, but a struct holding one still has a layout
@@ -955,18 +1127,18 @@ impl Checker {
         }
     }
 
-    /// Field offsets, size, and alignment of a struct, laid out as C would:
-    /// fields in order, each at a multiple of its alignment, and the whole
-    /// padded to a multiple of the largest.
-    fn struct_layout(&self, id: StructId) -> (Vec<u32>, u32, u32) {
+    /// Member offsets, size, and alignment of a struct or tuple, laid out as C
+    /// would: members in order, each at a multiple of its alignment, and the
+    /// whole padded to a multiple of the largest.
+    fn aggregate_layout(&self, ty: Ty) -> (Vec<u32>, u32, u32) {
         let (mut size, mut align) = (0u32, 1);
         let mut offsets = Vec::new();
-        for field in &self.structs[id.0 as usize].fields {
-            let (field_size, field_align) = self.layout(field.ty);
-            size = size.next_multiple_of(field_align);
+        for member in self.members(ty) {
+            let (member_size, member_align) = self.layout(member);
+            size = size.next_multiple_of(member_align);
             offsets.push(size);
-            size += field_size;
-            align = align.max(field_align);
+            size += member_size;
+            align = align.max(member_align);
         }
         (offsets, size.next_multiple_of(align), align)
     }
@@ -994,11 +1166,10 @@ impl Checker {
                 store: StoreOp::Store,
                 bool: false,
             }),
-            Ty::Struct(id) => {
-                let offsets = self.struct_layout(id).0;
-                for (field, field_offset) in self.structs[id.0 as usize].fields.iter().zip(offsets)
-                {
-                    self.push_cells(field.ty, offset + field_offset, out);
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                let offsets = self.aggregate_layout(ty).0;
+                for (member, member_offset) in self.members(ty).into_iter().zip(offsets) {
+                    self.push_cells(member, offset + member_offset, out);
                 }
             }
             Ty::ExternRef => unreachable!("`externref` has no pointer type"),
@@ -1114,13 +1285,34 @@ impl<'c> Body<'c> {
         match &stmt.kind {
             StmtKind::Binding(binding) => {
                 let (ty, value) = self.binding_value(binding);
-                let slots = self.alloc(&binding.name.name, ty);
+                let bounds = self.ck.destructure(&binding.pattern, ty);
+                // The local each leaf of the value goes to, if it's kept.
+                let mut dests = vec![None; self.ck.val_types(ty).len()];
+                let mut vars = Vec::new();
+                for (i, bound) in bounds.iter().enumerate() {
+                    if bounds[..i].iter().any(|prev| prev.name == bound.name) {
+                        let kind = TypeErrorKind::DuplicateBinding(bound.name.to_string());
+                        self.error(kind, bound.span);
+                        continue;
+                    }
+                    let slots = self.alloc(bound.name, bound.ty);
+                    for (leaf, slot) in bound.leaves.clone().zip(&slots) {
+                        dests[leaf] = Some(*slot);
+                    }
+                    vars.push((bound.name, bound.ty, slots));
+                }
                 out.extend(value.pre);
-                for (slot, (_, scalar)) in slots.iter().zip(value.scalars) {
-                    out.push(Stmt::SetLocal(*slot, scalar));
+                for (dest, (_, scalar)) in dests.into_iter().zip(value.scalars) {
+                    match dest {
+                        Some(slot) => out.push(Stmt::SetLocal(slot, scalar)),
+                        None if !is_pure(&scalar) => out.push(Stmt::Drop(scalar)),
+                        None => {}
+                    }
                 }
                 let mutable = binding.mutability == Mutability::Var;
-                self.bind(&binding.name.name, ty, mutable, slots);
+                for (name, ty, slots) in vars {
+                    self.bind(name, ty, mutable, slots);
+                }
             }
             StmtKind::Assign { target, op, value } => {
                 let Some(mut place) = self.place(target) else {
@@ -1406,6 +1598,7 @@ impl<'c> Body<'c> {
             ExprKind::Str(_) => self.unsupported("strings", expr.span),
             ExprKind::List(_) | ExprKind::Index(..) => self.unsupported("arrays", expr.span),
             ExprKind::Name(name) => self.name(name, expr.span),
+            ExprKind::Tuple(elems) => self.tuple(elems, expected),
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expected, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expected, expr.span),
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
@@ -1441,6 +1634,26 @@ impl<'c> Body<'c> {
             ExprKind::Cast(inner, ty) => self.cast(inner, ty, expr.span),
             ExprKind::AddrOf(inner) => self.addr_of(inner, expr.span),
         }
+    }
+
+    /// A tuple literal, whose elements are typed by those of `expected` and
+    /// evaluated in order.
+    fn tuple(&mut self, elems: &[parse::Expr], expected: Option<Ty>) -> (Ty, Value) {
+        let expected = match expected {
+            Some(Ty::Tuple(id)) => self.ck.tuples[id.0 as usize].clone(),
+            _ => Vec::new(),
+        };
+        let mut tys = Vec::new();
+        let mut values = Vec::new();
+        for (i, elem) in elems.iter().enumerate() {
+            let (ty, value) = self.expr(elem, expected.get(i).copied());
+            tys.push(ty);
+            values.push(value);
+        }
+        if tys.contains(&Ty::Error) {
+            return (Ty::Error, Value::default());
+        }
+        (self.ck.tuple_of(tys), self.seq(values))
     }
 
     fn unsupported(&mut self, what: &'static str, span: Span) -> (Ty, Value) {
@@ -1710,7 +1923,7 @@ impl<'c> Body<'c> {
                 map1(value, to.val_type(), |e| convert(from, to, e)),
             ),
             (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
-            | (Ty::Ptr(_), Ty::Prim(Prim::U32)) => (to, value),
+            | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => (to, value),
             _ => {
                 let kind = TypeErrorKind::InvalidCast {
                     from: self.ck.ty_name(from),
@@ -2252,6 +2465,27 @@ fn is_stable(expr: &Expr) -> bool {
         } => is_stable(cond) && is_stable(then_expr) && is_stable(else_expr),
         Expr::Global(_) | Expr::Call(..) | Expr::Load { .. } | Expr::Seq(..) => false,
     }
+}
+
+/// The names `pattern` binds, in source order.
+fn pattern_names(pattern: &Pattern) -> Vec<Ident> {
+    fn push(pattern: &Pattern, out: &mut Vec<Ident>) {
+        match &pattern.kind {
+            PatternKind::Name(name) => out.push(Ident {
+                name: name.clone(),
+                span: pattern.span,
+            }),
+            PatternKind::Discard => {}
+            PatternKind::Tuple(elems) => {
+                for elem in elems {
+                    push(elem, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    push(pattern, &mut out);
+    out
 }
 
 /// Every imported function, with the block that declares it.
@@ -3334,6 +3568,7 @@ let top = 4294967295 as **P
 pub fn f(p: *P, a: u32, n: i32) -> *u32:
     let q = a as *P
     let b = p as u32
+    let s = p as i32
     let c = p as *u32
     let d = p == q
     let e = p != q
@@ -3366,7 +3601,7 @@ pub fn f(p: *P, a: u32, n: i32) -> *u32:
         assert_eq!(module.funcs[0].results, vec![ValType::I32]);
         assert_eq!(
             body(&module, "f"),
-            "(set q a) (set b p) (set c p) (set d (I32.Eq p q)) (set e (I32.Ne p q)) \
+            "(set q a) (set b p) (set s p) (set c p) (set d (I32.Eq p q)) (set e (I32.Ne p q)) \
              (set g (I32.LtU p q)) (set h (I32.GeU p q)) (set r n) (return c)"
         );
         let src = "\
@@ -3376,7 +3611,6 @@ fn f(p: *u8, q: *i8, a: i64):
     let d = p < q
     let e = p + 1
     let g = a as *u8
-    let h = p as i32
     let i = p as u64
 ";
         let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
@@ -3391,7 +3625,6 @@ fn f(p: *u8, q: *i8, a: i64):
                 mismatch("*u8", "i32"),
                 invalid_operand("+", "*u8"),
                 cast("i64", "*u8"),
-                cast("*u8", "i32"),
                 cast("*u8", "u64"),
             ]
         );
@@ -3735,6 +3968,180 @@ fn f(a: externref, p: *externref):
                 cast("externref", "i32"),
                 cast("i32", "externref"),
                 not_storable("S"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tuples_are_split_into_scalars() {
+        let src = "\
+fn swap(t: (i32, f64)) -> (f64, i32):
+    return (t.1, t.0)
+
+fn f() -> f64:
+    let t: (u8, f64) = (1, 2)
+    let u = swap((3, 4.5))
+    var v = ((1, 2), 3)
+    v.0.1 = u.1
+    v = ((v.1, 5), 6)
+    return u.0 + t.1
+";
+        let module = lower(src);
+        let swap = &module.funcs[0];
+        assert_eq!(swap.params, vec![ValType::I32, ValType::F64]);
+        assert_eq!(swap.results, vec![ValType::F64, ValType::I32]);
+        assert_eq!(body(&module, "swap"), "(return t.1 t.0)");
+        assert_eq!(
+            body(&module, "f"),
+            "(set t.0 1) (set t.1 2f64) \
+             (call swap [3 4.5f64] -> [tmp2 tmp3]) (set u.0 tmp2) (set u.1 tmp3) \
+             (set v.0.0 1) (set v.0.1 2) (set v.1 3) \
+             (set v.0.1 u.1) \
+             (set tmp9 v.1) (set v.0.0 tmp9) (set v.0.1 5) (set v.1 6) \
+             (return (F64.Add u.0 t.1))"
+        );
+    }
+
+    #[test]
+    fn tuple_types_are_structural() {
+        let src = "\
+struct P:
+    x: i32
+    y: i32
+fn make() -> (i32, P):
+    return (1, P(x: 2, y: 3))
+fn take(t: (i32, P)) -> i32:
+    return t.1.y
+fn f() -> i32:
+    let t: (i32, P) = make()
+    return take(t) + take(make())
+";
+        lower(src);
+    }
+
+    #[test]
+    fn destructuring_binds_each_name() {
+        let src = "\
+extern:
+    fn pair() -> (i32, i64)
+    fn one() -> i32
+fn f() -> i64:
+    let (a, b) = pair()
+    let ((c, _), d) = ((one(), one()), 1 as i64)
+    var (e, g): (u8, u8) = (1, 2)
+    e += g
+    let () = ()
+    let _ = one()
+    return b + d + (a + c + e as i32) as i64
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(call pair [] -> [tmp0 tmp1]) (set a tmp0) (set b tmp1) \
+             (set c (call one )) (drop (call one )) (set d (I32.ExtendS 1)) \
+             (set e 1) (set g 2) \
+             (set e (I32.And (I32.Add e g) 255)) \
+             (drop (call one )) \
+             (return (I64.Add (I64.Add b d) \
+             (I32.ExtendS (I32.Add (I32.Add a c) e))))"
+        );
+    }
+
+    #[test]
+    fn destructured_globals_are_separate() {
+        let src = "\
+pub let (w, h) = (640, 480)
+pub let pos = (w, (h, 1.5))
+let (_, hidden) = (1, pos.1.1)
+";
+        let globals: Vec<_> = lower(src)
+            .globals
+            .into_iter()
+            .map(|g| (g.name, g.export.is_some(), g.init))
+            .collect();
+        let global = |name: &str, export, init| (name.to_string(), export, init);
+        assert_eq!(
+            globals,
+            vec![
+                global("w", true, Const::I32(640)),
+                global("h", true, Const::I32(480)),
+                global("pos.0", true, Const::I32(640)),
+                global("pos.1.0", true, Const::I32(480)),
+                global("pos.1.1", true, Const::F64(1.5)),
+                global("hidden", false, Const::F64(1.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn tuples_behind_pointers_use_c_layout() {
+        let src = "\
+fn f(p: *(u8, (f64, i16)), q: **(i32, i32)) -> *i16:
+    let a = p.0
+    let b = p.1.1
+    p.1.0 = 2.0
+    q.1 = 3
+    let (c, d) = q.*.*
+    return &p.1.1
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set a (I32.Load8U offset=0 p)) \
+             (set b (I32.Load16S offset=16 p)) \
+             (F64.Store offset=8 p 2f64) \
+             (set tmp4 (I32.Load offset=0 q)) (I32.Store offset=4 tmp4 3) \
+             (set tmp5 (I32.Load offset=0 q)) \
+             (set c (I32.Load offset=0 tmp5)) (set d (I32.Load offset=4 tmp5)) \
+             (return (I32.Add p 16))"
+        );
+    }
+
+    #[test]
+    fn tuple_errors() {
+        use TypeErrorKind::*;
+        let src = "\
+struct A:
+    t: (i32, A)
+struct B:
+    p: *(externref, i32)
+fn f(t: (i32, f32)) -> (i32, i32):
+    let x = t.2
+    let y = t.x
+    let (a, b, c) = t
+    let (d, e) = 1
+    let (g, g) = t
+    let z = t == t
+    let w = t as (i32, i32)
+    t.0 = 1
+    return (1, 2.0)
+";
+        let mismatch = |expected: &str, found: &str| Mismatch {
+            expected: expected.into(),
+            found: found.into(),
+        };
+        let no_field = |field: &str| NoField {
+            ty: "(i32, f32)".into(),
+            field: field.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                RecursiveStruct("A".into()),
+                NotStorable("(externref, i32)".into()),
+                no_field("2"),
+                no_field("x"),
+                mismatch("(_, _, _)", "(i32, f32)"),
+                mismatch("(_, _)", "i32"),
+                DuplicateBinding("g".into()),
+                InvalidOperand {
+                    op: "==",
+                    ty: "(i32, f32)".into()
+                },
+                InvalidCast {
+                    from: "(i32, f32)".into(),
+                    to: "(i32, i32)".into()
+                },
+                ImmutableAssign("t".into()),
+                mismatch("(i32, i32)", "(i32, f64)"),
             ]
         );
     }

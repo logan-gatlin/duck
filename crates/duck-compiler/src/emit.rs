@@ -754,6 +754,33 @@ fn f(p: *P) -> f64:
     }
 
     #[test]
+    fn tuples_are_multiple_values() {
+        let src = "\
+extern:
+    fn divmod(a: i32, b: i32) -> (i32, u8)
+pub let (w, h) = (640, 480)
+pub var pos = (1, (2.5, 3))
+pub fn f(p: *(u8, f64)) -> (f64, i32):
+    let (q, r) = divmod(w, h)
+    pos.1.0 = p.1
+    return (pos.1.0, q + r as i32)
+";
+        let wat = wat(&emit_src(src));
+        for line in [
+            "(type (;0;) (func (param i32 i32) (result i32 i32)))",
+            "(type (;1;) (func (param i32) (result f64 i32)))",
+            r#"(export "w" (global $w))"#,
+            r#"(export "h" (global $h))"#,
+            r#"(export "pos.0" (global $pos.0))"#,
+            r#"(export "pos.1.0" (global $pos.1.0))"#,
+            r#"(export "pos.1.1" (global $pos.1.1))"#,
+            "(global $pos.1.0 (;3;) (mut f64) f64.const 0x1.4p+1 (;=2.5;))",
+        ] {
+            assert!(wat.contains(line), "{line}\n{wat}");
+        }
+    }
+
+    #[test]
     fn multi_value_calls_set_their_destinations_last_first() {
         let src = "\
 struct P:
