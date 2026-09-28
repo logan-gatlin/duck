@@ -183,7 +183,7 @@ mod tests {
         errors
             .iter()
             .map(|e| {
-                let span = e.span();
+                let span = e.span().unwrap();
                 let file = files.display_name(span.file);
                 format!("{file} {:?}: {e}", files.text(span))
             })

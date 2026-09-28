@@ -24,11 +24,13 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn span(&self) -> Span {
+    /// Where in the source the error is. `None` for errors in the
+    /// [`file::Settings`], which no source file holds.
+    pub fn span(&self) -> Option<Span> {
         match self {
-            Self::Lex(e) => e.span,
-            Self::Parse(e) => e.span,
-            Self::Import(e) => e.span,
+            Self::Lex(e) => Some(e.span),
+            Self::Parse(e) => Some(e.span),
+            Self::Import(e) => Some(e.span),
             Self::Type(e) => e.span,
         }
     }

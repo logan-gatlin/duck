@@ -3,14 +3,14 @@
 //! The IR is already shaped after wasm, so this is one direct walk: every
 //! statement and expression maps to a fixed instruction sequence. The module
 //! imports its `extern` functions and exports its memory, `pub fn`s, and `pub`
-//! globals. Source names go in a `name` custom section so tools can show them.
+//! globals, and names its start function if it has one. Source names go in a `name` custom section so tools can show them.
 
 use std::collections::HashMap;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, GlobalSection, GlobalType, ImportSection, IndirectNameMap, Instruction,
-    MemArg, MemorySection, MemoryType, NameMap, NameSection, TypeSection,
+    MemArg, MemorySection, MemoryType, NameMap, NameSection, StartSection, TypeSection,
 };
 
 use crate::ir::{BinOp, Const, Expr, Func, LoadOp, Module, Stmt, StoreOp, UnOp, ValType};
@@ -76,6 +76,10 @@ pub fn emit(module: &Module) -> Vec<u8> {
         }
     }
 
+    let start = module.start.map(|func| StartSection {
+        function_index: func.0,
+    });
+
     let mut code = CodeSection::new();
     for func in &module.funcs {
         code.function(&function(func));
@@ -109,9 +113,11 @@ pub fn emit(module: &Module) -> Vec<u8> {
         .section(&functions)
         .section(&memories)
         .section(&globals)
-        .section(&exports)
-        .section(&code)
-        .section(&names);
+        .section(&exports);
+    if let Some(start) = &start {
+        out.section(start);
+    }
+    out.section(&code).section(&names);
     out.finish()
 }
 
@@ -608,9 +614,28 @@ pub fn shown():
                 min_pages: 2,
                 max_pages: Some(16),
             },
+            ..Settings::default()
         };
         let wat = wat(&emit_with("pub fn f():\n    pass\n", &settings));
         assert!(wat.contains("(memory (;0;) 2 16)"), "{wat}");
+    }
+
+    #[test]
+    fn start_function() {
+        let settings = Settings {
+            start: Some("init".to_string()),
+            ..Settings::default()
+        };
+        let src = "\
+extern:
+    fn log(n: i32)
+fn init():
+    log(1)
+";
+        let started = wat(&emit_with(src, &settings));
+        assert!(started.contains("(start $init)"), "{started}");
+        let unstarted = wat(&emit_src(src));
+        assert!(!unstarted.contains("(start"), "{unstarted}");
     }
 
     #[test]

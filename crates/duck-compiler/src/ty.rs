@@ -132,7 +132,8 @@ pub enum Ty {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeError {
     pub kind: TypeErrorKind,
-    pub span: Span,
+    /// `None` for errors in the [`Settings`], which no source file holds.
+    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +190,10 @@ pub enum TypeErrorKind {
     ConstTrap,
     /// A `pub` item whose export name is taken by the module itself.
     ReservedExport(String),
+    /// A start function named in the [`Settings`] that isn't a function.
+    UnknownStart(String),
+    /// A start function that takes arguments or returns something.
+    InvalidStart(String),
     Unsupported(&'static str),
 }
 
@@ -472,6 +477,11 @@ impl fmt::Display for TypeErrorKind {
             Self::NotConstant => write!(f, "global initializers must be constant"),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
+            Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
+            Self::InvalidStart(name) => write!(
+                f,
+                "start function `{name}` must take no arguments and return nothing"
+            ),
             Self::Unsupported(what) => write!(f, "{what} are not supported yet"),
         }
     }
@@ -479,14 +489,17 @@ impl fmt::Display for TypeErrorKind {
 
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at {}..{}", self.kind, self.span.start, self.span.end)
+        match self.span {
+            Some(span) => write!(f, "{} at {}..{}", self.kind, span.start, span.end),
+            None => self.kind.fmt(f),
+        }
     }
 }
 
 impl std::error::Error for TypeError {}
 
 /// Resolves names in, type checks, and lowers a parsed module, giving it the
-/// memory `settings` describe.
+/// memory and start function `settings` describe.
 ///
 /// Checking continues past errors, so every error in the module is reported
 /// at once.
@@ -496,6 +509,10 @@ pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, 
     ck.define_structs(module);
     ck.define_funcs(module);
     ck.define_globals(module);
+    let start = settings
+        .start
+        .as_ref()
+        .and_then(|name| ck.resolve_start(module, name));
     let imports = ck.lower_imports(module);
     let funcs = ck.lower_funcs(module);
     if ck.errors.is_empty() {
@@ -508,6 +525,7 @@ pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, 
             globals: ck.ir_globals,
             imports,
             funcs,
+            start,
         })
     } else {
         Err(ck.errors)
@@ -516,7 +534,10 @@ pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, 
 
 impl Checker {
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
-        self.errors.push(TypeError { kind, span });
+        self.errors.push(TypeError {
+            kind,
+            span: Some(span),
+        });
     }
 
     /// Registers every item's name, so bodies can refer to later items.
@@ -705,6 +726,25 @@ impl Checker {
             }
             self.globals[index] = Some(GlobalDef { ty, mutable, slots });
         }
+    }
+
+    /// The function `name`, which must take and return nothing. `None` after
+    /// reporting an error.
+    fn resolve_start(&mut self, module: &parse::Module, name: &str) -> Option<FuncId> {
+        let Some(&Item::Func(id)) = self.items.get(name) else {
+            self.errors.push(TypeError {
+                kind: TypeErrorKind::UnknownStart(name.to_string()),
+                span: None,
+            });
+            return None;
+        };
+        let sig = &self.funcs[id.0 as usize];
+        if !sig.params.is_empty() || !matches!(sig.ret, Ty::Unit | Ty::Error) {
+            let span = fn_sigs(module).nth(id.0 as usize).unwrap().name.span;
+            self.error(TypeErrorKind::InvalidStart(name.to_string()), span);
+            return None;
+        }
+        Some(id)
     }
 
     fn lower_imports(&self, module: &parse::Module) -> Vec<ir::Import> {
@@ -2989,7 +3029,10 @@ fn f():
             ]
         );
         // The later declaration, the import, is the duplicate.
-        assert_eq!(errors[0].span.start, src.find("a()\n    fn b").unwrap());
+        assert_eq!(
+            errors[0].span.unwrap().start,
+            src.find("a()\n    fn b").unwrap()
+        );
     }
 
     #[test]
@@ -3520,6 +3563,57 @@ fn f(a: i32, p: P, pp: **P):
                 invalid_operand(".*", "i32"),
             ]
         );
+    }
+
+    fn check_start(src: &str, start: &str) -> Result<Module, Vec<TypeError>> {
+        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
+        let settings = Settings {
+            start: Some(start.to_string()),
+            ..Settings::default()
+        };
+        check(&parse::parse(&tokens).unwrap(), &settings)
+    }
+
+    #[test]
+    fn start_function() {
+        let src = "\
+extern:
+    fn ready()
+    fn get() -> i32
+struct S:
+    x: i32
+let g = 1
+fn init():
+    ready()
+fn take(x: i32):
+    pass
+fn give() -> ():
+    return
+fn back() -> i32:
+    return 1
+";
+        let start = |name| check_start(src, name).map(|m| m.start);
+        assert_eq!(start("init"), Ok(Some(FuncId(2))));
+        assert_eq!(start("ready"), Ok(Some(FuncId(0))));
+        assert_eq!(start("give"), Ok(Some(FuncId(4))));
+        assert_eq!(lower(src).start, None);
+
+        for name in ["nope", "S", "g"] {
+            assert_eq!(
+                start(name),
+                Err(vec![TypeError {
+                    kind: TypeErrorKind::UnknownStart(name.into()),
+                    span: None,
+                }])
+            );
+        }
+        for name in ["take", "back", "get"] {
+            let errors = start(name).unwrap_err();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].kind, TypeErrorKind::InvalidStart(name.into()));
+            let span = errors[0].span.unwrap();
+            assert_eq!(&src[span.start..span.end], name);
+        }
     }
 
     #[test]

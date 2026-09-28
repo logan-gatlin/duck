@@ -23,6 +23,8 @@ pub struct Manifest {
     pub entry: PathBuf,
     /// Where the wasm module is written, relative to the manifest.
     pub output: PathBuf,
+    /// The function run when the module is instantiated.
+    pub start: Option<String>,
     pub memory: MemoryLimits,
 }
 
@@ -62,6 +64,7 @@ struct Raw {
 struct RawModule {
     entry: PathBuf,
     output: PathBuf,
+    start: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +91,7 @@ impl Manifest {
         Ok(Self {
             entry: raw.module.entry,
             output: raw.module.output,
+            start: raw.module.start,
             memory: MemoryLimits {
                 min_pages,
                 max_pages,
@@ -230,6 +234,7 @@ mod tests {
             Manifest {
                 entry: "src/main.duck".into(),
                 output: "build/out.wasm".into(),
+                start: None,
                 memory: MemoryLimits {
                     min_pages: 1,
                     max_pages: Some(256),
@@ -238,6 +243,11 @@ mod tests {
         );
         let manifest = with_memory("min = \"64KiB\"\n").unwrap();
         assert_eq!(manifest.memory.max_pages, None);
+        let manifest = Manifest::parse(
+            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\nstart = \"init\"\n\n[memory]\nmin = \"1pgs\"\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.start.as_deref(), Some("init"));
     }
 
     #[test]

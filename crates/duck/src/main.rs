@@ -68,6 +68,7 @@ fn build() -> ExitCode {
     let entry = root.join(&manifest.entry);
     let settings = Settings {
         memory: manifest.memory,
+        start: manifest.start,
     };
     let mut files = match Files::new(&entry, settings) {
         Ok(files) => files,
@@ -77,7 +78,10 @@ fn build() -> ExitCode {
         Ok(bytes) => bytes,
         Err(errors) => {
             for error in &errors {
-                let span = error.span();
+                let Some(span) = error.span() else {
+                    eprintln!("{}: error: {error}", manifest_path.display());
+                    continue;
+                };
                 let (line, col) = line_col(&files.contents(span.file), span.start);
                 eprintln!(
                     "{}:{line}:{col}: error: {error}",

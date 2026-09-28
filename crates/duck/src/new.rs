@@ -9,6 +9,8 @@ use crate::manifest::MANIFEST;
 const DEFAULT_MANIFEST: &str = r#"[module]
 entry = "src/main.duck"
 output = "build/out.wasm"
+# A function taking and returning nothing, run when the module is instantiated.
+start = "main"
 
 [memory]
 # Sizes are KiB, MiB, GiB, or pgs (64KiB wasm pages).
@@ -53,6 +55,7 @@ mod tests {
         let files = manifest.as_ref().ok().map(|manifest| {
             let settings = duck_compiler::file::Settings {
                 memory: manifest.memory,
+                start: manifest.start.clone(),
             };
             let mut files = Files::new(module.join(&manifest.entry), settings).unwrap();
             duck_compiler::compile(&mut files).map(|_| ())
@@ -64,6 +67,7 @@ mod tests {
         let manifest = manifest.unwrap();
         assert_eq!(manifest.entry, Path::new("src/main.duck"));
         assert_eq!(manifest.output, Path::new("build/out.wasm"));
+        assert_eq!(manifest.start.as_deref(), Some("main"));
         assert_eq!(
             manifest.memory,
             MemoryLimits {

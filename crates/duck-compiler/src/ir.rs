@@ -25,6 +25,8 @@ pub struct Module {
     pub globals: Vec<Global>,
     pub imports: Vec<Import>,
     pub funcs: Vec<Func>,
+    /// Called when the module is instantiated. Takes and returns nothing.
+    pub start: Option<FuncId>,
 }
 
 /// The module's one linear memory, which pointers address.

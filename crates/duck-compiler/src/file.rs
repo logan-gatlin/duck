@@ -24,6 +24,9 @@ pub trait FileManager {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub memory: MemoryLimits,
+    /// The function the module runs when it is instantiated, which takes no
+    /// arguments and returns nothing.
+    pub start: Option<String>,
 }
 
 /// Sizes of the module's linear memory, in 64 KiB pages.
