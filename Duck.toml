@@ -1,0 +1,7 @@
+[module]
+entry = "main.duck"
+output = "build/main.wasm"
+
+[memory]
+# Sizes are KiB, MiB, GiB, or pgs (64KiB wasm pages).
+min = "1pgs"

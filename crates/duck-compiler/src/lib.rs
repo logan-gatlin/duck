@@ -1,7 +1,8 @@
 use std::fmt;
 
-use crate::file::FileId;
+use crate::file::FileManager;
 use crate::lex::{LexError, Span};
+use crate::load::ImportError;
 use crate::parse::ParseError;
 use crate::ty::TypeError;
 
@@ -9,6 +10,7 @@ pub mod emit;
 pub mod file;
 pub mod ir;
 pub mod lex;
+pub mod load;
 pub mod parse;
 pub mod ty;
 
@@ -17,6 +19,7 @@ pub mod ty;
 pub enum Error {
     Lex(LexError),
     Parse(ParseError),
+    Import(ImportError),
     Type(TypeError),
 }
 
@@ -25,6 +28,7 @@ impl Error {
         match self {
             Self::Lex(e) => e.span,
             Self::Parse(e) => e.span,
+            Self::Import(e) => e.span,
             Self::Type(e) => e.span,
         }
     }
@@ -36,6 +40,7 @@ impl fmt::Display for Error {
         match self {
             Self::Lex(e) => e.kind.fmt(f),
             Self::Parse(e) => e.kind.fmt(f),
+            Self::Import(e) => e.kind.fmt(f),
             Self::Type(e) => e.kind.fmt(f),
         }
     }
@@ -43,15 +48,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Compiles the source text of `file` to a WebAssembly binary module.
+/// Compiles the entry point of `files`, and every file it imports, to a
+/// WebAssembly binary module.
 ///
-/// Stops at the first stage that fails, returning all of its errors.
-pub fn compile(file: FileId, src: &str) -> Result<Vec<u8>, Vec<Error>> {
-    fn wrap<E>(errors: Vec<E>, f: fn(E) -> Error) -> Vec<Error> {
-        errors.into_iter().map(f).collect()
-    }
-    let tokens = lex::tokenize(file, src).map_err(|e| vec![Error::Lex(e)])?;
-    let module = parse::parse(&tokens).map_err(|e| wrap(e, Error::Parse))?;
-    let module = ty::check(&module).map_err(|e| wrap(e, Error::Type))?;
+/// Stops at the first stage that fails, returning all of its errors. Loading
+/// every file counts as one stage.
+pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
+    let module = load::load(files)?;
+    let module = ty::check(&module, &files.settings())
+        .map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
     Ok(emit::emit(&module))
 }

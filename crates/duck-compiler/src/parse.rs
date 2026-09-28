@@ -2,7 +2,8 @@ use std::fmt;
 
 use crate::lex::{Span, Token, TokenKind};
 
-/// A parsed source file.
+/// A parsed source file, or a whole program once [`crate::load`] has spliced
+/// in the items of every imported file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub items: Vec<Item>,
@@ -21,6 +22,9 @@ pub enum ItemKind {
     Extern(ExternBlock),
     Struct(StructDecl),
     Binding(Binding),
+    /// `import "path"`, which evaluates the items of another file in its
+    /// place. Resolved by [`crate::load`], so later stages never see one.
+    Import(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -240,6 +244,8 @@ pub enum ParseErrorKind {
     ExternFnBody,
     /// `pub` on an `extern` block or on a function in one.
     PubExtern,
+    /// `pub` on an `import`, which has no names of its own to export.
+    PubImport,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -268,6 +274,7 @@ impl fmt::Display for ParseErrorKind {
             Self::MissingFnBody => write!(f, "functions outside `extern` blocks need a body"),
             Self::ExternFnBody => write!(f, "functions in `extern` blocks cannot have a body"),
             Self::PubExtern => write!(f, "`extern` blocks and their functions cannot be `pub`"),
+            Self::PubImport => write!(f, "`import` cannot be `pub`"),
         }
     }
 }
@@ -324,6 +331,15 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Struct => ItemKind::Struct(self.struct_decl()?),
             TokenKind::Let | TokenKind::Var => ItemKind::Binding(self.binding()?),
+            TokenKind::Import => {
+                if is_pub {
+                    self.error(ParseErrorKind::PubImport, start);
+                }
+                self.bump();
+                let path = self.string()?;
+                self.expect(TokenKind::Newline)?;
+                ItemKind::Import(path)
+            }
             _ => return Err(self.unexpected("item")),
         };
         Ok(Item {

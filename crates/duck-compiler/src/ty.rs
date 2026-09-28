@@ -9,6 +9,7 @@ use std::fmt;
 use std::mem;
 use std::ops::Range;
 
+use crate::file::Settings;
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
     UnOp as IrUnOp, ValType,
@@ -484,11 +485,12 @@ impl fmt::Display for TypeError {
 
 impl std::error::Error for TypeError {}
 
-/// Resolves names in, type checks, and lowers a parsed module.
+/// Resolves names in, type checks, and lowers a parsed module, giving it the
+/// memory `settings` describe.
 ///
 /// Checking continues past errors, so every error in the module is reported
 /// at once.
-pub fn check(module: &parse::Module) -> Result<ir::Module, Vec<TypeError>> {
+pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
     let mut ck = Checker::default();
     ck.declare(module);
     ck.define_structs(module);
@@ -499,7 +501,8 @@ pub fn check(module: &parse::Module) -> Result<ir::Module, Vec<TypeError>> {
     if ck.errors.is_empty() {
         Ok(ir::Module {
             memory: ir::Memory {
-                min_pages: 1,
+                min_pages: settings.memory.min_pages,
+                max_pages: settings.memory.max_pages,
                 export: MEMORY_EXPORT.to_string(),
             },
             globals: ck.ir_globals,
@@ -552,6 +555,8 @@ impl Checker {
                     self.globals.push(None);
                     (&b.name, Item::Global(self.globals.len() - 1))
                 }
+                // Replaced by the imported items when loading.
+                ItemKind::Import(_) => continue,
             };
             self.declare_name(name, entry);
             if item.is_pub && name.name == MEMORY_EXPORT {
@@ -2370,7 +2375,7 @@ mod tests {
 
     fn check_src(src: &str) -> Result<Module, Vec<TypeError>> {
         let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
-        check(&parse::parse(&tokens).unwrap())
+        check(&parse::parse(&tokens).unwrap(), &Settings::default())
     }
 
     fn lower(src: &str) -> Module {
@@ -3299,6 +3304,7 @@ pub fn f(p: *P, a: u32, n: i32) -> *u32:
             module.memory,
             ir::Memory {
                 min_pages: 1,
+                max_pages: None,
                 export: "memory".to_string()
             }
         );

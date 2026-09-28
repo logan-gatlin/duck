@@ -1,13 +1,18 @@
 mod files;
+mod manifest;
+mod new;
 
+use std::fmt::Display;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use duck_compiler::file::FileManager;
+use duck_compiler::file::{FileManager, Settings};
 
 use crate::files::Files;
+use crate::manifest::{MANIFEST, Manifest};
 
 #[derive(Parser)]
 #[command(version, about = "The duck programming language")]
@@ -18,36 +23,86 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compile a source file to a WebAssembly module
+    /// Compile the module described by the nearest Duck.toml
     Build,
+    /// Create a new module in a new directory
+    New {
+        /// The directory to create
+        path: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Build => build(),
+        Command::New { path } => match new::new(&path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                fail(format_args!("{} already exists", path.display()))
+            }
+            Err(e) => fail(format_args!("cannot create {}: {e}", path.display())),
+        },
     }
 }
 
 fn build() -> ExitCode {
-    let mut files = Files::new();
-    let entry = files.entry_point();
-    let src = files.contents(entry);
-    let bytes = match duck_compiler::compile(files.entry_point(), &src) {
+    let root = match Manifest::find() {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            return fail(format_args!(
+                "cannot find {MANIFEST} in this directory or any parent"
+            ));
+        }
+        Err(e) => return fail(format_args!("cannot find {MANIFEST}: {e}")),
+    };
+    let manifest_path = root.join(MANIFEST);
+    let manifest = match fs::read_to_string(&manifest_path) {
+        Ok(src) => Manifest::parse(&src),
+        Err(e) => return fail(format_args!("cannot read {}: {e}", manifest_path.display())),
+    };
+    let manifest = match manifest {
+        Ok(manifest) => manifest,
+        Err(e) => return fail(format_args!("{}: {e}", manifest_path.display())),
+    };
+
+    let entry = root.join(&manifest.entry);
+    let settings = Settings {
+        memory: manifest.memory,
+    };
+    let mut files = match Files::new(&entry, settings) {
+        Ok(files) => files,
+        Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
+    };
+    let bytes = match duck_compiler::compile(&mut files) {
         Ok(bytes) => bytes,
         Err(errors) => {
             for error in &errors {
-                let (line, col) = line_col(&src, error.span().start);
-                eprintln!("{}:{line}:{col}: error: {error}", files.display_name(entry));
+                let span = error.span();
+                let (line, col) = line_col(&files.contents(span.file), span.start);
+                eprintln!(
+                    "{}:{line}:{col}: error: {error}",
+                    files.display_name(span.file)
+                );
             }
             return ExitCode::FAILURE;
         }
     };
-    let output = "build/main.wasm";
+
+    let output = root.join(&manifest.output);
+    if let Some(dir) = output.parent()
+        && let Err(e) = fs::create_dir_all(dir)
+    {
+        return fail(format_args!("cannot create {}: {e}", dir.display()));
+    }
     if let Err(e) = fs::write(&output, bytes) {
-        eprintln!("error: cannot write {}: {e}", output);
-        return ExitCode::FAILURE;
+        return fail(format_args!("cannot write {}: {e}", output.display()));
     }
     ExitCode::SUCCESS
+}
+
+fn fail(message: impl Display) -> ExitCode {
+    eprintln!("error: {message}");
+    ExitCode::FAILURE
 }
 
 /// The 1-based line and column of byte `offset` in `src`.

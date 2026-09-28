@@ -44,7 +44,7 @@ pub fn emit(module: &Module) -> Vec<u8> {
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
         minimum: module.memory.min_pages.into(),
-        maximum: None,
+        maximum: module.memory.max_pages.map(Into::into),
         memory64: false,
         shared: false,
         page_size_log2: None,
@@ -463,14 +463,20 @@ fn val_type(ty: ValType) -> wasm_encoder::ValType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{DummyManager, FileManager};
+    use crate::file::{DummyManager, FileManager, MemoryLimits, Settings};
     use crate::lex::tokenize;
     use crate::{parse, ty};
 
     /// Compiles `src` and checks that the output is a valid module.
     fn emit_src(src: &str) -> Vec<u8> {
+        emit_with(src, &Settings::default())
+    }
+
+    /// Compiles `src` under `settings` and checks that the output is a valid
+    /// module.
+    fn emit_with(src: &str, settings: &Settings) -> Vec<u8> {
         let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
-        let module = match ty::check(&parse::parse(&tokens).unwrap()) {
+        let module = match ty::check(&parse::parse(&tokens).unwrap(), settings) {
             Ok(module) => module,
             Err(errors) => panic!("unexpected type errors: {errors:#?}"),
         };
@@ -593,6 +599,18 @@ pub fn shown():
             ]
         );
         assert!(wat.contains("(memory (;0;) 1)"), "{wat}");
+    }
+
+    #[test]
+    fn memory_limits() {
+        let settings = Settings {
+            memory: MemoryLimits {
+                min_pages: 2,
+                max_pages: Some(16),
+            },
+        };
+        let wat = wat(&emit_with("pub fn f():\n    pass\n", &settings));
+        assert!(wat.contains("(memory (;0;) 2 16)"), "{wat}");
     }
 
     #[test]

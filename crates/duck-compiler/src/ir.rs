@@ -27,11 +27,13 @@ pub struct Module {
     pub funcs: Vec<Func>,
 }
 
-/// The module's one linear memory, which pointers address. It has no maximum.
+/// The module's one linear memory, which pointers address.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Memory {
     /// Initial size in 64 KiB pages.
     pub min_pages: u32,
+    /// Size in 64 KiB pages it may grow to; `None` is unlimited.
+    pub max_pages: Option<u32>,
     pub export: String,
 }
 
