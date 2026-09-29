@@ -215,7 +215,11 @@ mod tests {
         ]);
         let module = ty::check(&load(&mut files).unwrap(), &files.settings()).unwrap();
         let inits: Vec<_> = module.globals.iter().map(|g| g.init).collect();
-        assert_eq!(inits, [Const::I32(1), Const::I32(2), Const::I32(3)]);
+        // `data_end` comes last.
+        assert_eq!(
+            inits,
+            [Const::I32(1), Const::I32(2), Const::I32(3), Const::I32(0)]
+        );
     }
 
     #[test]

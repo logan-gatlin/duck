@@ -22,6 +22,8 @@ pub struct LocalId(pub u32);
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub memory: Memory,
+    /// What memory holds when the module is instantiated, in address order.
+    pub data: Vec<Data>,
     pub globals: Vec<Global>,
     pub imports: Vec<Import>,
     pub funcs: Vec<Func>,
@@ -37,6 +39,13 @@ pub struct Memory {
     /// Size in 64 KiB pages it may grow to; `None` is unlimited.
     pub max_pages: Option<u32>,
     pub export: String,
+}
+
+/// Bytes copied into memory at `offset` when the module is instantiated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Data {
+    pub offset: u32,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

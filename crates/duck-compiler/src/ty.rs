@@ -84,6 +84,16 @@ macro_rules! fold_float_binary {
 /// The export name of the module's memory, which no item may take.
 const MEMORY_EXPORT: &str = "memory";
 
+/// The name of the global holding the first address after literal data, and
+/// its export name, which no item may take.
+const DATA_END_EXPORT: &str = "data_end";
+
+/// Bytes in a wasm page.
+const PAGE_SIZE: u64 = 64 * 1024;
+
+/// The fields of every array, in order.
+const ARRAY_FIELDS: [&str; 2] = ["len", "ptr"];
+
 /// The module that `extern` blocks without one import from.
 const DEFAULT_IMPORT_MODULE: &str = "env";
 
@@ -115,6 +125,10 @@ pub struct PtrId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TupleId(u32);
 
+/// Index of an interned array type, which records the type of its `ptr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ArrayId(u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     Prim(Prim),
@@ -123,6 +137,9 @@ pub enum Ty {
     Ptr(PtrId),
     /// `(A, B)`, which is laid out like a struct with a field per element.
     Tuple(TupleId),
+    /// `[T]`, a view of elements in linear memory that it doesn't own. Laid
+    /// out like a struct with the fields `len: u32` and `ptr: *T`.
+    Array(ArrayId),
     /// `externref`, an opaque reference that only the host can create. It
     /// can't be stored in linear memory, so nothing that holds one has a
     /// pointer type.
@@ -202,7 +219,15 @@ pub enum TypeErrorKind {
     UnknownStart(String),
     /// A start function that takes arguments or returns something.
     InvalidStart(String),
-    Unsupported(&'static str),
+    /// Literal data that doesn't fit in the memory's initial pages.
+    DataTooLarge {
+        bytes: u32,
+        min_pages: u32,
+    },
+    /// A string or array literal outside a global initializer.
+    LiteralOutsideGlobal,
+    /// `[]` with no type to give its elements.
+    UntypedEmptyArray,
 }
 
 #[derive(Default)]
@@ -215,6 +240,10 @@ struct Checker {
     /// The element types of each tuple type.
     tuples: Vec<Vec<Ty>>,
     tuple_ids: HashMap<Vec<Ty>, TupleId>,
+    /// The type of each array type's `ptr` field, which points to its
+    /// elements.
+    arrays: Vec<Ty>,
+    array_ids: HashMap<Ty, ArrayId>,
     /// Whether every struct's fields are known, so pointer types can be
     /// checked for storability as they are resolved.
     structs_defined: bool,
@@ -225,6 +254,11 @@ struct Checker {
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
     ir_globals: Vec<ir::Global>,
+    /// The contents of literals, placed in memory in the order they are
+    /// lowered.
+    data: Vec<ir::Data>,
+    /// The first address after `data`.
+    data_end: u32,
     errors: Vec<TypeError>,
 }
 
@@ -281,6 +315,9 @@ struct Body<'c> {
     scopes: Vec<HashMap<String, Var>>,
     /// Enclosing wasm labels, innermost last.
     labels: Vec<Label>,
+    /// Whether this is a global initializer, the only place literals that
+    /// need memory can be.
+    global: bool,
 }
 
 #[derive(Clone)]
@@ -503,7 +540,15 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "start function `{name}` must take no arguments and return nothing"
             ),
-            Self::Unsupported(what) => write!(f, "{what} are not supported yet"),
+            Self::DataTooLarge { bytes, min_pages } => write!(
+                f,
+                "literals take {bytes} bytes, more than the {min_pages} pages memory starts with"
+            ),
+            Self::LiteralOutsideGlobal => write!(
+                f,
+                "string and array literals are only allowed in global initializers"
+            ),
+            Self::UntypedEmptyArray => write!(f, "can't infer the element type of `[]`"),
         }
     }
 }
@@ -530,6 +575,7 @@ pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, 
     ck.define_structs(module);
     ck.define_funcs(module);
     ck.define_globals(module);
+    ck.end_data(settings);
     let start = settings
         .start
         .as_ref()
@@ -543,6 +589,7 @@ pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, 
                 max_pages: settings.memory.max_pages,
                 export: MEMORY_EXPORT.to_string(),
             },
+            data: ck.data,
             globals: ck.ir_globals,
             imports,
             funcs,
@@ -610,7 +657,7 @@ impl Checker {
     /// Declares a name defined by `item`, which may export it.
     fn declare_item(&mut self, item: &parse::Item, name: &Ident, entry: Item) {
         self.declare_name(name, entry);
-        if item.is_pub && name.name == MEMORY_EXPORT {
+        if item.is_pub && [MEMORY_EXPORT, DATA_END_EXPORT].contains(&name.name.as_str()) {
             self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
         }
     }
@@ -684,6 +731,7 @@ impl Checker {
             Ty::Tuple(id) => self.tuples[id.0 as usize]
                 .iter()
                 .find_map(|elem| self.unstorable_pointee(*elem)),
+            Ty::Array(id) => self.unstorable_pointee(self.arrays[id.0 as usize]),
             _ => None,
         }
     }
@@ -752,26 +800,11 @@ impl Checker {
         });
         let mut index = 0;
         for (item, decl) in decls {
-            let (ty, value) = Body::new(self, Ty::Unit).binding_value(decl);
+            let mut body = Body::new(self, Ty::Unit);
+            body.global = true;
+            let (ty, value) = body.binding_value(decl);
             let mutable = decl.mutability == Mutability::Var;
-            let mut inits = Vec::new();
-            if value.pre.is_empty() {
-                for (_, scalar) in &value.scalars {
-                    match self.fold(scalar) {
-                        Ok(c) => inits.push(c),
-                        Err(fold) => {
-                            let kind = match fold {
-                                Fold::NotConstant => TypeErrorKind::NotConstant,
-                                Fold::Trap => TypeErrorKind::ConstTrap,
-                            };
-                            self.error(kind, decl.value.span);
-                            break;
-                        }
-                    }
-                }
-            } else {
-                self.error(TypeErrorKind::NotConstant, decl.value.span);
-            }
+            let inits = self.fold_value(&value, decl.value.span);
             // Each name gets its own globals, in the order `declare` gave them.
             for bound in self.destructure(&decl.pattern, ty) {
                 let mut slots = Vec::new();
@@ -791,6 +824,28 @@ impl Checker {
                 index += 1;
             }
         }
+    }
+
+    /// Checks that literal data fits in the memory's initial pages, and
+    /// exports where it ends.
+    fn end_data(&mut self, settings: &Settings) {
+        let min_pages = settings.memory.min_pages;
+        if u64::from(self.data_end) > u64::from(min_pages) * PAGE_SIZE {
+            self.errors.push(TypeError {
+                kind: TypeErrorKind::DataTooLarge {
+                    bytes: self.data_end,
+                    min_pages,
+                },
+                span: None,
+            });
+        }
+        self.ir_globals.push(ir::Global {
+            name: DATA_END_EXPORT.to_string(),
+            ty: ValType::I32,
+            mutable: false,
+            init: Const::I32(self.data_end as i32),
+            export: Some(DATA_END_EXPORT.to_string()),
+        });
     }
 
     /// The function `name`, which must take and return nothing. `None` after
@@ -887,10 +942,16 @@ impl Checker {
                     false => self.tuple_of(elems),
                 }
             }
-            TypeKind::Array(_) => {
-                self.error(TypeErrorKind::Unsupported("arrays"), ty.span);
-                Ty::Error
-            }
+            TypeKind::Array(elem) => match self.resolve_ty(elem) {
+                Ty::Error => Ty::Error,
+                // Struct fields are checked once every struct is defined.
+                elem if self.structs_defined && !self.storable(elem) => {
+                    let kind = TypeErrorKind::NotStorable(self.ty_name(elem));
+                    self.error(kind, ty.span);
+                    Ty::Error
+                }
+                elem => self.array_of(elem),
+            },
             TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
@@ -912,12 +973,12 @@ impl Checker {
                 .members(ty)
                 .into_iter()
                 .all(|member| self.storable(member)),
-            Ty::Prim(_) | Ty::Ptr(_) | Ty::Unit | Ty::Error => true,
+            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Unit | Ty::Error => true,
         }
     }
 
-    /// The types of a struct's fields or a tuple's elements, in order. Empty
-    /// for any other type.
+    /// The types of a struct's fields, a tuple's elements, or an array's
+    /// `len` and `ptr`, in order. Empty for any other type.
     fn members(&self, ty: Ty) -> Vec<Ty> {
         match ty {
             Ty::Struct(id) => self.structs[id.0 as usize]
@@ -926,6 +987,7 @@ impl Checker {
                 .map(|field| field.ty)
                 .collect(),
             Ty::Tuple(id) => self.tuples[id.0 as usize].clone(),
+            Ty::Array(id) => vec![Ty::Prim(Prim::U32), self.arrays[id.0 as usize]],
             _ => Vec::new(),
         }
     }
@@ -954,11 +1016,30 @@ impl Checker {
         self.pointees[id.0 as usize]
     }
 
+    /// The interned type `[elem]`.
+    fn array_of(&mut self, elem: Ty) -> Ty {
+        let ptr = self.ptr_to(elem);
+        let next = ArrayId(self.arrays.len() as u32);
+        let id = *self.array_ids.entry(elem).or_insert(next);
+        if id == next {
+            self.arrays.push(ptr);
+        }
+        Ty::Array(id)
+    }
+
+    fn element(&self, id: ArrayId) -> Ty {
+        match self.arrays[id.0 as usize] {
+            Ty::Ptr(ptr) => self.pointee(ptr),
+            _ => unreachable!("an array's `ptr` is a pointer"),
+        }
+    }
+
     fn ty_name(&self, ty: Ty) -> String {
         match ty {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
             Ty::Ptr(id) => format!("*{}", self.ty_name(self.pointee(id))),
+            Ty::Array(id) => format!("[{}]", self.ty_name(self.element(id))),
             Ty::Tuple(id) => {
                 let elems: Vec<_> = self.tuples[id.0 as usize]
                     .iter()
@@ -995,6 +1076,11 @@ impl Checker {
                     self.push_leaves(*elem, format!("{name}.{i}"), out);
                 }
             }
+            Ty::Array(_) => {
+                for (field, member) in ARRAY_FIELDS.iter().zip(self.members(ty)) {
+                    self.push_leaves(member, format!("{name}.{field}"), out);
+                }
+            }
             Ty::Unit | Ty::Error => {}
         }
     }
@@ -1015,7 +1101,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => out.push(Some(prim)),
             Ty::Ptr(_) | Ty::ExternRef => out.push(None),
-            Ty::Struct(_) | Ty::Tuple(_) => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) => {
                 for member in self.members(ty) {
                     self.push_leaf_prims(member, out);
                 }
@@ -1038,6 +1124,7 @@ impl Checker {
                 .parse()
                 .ok()
                 .filter(|i| *i < self.tuples[id.0 as usize].len()),
+            Ty::Array(_) => ARRAY_FIELDS.iter().position(|name| *name == field.name),
             _ => None,
         };
         if let Some(index) = index {
@@ -1117,7 +1204,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => (prim.size(), prim.size()),
             Ty::Ptr(_) => (4, 4),
-            Ty::Struct(_) | Ty::Tuple(_) => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) => {
                 let (_, size, align) = self.aggregate_layout(ty);
                 (size, align)
             }
@@ -1127,9 +1214,9 @@ impl Checker {
         }
     }
 
-    /// Member offsets, size, and alignment of a struct or tuple, laid out as C
-    /// would: members in order, each at a multiple of its alignment, and the
-    /// whole padded to a multiple of the largest.
+    /// Member offsets, size, and alignment of a struct, tuple, or array, laid
+    /// out as C would: members in order, each at a multiple of its alignment,
+    /// and the whole padded to a multiple of the largest.
     fn aggregate_layout(&self, ty: Ty) -> (Vec<u32>, u32, u32) {
         let (mut size, mut align) = (0u32, 1);
         let mut offsets = Vec::new();
@@ -1166,7 +1253,7 @@ impl Checker {
                 store: StoreOp::Store,
                 bool: false,
             }),
-            Ty::Struct(_) | Ty::Tuple(_) => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) => {
                 let offsets = self.aggregate_layout(ty).0;
                 for (member, member_offset) in self.members(ty).into_iter().zip(offsets) {
                     self.push_cells(member, offset + member_offset, out);
@@ -1175,6 +1262,47 @@ impl Checker {
             Ty::ExternRef => unreachable!("`externref` has no pointer type"),
             Ty::Unit | Ty::Error => {}
         }
+    }
+
+    /// Places `bytes`, which hold `len` elements, in memory at the next
+    /// multiple of `align`, or right at the end if there are none. Returns the
+    /// array of them.
+    fn push_data(&mut self, bytes: Vec<u8>, align: u32, len: u32) -> Value {
+        let mut offset = self.data_end;
+        if !bytes.is_empty() {
+            offset = offset.next_multiple_of(align);
+            self.data_end = offset + bytes.len() as u32;
+            self.data.push(ir::Data { offset, bytes });
+        }
+        let consts = [len, offset].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
+        Value {
+            pre: Vec::new(),
+            scalars: consts.to_vec(),
+        }
+    }
+
+    /// Evaluates each scalar of a lowered constant at compile time, reporting
+    /// at `span` if it isn't constant. Stops at the first that can't be.
+    fn fold_value(&mut self, value: &Value, span: Span) -> Vec<Const> {
+        if !value.pre.is_empty() {
+            self.error(TypeErrorKind::NotConstant, span);
+            return Vec::new();
+        }
+        let mut consts = Vec::new();
+        for (_, scalar) in &value.scalars {
+            match self.fold(scalar) {
+                Ok(c) => consts.push(c),
+                Err(fold) => {
+                    let kind = match fold {
+                        Fold::NotConstant => TypeErrorKind::NotConstant,
+                        Fold::Trap => TypeErrorKind::ConstTrap,
+                    };
+                    self.error(kind, span);
+                    break;
+                }
+            }
+        }
+        consts
     }
 
     /// Evaluates a lowered global initializer at compile time.
@@ -1215,6 +1343,7 @@ impl<'c> Body<'c> {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
+            global: false,
         }
     }
 
@@ -1381,13 +1510,9 @@ impl<'c> Body<'c> {
                     let exit = Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(cond));
                     inner.push(Stmt::BrIf(1, exit));
                 }
-                self.labels.push(Label::Break);
-                inner.extend(self.labelled(Label::Continue, body));
-                self.labels.pop();
-                inner.push(Stmt::Br(0));
-                out.push(Stmt::Block(vec![Stmt::Loop(inner)]));
+                out.push(self.loop_stmt(inner, body));
             }
-            StmtKind::For { .. } => self.error(TypeErrorKind::Unsupported("for loops"), stmt.span),
+            StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
             StmtKind::Break => match self.depth(Label::Break) {
                 Some(depth) => out.push(Stmt::Br(depth)),
                 None => self.error(TypeErrorKind::BreakOutsideLoop, stmt.span),
@@ -1398,6 +1523,63 @@ impl<'c> Body<'c> {
             },
             StmtKind::Pass => {}
         }
+    }
+
+    /// `for var in iter`, which copies each element of the array `iter` to
+    /// `var` in turn. The array's `len` and `ptr` are read once, before the
+    /// first iteration.
+    fn for_loop(
+        &mut self,
+        var: &Ident,
+        iter: &parse::Expr,
+        body: &parse::Block,
+        out: &mut Vec<Stmt>,
+    ) {
+        let (ty, value) = self.expr(iter, None);
+        let elem = match ty {
+            Ty::Array(id) => self.ck.element(id),
+            _ => self.invalid_operand("for", ty, iter.span).0,
+        };
+        let (len, ptr, index) = (
+            self.temp(ValType::I32),
+            self.temp(ValType::I32),
+            self.temp(ValType::I32),
+        );
+        out.extend(value.pre);
+        let mut scalars = exprs(value.scalars).into_iter();
+        for dest in [len, ptr] {
+            let scalar = scalars.next().unwrap_or(Expr::Const(Const::I32(0)));
+            out.push(Stmt::SetLocal(dest, scalar));
+        }
+        out.push(Stmt::SetLocal(index, Expr::Const(Const::I32(0))));
+        let i = Expr::Local(index);
+        let done = binary(ValType::I32, IrBinOp::GeU, i.clone(), Expr::Local(len));
+        let mut inner = vec![Stmt::BrIf(1, done)];
+        let addr = element_addr(Expr::Local(ptr), i.clone(), self.ck.layout(elem).0);
+        let element = self.load(scalar(ValType::I32, addr), 0, elem);
+        let slots = self.alloc(&var.name, elem);
+        inner.extend(element.pre);
+        for (slot, (_, scalar)) in slots.iter().zip(element.scalars) {
+            inner.push(Stmt::SetLocal(*slot, scalar));
+        }
+        // Advanced before the body, so `continue` moves on too.
+        let next = binary(ValType::I32, IrBinOp::Add, i, Expr::Const(Const::I32(1)));
+        inner.push(Stmt::SetLocal(index, next));
+        self.scopes.push(HashMap::new());
+        self.bind(&var.name, elem, false, slots);
+        let stmt = self.loop_stmt(inner, body);
+        self.scopes.pop();
+        out.push(stmt);
+    }
+
+    /// A loop that runs `head`, which may leave with `br 1`, then `body`, and
+    /// then repeats.
+    fn loop_stmt(&mut self, mut head: Vec<Stmt>, body: &parse::Block) -> Stmt {
+        self.labels.push(Label::Break);
+        head.extend(self.labelled(Label::Continue, body));
+        self.labels.pop();
+        head.push(Stmt::Br(0));
+        Stmt::Block(vec![Stmt::Loop(head)])
     }
 
     /// Branch depth of the innermost `label`.
@@ -1453,9 +1635,10 @@ impl<'c> Body<'c> {
             }
             ExprKind::Field(inner, field) => {
                 let mut place = match &inner.kind {
-                    ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Deref(_) => {
-                        self.place(inner)?
-                    }
+                    ExprKind::Name(_)
+                    | ExprKind::Field(..)
+                    | ExprKind::Deref(_)
+                    | ExprKind::Index(..) => self.place(inner)?,
                     _ => match self.expr(inner, None) {
                         (Ty::Ptr(id), ptr) => self.deref_place(ptr, self.ck.pointee(id)),
                         (Ty::Error, _) => return None,
@@ -1493,15 +1676,54 @@ impl<'c> Body<'c> {
                     None
                 }
             },
-            ExprKind::Index(..) => {
-                self.error(TypeErrorKind::Unsupported("arrays"), target.span);
-                None
-            }
+            ExprKind::Index(array, index) => self.index_place(array, index, target.span),
             _ => {
                 self.error(TypeErrorKind::NotAssignable, target.span);
                 None
             }
         }
+    }
+
+    /// The element `array[index]`, as a place whose `pre` traps unless
+    /// `index < array.len`. `None` after reporting an error.
+    fn index_place(
+        &mut self,
+        array: &parse::Expr,
+        index: &parse::Expr,
+        span: Span,
+    ) -> Option<Place> {
+        let (ty, array) = self.expr(array, None);
+        let index = self.check(index, Ty::Prim(Prim::U32));
+        let Ty::Array(id) = ty else {
+            self.invalid_operand("[]", ty, span);
+            return None;
+        };
+        let elem = self.ck.element(id);
+        let mut value = self.seq(vec![array, index]);
+        // The bounds check reads the index again, and everything is read
+        // after the prelude.
+        self.spill(&mut value, |e| matches!(e, Expr::Local(_) | Expr::Const(_)));
+        // Only a mistyped index has other than one scalar.
+        let [len, ptr, index] = <[_; 3]>::try_from(exprs(value.scalars)).ok()?;
+        let mut pre = value.pre;
+        pre.push(Stmt::If {
+            cond: binary(ValType::I32, IrBinOp::GeU, index.clone(), len),
+            then_body: vec![Stmt::Unreachable],
+            else_body: Vec::new(),
+        });
+        let tmp = self.temp(ValType::I32);
+        let addr = element_addr(ptr, index, self.ck.layout(elem).0);
+        pre.push(Stmt::SetLocal(tmp, addr));
+        Some(Place {
+            name: String::new(),
+            ty: elem,
+            mutable: true,
+            pre,
+            slots: Slots::Memory {
+                addr: Expr::Local(tmp),
+                offset: 0,
+            },
+        })
     }
 
     /// The memory a pointer points to, as a place.
@@ -1595,8 +1817,22 @@ impl<'c> Body<'c> {
                 scalar(ValType::I32, Expr::Const(Const::I32(*b as i32))),
             ),
             ExprKind::Unit => (Ty::Unit, Value::default()),
-            ExprKind::Str(_) => self.unsupported("strings", expr.span),
-            ExprKind::List(_) | ExprKind::Index(..) => self.unsupported("arrays", expr.span),
+            ExprKind::Str(_) | ExprKind::List(_) if !self.global => {
+                self.error(TypeErrorKind::LiteralOutsideGlobal, expr.span);
+                (Ty::Error, Value::default())
+            }
+            ExprKind::Str(s) => self.string(s),
+            ExprKind::List(items) => self.list(items, expected, expr.span),
+            ExprKind::Index(..) => match self.place(expr) {
+                Some(place) => {
+                    let value = self.read_place(&place);
+                    let mut pre = place.pre;
+                    pre.extend(value.pre);
+                    let scalars = value.scalars;
+                    (place.ty, Value { pre, scalars })
+                }
+                None => (Ty::Error, Value::default()),
+            },
             ExprKind::Name(name) => self.name(name, expr.span),
             ExprKind::Tuple(elems) => self.tuple(elems, expected),
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expected, expr.span),
@@ -1656,9 +1892,53 @@ impl<'c> Body<'c> {
         (self.ck.tuple_of(tys), self.seq(values))
     }
 
-    fn unsupported(&mut self, what: &'static str, span: Span) -> (Ty, Value) {
-        self.error(TypeErrorKind::Unsupported(what), span);
-        (Ty::Error, Value::default())
+    /// A string literal: an array of its UTF-8 bytes.
+    fn string(&mut self, s: &str) -> (Ty, Value) {
+        let ty = self.ck.array_of(Ty::Prim(Prim::U8));
+        (
+            ty,
+            self.ck.push_data(s.as_bytes().to_vec(), 1, s.len() as u32),
+        )
+    }
+
+    /// An array literal, whose elements are typed like those of `expected`,
+    /// or else like the first element, and must be constant. Its elements are
+    /// placed in memory after any literals within them.
+    fn list(&mut self, items: &[parse::Expr], expected: Option<Ty>, span: Span) -> (Ty, Value) {
+        let mut elem = match expected {
+            Some(Ty::Array(id)) => Some(self.ck.element(id)),
+            // An array type that failed to resolve, already reported.
+            Some(Ty::Error) => Some(Ty::Error),
+            _ => None,
+        };
+        let mut consts = Vec::new();
+        for item in items {
+            let (ty, value) = self.expr(item, elem);
+            let want = *elem.get_or_insert(ty);
+            self.expect(ty, want, item.span);
+            let item_consts = self.ck.fold_value(&value, item.span);
+            // A mistyped element's scalars don't fit the cells.
+            consts.push(if ty == want { item_consts } else { Vec::new() });
+        }
+        let Some(elem) = elem else {
+            self.error(TypeErrorKind::UntypedEmptyArray, span);
+            return (Ty::Error, Value::default());
+        };
+        // Nothing holding an `externref` is constant, so that's reported.
+        if elem == Ty::Error || !self.ck.storable(elem) {
+            return (Ty::Error, Value::default());
+        }
+        let (size, align) = self.ck.layout(elem);
+        let cells = self.ck.cells(elem);
+        let mut bytes = vec![0; size as usize * items.len()];
+        for (i, consts) in consts.iter().enumerate() {
+            let start = i * size as usize;
+            for (cell, c) in cells.iter().zip(consts) {
+                write_const(&mut bytes[start + cell.offset as usize..], cell.store, *c);
+            }
+        }
+        let value = self.ck.push_data(bytes, align, items.len() as u32);
+        (self.ck.array_of(elem), value)
     }
 
     /// An integer literal, typed by `expected` and defaulting to `i32`.
@@ -1911,8 +2191,13 @@ impl<'c> Body<'c> {
 
     fn cast(&mut self, operand: &parse::Expr, ty: &parse::Type, span: Span) -> (Ty, Value) {
         let to = self.ck.resolve_ty(ty);
-        // An integer literal cast to a pointer is an address.
-        let expected = matches!(to, Ty::Ptr(_)).then_some(Ty::Prim(Prim::U32));
+        let expected = match to {
+            // An integer literal cast to a pointer is an address.
+            Ty::Ptr(_) => Some(Ty::Prim(Prim::U32)),
+            // A tuple literal cast to an array is its `len` and `ptr`.
+            Ty::Array(_) => Some(self.ck.tuple_of(self.ck.members(to))),
+            _ => None,
+        };
         let (from, value) = self.expr(operand, expected);
         match (from, to) {
             (Ty::Error, _) | (_, Ty::Error) => (Ty::Error, Value::default()),
@@ -1924,6 +2209,12 @@ impl<'c> Body<'c> {
             ),
             (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
             | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => (to, value),
+            // An array is the same scalars as a `(u32, *T)`.
+            (Ty::Tuple(_), Ty::Array(_)) | (Ty::Array(_), Ty::Tuple(_))
+                if self.ck.members(from) == self.ck.members(to) =>
+            {
+                (to, value)
+            }
             _ => {
                 let kind = TypeErrorKind::InvalidCast {
                     from: self.ck.ty_name(from),
@@ -1935,9 +2226,12 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// `&place`, the address of memory reached through a pointer.
+    /// `&place`, the address of memory reached through a pointer or array.
     fn addr_of(&mut self, inner: &parse::Expr, span: Span) -> (Ty, Value) {
-        if !matches!(inner.kind, ExprKind::Field(..) | ExprKind::Deref(_)) {
+        if !matches!(
+            inner.kind,
+            ExprKind::Field(..) | ExprKind::Deref(_) | ExprKind::Index(..)
+        ) {
             self.error(TypeErrorKind::NotAddressable, span);
             return (Ty::Error, Value::default());
         }
@@ -2308,6 +2602,37 @@ fn binary(ty: ValType, op: IrBinOp, a: Expr, b: Expr) -> Expr {
     Expr::Binary(ty, op, Box::new(a), Box::new(b))
 }
 
+/// Writes `c` to the start of `out` as `store` would.
+fn write_const(out: &mut [u8], store: StoreOp, c: Const) {
+    let bytes = match c {
+        Const::I32(x) => x.to_le_bytes().to_vec(),
+        Const::I64(x) => x.to_le_bytes().to_vec(),
+        Const::F32(x) => x.to_le_bytes().to_vec(),
+        Const::F64(x) => x.to_le_bytes().to_vec(),
+    };
+    let width = match store {
+        StoreOp::Store8 => 1,
+        StoreOp::Store16 => 2,
+        StoreOp::Store => bytes.len(),
+    };
+    out[..width].copy_from_slice(&bytes[..width]);
+}
+
+/// The address of element `index` of an array whose elements start at `ptr`
+/// and are `stride` bytes apart.
+fn element_addr(ptr: Expr, index: Expr, stride: u32) -> Expr {
+    let offset = match stride {
+        1 => index,
+        _ => binary(
+            ValType::I32,
+            IrBinOp::Mul,
+            index,
+            Expr::Const(Const::I32(stride as i32)),
+        ),
+    };
+    binary(ValType::I32, IrBinOp::Add, ptr, offset)
+}
+
 fn zero(ty: ValType) -> Const {
     match ty {
         // Only after a type error: nothing constant has this type.
@@ -2643,13 +2968,17 @@ fn wasm_max(a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{DummyManager, FileManager};
+    use crate::file::{DummyManager, FileManager, MemoryLimits};
     use crate::ir::{Const, Expr, Func, Module, Stmt, ValType};
     use crate::lex::tokenize;
 
     fn check_src(src: &str) -> Result<Module, Vec<TypeError>> {
+        check_with(src, &Settings::default())
+    }
+
+    fn check_with(src: &str, settings: &Settings) -> Result<Module, Vec<TypeError>> {
         let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
-        check(&parse::parse(&tokens).unwrap(), &Settings::default())
+        check(&parse::parse(&tokens).unwrap(), settings)
     }
 
     fn lower(src: &str) -> Module {
@@ -2764,6 +3093,15 @@ mod tests {
         }
     }
 
+    /// The offset and bytes of each data segment.
+    fn data(module: &Module) -> Vec<(u32, &[u8])> {
+        module
+            .data
+            .iter()
+            .map(|d| (d.offset, &d.bytes[..]))
+            .collect()
+    }
+
     /// Temporaries are numbered so that tests can tell them apart.
     fn local(f: &Func, l: ir::LocalId) -> String {
         match f.locals[l.0 as usize].name.as_str() {
@@ -2785,12 +3123,23 @@ mod tests {
             .collect();
         assert_eq!(
             imports,
-            vec![("logi", "env", "logi"), ("logf", "env", "log_f32")]
+            vec![
+                ("logi", "env", "logi"),
+                ("logf", "env", "log_f32"),
+                ("logs", "env", "log_str")
+            ]
         );
         let main = body(&module, "main");
         assert!(
-            main.contains("(call logi [c] -> []) (call logf [1.5f32] -> [])"),
+            main.contains(
+                "(call logi [c] -> []) (call logf [1.5f32] -> []) \
+                 (call logs [@greeting.len @greeting.ptr] -> [])"
+            ),
             "{main}"
+        );
+        assert_eq!(
+            data(&module),
+            [(0, &b"Hello, duck!"[..]), (12, &[2, 3, 5, 7])]
         );
         let globals: Vec<_> = module
             .globals
@@ -2801,7 +3150,12 @@ mod tests {
             globals,
             vec![
                 ("global", false, Const::I32(1)),
-                ("counter", true, Const::I32(0))
+                ("counter", true, Const::I32(0)),
+                ("greeting.len", false, Const::I32(12)),
+                ("greeting.ptr", false, Const::I32(0)),
+                ("primes.len", false, Const::I32(4)),
+                ("primes.ptr", false, Const::I32(12)),
+                ("data_end", false, Const::I32(16)),
             ]
         );
     }
@@ -3121,6 +3475,7 @@ var v = 1.5 as f32
             ("origin.y", false, "2"),
             ("flag", false, "1"),
             ("v", true, "1.5f32"),
+            ("data_end", false, "0"),
         ];
         let expected: Vec<_> = expected
             .into_iter()
@@ -3420,9 +3775,9 @@ fn f(a: i32):
                 ImmutableAssign("b".into()),
                 BreakOutsideLoop,
                 ContinueOutsideLoop,
-                Unsupported("for loops"),
-                Unsupported("strings"),
-                Unsupported("arrays"),
+                LiteralOutsideGlobal,
+                LiteralOutsideGlobal,
+                mismatch("[i32]", "i32"),
             ]
         );
     }
@@ -3469,7 +3824,7 @@ let g: f32 = 1.0
 let p = P(y: g, x: 2.0)
 ";
         let inits: Vec<_> = lower(src).globals.iter().map(|g| konst(g.init)).collect();
-        assert_eq!(inits, vec!["1f32", "2f32", "1f32"]);
+        assert_eq!(inits, vec!["1f32", "2f32", "1f32", "0"]);
     }
 
     #[test]
@@ -3517,7 +3872,8 @@ fn f():
     return b
 ";
         let module = lower(src);
-        assert!(module.globals.is_empty());
+        let globals: Vec<_> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(globals, ["data_end"]);
         assert!(module.funcs[1].locals.is_empty());
         assert_eq!(body(&module, "u"), "(return )");
         assert_eq!(body(&module, "f"), "(return )");
@@ -3553,7 +3909,8 @@ let hidden = 2
                 named("a"),
                 named("origin.x"),
                 named("origin.y"),
-                ("hidden".to_string(), None)
+                ("hidden".to_string(), None),
+                named("data_end"),
             ]
         );
     }
@@ -3591,7 +3948,8 @@ pub fn f(p: *P, a: u32, n: i32) -> *u32:
             globals,
             vec![
                 (ValType::I32, Const::I32(0)),
-                (ValType::I32, Const::I32(-1))
+                (ValType::I32, Const::I32(-1)),
+                (ValType::I32, Const::I32(0)),
             ]
         );
         assert_eq!(
@@ -3799,12 +4157,11 @@ fn f(a: i32, p: P, pp: **P):
     }
 
     fn check_start(src: &str, start: &str) -> Result<Module, Vec<TypeError>> {
-        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
         let settings = Settings {
             start: Some(start.to_string()),
             ..Settings::default()
         };
-        check(&parse::parse(&tokens).unwrap(), &settings)
+        check_with(src, &settings)
     }
 
     #[test]
@@ -4068,6 +4425,7 @@ let (_, hidden) = (1, pos.1.1)
                 global("pos.1.0", true, Const::I32(480)),
                 global("pos.1.1", true, Const::F64(1.5)),
                 global("hidden", false, Const::F64(1.5)),
+                global("data_end", true, Const::I32(0)),
             ]
         );
     }
@@ -4143,6 +4501,351 @@ fn f(t: (i32, f32)) -> (i32, i32):
                 ImmutableAssign("t".into()),
                 mismatch("(i32, i32)", "(i32, f64)"),
             ]
+        );
+    }
+
+    #[test]
+    fn arrays_are_a_length_then_a_pointer() {
+        let src = "\
+extern:
+    fn put(s: [u8]) -> [i32]
+fn f(a: [u8]) -> [u8]:
+    return a
+";
+        let module = lower(src);
+        assert_eq!(module.imports[0].params, [ValType::I32, ValType::I32]);
+        assert_eq!(module.imports[0].results, [ValType::I32, ValType::I32]);
+        let f = &module.funcs[0];
+        let locals: Vec<_> = f.locals.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(locals, ["a.len", "a.ptr"]);
+        assert_eq!(body(&module, "f"), "(return a.len a.ptr)");
+    }
+
+    #[test]
+    fn array_fields_are_places_laid_out_like_a_struct() {
+        let src = "\
+struct S:
+    tag: u8
+    name: [u16]
+fn f(a: [u8], s: *S) -> u32:
+    var b = a
+    b.len = 2
+    s.name.ptr = b.ptr as *u16
+    return s.name.len
+fn g(t: *(u8, [i32])) -> *i32:
+    return t.1.ptr
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "g"), "(return (I32.Load offset=8 t))");
+        assert_eq!(
+            body(&module, "f"),
+            "(set b.len a.len) (set b.ptr a.ptr) (set b.len 2) \
+             (I32.Store offset=8 s b.ptr) (return (I32.Load offset=4 s))"
+        );
+    }
+
+    #[test]
+    fn arrays_cast_to_and_from_a_length_pointer_tuple() {
+        let src = "\
+fn f(n: u32, p: *u8, a: [u8]) -> *u8:
+    let b = (n, p) as [u8]
+    let c = (3, p) as [u8]
+    let (m, q) = a as (u32, *u8)
+    return q
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set b.len n) (set b.ptr p) (set c.len 3) (set c.ptr p) \
+             (set m a.len) (set q a.ptr) (return q)"
+        );
+        let src = "\
+fn f(n: u32, i: i32, p: *u8, q: *i8, a: [u8]):
+    let b = (n, q) as [u8]
+    let c = (i, p) as [u8]
+    let d = (p, n) as [u8]
+    let e = a as (i32, *u8)
+    let g = a as [i8]
+";
+        let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                cast("(u32, *i8)", "[u8]"),
+                cast("(i32, *u8)", "[u8]"),
+                cast("(*u8, u32)", "[u8]"),
+                cast("[u8]", "(i32, *u8)"),
+                cast("[u8]", "[i8]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn indexing_checks_bounds_then_loads() {
+        let src = "\
+extern:
+    fn tick() -> u32
+fn f(a: [u16], i: u32) -> u16:
+    return a[i]
+fn g(a: [u8]) -> u8:
+    return a[3]
+fn h(a: [u8]) -> u8:
+    return a[tick()]
+struct Q:
+    a: i32
+    b: i32
+    c: i32
+fn k(a: [Q]) -> i32:
+    return a[357913941].c
+";
+        let module = lower(src);
+        let check =
+            |i: &str, len: &str| format!("(if (I32.GeU {i} {len}) (then unreachable) (else ))");
+        assert_eq!(
+            body(&module, "f"),
+            format!(
+                "{} (set tmp3 (I32.Add a.ptr (I32.Mul i 2))) (return (I32.Load16U offset=0 tmp3))",
+                check("i", "a.len")
+            )
+        );
+        assert_eq!(
+            body(&module, "g"),
+            format!(
+                "{} (set tmp2 (I32.Add a.ptr 3)) (return (I32.Load8U offset=0 tmp2))",
+                check("3", "a.len")
+            )
+        );
+        assert_eq!(
+            body(&module, "h"),
+            format!(
+                "(set tmp2 (call tick )) {} (set tmp3 (I32.Add a.ptr tmp2)) \
+                 (return (I32.Load8U offset=0 tmp3))",
+                check("tmp2", "a.len")
+            )
+        );
+        let src = "\
+fn f(a: [u8], i: i32, n: i32):
+    let b = a[i]
+    let c = n[0]
+    let d = a == a
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                mismatch("u32", "i32"),
+                invalid_operand("[]", "i32"),
+                invalid_operand("==", "[u8]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn elements_are_assignable_and_addressable() {
+        let src = "\
+struct P:
+    x: i32
+    y: f64
+fn f(a: [P], i: u32) -> *P:
+    a[i].x += 1
+    a[0] = P(x: 1, y: 2.0)
+    return &a[i]
+";
+        let check = |i: &str| format!("(if (I32.GeU {i} a.len) (then unreachable) (else ))");
+        assert_eq!(
+            body(&lower(src), "f"),
+            format!(
+                "{} (set tmp3 (I32.Add a.ptr (I32.Mul i 16))) \
+                 (I32.Store offset=0 tmp3 (I32.Add (I32.Load offset=0 tmp3) 1)) \
+                 {} (set tmp4 (I32.Add a.ptr (I32.Mul 0 16))) \
+                 (I32.Store offset=0 tmp4 1) (F64.Store offset=8 tmp4 2f64) \
+                 {} (set tmp5 (I32.Add a.ptr (I32.Mul i 16))) (return tmp5)",
+                check("i"),
+                check("0"),
+                check("i"),
+            )
+        );
+    }
+
+    #[test]
+    fn for_loops_copy_each_element() {
+        let src = "\
+extern:
+    fn log(n: u16)
+fn f(a: [u16]):
+    for x in a:
+        if x == 0:
+            break
+        log(x)
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp2 a.len) (set tmp3 a.ptr) (set tmp4 0) (block (loop \
+             (br_if 1 (I32.GeU tmp4 tmp2)) \
+             (set x (I32.Load16U offset=0 (I32.Add tmp3 (I32.Mul tmp4 2)))) \
+             (set tmp4 (I32.Add tmp4 1)) \
+             (if (I32.Eq x 0) (then (br 2)) (else )) (call log [x] -> []) (br 0)))"
+        );
+        let src = "\
+fn f(a: [u8]):
+    for x in a:
+        x = 1
+    for y in 5:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ImmutableAssign("x".into()),
+                invalid_operand("for", "i32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn string_literals_are_data() {
+        let src = "\
+pub let greeting = \"hi\"
+var duck = \"🦆\"
+";
+        let module = lower(src);
+        assert_eq!(
+            data(&module),
+            [(0, &b"hi"[..]), (2, &[0xf0, 0x9f, 0xa6, 0x86][..])]
+        );
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.export.as_deref(), g.init))
+            .collect();
+        assert_eq!(
+            globals[..4],
+            [
+                ("greeting.len", Some("greeting.len"), Const::I32(2)),
+                ("greeting.ptr", Some("greeting.ptr"), Const::I32(0)),
+                ("duck.len", None, Const::I32(4)),
+                ("duck.ptr", None, Const::I32(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn array_literals_are_aligned_data_placed_inner_first() {
+        let src = "\
+struct P:
+    a: u8
+    b: i32
+let names = [\"foo\", \"bar\"]
+let table: [u16] = [1, 2, 65535]
+let points = [P(a: 1, b: -2)]
+let empty: [f64] = []
+let flags = [true, false]
+let nested: [[i8]] = [[], [-1]]
+";
+        let module = lower(src);
+        assert_eq!(
+            data(&module),
+            [
+                (0, &b"foo"[..]),
+                (3, b"bar"),
+                (8, &[3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0]),
+                (24, &[1, 0, 2, 0, 0xff, 0xff]),
+                (32, &[1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]),
+                (40, &[1, 0]),
+                (42, &[0xff]),
+                (44, &[0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 0, 0, 42, 0, 0, 0]),
+            ]
+        );
+        let inits: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
+        for global in [
+            ("names.len", Const::I32(2)),
+            ("names.ptr", Const::I32(8)),
+            ("empty.len", Const::I32(0)),
+            ("empty.ptr", Const::I32(40)),
+            ("nested.len", Const::I32(2)),
+            ("nested.ptr", Const::I32(44)),
+        ] {
+            assert!(inits.contains(&global), "{global:?} in {inits:?}");
+        }
+    }
+
+    #[test]
+    fn literal_errors() {
+        use TypeErrorKind::*;
+        let src = "\
+fn get() -> u8:
+    return 1
+let a = []
+let b = [1, 2.0]
+let c = [get()]
+let d: [u8] = [256]
+let e = [1 / 0]
+let g: [externref] = []
+fn f():
+    let s = \"hi\"
+    let l = [1]
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                UntypedEmptyArray,
+                mismatch("i32", "f64"),
+                NotConstant,
+                IntOutOfRange("u8".into()),
+                ConstTrap,
+                NotStorable("externref".into()),
+                LiteralOutsideGlobal,
+                LiteralOutsideGlobal,
+            ]
+        );
+    }
+
+    #[test]
+    fn data_end_is_the_first_free_address() {
+        let data_end = |src: &str| {
+            let global = lower(src).globals.pop().unwrap();
+            (global.name, global.export, global.mutable, global.init)
+        };
+        let exported = |end| {
+            let name = "data_end".to_string();
+            (name.clone(), Some(name), false, Const::I32(end))
+        };
+        assert_eq!(data_end("pub let a = 1\n"), exported(0));
+        assert_eq!(
+            data_end("let s = \"abc\"\nlet t: [i32] = []\n"),
+            exported(3)
+        );
+        assert_eq!(data_end("let data_end = 1\n"), exported(0));
+        assert_eq!(
+            errors("pub let data_end = 1\n"),
+            [TypeErrorKind::ReservedExport("data_end".into())]
+        );
+    }
+
+    #[test]
+    fn data_must_fit_in_the_initial_memory() {
+        let pages = |min_pages| Settings {
+            memory: MemoryLimits {
+                min_pages,
+                max_pages: None,
+            },
+            ..Settings::default()
+        };
+        assert!(check_with("let s = \"\"\n", &pages(0)).is_ok());
+        assert_eq!(
+            check_with("let s = \"a\"\n", &pages(0)),
+            Err(vec![TypeError {
+                kind: TypeErrorKind::DataTooLarge {
+                    bytes: 1,
+                    min_pages: 0
+                },
+                span: None,
+            }])
         );
     }
 }

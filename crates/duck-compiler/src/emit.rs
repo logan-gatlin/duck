@@ -3,14 +3,16 @@
 //! The IR is already shaped after wasm, so this is one direct walk: every
 //! statement and expression maps to a fixed instruction sequence. The module
 //! imports its `extern` functions and exports its memory, `pub fn`s, and `pub`
-//! globals, and names its start function if it has one. Source names go in a `name` custom section so tools can show them.
+//! globals, names its start function if it has one, and fills memory with its
+//! literals. Source names go in a `name` custom section so tools can show them.
 
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, ImportSection, IndirectNameMap, Instruction,
-    MemArg, MemorySection, MemoryType, NameMap, NameSection, StartSection, TypeSection,
+    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, IndirectNameMap,
+    Instruction, MemArg, MemorySection, MemoryType, NameMap, NameSection, StartSection,
+    TypeSection,
 };
 
 use crate::ir::{BinOp, Const, Expr, Func, LoadOp, Module, Stmt, StoreOp, UnOp, ValType};
@@ -85,6 +87,12 @@ pub fn emit(module: &Module) -> Vec<u8> {
         code.function(&function(func));
     }
 
+    let mut data = DataSection::new();
+    for segment in &module.data {
+        let offset = ConstExpr::i32_const(segment.offset as i32);
+        data.active(0, &offset, segment.bytes.iter().copied());
+    }
+
     let mut func_names = NameMap::new();
     for (i, import) in module.imports.iter().enumerate() {
         func_names.append(i as u32, &import.name);
@@ -117,7 +125,7 @@ pub fn emit(module: &Module) -> Vec<u8> {
     if let Some(start) = &start {
         out.section(start);
     }
-    out.section(&code).section(&names);
+    out.section(&code).section(&data).section(&names);
     out.finish()
 }
 
@@ -514,6 +522,10 @@ mod tests {
         );
         assert!(wat.contains(r#"(export "add" (func $add))"#), "{wat}");
         assert!(wat.contains(r#"(export "main" (func $main))"#), "{wat}");
+        assert!(
+            wat.contains(r#"(data (;0;) (i32.const 0) "Hello, duck!")"#),
+            "{wat}"
+        );
         assert!(wat.contains(r#"(global $counter (;1;) (mut i32) i32.const 0)"#));
     }
 
@@ -602,6 +614,7 @@ pub fn shown():
                 r#"  (export "memory" (memory 0))"#,
                 r#"  (export "shown" (func $shown))"#,
                 r#"  (export "a" (global $a))"#,
+                r#"  (export "data_end" (global $data_end))"#,
             ]
         );
         assert!(wat.contains("(memory (;0;) 1)"), "{wat}");
@@ -826,5 +839,76 @@ fn f(a: i8, b: u32, c: i64, x: f32, y: f64) -> f64:
         ] {
             assert!(func.contains(op), "missing {op} in {func}");
         }
+    }
+
+    #[test]
+    fn literals_are_active_data_segments() {
+        let src = "\
+pub let greeting = \"hey\"
+let table: [u16] = [1, 2]
+";
+        let wat = wat(&emit_src(src));
+        for line in [
+            r#"(data (;0;) (i32.const 0) "hey")"#,
+            r#"(data (;1;) (i32.const 4) "\01\00\02\00")"#,
+            r#"(export "greeting.len" (global $greeting.len))"#,
+            r#"(export "greeting.ptr" (global $greeting.ptr))"#,
+            r#"(export "data_end" (global $data_end))"#,
+            "(global $data_end (;4;) i32 i32.const 8)",
+        ] {
+            assert!(wat.contains(line), "{line}\n{wat}");
+        }
+    }
+
+    #[test]
+    fn indexing_traps_out_of_bounds() {
+        let src = "\
+fn f(a: [u8], i: u32) -> u8:
+    return a[i]
+";
+        let func = func_wat(&emit_src(src), "f");
+        assert!(
+            func.contains("i32.ge_u\n    if ;; label = @1\n      unreachable\n    end\n"),
+            "{func}"
+        );
+    }
+
+    #[test]
+    fn for_loops_index_from_zero_to_len() {
+        let src = "\
+extern:
+    fn log(n: i32)
+fn f(a: [i32]):
+    for x in a:
+        log(x)
+";
+        let func = func_wat(&emit_src(src), "f");
+        let loop_start = func.find("block").unwrap();
+        assert_eq!(
+            &func[loop_start..],
+            "\
+    block ;; label = @1
+      loop ;; label = @2
+        local.get $\"#local4 tmp\"
+        local.get $tmp
+        i32.ge_u
+        br_if 1 (;@1;)
+        local.get $\"#local3 tmp\"
+        local.get $\"#local4 tmp\"
+        i32.const 4
+        i32.mul
+        i32.add
+        i32.load
+        local.set $x
+        local.get $\"#local4 tmp\"
+        i32.const 1
+        i32.add
+        local.set $\"#local4 tmp\"
+        local.get $x
+        call $log
+        br 0 (;@2;)
+      end
+    end"
+        );
     }
 }

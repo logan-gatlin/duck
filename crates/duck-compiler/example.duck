@@ -1,9 +1,12 @@
 extern:
 	fn logi(num: i32)
 	fn logf(num: f32) = "log_f32"
+	fn logs(text: [u8]) = "log_str"
 
 pub let global = true
 pub var counter = 0
+pub let greeting = "Hello, duck!"
+pub let primes: [u8] = [2, 3, 5, 7]
 
 pub struct Point:
 	x: f32
@@ -19,6 +22,9 @@ pub fn main():
 	let c = add(a, b)
 	logi(c)
 	logf(1.5)
+	logs(greeting)
+	for p in primes:
+		logi(p as i32)
 	var i = 0
 	while i < 3:
 		i += 1

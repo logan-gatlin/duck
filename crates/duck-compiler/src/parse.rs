@@ -1187,8 +1187,8 @@ mod tests {
     #[test]
     fn example_program() {
         let module = parse_src(include_str!("../example.duck")).unwrap();
-        let [host, global, counter, point, add, main] = &module.items[..] else {
-            panic!("expected 6 items, got {:#?}", module.items);
+        let [host, global, counter, greeting, primes, point, add, main] = &module.items[..] else {
+            panic!("expected 8 items, got {:#?}", module.items);
         };
         assert!(!host.is_pub);
         assert!(module.items[1..].iter().all(|item| item.is_pub));
@@ -1202,8 +1202,16 @@ mod tests {
             .iter()
             .map(|f| (f.sig.name.name.as_str(), f.import_name.as_deref()))
             .collect();
-        assert_eq!(fns, vec![("logi", None), ("logf", Some("log_f32"))]);
+        assert_eq!(
+            fns,
+            vec![
+                ("logi", None),
+                ("logf", Some("log_f32")),
+                ("logs", Some("log_str"))
+            ]
+        );
         assert_eq!(host.fns[0].sig.params[0].ty.kind, named("i32"));
+        assert_eq!(render_ty(&host.fns[2].sig.params[0].ty), "[u8]");
 
         let ItemKind::Binding(global) = &global.kind else {
             panic!()
@@ -1217,6 +1225,15 @@ mod tests {
         };
         assert_eq!(counter.mutability, Mutability::Var);
         assert_eq!(counter.value.kind, ExprKind::Int(0));
+
+        let ItemKind::Binding(greeting) = &greeting.kind else {
+            panic!()
+        };
+        assert_eq!(sexpr(&greeting.value), r#""Hello, duck!""#);
+        let ItemKind::Binding(primes) = &primes.kind else {
+            panic!()
+        };
+        assert_eq!(sexpr(&primes.value), "[2 3 5 7]");
 
         let ItemKind::Struct(point) = &point.kind else {
             panic!()
@@ -1247,10 +1264,11 @@ mod tests {
         assert_eq!(
             stmt_kinds(&main.body),
             vec![
-                "binding", "binding", "binding", "expr", "expr", "binding", "while", "while"
+                "binding", "binding", "binding", "expr", "expr", "expr", "for", "binding", "while",
+                "while"
             ]
         );
-        let StmtKind::While { cond, body } = &main.body[6].kind else {
+        let StmtKind::While { cond, body } = &main.body[8].kind else {
             panic!()
         };
         assert_eq!(sexpr(cond), "(Lt i 3)");
