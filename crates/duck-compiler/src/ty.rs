@@ -20,6 +20,10 @@ use crate::parse::{
     PatternKind, StmtKind, TypeKind, UnaryOp,
 };
 
+use generic::{Instance, ParamDef};
+
+mod generic;
+
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
 /// signed type `$s` and unsigned counterpart `$u`. Returns from the enclosing
 /// function on a trap or a non-integer instruction.
@@ -322,21 +326,6 @@ struct StructDef {
     fields: Vec<FieldDef>,
 }
 
-/// A use of a generic struct with type arguments.
-struct Instance {
-    generic: StructId,
-    args: Vec<Ty>,
-    /// Where it was first used, which errors in its fields are reported at.
-    site: Span,
-}
-
-/// A type parameter of a generic struct.
-struct ParamDef {
-    name: String,
-    /// Position in the struct's type parameters.
-    index: usize,
-}
-
 #[derive(Clone)]
 struct FieldDef {
     name: String,
@@ -449,19 +438,6 @@ struct Cell {
     store: StoreOp,
     /// Whether the cell holds a `bool`, which may be any byte in memory.
     bool: bool,
-}
-
-/// A type argument of a generic declaration's field that holds one of the
-/// declaration's type parameters, which it passes on to another generic.
-#[derive(Clone, Copy)]
-struct Flow {
-    /// The declaration and index of the field.
-    from: (usize, usize),
-    /// The generic declaration it passes the type argument to.
-    to: usize,
-    /// Whether the type parameter is wrapped in a larger type, as in `&T`
-    /// or `Box(T)`, rather than passed as is.
-    expands: bool,
 }
 
 /// Why a global initializer could not be folded.
@@ -834,106 +810,6 @@ impl Checker {
         self.structs_defined = true;
     }
 
-    /// Brings the type parameters of struct `id` into scope, reporting
-    /// repeated ones and ones named after a type.
-    fn declare_type_params(&mut self, id: usize, params: &[Ident]) {
-        for (i, param) in params.iter().enumerate() {
-            if params[..i].iter().any(|p| p.name == param.name) {
-                self.error(
-                    TypeErrorKind::DuplicateParam(param.name.clone()),
-                    param.span,
-                );
-            } else if is_builtin_type(&param.name)
-                || matches!(self.items.get(&param.name), Some(Item::Struct(_)))
-            {
-                self.error(TypeErrorKind::DuplicateItem(param.name.clone()), param.span);
-            } else {
-                let ty = self.structs[id].params[i];
-                self.type_params.push((param.name.clone(), ty));
-            }
-        }
-    }
-
-    /// Whether struct `id` is a generic declaration, or an instance whose type
-    /// arguments hold type parameters. Neither is ever laid out.
-    fn is_open(&self, id: StructId) -> bool {
-        let def = &self.structs[id.0 as usize];
-        match &def.instance {
-            Some(instance) => instance.args.iter().any(|arg| self.has_param(*arg)),
-            None => !def.params.is_empty(),
-        }
-    }
-
-    /// Whether `ty` holds a type parameter anywhere within it.
-    fn has_param(&self, ty: Ty) -> bool {
-        match ty {
-            Ty::Param(_) => true,
-            Ty::Ptr(id) => self.has_param(self.pointee(id)),
-            Ty::Tuple(id) => self.tuples[id.0 as usize]
-                .iter()
-                .any(|elem| self.has_param(*elem)),
-            Ty::Array(id) => self.has_param(self.element(id)),
-            Ty::Struct(id) => self.is_open(id) && self.structs[id.0 as usize].instance.is_some(),
-            _ => false,
-        }
-    }
-
-    /// Reports each field of a generic declaration that passes a type
-    /// parameter, wrapped in a larger type, around a cycle of generic
-    /// structs back to itself, and cuts the cycle by giving the field the
-    /// error type. Such a struct would have infinitely many instances.
-    fn break_expansions(&mut self, decl_count: usize) {
-        let mut edges = Vec::new();
-        for id in 0..decl_count {
-            for (i, field) in self.structs[id].fields.iter().enumerate() {
-                self.push_param_flows(field.ty, (id, i), &mut edges);
-            }
-        }
-        let mut cut = Vec::new();
-        for edge in &edges {
-            if edge.expands
-                && !cut.contains(&edge.from)
-                && flows_to(&edges, &cut, edge.to, edge.from.0)
-            {
-                let (id, i) = edge.from;
-                self.structs[id].fields[i].ty = Ty::Error;
-                let kind = TypeErrorKind::ExpansiveRecursion(self.structs[id].name.clone());
-                self.error(kind, self.structs[id].fields[i].span);
-                cut.push(edge.from);
-            }
-        }
-    }
-
-    /// Pushes a flow for each type argument in `ty` that holds a type
-    /// parameter of the declaration whose field `from` is.
-    fn push_param_flows(&self, ty: Ty, from: (usize, usize), out: &mut Vec<Flow>) {
-        match ty {
-            Ty::Ptr(id) => self.push_param_flows(self.pointee(id), from, out),
-            Ty::Tuple(id) => {
-                for elem in &self.tuples[id.0 as usize] {
-                    self.push_param_flows(*elem, from, out);
-                }
-            }
-            Ty::Array(id) => self.push_param_flows(self.element(id), from, out),
-            Ty::Struct(id) => {
-                let Some(instance) = &self.structs[id.0 as usize].instance else {
-                    return;
-                };
-                for arg in &instance.args {
-                    if self.has_param(*arg) {
-                        out.push(Flow {
-                            from,
-                            to: instance.generic.0 as usize,
-                            expands: !matches!(arg, Ty::Param(_)),
-                        });
-                    }
-                    self.push_param_flows(*arg, from, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Reports pointer fields whose pointee can't be stored in memory, which
     /// `resolve_ty` couldn't know before every struct was defined, and gives
     /// them the error type. Only checks the structs `ids`.
@@ -962,19 +838,13 @@ impl Checker {
     /// memory, not counting the fields of structs, which are checked on their
     /// own.
     fn unstorable_pointee(&self, ty: Ty) -> Option<Ty> {
+        let components = self.components(ty);
         match ty {
-            Ty::Ptr(ptr) => {
-                let pointee = self.pointee(ptr);
-                match self.storable(pointee) {
-                    true => self.unstorable_pointee(pointee),
-                    false => Some(pointee),
-                }
-            }
-            Ty::Tuple(id) => self.tuples[id.0 as usize]
-                .iter()
-                .find_map(|elem| self.unstorable_pointee(*elem)),
-            Ty::Array(id) => self.unstorable_pointee(self.arrays[id.0 as usize]),
-            _ => None,
+            // An array's elements are behind its `ptr`.
+            Ty::Ptr(_) | Ty::Array(_) if !self.storable(components[0]) => Some(components[0]),
+            _ => components
+                .into_iter()
+                .find_map(|component| self.unstorable_pointee(component)),
         }
     }
 
@@ -1166,42 +1036,6 @@ impl Checker {
         funcs
     }
 
-    /// Reads a type written as an expression, such as the `Box(&i32)` in
-    /// `Box(&i32)(value: p)`. `None` after reporting an error.
-    fn type_syntax(&mut self, expr: &parse::Expr) -> Option<parse::Type> {
-        let kind = match &expr.kind {
-            ExprKind::Name(name) => TypeKind::Named(name.clone(), Vec::new()),
-            ExprKind::Call(callee, args) => {
-                let ExprKind::Name(name) = &callee.kind else {
-                    self.error(TypeErrorKind::NotAType, callee.span);
-                    return None;
-                };
-                let mut types = Vec::new();
-                for arg in args {
-                    if let Some(label) = &arg.label {
-                        self.error(TypeErrorKind::LabelledTypeArg, label.span);
-                    }
-                    types.push(self.type_syntax(&arg.value));
-                }
-                TypeKind::Named(name.clone(), types.into_iter().collect::<Option<_>>()?)
-            }
-            ExprKind::AddrOf(pointee) => TypeKind::Pointer(Box::new(self.type_syntax(pointee)?)),
-            ExprKind::Unit => TypeKind::Unit,
-            ExprKind::Tuple(elems) => {
-                let elems: Vec<_> = elems.iter().map(|elem| self.type_syntax(elem)).collect();
-                TypeKind::Tuple(elems.into_iter().collect::<Option<_>>()?)
-            }
-            _ => {
-                self.error(TypeErrorKind::NotAType, expr.span);
-                return None;
-            }
-        };
-        Some(parse::Type {
-            kind,
-            span: expr.span,
-        })
-    }
-
     fn resolve_ty(&mut self, ty: &parse::Type) -> Ty {
         match &ty.kind {
             TypeKind::Named(name, args) => {
@@ -1274,103 +1108,6 @@ impl Checker {
         }
     }
 
-    /// How many type arguments the type `name` takes. Zero for names that
-    /// aren't types.
-    fn type_arity(&self, name: &str) -> usize {
-        match self.items.get(name) {
-            _ if name == ARRAY => 1,
-            Some(Item::Struct(id)) => self.structs[id.0 as usize].params.len(),
-            _ => 0,
-        }
-    }
-
-    /// The instance of generic struct `generic` with type arguments `args`,
-    /// first used at `site`. Instances are given their fields as soon as
-    /// every generic struct is defined, and reported at `site` if a pointer
-    /// in them can't be stored once every struct is.
-    fn instantiate(&mut self, generic: StructId, args: Vec<Ty>, site: Span) -> Ty {
-        if let Some(id) = self.instances.get(&(generic, args.clone())) {
-            return Ty::Struct(*id);
-        }
-        let id = StructId(self.structs.len() as u32);
-        let names: Vec<_> = args.iter().map(|arg| self.ty_name(*arg)).collect();
-        self.structs.push(StructDef {
-            name: format!(
-                "{}({})",
-                self.structs[generic.0 as usize].name,
-                names.join(", ")
-            ),
-            params: Vec::new(),
-            instance: Some(Instance {
-                generic,
-                args: args.clone(),
-                site,
-            }),
-            fields: Vec::new(),
-        });
-        self.instances.insert((generic, args), id);
-        if self.is_open(id) {
-            return Ty::Struct(id);
-        }
-        if !self.generics_defined {
-            self.pending.push(id);
-            return Ty::Struct(id);
-        }
-        let first_new = id.0 as usize;
-        self.fill_instance(id);
-        if self.structs_defined {
-            self.check_field_pointers(first_new..self.structs.len());
-        }
-        Ty::Struct(id)
-    }
-
-    /// Gives instance `id` the fields of its generic declaration, with type
-    /// arguments in place of type parameters.
-    fn fill_instance(&mut self, id: StructId) {
-        let instance = self.structs[id.0 as usize].instance.as_ref().unwrap();
-        let (generic, args, site) = (instance.generic, instance.args.clone(), instance.site);
-        let mut fields = self.structs[generic.0 as usize].fields.clone();
-        for field in &mut fields {
-            field.ty = self.substitute(field.ty, &args, site);
-        }
-        self.structs[id.0 as usize].fields = fields;
-    }
-
-    /// `ty` with each type parameter replaced by its argument in `args`.
-    fn substitute(&mut self, ty: Ty, args: &[Ty], site: Span) -> Ty {
-        match ty {
-            Ty::Param(id) => args[self.params[id.0 as usize].index],
-            Ty::Ptr(id) => {
-                let pointee = self.substitute(self.pointee(id), args, site);
-                self.ptr_to(pointee)
-            }
-            Ty::Tuple(id) => {
-                let elems = self.tuples[id.0 as usize].clone();
-                let elems = elems
-                    .into_iter()
-                    .map(|elem| self.substitute(elem, args, site))
-                    .collect();
-                self.tuple_of(elems)
-            }
-            Ty::Array(id) => {
-                let elem = self.substitute(self.element(id), args, site);
-                self.array_of(elem)
-            }
-            Ty::Struct(id) => match &self.structs[id.0 as usize].instance {
-                Some(instance) if self.is_open(id) => {
-                    let (generic, inner) = (instance.generic, instance.args.clone());
-                    let inner = inner
-                        .into_iter()
-                        .map(|arg| self.substitute(arg, args, site))
-                        .collect();
-                    self.instantiate(generic, inner, site)
-                }
-                _ => ty,
-            },
-            Ty::Prim(_) | Ty::ExternRef | Ty::Unit | Ty::Error => ty,
-        }
-    }
-
     /// Whether `ty` can live in linear memory: it holds no `externref`.
     fn storable(&self, ty: Ty) -> bool {
         match ty {
@@ -1433,6 +1170,28 @@ impl Checker {
             self.arrays.push(ptr);
         }
         Ty::Array(id)
+    }
+
+    /// The types a pointer, tuple, or array type is made of: its pointee,
+    /// elements, or element type. Empty for any other type.
+    fn components(&self, ty: Ty) -> Vec<Ty> {
+        match ty {
+            Ty::Ptr(id) => vec![self.pointee(id)],
+            Ty::Tuple(id) => self.tuples[id.0 as usize].clone(),
+            Ty::Array(id) => vec![self.element(id)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The type shaped like `ty` but made of `components`, as
+    /// [`Self::components`] takes it apart. Any other type is itself.
+    fn rebuild(&mut self, ty: Ty, components: Vec<Ty>) -> Ty {
+        match ty {
+            Ty::Ptr(_) => self.ptr_to(components[0]),
+            Ty::Tuple(_) => self.tuple_of(components),
+            Ty::Array(_) => self.array_of(components[0]),
+            _ => ty,
+        }
     }
 
     fn element(&self, id: ArrayId) -> Ty {
@@ -2745,60 +2504,6 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// A generic type `name` called directly: as `Box(i32)`, a type used as a
-    /// value, or as `Box(value: 1)`, a constructor missing type arguments.
-    fn generic_call(
-        &mut self,
-        name: &str,
-        callee: &parse::Expr,
-        args: &[Arg],
-        span: Span,
-    ) -> (Ty, Value) {
-        if args.iter().all(|arg| arg.label.is_none()) {
-            let expr = parse::Expr {
-                kind: ExprKind::Call(Box::new(callee.clone()), args.to_vec()),
-                span,
-            };
-            let ty = self.expr_type(&expr);
-            if ty != Ty::Error {
-                self.error(TypeErrorKind::NotAValue(self.ck.ty_name(ty)), span);
-            }
-        } else {
-            // The arguments may be fields or mislabelled type arguments, so
-            // they aren't checked.
-            let kind = TypeErrorKind::TypeArgCount {
-                name: name.to_string(),
-                expected: self.ck.type_arity(name),
-                found: 0,
-            };
-            self.error(kind, callee.span);
-        }
-        (Ty::Error, Value::default())
-    }
-
-    /// Resolves a type written as an expression.
-    fn expr_type(&mut self, expr: &parse::Expr) -> Ty {
-        match self.ck.type_syntax(expr) {
-            Some(ty) => self.ck.resolve_ty(&ty),
-            None => Ty::Error,
-        }
-    }
-
-    /// Whether `expr(args)` gives a type its type arguments, rather than
-    /// building a struct that is then called. A generic type always takes
-    /// type arguments; any other struct is taken to when none are labelled,
-    /// so that giving it some is reported.
-    fn names_type(&self, expr: &parse::Expr, args: &[Arg]) -> bool {
-        match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => {
-                self.ck.type_arity(name) > 0
-                    || matches!(self.ck.items.get(name), Some(Item::Struct(_)))
-                        && args.iter().all(|arg| arg.label.is_none())
-            }
-            _ => false,
-        }
-    }
-
     /// A value of a struct or array type `ty`, built from its labelled
     /// fields.
     fn construct(&mut self, ty: Ty, args: &[Arg], span: Span) -> (Ty, Value) {
@@ -3286,29 +2991,8 @@ fn is_stable(expr: &Expr) -> bool {
     }
 }
 
-/// Whether type parameters flow from declaration `from` to `to` along
-/// `edges`, not counting those from the fields in `cut`.
-fn flows_to(edges: &[Flow], cut: &[(usize, usize)], from: usize, to: usize) -> bool {
-    let mut seen = vec![from];
-    let mut stack = vec![from];
-    while let Some(id) = stack.pop() {
-        if id == to {
-            return true;
-        }
-        for edge in edges
-            .iter()
-            .filter(|e| e.from.0 == id && !cut.contains(&e.from))
-        {
-            if !seen.contains(&edge.to) {
-                seen.push(edge.to);
-                stack.push(edge.to);
-            }
-        }
-    }
-    false
-}
-
-/// Whether `name` is a type the language defines, which no item may take.
+/// Whether `name` is a type the language defines, which no type parameter
+/// may take.
 fn is_builtin_type(name: &str) -> bool {
     name == ARRAY || name == EXTERNREF || Prim::from_name(name).is_some()
 }
