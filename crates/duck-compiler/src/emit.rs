@@ -540,10 +540,10 @@ pub fn f(a: i32) -> i32:
 extern \"js\":
     fn now(scale: i32) -> i32 = \"Date.now\"
 extern:
-    fn put(p: *P, v: P) -> P
+    fn put(p: &P, v: P) -> P
     fn flag() -> bool
 pub fn g() -> i32:
-    let p = put(0 as *P, P(x: 1.0, y: 2))
+    let p = put(0 as &P, P(x: 1.0, y: 2))
     if flag():
         return f(now(1))
     return 0
@@ -756,7 +756,7 @@ struct P:
     a: u8
     b: i16
     c: f64
-fn f(p: *P) -> f64:
+fn f(p: &P) -> f64:
     p.b = p.a as i16
     return p.c
 ";
@@ -773,7 +773,7 @@ extern:
     fn divmod(a: i32, b: i32) -> (i32, u8)
 pub let (w, h) = (640, 480)
 pub var pos = (1, (2.5, 3))
-pub fn f(p: *(u8, f64)) -> (f64, i32):
+pub fn f(p: &(u8, f64)) -> (f64, i32):
     let (q, r) = divmod(w, h)
     pos.1.0 = p.1
     return (pos.1.0, q + r as i32)
@@ -845,7 +845,7 @@ fn f(a: i8, b: u32, c: i64, x: f32, y: f64) -> f64:
     fn literals_are_active_data_segments() {
         let src = "\
 pub let greeting = \"hey\"
-let table: [u16] = [1, 2]
+let table: array(u16) = [1, 2]
 ";
         let wat = wat(&emit_src(src));
         for line in [
@@ -863,7 +863,7 @@ let table: [u16] = [1, 2]
     #[test]
     fn indexing_traps_out_of_bounds() {
         let src = "\
-fn f(a: [u8], i: u32) -> u8:
+fn f(a: array(u8), i: u32) -> u8:
     return a[i]
 ";
         let func = func_wat(&emit_src(src), "f");
@@ -878,7 +878,7 @@ fn f(a: [u8], i: u32) -> u8:
         let src = "\
 extern:
     fn log(n: i32)
-fn f(a: [i32]):
+fn f(a: array(i32)):
     for x in a:
         log(x)
 ";

@@ -91,6 +91,12 @@ const DATA_END_EXPORT: &str = "data_end";
 /// Bytes in a wasm page.
 const PAGE_SIZE: u64 = 64 * 1024;
 
+/// The name of the built-in array type.
+const ARRAY: &str = "array";
+
+/// The name of the host reference type.
+const EXTERNREF: &str = "externref";
+
 /// The fields of every array, in order.
 const ARRAY_FIELDS: [&str; 2] = ["len", "ptr"];
 
@@ -129,17 +135,24 @@ pub struct TupleId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArrayId(u32);
 
+/// Index of a generic struct's type parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParamId(u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     Prim(Prim),
     Struct(StructId),
-    /// `*T`, an address in linear memory, stored as an `i32`.
+    /// `&T`, an address in linear memory, stored as an `i32`.
     Ptr(PtrId),
     /// `(A, B)`, which is laid out like a struct with a field per element.
     Tuple(TupleId),
-    /// `[T]`, a view of elements in linear memory that it doesn't own. Laid
-    /// out like a struct with the fields `len: u32` and `ptr: *T`.
+    /// `array(T)`, a view of elements in linear memory that it doesn't own.
+    /// Laid out like a struct with the fields `len: u32` and `ptr: &T`.
     Array(ArrayId),
+    /// A type parameter, which only the fields of its generic struct's
+    /// declaration have. Uses of the struct replace it with a type argument.
+    Param(ParamId),
     /// `externref`, an opaque reference that only the host can create. It
     /// can't be stored in linear memory, so nothing that holds one has a
     /// pointer type.
@@ -173,6 +186,15 @@ pub enum TypeErrorKind {
     DuplicateBinding(String),
     /// A struct that contains itself by value.
     RecursiveStruct(String),
+    /// A generic struct that uses itself with ever larger type arguments,
+    /// so it has no end of instances.
+    ExpansiveRecursion(String),
+    /// A type given the wrong number of type arguments.
+    TypeArgCount {
+        name: String,
+        expected: usize,
+        found: usize,
+    },
     Mismatch {
         expected: String,
         found: String,
@@ -228,12 +250,31 @@ pub enum TypeErrorKind {
     LiteralOutsideGlobal,
     /// `[]` with no type to give its elements.
     UntypedEmptyArray,
+    /// An expression where a type argument should be.
+    NotAType,
+    /// A type argument given a label, as only fields and parameters are.
+    LabelledTypeArg,
 }
 
 #[derive(Default)]
 struct Checker {
     items: HashMap<String, Item>,
+    /// Struct declarations in declaration order, then instances of generic
+    /// ones as they are used.
     structs: Vec<StructDef>,
+    /// Each instance of a generic struct by its declaration and type
+    /// arguments.
+    instances: HashMap<(StructId, Vec<Ty>), StructId>,
+    /// Every generic struct's type parameters, indexed by [`ParamId`].
+    params: Vec<ParamDef>,
+    /// The type parameters in scope, while resolving a generic struct's
+    /// fields.
+    type_params: Vec<(String, Ty)>,
+    /// Instances whose fields wait on every generic struct's being defined.
+    pending: Vec<StructId>,
+    /// Whether every generic struct's fields are known, so instances can
+    /// be given theirs.
+    generics_defined: bool,
     /// The pointee of each pointer type.
     pointees: Vec<Ty>,
     ptr_ids: HashMap<Ty, PtrId>,
@@ -270,10 +311,33 @@ enum Item {
 }
 
 struct StructDef {
+    /// The declared name, or for an instance, its type as written.
     name: String,
+    /// The [`Ty::Param`] of each type parameter of a generic declaration.
+    params: Vec<Ty>,
+    /// Set for instances of generic declarations.
+    instance: Option<Instance>,
+    /// Empty for instances whose type arguments hold type parameters, which
+    /// are never laid out.
     fields: Vec<FieldDef>,
 }
 
+/// A use of a generic struct with type arguments.
+struct Instance {
+    generic: StructId,
+    args: Vec<Ty>,
+    /// Where it was first used, which errors in its fields are reported at.
+    site: Span,
+}
+
+/// A type parameter of a generic struct.
+struct ParamDef {
+    name: String,
+    /// Position in the struct's type parameters.
+    index: usize,
+}
+
+#[derive(Clone)]
 struct FieldDef {
     name: String,
     ty: Ty,
@@ -385,6 +449,19 @@ struct Cell {
     store: StoreOp,
     /// Whether the cell holds a `bool`, which may be any byte in memory.
     bool: bool,
+}
+
+/// A type argument of a generic declaration's field that holds one of the
+/// declaration's type parameters, which it passes on to another generic.
+#[derive(Clone, Copy)]
+struct Flow {
+    /// The declaration and index of the field.
+    from: (usize, usize),
+    /// The generic declaration it passes the type argument to.
+    to: usize,
+    /// Whether the type parameter is wrapped in a larger type, as in `&T`
+    /// or `Box(T)`, rather than passed as is.
+    expands: bool,
 }
 
 /// Why a global initializer could not be folded.
@@ -508,6 +585,21 @@ impl fmt::Display for TypeErrorKind {
             Self::DuplicateParam(name) => write!(f, "duplicate parameter `{name}`"),
             Self::DuplicateBinding(name) => write!(f, "`{name}` is bound more than once"),
             Self::RecursiveStruct(name) => write!(f, "struct `{name}` contains itself"),
+            Self::ExpansiveRecursion(name) => write!(
+                f,
+                "struct `{name}` uses itself with ever larger type arguments"
+            ),
+            Self::TypeArgCount {
+                name,
+                expected,
+                found,
+            } => {
+                let s = if *expected == 1 { "" } else { "s" };
+                write!(
+                    f,
+                    "`{name}` takes {expected} type argument{s}, found {found}"
+                )
+            }
             Self::Mismatch { expected, found } => {
                 write!(f, "expected `{expected}`, found `{found}`")
             }
@@ -549,6 +641,8 @@ impl fmt::Display for TypeErrorKind {
                 "string and array literals are only allowed in global initializers"
             ),
             Self::UntypedEmptyArray => write!(f, "can't infer the element type of `[]`"),
+            Self::NotAType => write!(f, "expected a type"),
+            Self::LabelledTypeArg => write!(f, "type arguments can't be labelled"),
         }
     }
 }
@@ -623,8 +717,22 @@ impl Checker {
             let (name, entry) = match &item.kind {
                 ItemKind::Struct(s) => {
                     let id = StructId(self.structs.len() as u32);
+                    let params = s
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(index, param)| {
+                            self.params.push(ParamDef {
+                                name: param.name.clone(),
+                                index,
+                            });
+                            Ty::Param(ParamId(self.params.len() as u32 - 1))
+                        })
+                        .collect();
                     self.structs.push(StructDef {
                         name: s.name.name.clone(),
+                        params,
+                        instance: None,
                         fields: Vec::new(),
                     });
                     (&s.name, Item::Struct(id))
@@ -663,19 +771,25 @@ impl Checker {
     }
 
     fn declare_name(&mut self, name: &Ident, entry: Item) {
-        if self.items.contains_key(&name.name) {
+        if self.items.contains_key(&name.name) || name.name == ARRAY {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
             self.items.insert(name.name.clone(), entry);
         }
     }
 
+    /// Resolves every struct's fields, reporting generic structs that recurse
+    /// without end and structs that contain themselves, then gives every
+    /// instance used so far its fields.
     fn define_structs(&mut self, module: &parse::Module) {
         let decls = module.items.iter().filter_map(|item| match &item.kind {
             ItemKind::Struct(s) => Some(s),
             _ => None,
         });
+        let mut decl_count = 0;
         for (id, decl) in decls.enumerate() {
+            decl_count += 1;
+            self.declare_type_params(id, &decl.params);
             let mut fields: Vec<FieldDef> = Vec::new();
             for field in &decl.fields {
                 let ty = self.resolve_ty(&field.ty);
@@ -691,28 +805,156 @@ impl Checker {
                     span: field.span,
                 });
             }
+            self.type_params.clear();
             self.structs[id].fields = fields;
         }
+        self.break_expansions(decl_count);
+        // Whether a declaration contains another by value doesn't depend on
+        // type arguments, so a cycle of declarations is caught once here.
         let mut visits = vec![Visit::New; self.structs.len()];
-        for id in 0..self.structs.len() {
-            self.break_cycles(id, &mut visits);
+        for id in 0..decl_count {
+            self.break_cycles(id, &mut visits, true);
         }
-        self.check_field_pointers();
+        self.generics_defined = true;
+        while let Some(id) = self.pending.pop() {
+            self.fill_instance(id);
+        }
+        // Type arguments can close a cycle through a declaration, as in
+        // `struct S: w: W(S)` where `struct W(T): x: T`.
+        let mut visits: Vec<_> = (0..self.structs.len())
+            .map(|id| match self.is_open(StructId(id as u32)) {
+                true => Visit::Done,
+                false => Visit::New,
+            })
+            .collect();
+        for id in 0..self.structs.len() {
+            self.break_cycles(id, &mut visits, false);
+        }
+        self.check_field_pointers(0..self.structs.len());
         self.structs_defined = true;
+    }
+
+    /// Brings the type parameters of struct `id` into scope, reporting
+    /// repeated ones and ones named after a type.
+    fn declare_type_params(&mut self, id: usize, params: &[Ident]) {
+        for (i, param) in params.iter().enumerate() {
+            if params[..i].iter().any(|p| p.name == param.name) {
+                self.error(
+                    TypeErrorKind::DuplicateParam(param.name.clone()),
+                    param.span,
+                );
+            } else if is_builtin_type(&param.name)
+                || matches!(self.items.get(&param.name), Some(Item::Struct(_)))
+            {
+                self.error(TypeErrorKind::DuplicateItem(param.name.clone()), param.span);
+            } else {
+                let ty = self.structs[id].params[i];
+                self.type_params.push((param.name.clone(), ty));
+            }
+        }
+    }
+
+    /// Whether struct `id` is a generic declaration, or an instance whose type
+    /// arguments hold type parameters. Neither is ever laid out.
+    fn is_open(&self, id: StructId) -> bool {
+        let def = &self.structs[id.0 as usize];
+        match &def.instance {
+            Some(instance) => instance.args.iter().any(|arg| self.has_param(*arg)),
+            None => !def.params.is_empty(),
+        }
+    }
+
+    /// Whether `ty` holds a type parameter anywhere within it.
+    fn has_param(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Param(_) => true,
+            Ty::Ptr(id) => self.has_param(self.pointee(id)),
+            Ty::Tuple(id) => self.tuples[id.0 as usize]
+                .iter()
+                .any(|elem| self.has_param(*elem)),
+            Ty::Array(id) => self.has_param(self.element(id)),
+            Ty::Struct(id) => self.is_open(id) && self.structs[id.0 as usize].instance.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Reports each field of a generic declaration that passes a type
+    /// parameter, wrapped in a larger type, around a cycle of generic
+    /// structs back to itself, and cuts the cycle by giving the field the
+    /// error type. Such a struct would have infinitely many instances.
+    fn break_expansions(&mut self, decl_count: usize) {
+        let mut edges = Vec::new();
+        for id in 0..decl_count {
+            for (i, field) in self.structs[id].fields.iter().enumerate() {
+                self.push_param_flows(field.ty, (id, i), &mut edges);
+            }
+        }
+        let mut cut = Vec::new();
+        for edge in &edges {
+            if edge.expands
+                && !cut.contains(&edge.from)
+                && flows_to(&edges, &cut, edge.to, edge.from.0)
+            {
+                let (id, i) = edge.from;
+                self.structs[id].fields[i].ty = Ty::Error;
+                let kind = TypeErrorKind::ExpansiveRecursion(self.structs[id].name.clone());
+                self.error(kind, self.structs[id].fields[i].span);
+                cut.push(edge.from);
+            }
+        }
+    }
+
+    /// Pushes a flow for each type argument in `ty` that holds a type
+    /// parameter of the declaration whose field `from` is.
+    fn push_param_flows(&self, ty: Ty, from: (usize, usize), out: &mut Vec<Flow>) {
+        match ty {
+            Ty::Ptr(id) => self.push_param_flows(self.pointee(id), from, out),
+            Ty::Tuple(id) => {
+                for elem in &self.tuples[id.0 as usize] {
+                    self.push_param_flows(*elem, from, out);
+                }
+            }
+            Ty::Array(id) => self.push_param_flows(self.element(id), from, out),
+            Ty::Struct(id) => {
+                let Some(instance) = &self.structs[id.0 as usize].instance else {
+                    return;
+                };
+                for arg in &instance.args {
+                    if self.has_param(*arg) {
+                        out.push(Flow {
+                            from,
+                            to: instance.generic.0 as usize,
+                            expands: !matches!(arg, Ty::Param(_)),
+                        });
+                    }
+                    self.push_param_flows(*arg, from, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Reports pointer fields whose pointee can't be stored in memory, which
     /// `resolve_ty` couldn't know before every struct was defined, and gives
-    /// them the error type.
-    fn check_field_pointers(&mut self) {
-        for id in 0..self.structs.len() {
+    /// them the error type. Only checks the structs `ids`.
+    fn check_field_pointers(&mut self, ids: Range<usize>) {
+        for id in ids {
             for i in 0..self.structs[id].fields.len() {
                 if let Some(ty) = self.unstorable_pointee(self.structs[id].fields[i].ty) {
                     let kind = TypeErrorKind::NotStorable(self.ty_name(ty));
-                    self.error(kind, self.structs[id].fields[i].span);
+                    self.error(kind, self.field_site(id, i));
                     self.structs[id].fields[i].ty = Ty::Error;
                 }
             }
+        }
+    }
+
+    /// Where to report an error in field `i` of struct `id`: the field
+    /// itself, or where an instance was used, since its declaration is fine.
+    fn field_site(&self, id: usize, i: usize) -> Span {
+        match &self.structs[id].instance {
+            Some(instance) => instance.site,
+            None => self.structs[id].fields[i].span,
         }
     }
 
@@ -737,8 +979,9 @@ impl Checker {
     }
 
     /// Reports structs that contain themselves by value, and cuts each cycle
-    /// by giving the offending field the error type.
-    fn break_cycles(&mut self, id: usize, visits: &mut [Visit]) {
+    /// by giving the offending field the error type. With `by_declaration`,
+    /// an instance stands for its generic declaration.
+    fn break_cycles(&mut self, id: usize, visits: &mut [Visit], by_declaration: bool) {
         if visits[id] != Visit::New {
             return;
         }
@@ -747,15 +990,18 @@ impl Checker {
             let mut children = Vec::new();
             self.push_inline_structs(self.structs[id].fields[i].ty, &mut children);
             for StructId(child) in children {
-                let child = child as usize;
+                let mut child = child as usize;
+                if by_declaration && let Some(instance) = &self.structs[child].instance {
+                    child = instance.generic.0 as usize;
+                }
                 match visits[child] {
                     Visit::Active => {
                         let kind = TypeErrorKind::RecursiveStruct(self.structs[id].name.clone());
-                        self.error(kind, self.structs[id].fields[i].span);
+                        self.error(kind, self.field_site(id, i));
                         self.structs[id].fields[i].ty = Ty::Error;
                         break;
                     }
-                    Visit::New => self.break_cycles(child, visits),
+                    Visit::New => self.break_cycles(child, visits, by_declaration),
                     Visit::Done => {}
                 }
             }
@@ -920,15 +1166,88 @@ impl Checker {
         funcs
     }
 
+    /// Reads a type written as an expression, such as the `Box(&i32)` in
+    /// `Box(&i32)(value: p)`. `None` after reporting an error.
+    fn type_syntax(&mut self, expr: &parse::Expr) -> Option<parse::Type> {
+        let kind = match &expr.kind {
+            ExprKind::Name(name) => TypeKind::Named(name.clone(), Vec::new()),
+            ExprKind::Call(callee, args) => {
+                let ExprKind::Name(name) = &callee.kind else {
+                    self.error(TypeErrorKind::NotAType, callee.span);
+                    return None;
+                };
+                let mut types = Vec::new();
+                for arg in args {
+                    if let Some(label) = &arg.label {
+                        self.error(TypeErrorKind::LabelledTypeArg, label.span);
+                    }
+                    types.push(self.type_syntax(&arg.value));
+                }
+                TypeKind::Named(name.clone(), types.into_iter().collect::<Option<_>>()?)
+            }
+            ExprKind::AddrOf(pointee) => TypeKind::Pointer(Box::new(self.type_syntax(pointee)?)),
+            ExprKind::Unit => TypeKind::Unit,
+            ExprKind::Tuple(elems) => {
+                let elems: Vec<_> = elems.iter().map(|elem| self.type_syntax(elem)).collect();
+                TypeKind::Tuple(elems.into_iter().collect::<Option<_>>()?)
+            }
+            _ => {
+                self.error(TypeErrorKind::NotAType, expr.span);
+                return None;
+            }
+        };
+        Some(parse::Type {
+            kind,
+            span: expr.span,
+        })
+    }
+
     fn resolve_ty(&mut self, ty: &parse::Type) -> Ty {
         match &ty.kind {
-            TypeKind::Named(name) => {
-                if let Some(prim) = Prim::from_name(name) {
+            TypeKind::Named(name, args) => {
+                let param = self.type_params.iter().find(|(p, _)| p == name);
+                let (found, expected) = (
+                    args.len(),
+                    match param {
+                        Some(_) => 0,
+                        None => self.type_arity(name),
+                    },
+                );
+                if found != expected {
+                    let name = name.clone();
+                    let kind = TypeErrorKind::TypeArgCount {
+                        name,
+                        expected,
+                        found,
+                    };
+                    self.error(kind, ty.span);
+                    return Ty::Error;
+                }
+                if let Some((_, param)) = param {
+                    return *param;
+                }
+                let args: Vec<_> = args.iter().map(|arg| self.resolve_ty(arg)).collect();
+                if args.contains(&Ty::Error) {
+                    Ty::Error
+                } else if let Some(prim) = Prim::from_name(name) {
                     Ty::Prim(prim)
-                } else if name == "externref" {
+                } else if name == EXTERNREF {
                     Ty::ExternRef
-                } else if let Some(Item::Struct(id)) = self.items.get(name) {
-                    Ty::Struct(*id)
+                } else if name == ARRAY {
+                    match args[0] {
+                        // Struct fields are checked once every struct is defined.
+                        elem if self.structs_defined && !self.storable(elem) => {
+                            let kind = TypeErrorKind::NotStorable(self.ty_name(elem));
+                            self.error(kind, ty.span);
+                            Ty::Error
+                        }
+                        elem => self.array_of(elem),
+                    }
+                } else if let Some(Item::Struct(id)) = self.items.get(name).copied() {
+                    match args.is_empty() {
+                        true => Ty::Struct(id),
+                        false => self.instantiate(id, args, ty.span),
+                    }
                 } else {
                     self.error(TypeErrorKind::UnknownType(name.clone()), ty.span);
                     Ty::Error
@@ -942,16 +1261,6 @@ impl Checker {
                     false => self.tuple_of(elems),
                 }
             }
-            TypeKind::Array(elem) => match self.resolve_ty(elem) {
-                Ty::Error => Ty::Error,
-                // Struct fields are checked once every struct is defined.
-                elem if self.structs_defined && !self.storable(elem) => {
-                    let kind = TypeErrorKind::NotStorable(self.ty_name(elem));
-                    self.error(kind, ty.span);
-                    Ty::Error
-                }
-                elem => self.array_of(elem),
-            },
             TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
@@ -965,6 +1274,103 @@ impl Checker {
         }
     }
 
+    /// How many type arguments the type `name` takes. Zero for names that
+    /// aren't types.
+    fn type_arity(&self, name: &str) -> usize {
+        match self.items.get(name) {
+            _ if name == ARRAY => 1,
+            Some(Item::Struct(id)) => self.structs[id.0 as usize].params.len(),
+            _ => 0,
+        }
+    }
+
+    /// The instance of generic struct `generic` with type arguments `args`,
+    /// first used at `site`. Instances are given their fields as soon as
+    /// every generic struct is defined, and reported at `site` if a pointer
+    /// in them can't be stored once every struct is.
+    fn instantiate(&mut self, generic: StructId, args: Vec<Ty>, site: Span) -> Ty {
+        if let Some(id) = self.instances.get(&(generic, args.clone())) {
+            return Ty::Struct(*id);
+        }
+        let id = StructId(self.structs.len() as u32);
+        let names: Vec<_> = args.iter().map(|arg| self.ty_name(*arg)).collect();
+        self.structs.push(StructDef {
+            name: format!(
+                "{}({})",
+                self.structs[generic.0 as usize].name,
+                names.join(", ")
+            ),
+            params: Vec::new(),
+            instance: Some(Instance {
+                generic,
+                args: args.clone(),
+                site,
+            }),
+            fields: Vec::new(),
+        });
+        self.instances.insert((generic, args), id);
+        if self.is_open(id) {
+            return Ty::Struct(id);
+        }
+        if !self.generics_defined {
+            self.pending.push(id);
+            return Ty::Struct(id);
+        }
+        let first_new = id.0 as usize;
+        self.fill_instance(id);
+        if self.structs_defined {
+            self.check_field_pointers(first_new..self.structs.len());
+        }
+        Ty::Struct(id)
+    }
+
+    /// Gives instance `id` the fields of its generic declaration, with type
+    /// arguments in place of type parameters.
+    fn fill_instance(&mut self, id: StructId) {
+        let instance = self.structs[id.0 as usize].instance.as_ref().unwrap();
+        let (generic, args, site) = (instance.generic, instance.args.clone(), instance.site);
+        let mut fields = self.structs[generic.0 as usize].fields.clone();
+        for field in &mut fields {
+            field.ty = self.substitute(field.ty, &args, site);
+        }
+        self.structs[id.0 as usize].fields = fields;
+    }
+
+    /// `ty` with each type parameter replaced by its argument in `args`.
+    fn substitute(&mut self, ty: Ty, args: &[Ty], site: Span) -> Ty {
+        match ty {
+            Ty::Param(id) => args[self.params[id.0 as usize].index],
+            Ty::Ptr(id) => {
+                let pointee = self.substitute(self.pointee(id), args, site);
+                self.ptr_to(pointee)
+            }
+            Ty::Tuple(id) => {
+                let elems = self.tuples[id.0 as usize].clone();
+                let elems = elems
+                    .into_iter()
+                    .map(|elem| self.substitute(elem, args, site))
+                    .collect();
+                self.tuple_of(elems)
+            }
+            Ty::Array(id) => {
+                let elem = self.substitute(self.element(id), args, site);
+                self.array_of(elem)
+            }
+            Ty::Struct(id) => match &self.structs[id.0 as usize].instance {
+                Some(instance) if self.is_open(id) => {
+                    let (generic, inner) = (instance.generic, instance.args.clone());
+                    let inner = inner
+                        .into_iter()
+                        .map(|arg| self.substitute(arg, args, site))
+                        .collect();
+                    self.instantiate(generic, inner, site)
+                }
+                _ => ty,
+            },
+            Ty::Prim(_) | Ty::ExternRef | Ty::Unit | Ty::Error => ty,
+        }
+    }
+
     /// Whether `ty` can live in linear memory: it holds no `externref`.
     fn storable(&self, ty: Ty) -> bool {
         match ty {
@@ -973,6 +1379,8 @@ impl Checker {
                 .members(ty)
                 .into_iter()
                 .all(|member| self.storable(member)),
+            // Checked in each instance, once it is known.
+            Ty::Param(_) => true,
             Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Unit | Ty::Error => true,
         }
     }
@@ -1038,8 +1446,8 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
-            Ty::Ptr(id) => format!("*{}", self.ty_name(self.pointee(id))),
-            Ty::Array(id) => format!("[{}]", self.ty_name(self.element(id))),
+            Ty::Ptr(id) => format!("&{}", self.ty_name(self.pointee(id))),
+            Ty::Array(id) => format!("{ARRAY}({})", self.ty_name(self.element(id))),
             Ty::Tuple(id) => {
                 let elems: Vec<_> = self.tuples[id.0 as usize]
                     .iter()
@@ -1047,7 +1455,8 @@ impl Checker {
                     .collect();
                 format!("({})", elems.join(", "))
             }
-            Ty::ExternRef => "externref".to_string(),
+            Ty::Param(id) => self.params[id.0 as usize].name.clone(),
+            Ty::ExternRef => EXTERNREF.to_string(),
             Ty::Unit => "()".to_string(),
             Ty::Error => "{error}".to_string(),
         }
@@ -1081,7 +1490,7 @@ impl Checker {
                     self.push_leaves(member, format!("{name}.{field}"), out);
                 }
             }
-            Ty::Unit | Ty::Error => {}
+            Ty::Param(_) | Ty::Unit | Ty::Error => {}
         }
     }
 
@@ -1106,7 +1515,7 @@ impl Checker {
                     self.push_leaf_prims(member, out);
                 }
             }
-            Ty::Unit | Ty::Error => {}
+            Ty::Param(_) | Ty::Unit | Ty::Error => {}
         }
     }
 
@@ -1210,7 +1619,7 @@ impl Checker {
             }
             // Never in memory, but a struct holding one still has a layout
             // that `field` asks for.
-            Ty::ExternRef | Ty::Unit | Ty::Error => (0, 1),
+            Ty::ExternRef | Ty::Param(_) | Ty::Unit | Ty::Error => (0, 1),
         }
     }
 
@@ -1260,7 +1669,7 @@ impl Checker {
                 }
             }
             Ty::ExternRef => unreachable!("`externref` has no pointer type"),
-            Ty::Unit | Ty::Error => {}
+            Ty::Param(_) | Ty::Unit | Ty::Error => {}
         }
     }
 
@@ -1941,8 +2350,16 @@ impl<'c> Body<'c> {
         (self.ck.array_of(elem), value)
     }
 
-    /// An integer literal, typed by `expected` and defaulting to `i32`.
+    /// An integer literal, typed by `expected` and defaulting to `i32`. Where
+    /// a pointer is expected, it is an address.
     fn int_literal(&mut self, n: i128, expected: Option<Ty>, span: Span) -> (Ty, Value) {
+        if let Some(ptr @ Ty::Ptr(_)) = expected {
+            let (min, max) = Prim::U32.range();
+            if n < min || n > max {
+                self.error(TypeErrorKind::IntOutOfRange(self.ck.ty_name(ptr)), span);
+            }
+            return (ptr, scalar(ValType::I32, Expr::Const(Const::I32(n as i32))));
+        }
         let prim = match expected {
             Some(Ty::Prim(prim)) if prim.is_numeric() => prim,
             _ => Prim::I32,
@@ -1984,6 +2401,10 @@ impl<'c> Body<'c> {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
+            None if name == ARRAY => {
+                self.error(TypeErrorKind::NotAValue(name.to_string()), span);
+                (Ty::Error, Value::default())
+            }
             None => {
                 self.error(TypeErrorKind::UnknownName(name.to_string()), span);
                 (Ty::Error, Value::default())
@@ -2008,11 +2429,13 @@ impl<'c> Body<'c> {
     ) -> (Ty, Value) {
         match (op, &operand.kind) {
             (UnaryOp::Neg, ExprKind::Int(n)) => {
-                if let Some(Ty::Prim(prim)) = expected
-                    && prim.is_int()
-                    && !prim.is_signed()
-                {
-                    return self.invalid_operand("-", Ty::Prim(prim), span);
+                match expected {
+                    Some(Ty::Prim(prim)) if prim.is_int() && !prim.is_signed() => {
+                        return self.invalid_operand("-", Ty::Prim(prim), span);
+                    }
+                    // Addresses are unsigned.
+                    Some(ptr @ Ty::Ptr(_)) => return self.invalid_operand("-", ptr, span),
+                    _ => {}
                 }
                 return self.int_literal(-(*n as i128), expected, span);
             }
@@ -2194,8 +2617,6 @@ impl<'c> Body<'c> {
         let expected = match to {
             // An integer literal cast to a pointer is an address.
             Ty::Ptr(_) => Some(Ty::Prim(Prim::U32)),
-            // A tuple literal cast to an array is its `len` and `ptr`.
-            Ty::Array(_) => Some(self.ck.tuple_of(self.ck.members(to))),
             _ => None,
         };
         let (from, value) = self.expr(operand, expected);
@@ -2209,12 +2630,6 @@ impl<'c> Body<'c> {
             ),
             (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
             | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => (to, value),
-            // An array is the same scalars as a `(u32, *T)`.
-            (Ty::Tuple(_), Ty::Array(_)) | (Ty::Array(_), Ty::Tuple(_))
-                if self.ck.members(from) == self.ck.members(to) =>
-            {
-                (to, value)
-            }
             _ => {
                 let kind = TypeErrorKind::InvalidCast {
                     from: self.ck.ty_name(from),
@@ -2266,12 +2681,20 @@ impl<'c> Body<'c> {
             ExprKind::Name(name) if self.lookup(name).is_some() => {
                 Err(TypeErrorKind::NotCallable(name.clone()))
             }
+            ExprKind::Name(name) if self.ck.type_arity(name) > 0 => {
+                return self.generic_call(name, callee, args, span);
+            }
             ExprKind::Name(name) => match self.ck.items.get(name).copied() {
                 Some(Item::Func(id)) => Ok(Item::Func(id)),
                 Some(Item::Struct(id)) => Ok(Item::Struct(id)),
                 Some(Item::Global(_)) => Err(TypeErrorKind::NotCallable(name.clone())),
                 None => Err(TypeErrorKind::UnknownName(name.clone())),
             },
+            // A type given type arguments, such as `array(u8)`.
+            ExprKind::Call(inner, targs) if self.names_type(inner, targs) => {
+                let ty = self.expr_type(callee);
+                return self.construct(ty, args, span);
+            }
             _ => Err(TypeErrorKind::NotCallable("expression".to_string())),
         };
         match item {
@@ -2309,14 +2732,7 @@ impl<'c> Body<'c> {
                 }
                 (sig.ret, Value { pre, scalars })
             }
-            Ok(Item::Struct(id)) => {
-                let fields = self.ck.structs[id.0 as usize]
-                    .fields
-                    .iter()
-                    .map(|f| (f.name.clone(), f.ty))
-                    .collect::<Vec<_>>();
-                (Ty::Struct(id), self.args(&fields, args, true, span))
-            }
+            Ok(Item::Struct(id)) => self.construct(Ty::Struct(id), args, span),
             Ok(Item::Global(_)) | Err(_) => {
                 if let Err(kind) = item {
                     self.error(kind, callee.span);
@@ -2327,6 +2743,84 @@ impl<'c> Body<'c> {
                 (Ty::Error, Value::default())
             }
         }
+    }
+
+    /// A generic type `name` called directly: as `Box(i32)`, a type used as a
+    /// value, or as `Box(value: 1)`, a constructor missing type arguments.
+    fn generic_call(
+        &mut self,
+        name: &str,
+        callee: &parse::Expr,
+        args: &[Arg],
+        span: Span,
+    ) -> (Ty, Value) {
+        if args.iter().all(|arg| arg.label.is_none()) {
+            let expr = parse::Expr {
+                kind: ExprKind::Call(Box::new(callee.clone()), args.to_vec()),
+                span,
+            };
+            let ty = self.expr_type(&expr);
+            if ty != Ty::Error {
+                self.error(TypeErrorKind::NotAValue(self.ck.ty_name(ty)), span);
+            }
+        } else {
+            // The arguments may be fields or mislabelled type arguments, so
+            // they aren't checked.
+            let kind = TypeErrorKind::TypeArgCount {
+                name: name.to_string(),
+                expected: self.ck.type_arity(name),
+                found: 0,
+            };
+            self.error(kind, callee.span);
+        }
+        (Ty::Error, Value::default())
+    }
+
+    /// Resolves a type written as an expression.
+    fn expr_type(&mut self, expr: &parse::Expr) -> Ty {
+        match self.ck.type_syntax(expr) {
+            Some(ty) => self.ck.resolve_ty(&ty),
+            None => Ty::Error,
+        }
+    }
+
+    /// Whether `expr(args)` gives a type its type arguments, rather than
+    /// building a struct that is then called. A generic type always takes
+    /// type arguments; any other struct is taken to when none are labelled,
+    /// so that giving it some is reported.
+    fn names_type(&self, expr: &parse::Expr, args: &[Arg]) -> bool {
+        match &expr.kind {
+            ExprKind::Name(name) if self.lookup(name).is_none() => {
+                self.ck.type_arity(name) > 0
+                    || matches!(self.ck.items.get(name), Some(Item::Struct(_)))
+                        && args.iter().all(|arg| arg.label.is_none())
+            }
+            _ => false,
+        }
+    }
+
+    /// A value of a struct or array type `ty`, built from its labelled
+    /// fields.
+    fn construct(&mut self, ty: Ty, args: &[Arg], span: Span) -> (Ty, Value) {
+        let fields: Vec<_> = match ty {
+            Ty::Struct(id) => self.ck.structs[id.0 as usize]
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), f.ty))
+                .collect(),
+            Ty::Array(_) => ARRAY_FIELDS
+                .iter()
+                .map(|name| name.to_string())
+                .zip(self.ck.members(ty))
+                .collect(),
+            _ => {
+                for arg in args {
+                    self.expr(&arg.value, None);
+                }
+                return (Ty::Error, Value::default());
+            }
+        };
+        (ty, self.args(&fields, args, true, span))
     }
 
     /// Checks call arguments against `params`. They are evaluated in source
@@ -2792,6 +3286,33 @@ fn is_stable(expr: &Expr) -> bool {
     }
 }
 
+/// Whether type parameters flow from declaration `from` to `to` along
+/// `edges`, not counting those from the fields in `cut`.
+fn flows_to(edges: &[Flow], cut: &[(usize, usize)], from: usize, to: usize) -> bool {
+    let mut seen = vec![from];
+    let mut stack = vec![from];
+    while let Some(id) = stack.pop() {
+        if id == to {
+            return true;
+        }
+        for edge in edges
+            .iter()
+            .filter(|e| e.from.0 == id && !cut.contains(&e.from))
+        {
+            if !seen.contains(&edge.to) {
+                seen.push(edge.to);
+                stack.push(edge.to);
+            }
+        }
+    }
+    false
+}
+
+/// Whether `name` is a type the language defines, which no item may take.
+fn is_builtin_type(name: &str) -> bool {
+    name == ARRAY || name == EXTERNREF || Prim::from_name(name).is_some()
+}
+
 /// The names `pattern` binds, in source order.
 fn pattern_names(pattern: &Pattern) -> Vec<Ident> {
     fn push(pattern: &Pattern, out: &mut Vec<Ident>) {
@@ -3246,7 +3767,7 @@ extern \"js\":
 fn second() -> i32:
     return 0
 extern:
-    fn put(p: *P, value: P) -> P
+    fn put(p: &P, value: P) -> P
 ";
         let module = lower(src);
         let imports: Vec<_> = module
@@ -3284,13 +3805,13 @@ extern:
         let src = "\
 struct S:
     a: u8
-    b: *i8
+    b: &i8
     c: bool
 extern:
     fn u() -> u8
     fn i() -> i16
     fn b() -> bool
-    fn p() -> *u8
+    fn p() -> &u8
     fn s() -> S
 fn f():
     let x = u()
@@ -3411,9 +3932,9 @@ struct S:
     e: externref
 fn u():
     pass
-fn f(b: bool, p: *i32, e: externref, s: S):
+fn f(b: bool, p: &i32, e: externref, s: S):
     let b2 = b as bool
-    let p2 = p as *i32
+    let p2 = p as &i32
     let e2 = e as externref
     let s2 = s as S
     let u2 = u() as ()
@@ -3766,7 +4287,7 @@ fn f(a: i32):
     for x in [1]:
         pass
     let s = \"hi\"
-    let l: [i32] = a
+    let l: array(i32) = a
 ";
         assert_eq!(
             errors(src),
@@ -3777,7 +4298,7 @@ fn f(a: i32):
                 ContinueOutsideLoop,
                 LiteralOutsideGlobal,
                 LiteralOutsideGlobal,
-                mismatch("[i32]", "i32"),
+                mismatch("array(i32)", "i32"),
             ]
         );
     }
@@ -3920,18 +4441,18 @@ let hidden = 2
         let src = "\
 struct P:
     x: f64
-var null = 0 as *u32
-let top = 4294967295 as **P
-pub fn f(p: *P, a: u32, n: i32) -> *u32:
-    let q = a as *P
+var null = 0 as &u32
+let top = 4294967295 as &&P
+pub fn f(p: &P, a: u32, n: i32) -> &u32:
+    let q = a as &P
     let b = p as u32
     let s = p as i32
-    let c = p as *u32
+    let c = p as &u32
     let d = p == q
     let e = p != q
     let g = p < q
     let h = p >= q
-    let r = n as *P
+    let r = n as &P
     return c
 ";
         let module = lower(src);
@@ -3963,12 +4484,12 @@ pub fn f(p: *P, a: u32, n: i32) -> *u32:
              (set g (I32.LtU p q)) (set h (I32.GeU p q)) (set r n) (return c)"
         );
         let src = "\
-fn f(p: *u8, q: *i8, a: i64):
-    let b = p as *i8 == q
+fn f(p: &u8, q: &i8, a: i64):
+    let b = p as &i8 == q
     let c = p == q
     let d = p < q
     let e = p + 1
-    let g = a as *u8
+    let g = a as &u8
     let i = p as u64
 ";
         let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
@@ -3978,12 +4499,11 @@ fn f(p: *u8, q: *i8, a: i64):
         assert_eq!(
             errors(src),
             vec![
-                mismatch("*u8", "*i8"),
-                mismatch("*u8", "*i8"),
-                mismatch("*u8", "i32"),
-                invalid_operand("+", "*u8"),
-                cast("i64", "*u8"),
-                cast("*u8", "u64"),
+                mismatch("&u8", "&i8"),
+                mismatch("&u8", "&i8"),
+                invalid_operand("+", "&u8"),
+                cast("i64", "&u8"),
+                cast("&u8", "u64"),
             ]
         );
     }
@@ -3998,10 +4518,10 @@ struct S:
     flag: bool
     n: i16
     inner: Inner
-    next: *S
+    next: &S
     k: i8
     u: u16
-fn f(p: *S, q: *()) -> f64:
+fn f(p: &S, q: &()) -> f64:
     let flag = p.flag
     let n = p.n
     let b = p.inner.b
@@ -4031,8 +4551,8 @@ fn f(p: *S, q: *()) -> f64:
         let src = "\
 struct S:
     x: i32
-    next: **S
-fn f(p: ***S) -> i32:
+    next: &&S
+fn f(p: &&&S) -> i32:
     let a = p.x
     let b = p.*.x
     return p.next.x
@@ -4047,7 +4567,7 @@ fn f(p: ***S) -> i32:
         let src = "\
 struct S:
     x: i32
-fn f(p: **S, q: **i32, a: i32):
+fn f(p: &&S, q: &&i32, a: i32):
     let b = p.y
     let c = q.x
     let d = a.*
@@ -4073,12 +4593,12 @@ struct P:
     x: i32
     y: u8
     z: i64
-var q = 0 as *P
+var q = 0 as &P
 fn make() -> P:
     return P(x: 1, y: 2, z: 3)
 fn tick() -> i32:
     return 1
-fn f(p: *P, pp: **P):
+fn f(p: &P, pp: &&P):
     p.x = 1
     p.y += 1
     p.z = 5
@@ -4111,11 +4631,11 @@ fn f(p: *P, pp: **P):
 struct Node:
     val: i32
     pair: Pair
-    next: *Node
+    next: &Node
 struct Pair:
     a: u8
     b: i64
-fn f(n: *Node, nn: **Node) -> *i64:
+fn f(n: &Node, nn: &&Node) -> &i64:
     let p = &n.pair.b
     let q = &n.*
     let r = &n.next.val
@@ -4134,12 +4654,12 @@ fn f(n: *Node, nn: **Node) -> *i64:
 struct P:
     x: i32
 var g = P(x: 1)
-fn f(a: i32, p: P, pp: **P):
+fn f(a: i32, p: P, pp: &&P):
     let b = &a
     let c = &p.x
     let d = &g.x
     let e = &(a + 1)
-    let h: *i32 = &pp.*
+    let h: &i32 = &pp.*
     a.* = 1
 ";
         use TypeErrorKind::*;
@@ -4150,7 +4670,7 @@ fn f(a: i32, p: P, pp: **P):
                 NotAddressable,
                 NotAddressable,
                 NotAddressable,
-                mismatch("*i32", "**P"),
+                mismatch("&i32", "&&P"),
                 invalid_operand(".*", "i32"),
             ]
         );
@@ -4289,22 +4809,22 @@ pub fn f(a: externref) -> Handle:
 struct S:
     e: externref
 struct T:
-    p: **S
-    q: *U
-    r: *T
+    p: &&S
+    q: &U
+    r: &T
 struct U:
     s: S
 extern:
     fn get() -> externref
 let g = get()
-fn f(a: externref, p: *externref):
+fn f(a: externref, p: &externref):
     let b = a == a
     let c = a + a
     let d = -a
     let e: externref = 0
     let h = a as i32
     let i = 0 as externref
-    let j = 1 as *S
+    let j = 1 as &S
 ";
         let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
             from: from.into(),
@@ -4433,7 +4953,7 @@ let (_, hidden) = (1, pos.1.1)
     #[test]
     fn tuples_behind_pointers_use_c_layout() {
         let src = "\
-fn f(p: *(u8, (f64, i16)), q: **(i32, i32)) -> *i16:
+fn f(p: &(u8, (f64, i16)), q: &&(i32, i32)) -> &i16:
     let a = p.0
     let b = p.1.1
     p.1.0 = 2.0
@@ -4460,7 +4980,7 @@ fn f(p: *(u8, (f64, i16)), q: **(i32, i32)) -> *i16:
 struct A:
     t: (i32, A)
 struct B:
-    p: *(externref, i32)
+    p: &(externref, i32)
 fn f(t: (i32, f32)) -> (i32, i32):
     let x = t.2
     let y = t.x
@@ -4505,11 +5025,187 @@ fn f(t: (i32, f32)) -> (i32, i32):
     }
 
     #[test]
+    fn generic_structs_are_instantiated_per_type_argument() {
+        let src = "\
+struct Box(T):
+    value: T
+struct Pair(A, B):
+    a: A
+    b: Box(B)
+fn f(x: Box(i32)) -> Pair(f64, u8):
+    let b: Box(i32) = Box(i32)(value: 1)
+    let c: Box(i32) = x
+    return Pair(f64, u8)(a: 2.0, b: Box(u8)(value: 3))
+fn g(p: &Pair(u8, i64)) -> i64:
+    return p.b.value
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "g"), "(return (I64.Load offset=8 p))");
+        let f = &module.funcs[0];
+        assert_eq!(f.params, [ValType::I32]);
+        assert_eq!(f.results, [ValType::F64, ValType::I32]);
+        assert_eq!(f.locals[0].name, "x.value");
+        assert_eq!(
+            body(&module, "f"),
+            "(set b.value 1) (set c.value x.value) (return 2f64 3)"
+        );
+        assert_eq!(
+            errors("struct Box(T):\n    value: T\nfn f(x: Box(i32)) -> Box(u8):\n    return x\n"),
+            vec![mismatch("Box(u8)", "Box(i32)")]
+        );
+    }
+
+    #[test]
+    fn type_arguments_must_match_type_parameters() {
+        use TypeErrorKind::*;
+        let src = "\
+struct Box(T):
+    value: T
+struct P:
+    x: i32
+struct Bad(T, T, P, i32):
+    pass
+struct array:
+    pass
+fn f(a: Box, b: P(i32), c: Box(i32, u8), d: array, e: i32(u8)):
+    let g = Box(i32)
+    let h = Box(value: 1)
+    let i = Box(T: i32)(value: 1)
+    let j = Box(1)(value: 1)
+    let k = array
+    let l = Box(T: i32)
+    let m = P(x: 1)(x: 2)
+";
+        let count = |name: &str, expected, found| TypeArgCount {
+            name: name.into(),
+            expected,
+            found,
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateItem("array".into()),
+                DuplicateParam("T".into()),
+                DuplicateItem("P".into()),
+                DuplicateItem("i32".into()),
+                count("Box", 1, 0),
+                count("P", 0, 1),
+                count("Box", 1, 2),
+                count("array", 1, 0),
+                count("i32", 0, 1),
+                NotAValue("Box(i32)".into()),
+                count("Box", 1, 0),
+                LabelledTypeArg,
+                NotAType,
+                NotAValue("array".into()),
+                count("Box", 1, 0),
+                NotCallable("expression".into()),
+            ]
+        );
+        assert_eq!(
+            count("Box", 1, 0).to_string(),
+            "`Box` takes 1 type argument, found 0"
+        );
+    }
+
+    #[test]
+    fn generic_declarations_report_errors_once_and_uses_report_their_own() {
+        let src = "\
+struct Box(T):
+    value: T
+    other: Missing
+struct Ptr(T):
+    p: &T
+struct Holder:
+    h: Ptr(externref)
+fn f(a: Ptr((externref, i32)), b: &Box(externref), c: Box(i32), d: Box(u8)):
+    pass
+";
+        let errors: Vec<_> = check_src(src)
+            .unwrap_err()
+            .into_iter()
+            .map(|e| {
+                let span = e.span.unwrap();
+                (e.kind, &src[span.start..span.end])
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                (TypeErrorKind::UnknownType("Missing".into()), "Missing"),
+                (
+                    TypeErrorKind::NotStorable("externref".into()),
+                    "Ptr(externref)"
+                ),
+                (
+                    TypeErrorKind::NotStorable("(externref, i32)".into()),
+                    "Ptr((externref, i32))"
+                ),
+                (
+                    TypeErrorKind::NotStorable("Box(externref)".into()),
+                    "&Box(externref)"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_structs_must_have_finitely_many_finite_instances() {
+        use TypeErrorKind::*;
+        let src = "\
+struct L(T):
+    next: L(T)
+struct A(T):
+    b: B(T)
+struct B(T):
+    a: A(T)
+struct W(T):
+    x: T
+struct S:
+    w: W(S)
+struct List(T):
+    next: &List(T)
+struct Pair(X, Y):
+    swap: &Pair(Y, X)
+struct C(T):
+    other: &C(i32)
+struct Bad(T):
+    next: &Bad(&T)
+struct M(T):
+    n: &N(Box(T))
+struct N(T):
+    m: &M(T)
+struct Box(T):
+    value: T
+fn f(a: List(i32), p: Pair(i32, u8), c: C(u8), b: Bad(i32), m: M(f32)):
+    pass
+";
+        let errors: Vec<_> = check_src(src)
+            .unwrap_err()
+            .into_iter()
+            .map(|e| {
+                let span = e.span.unwrap();
+                (e.kind, &src[span.start..span.end])
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                (ExpansiveRecursion("Bad".into()), "next: &Bad(&T)"),
+                (ExpansiveRecursion("M".into()), "n: &N(Box(T))"),
+                (RecursiveStruct("L".into()), "next: L(T)"),
+                (RecursiveStruct("B".into()), "a: A(T)"),
+                (RecursiveStruct("W(S)".into()), "W(S)"),
+            ]
+        );
+    }
+
+    #[test]
     fn arrays_are_a_length_then_a_pointer() {
         let src = "\
 extern:
-    fn put(s: [u8]) -> [i32]
-fn f(a: [u8]) -> [u8]:
+    fn put(s: array(u8)) -> array(i32)
+fn f(a: array(u8)) -> array(u8):
     return a
 ";
         let module = lower(src);
@@ -4526,13 +5222,13 @@ fn f(a: [u8]) -> [u8]:
         let src = "\
 struct S:
     tag: u8
-    name: [u16]
-fn f(a: [u8], s: *S) -> u32:
+    name: array(u16)
+fn f(a: array(u8), s: &S) -> u32:
     var b = a
     b.len = 2
-    s.name.ptr = b.ptr as *u16
+    s.name.ptr = b.ptr as &u16
     return s.name.len
-fn g(t: *(u8, [i32])) -> *i32:
+fn g(t: &(u8, array(i32))) -> &i32:
     return t.1.ptr
 ";
         let module = lower(src);
@@ -4545,26 +5241,23 @@ fn g(t: *(u8, [i32])) -> *i32:
     }
 
     #[test]
-    fn arrays_cast_to_and_from_a_length_pointer_tuple() {
+    fn arrays_are_constructed_from_a_length_and_pointer() {
         let src = "\
-fn f(n: u32, p: *u8, a: [u8]) -> *u8:
-    let b = (n, p) as [u8]
-    let c = (3, p) as [u8]
-    let (m, q) = a as (u32, *u8)
-    return q
+fn f(n: u32, p: &u8) -> array(u8):
+    let b = array(u8)(len: n, ptr: p)
+    let c = array(u8)(ptr: p, len: 3)
+    return array(u8)(len: 0, ptr: 0)
 ";
         assert_eq!(
             body(&lower(src), "f"),
-            "(set b.len n) (set b.ptr p) (set c.len 3) (set c.ptr p) \
-             (set m a.len) (set q a.ptr) (return q)"
+            "(set b.len n) (set b.ptr p) (set c.len 3) (set c.ptr p) (return 0 0)"
         );
         let src = "\
-fn f(n: u32, i: i32, p: *u8, q: *i8, a: [u8]):
-    let b = (n, q) as [u8]
-    let c = (i, p) as [u8]
-    let d = (p, n) as [u8]
-    let e = a as (i32, *u8)
-    let g = a as [i8]
+fn f(n: u32, p: &u8, q: &i8, a: array(u8)):
+    let b = array(u8)(len: n, ptr: q)
+    let c = array(u8)(len: -1, ptr: 4294967296)
+    let d = (n, p) as array(u8)
+    let e = a as (u32, &u8)
 ";
         let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
             from: from.into(),
@@ -4573,12 +5266,32 @@ fn f(n: u32, i: i32, p: *u8, q: *i8, a: [u8]):
         assert_eq!(
             errors(src),
             vec![
-                cast("(u32, *i8)", "[u8]"),
-                cast("(i32, *u8)", "[u8]"),
-                cast("(*u8, u32)", "[u8]"),
-                cast("[u8]", "(i32, *u8)"),
-                cast("[u8]", "[i8]"),
+                mismatch("&u8", "&i8"),
+                TypeErrorKind::InvalidOperand {
+                    op: "-",
+                    ty: "u32".into()
+                },
+                TypeErrorKind::IntOutOfRange("&u8".into()),
+                cast("(u32, &u8)", "array(u8)"),
+                cast("array(u8)", "(u32, &u8)"),
             ]
+        );
+    }
+
+    #[test]
+    fn integer_literals_are_addresses_where_pointers_are_expected() {
+        let src = "\
+fn f(p: &u8) -> bool:
+    let q: &u8 = 16
+    return p == 0
+";
+        assert_eq!(body(&lower(src), "f"), "(set q 16) (return (I32.Eq p 0))");
+        assert_eq!(
+            errors("fn f():\n    let p: &u8 = -4\n"),
+            vec![TypeErrorKind::InvalidOperand {
+                op: "-",
+                ty: "&u8".into()
+            }]
         );
     }
 
@@ -4587,17 +5300,17 @@ fn f(n: u32, i: i32, p: *u8, q: *i8, a: [u8]):
         let src = "\
 extern:
     fn tick() -> u32
-fn f(a: [u16], i: u32) -> u16:
+fn f(a: array(u16), i: u32) -> u16:
     return a[i]
-fn g(a: [u8]) -> u8:
+fn g(a: array(u8)) -> u8:
     return a[3]
-fn h(a: [u8]) -> u8:
+fn h(a: array(u8)) -> u8:
     return a[tick()]
 struct Q:
     a: i32
     b: i32
     c: i32
-fn k(a: [Q]) -> i32:
+fn k(a: array(Q)) -> i32:
     return a[357913941].c
 ";
         let module = lower(src);
@@ -4626,7 +5339,7 @@ fn k(a: [Q]) -> i32:
             )
         );
         let src = "\
-fn f(a: [u8], i: i32, n: i32):
+fn f(a: array(u8), i: i32, n: i32):
     let b = a[i]
     let c = n[0]
     let d = a == a
@@ -4636,7 +5349,7 @@ fn f(a: [u8], i: i32, n: i32):
             vec![
                 mismatch("u32", "i32"),
                 invalid_operand("[]", "i32"),
-                invalid_operand("==", "[u8]"),
+                invalid_operand("==", "array(u8)"),
             ]
         );
     }
@@ -4647,7 +5360,7 @@ fn f(a: [u8], i: i32, n: i32):
 struct P:
     x: i32
     y: f64
-fn f(a: [P], i: u32) -> *P:
+fn f(a: array(P), i: u32) -> &P:
     a[i].x += 1
     a[0] = P(x: 1, y: 2.0)
     return &a[i]
@@ -4673,7 +5386,7 @@ fn f(a: [P], i: u32) -> *P:
         let src = "\
 extern:
     fn log(n: u16)
-fn f(a: [u16]):
+fn f(a: array(u16)):
     for x in a:
         if x == 0:
             break
@@ -4688,7 +5401,7 @@ fn f(a: [u16]):
              (if (I32.Eq x 0) (then (br 2)) (else )) (call log [x] -> []) (br 0)))"
         );
         let src = "\
-fn f(a: [u8]):
+fn f(a: array(u8)):
     for x in a:
         x = 1
     for y in 5:
@@ -4737,11 +5450,11 @@ struct P:
     a: u8
     b: i32
 let names = [\"foo\", \"bar\"]
-let table: [u16] = [1, 2, 65535]
+let table: array(u16) = [1, 2, 65535]
 let points = [P(a: 1, b: -2)]
-let empty: [f64] = []
+let empty: array(f64) = []
 let flags = [true, false]
-let nested: [[i8]] = [[], [-1]]
+let nested: array(array(i8)) = [[], [-1]]
 ";
         let module = lower(src);
         assert_eq!(
@@ -4783,9 +5496,9 @@ fn get() -> u8:
 let a = []
 let b = [1, 2.0]
 let c = [get()]
-let d: [u8] = [256]
+let d: array(u8) = [256]
 let e = [1 / 0]
-let g: [externref] = []
+let g: array(externref) = []
 fn f():
     let s = \"hi\"
     let l = [1]
@@ -4817,7 +5530,7 @@ fn f():
         };
         assert_eq!(data_end("pub let a = 1\n"), exported(0));
         assert_eq!(
-            data_end("let s = \"abc\"\nlet t: [i32] = []\n"),
+            data_end("let s = \"abc\"\nlet t: array(i32) = []\n"),
             exported(3)
         );
         assert_eq!(data_end("let data_end = 1\n"), exported(0));

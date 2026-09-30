@@ -69,6 +69,8 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     pub name: Ident,
+    /// The names of `struct Name(A, B)`'s type parameters, if it has any.
+    pub params: Vec<Ident>,
     pub fields: Vec<Field>,
 }
 
@@ -127,14 +129,13 @@ pub struct Type {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeKind {
-    Named(String),
+    /// `Name`, or `Name(A, B)` given type arguments.
+    Named(String, Vec<Type>),
     /// `()`
     Unit,
     /// `(A, B)`, with at least two elements.
     Tuple(Vec<Type>),
-    /// `[T]`
-    Array(Box<Type>),
-    /// `*T`
+    /// `&T`
     Pointer(Box<Type>),
 }
 
@@ -453,6 +454,13 @@ impl<'a> Parser<'a> {
     fn struct_decl(&mut self) -> PResult<StructDecl> {
         self.expect(TokenKind::Struct)?;
         let name = self.ident()?;
+        let mut params = Vec::new();
+        if self.eat(TokenKind::LParen) {
+            if self.at(TokenKind::RParen) {
+                return Err(self.unexpected("type parameter"));
+            }
+            params = self.comma_list(TokenKind::RParen, Self::ident)?;
+        }
         let fields = self.indented(|p| {
             if p.eat(TokenKind::Pass) {
                 p.expect(TokenKind::Newline)?;
@@ -464,6 +472,7 @@ impl<'a> Parser<'a> {
         })?;
         Ok(StructDecl {
             name,
+            params,
             fields: fields.into_iter().flatten().collect(),
         })
     }
@@ -553,7 +562,11 @@ impl<'a> Parser<'a> {
         let kind = match &token.kind {
             TokenKind::Ident(name) => {
                 self.bump();
-                TypeKind::Named(name.clone())
+                let args = match self.eat(TokenKind::LParen) {
+                    true => self.comma_list(TokenKind::RParen, Self::ty)?,
+                    false => Vec::new(),
+                };
+                TypeKind::Named(name.clone(), args)
             }
             TokenKind::LParen => {
                 self.bump();
@@ -563,13 +576,7 @@ impl<'a> Parser<'a> {
                     Parens::Tuple(items) => TypeKind::Tuple(items),
                 }
             }
-            TokenKind::LBracket => {
-                self.bump();
-                let elem = self.ty()?;
-                self.expect(TokenKind::RBracket)?;
-                TypeKind::Array(Box::new(elem))
-            }
-            TokenKind::Star => {
+            TokenKind::Amp => {
                 self.bump();
                 TypeKind::Pointer(Box::new(self.ty()?))
             }
@@ -1152,14 +1159,17 @@ mod tests {
 
     fn render_ty(ty: &Type) -> String {
         match &ty.kind {
-            TypeKind::Named(name) => name.clone(),
+            TypeKind::Named(name, args) if args.is_empty() => name.clone(),
+            TypeKind::Named(name, args) => {
+                let args: Vec<_> = args.iter().map(render_ty).collect();
+                format!("{name}({})", args.join(", "))
+            }
             TypeKind::Unit => "()".to_string(),
             TypeKind::Tuple(elems) => {
                 let elems: Vec<_> = elems.iter().map(render_ty).collect();
                 format!("({})", elems.join(", "))
             }
-            TypeKind::Array(elem) => format!("[{}]", render_ty(elem)),
-            TypeKind::Pointer(pointee) => format!("*{}", render_ty(pointee)),
+            TypeKind::Pointer(pointee) => format!("&{}", render_ty(pointee)),
         }
     }
 
@@ -1181,7 +1191,7 @@ mod tests {
     }
 
     fn named(name: &str) -> TypeKind {
-        TypeKind::Named(name.to_string())
+        TypeKind::Named(name.to_string(), Vec::new())
     }
 
     #[test]
@@ -1211,7 +1221,7 @@ mod tests {
             ]
         );
         assert_eq!(host.fns[0].sig.params[0].ty.kind, named("i32"));
-        assert_eq!(render_ty(&host.fns[2].sig.params[0].ty), "[u8]");
+        assert_eq!(render_ty(&host.fns[2].sig.params[0].ty), "array(u8)");
 
         let ItemKind::Binding(global) = &global.kind else {
             panic!()
@@ -1321,14 +1331,14 @@ mod tests {
         assert_eq!(expr("p.*.x.*"), "(.* (. (.* p) x))");
         assert_eq!(expr("&p.x"), "(& (. p x))");
         assert_eq!(expr("-&p.* as u32"), "(as (Neg (& (.* p))) u32)");
-        assert_eq!(expr("0 as **u32"), "(as 0 **u32)");
-        let src = "fn f(p: *P) -> *[i32]:\n    p.* = 1\n    p.*.x += 1\n    p.*= 2\n";
+        assert_eq!(expr("0 as &&u32"), "(as 0 &&u32)");
+        let src = "fn f(p: &P) -> &array(i32):\n    p.* = 1\n    p.*.x += 1\n    p.*= 2\n";
         let module = parse_src(src).unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(&f.sig.params[0].ty), "*P");
-        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "*[i32]");
+        assert_eq!(render_ty(&f.sig.params[0].ty), "&P");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "&array(i32)");
         assert_eq!(stmt_kinds(&f.body), vec!["assign", "assign", "assign"]);
         assert_eq!(
             errors("fn f():\n    &p = 1\n"),
@@ -1363,12 +1373,12 @@ mod tests {
         assert_eq!(expr("t.0.1"), "(. (. t 0) 1)");
         assert_eq!(expr("f(x).10"), "(. (call f x) 10)");
         assert_eq!(expr("p.*.0"), "(. (.* p) 0)");
-        let src = "fn f(t: (i32, (f32, *u8))) -> ((i32), ()):\n    t.1.0 = 1.0\n";
+        let src = "fn f(t: (i32, (f32, &u8))) -> ((i32), ()):\n    t.1.0 = 1.0\n";
         let module = parse_src(src).unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(&f.sig.params[0].ty), "(i32, (f32, *u8))");
+        assert_eq!(render_ty(&f.sig.params[0].ty), "(i32, (f32, &u8))");
         assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "(i32, ())");
         assert_eq!(stmt_kinds(&f.body), vec!["assign"]);
         assert_eq!(
@@ -1438,20 +1448,21 @@ mod tests {
 
     #[test]
     fn types() {
-        let module = parse_src("fn f(xs: [[i32]], n: u8,) -> [f32]:\n\tpass").unwrap();
+        let module =
+            parse_src("fn f(xs: array(array(i32)), n: u8,) -> array(f32):\n\tpass").unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(&f.sig.params[0].ty), "[[i32]]");
+        assert_eq!(render_ty(&f.sig.params[0].ty), "array(array(i32))");
         assert_eq!(render_ty(&f.sig.params[1].ty), "u8");
-        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "[f32]");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "array(f32)");
 
-        let module = parse_src("fn f(a: (), b: *()) -> ():\n\tpass").unwrap();
+        let module = parse_src("fn f(a: (), b: &()) -> ():\n\tpass").unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
         assert_eq!(f.sig.params[0].ty.kind, TypeKind::Unit);
-        assert_eq!(render_ty(&f.sig.params[1].ty), "*()");
+        assert_eq!(render_ty(&f.sig.params[1].ty), "&()");
         assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "()");
 
         let module = parse_src("let x: i32 = 1").unwrap();
@@ -1459,6 +1470,32 @@ mod tests {
             panic!()
         };
         assert_eq!(x.ty.as_ref().unwrap().kind, named("i32"));
+    }
+
+    #[test]
+    fn generic_types() {
+        let module = parse_src("let x: Map(&K, (V, W), Box(T),) = 1").unwrap();
+        let ItemKind::Binding(x) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(render_ty(x.ty.as_ref().unwrap()), "Map(&K, (V, W), Box(T))");
+        assert_eq!(expr("x as Box(i32)"), "(as x Box(i32))");
+        assert_eq!(
+            expr("Box(&i32)(value: 1)"),
+            "(call (call Box (& i32)) value:1)"
+        );
+    }
+
+    #[test]
+    fn types_are_not_bracketed_or_starred() {
+        assert_eq!(
+            errors("let x: [u8] = 1"),
+            vec![expected("type", TokenKind::LBracket)]
+        );
+        assert_eq!(
+            errors("let x: *u8 = 1"),
+            vec![expected("type", TokenKind::Star)]
+        );
     }
 
     #[test]
@@ -1547,11 +1584,31 @@ fn f():
     }
 
     #[test]
+    fn type_params() {
+        let module =
+            parse_src("struct Pair(A, B,):\n    a: A\n    b: B\nstruct P:\n    pass\n").unwrap();
+        let ItemKind::Struct(pair) = &module.items[0].kind else {
+            panic!()
+        };
+        let params: Vec<_> = pair.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(params, vec!["A", "B"]);
+        let ItemKind::Struct(p) = &module.items[1].kind else {
+            panic!()
+        };
+        assert!(p.params.is_empty());
+
+        assert_eq!(
+            errors("struct Box():\n    pass\n"),
+            vec![expected("type parameter", TokenKind::RParen)]
+        );
+    }
+
+    #[test]
     fn extern_blocks() {
         let src = "\
 extern \"js\":
     fn now() -> f64
-    fn log(p: *u8, len: i32) = \"console.log\"
+    fn log(p: &u8, len: i32) = \"console.log\"
 extern:
     pass
 extern \"\":
@@ -1578,7 +1635,7 @@ extern \"\":
         assert_eq!(log.import_name.as_deref(), Some("console.log"));
         assert_eq!(
             &src[log.span.start..log.span.end],
-            "fn log(p: *u8, len: i32) = \"console.log\""
+            "fn log(p: &u8, len: i32) = \"console.log\""
         );
         assert_eq!(blocks[1].module, None);
         assert!(blocks[1].fns.is_empty());

@@ -1,12 +1,12 @@
 extern:
 	fn logi(num: i32)
 	fn logf(num: f32) = "log_f32"
-	fn logs(text: [u8]) = "log_str"
+	fn logs(text: array(u8)) = "log_str"
 
 pub let global = true
 pub var counter = 0
 pub let greeting = "Hello, duck!"
-pub let primes: [u8] = [2, 3, 5, 7]
+pub let primes: array(u8) = [2, 3, 5, 7]
 
 pub struct Point:
 	x: f32
