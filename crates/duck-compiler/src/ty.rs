@@ -20,7 +20,7 @@ use crate::parse::{
     PatternKind, StmtKind, TypeKind, UnaryOp,
 };
 
-use generic::{Instance, ParamDef};
+use generic::{Arity, Instance, ParamDef};
 
 mod generic;
 
@@ -98,6 +98,9 @@ const PAGE_SIZE: u64 = 64 * 1024;
 /// The name of the built-in array type.
 const ARRAY: &str = "array";
 
+/// The name of the built-in tuple type.
+const TUPLE: &str = "tuple";
+
 /// The name of the host reference type.
 const EXTERNREF: &str = "externref";
 
@@ -149,7 +152,7 @@ pub enum Ty {
     Struct(StructId),
     /// `&T`, an address in linear memory, stored as an `i32`.
     Ptr(PtrId),
-    /// `(A, B)`, which is laid out like a struct with a field per element.
+    /// `tuple(A, B)`, which is laid out like a struct with a field per element.
     Tuple(TupleId),
     /// `array(T)`, a view of elements in linear memory that it doesn't own.
     /// Laid out like a struct with the fields `len: u32` and `ptr: &T`.
@@ -197,6 +200,12 @@ pub enum TypeErrorKind {
     TypeArgCount {
         name: String,
         expected: usize,
+        found: usize,
+    },
+    /// A type that takes any number of type arguments given too few.
+    TooFewTypeArgs {
+        name: String,
+        at_least: usize,
         found: usize,
     },
     Mismatch {
@@ -576,6 +585,14 @@ impl fmt::Display for TypeErrorKind {
                     "`{name}` takes {expected} type argument{s}, found {found}"
                 )
             }
+            Self::TooFewTypeArgs {
+                name,
+                at_least,
+                found,
+            } => write!(
+                f,
+                "`{name}` takes at least {at_least} type arguments, found {found}"
+            ),
             Self::Mismatch { expected, found } => {
                 write!(f, "expected `{expected}`, found `{found}`")
             }
@@ -747,7 +764,7 @@ impl Checker {
     }
 
     fn declare_name(&mut self, name: &Ident, entry: Item) {
-        if self.items.contains_key(&name.name) || name.name == ARRAY {
+        if self.items.contains_key(&name.name) || [ARRAY, TUPLE].contains(&name.name.as_str()) {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
             self.items.insert(name.name.clone(), entry);
@@ -1040,21 +1057,12 @@ impl Checker {
         match &ty.kind {
             TypeKind::Named(name, args) => {
                 let param = self.type_params.iter().find(|(p, _)| p == name);
-                let (found, expected) = (
-                    args.len(),
-                    match param {
-                        Some(_) => 0,
-                        None => self.type_arity(name),
-                    },
-                );
-                if found != expected {
-                    let name = name.clone();
-                    let kind = TypeErrorKind::TypeArgCount {
-                        name,
-                        expected,
-                        found,
-                    };
-                    self.error(kind, ty.span);
+                let arity = match param {
+                    Some(_) => Arity::Exactly(0),
+                    None => self.type_arity(name),
+                };
+                if !arity.accepts(args.len()) {
+                    self.error(arity.mismatch(name, args.len()), ty.span);
                     return Ty::Error;
                 }
                 if let Some((_, param)) = param {
@@ -1067,6 +1075,8 @@ impl Checker {
                     Ty::Prim(prim)
                 } else if name == EXTERNREF {
                     Ty::ExternRef
+                } else if name == TUPLE {
+                    self.tuple_of(args)
                 } else if name == ARRAY {
                     match args[0] {
                         // Struct fields are checked once every struct is defined.
@@ -1088,13 +1098,6 @@ impl Checker {
                 }
             }
             TypeKind::Unit => Ty::Unit,
-            TypeKind::Tuple(elems) => {
-                let elems: Vec<_> = elems.iter().map(|elem| self.resolve_ty(elem)).collect();
-                match elems.contains(&Ty::Error) {
-                    true => Ty::Error,
-                    false => self.tuple_of(elems),
-                }
-            }
             TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
@@ -1212,7 +1215,7 @@ impl Checker {
                     .iter()
                     .map(|elem| self.ty_name(*elem))
                     .collect();
-                format!("({})", elems.join(", "))
+                format!("{TUPLE}({})", elems.join(", "))
             }
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
             Ty::ExternRef => EXTERNREF.to_string(),
@@ -1350,7 +1353,10 @@ impl Checker {
                     _ => {
                         if ty != Ty::Error {
                             let kind = TypeErrorKind::Mismatch {
-                                expected: format!("({})", vec!["_"; elems.len()].join(", ")),
+                                expected: match elems.len() {
+                                    0 => "()".to_string(),
+                                    n => format!("{TUPLE}({})", vec!["_"; n].join(", ")),
+                                },
                                 found: self.ty_name(ty),
                             };
                             self.error(kind, pattern.span);
@@ -2160,7 +2166,7 @@ impl<'c> Body<'c> {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
-            None if name == ARRAY => {
+            None if [ARRAY, TUPLE].contains(&name) => {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
@@ -2440,7 +2446,7 @@ impl<'c> Body<'c> {
             ExprKind::Name(name) if self.lookup(name).is_some() => {
                 Err(TypeErrorKind::NotCallable(name.clone()))
             }
-            ExprKind::Name(name) if self.ck.type_arity(name) > 0 => {
+            ExprKind::Name(name) if self.ck.type_arity(name).takes_args() => {
                 return self.generic_call(name, callee, args, span);
             }
             ExprKind::Name(name) => match self.ck.items.get(name).copied() {
@@ -2519,6 +2525,9 @@ impl<'c> Body<'c> {
                 .zip(self.ck.members(ty))
                 .collect(),
             _ => {
+                if ty != Ty::Error {
+                    self.error(TypeErrorKind::NotCallable(self.ck.ty_name(ty)), span);
+                }
                 for arg in args {
                     self.expr(&arg.value, None);
                 }
@@ -2994,7 +3003,7 @@ fn is_stable(expr: &Expr) -> bool {
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
-    name == ARRAY || name == EXTERNREF || Prim::from_name(name).is_some()
+    [ARRAY, TUPLE, EXTERNREF].contains(&name) || Prim::from_name(name).is_some()
 }
 
 /// The names `pattern` binds, in source order.
@@ -4536,11 +4545,11 @@ fn f(a: externref, p: &externref):
     #[test]
     fn tuples_are_split_into_scalars() {
         let src = "\
-fn swap(t: (i32, f64)) -> (f64, i32):
+fn swap(t: tuple(i32, f64)) -> tuple(f64, i32):
     return (t.1, t.0)
 
 fn f() -> f64:
-    let t: (u8, f64) = (1, 2)
+    let t: tuple(u8, f64) = (1, 2)
     let u = swap((3, 4.5))
     var v = ((1, 2), 3)
     v.0.1 = u.1
@@ -4569,12 +4578,12 @@ fn f() -> f64:
 struct P:
     x: i32
     y: i32
-fn make() -> (i32, P):
+fn make() -> tuple(i32, P):
     return (1, P(x: 2, y: 3))
-fn take(t: (i32, P)) -> i32:
+fn take(t: tuple(i32, P)) -> i32:
     return t.1.y
 fn f() -> i32:
-    let t: (i32, P) = make()
+    let t: tuple(i32, P) = make()
     return take(t) + take(make())
 ";
         lower(src);
@@ -4584,12 +4593,12 @@ fn f() -> i32:
     fn destructuring_binds_each_name() {
         let src = "\
 extern:
-    fn pair() -> (i32, i64)
+    fn pair() -> tuple(i32, i64)
     fn one() -> i32
 fn f() -> i64:
     let (a, b) = pair()
     let ((c, _), d) = ((one(), one()), 1 as i64)
-    var (e, g): (u8, u8) = (1, 2)
+    var (e, g): tuple(u8, u8) = (1, 2)
     e += g
     let () = ()
     let _ = one()
@@ -4637,7 +4646,7 @@ let (_, hidden) = (1, pos.1.1)
     #[test]
     fn tuples_behind_pointers_use_c_layout() {
         let src = "\
-fn f(p: &(u8, (f64, i16)), q: &&(i32, i32)) -> &i16:
+fn f(p: &tuple(u8, tuple(f64, i16)), q: &&tuple(i32, i32)) -> &i16:
     let a = p.0
     let b = p.1.1
     p.1.0 = 2.0
@@ -4662,17 +4671,17 @@ fn f(p: &(u8, (f64, i16)), q: &&(i32, i32)) -> &i16:
         use TypeErrorKind::*;
         let src = "\
 struct A:
-    t: (i32, A)
+    t: tuple(i32, A)
 struct B:
-    p: &(externref, i32)
-fn f(t: (i32, f32)) -> (i32, i32):
+    p: &tuple(externref, i32)
+fn f(t: tuple(i32, f32)) -> tuple(i32, i32):
     let x = t.2
     let y = t.x
     let (a, b, c) = t
     let (d, e) = 1
     let (g, g) = t
     let z = t == t
-    let w = t as (i32, i32)
+    let w = t as tuple(i32, i32)
     t.0 = 1
     return (1, 2.0)
 ";
@@ -4681,29 +4690,29 @@ fn f(t: (i32, f32)) -> (i32, i32):
             found: found.into(),
         };
         let no_field = |field: &str| NoField {
-            ty: "(i32, f32)".into(),
+            ty: "tuple(i32, f32)".into(),
             field: field.into(),
         };
         assert_eq!(
             errors(src),
             vec![
                 RecursiveStruct("A".into()),
-                NotStorable("(externref, i32)".into()),
+                NotStorable("tuple(externref, i32)".into()),
                 no_field("2"),
                 no_field("x"),
-                mismatch("(_, _, _)", "(i32, f32)"),
-                mismatch("(_, _)", "i32"),
+                mismatch("tuple(_, _, _)", "tuple(i32, f32)"),
+                mismatch("tuple(_, _)", "i32"),
                 DuplicateBinding("g".into()),
                 InvalidOperand {
                     op: "==",
-                    ty: "(i32, f32)".into()
+                    ty: "tuple(i32, f32)".into()
                 },
                 InvalidCast {
-                    from: "(i32, f32)".into(),
-                    to: "(i32, i32)".into()
+                    from: "tuple(i32, f32)".into(),
+                    to: "tuple(i32, i32)".into()
                 },
                 ImmutableAssign("t".into()),
-                mismatch("(i32, i32)", "(i32, f64)"),
+                mismatch("tuple(i32, i32)", "tuple(i32, f64)"),
             ]
         );
     }
@@ -4802,7 +4811,7 @@ struct Ptr(T):
     p: &T
 struct Holder:
     h: Ptr(externref)
-fn f(a: Ptr((externref, i32)), b: &Box(externref), c: Box(i32), d: Box(u8)):
+fn f(a: Ptr(tuple(externref, i32)), b: &Box(externref), c: Box(i32), d: Box(u8)):
     pass
 ";
         let errors: Vec<_> = check_src(src)
@@ -4822,8 +4831,8 @@ fn f(a: Ptr((externref, i32)), b: &Box(externref), c: Box(i32), d: Box(u8)):
                     "Ptr(externref)"
                 ),
                 (
-                    TypeErrorKind::NotStorable("(externref, i32)".into()),
-                    "Ptr((externref, i32))"
+                    TypeErrorKind::NotStorable("tuple(externref, i32)".into()),
+                    "Ptr(tuple(externref, i32))"
                 ),
                 (
                     TypeErrorKind::NotStorable("Box(externref)".into()),
@@ -4885,6 +4894,50 @@ fn f(a: List(i32), p: Pair(i32, u8), c: C(u8), b: Bad(i32), m: M(f32)):
     }
 
     #[test]
+    fn tuple_types_take_at_least_two_type_arguments() {
+        use TypeErrorKind::*;
+        let src = "\
+struct tuple:
+    pass
+struct Box(T):
+    value: T
+struct Bad(tuple):
+    pass
+fn f(a: tuple(i32), b: tuple(), c: tuple):
+    let d = Box(tuple(i32, u8))(value: (1, 2))
+    let e = Box((i32, u8))(value: (1, 2))
+    let g = tuple(i32, u8)(1, 2)
+    let h = tuple(i32, u8)
+    let i = tuple
+    let j: Box(tuple(u8, bool)) = d
+";
+        let count = |found| TooFewTypeArgs {
+            name: "tuple".into(),
+            at_least: 2,
+            found,
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateItem("tuple".into()),
+                DuplicateItem("tuple".into()),
+                count(1),
+                count(0),
+                count(0),
+                NotAType,
+                NotCallable("tuple(i32, u8)".into()),
+                NotAValue("tuple(i32, u8)".into()),
+                NotAValue("tuple".into()),
+                mismatch("Box(tuple(u8, bool))", "Box(tuple(i32, u8))"),
+            ]
+        );
+        assert_eq!(
+            count(1).to_string(),
+            "`tuple` takes at least 2 type arguments, found 1"
+        );
+    }
+
+    #[test]
     fn arrays_are_a_length_then_a_pointer() {
         let src = "\
 extern:
@@ -4912,7 +4965,7 @@ fn f(a: array(u8), s: &S) -> u32:
     b.len = 2
     s.name.ptr = b.ptr as &u16
     return s.name.len
-fn g(t: &(u8, array(i32))) -> &i32:
+fn g(t: &tuple(u8, array(i32))) -> &i32:
     return t.1.ptr
 ";
         let module = lower(src);
@@ -4941,7 +4994,7 @@ fn f(n: u32, p: &u8, q: &i8, a: array(u8)):
     let b = array(u8)(len: n, ptr: q)
     let c = array(u8)(len: -1, ptr: 4294967296)
     let d = (n, p) as array(u8)
-    let e = a as (u32, &u8)
+    let e = a as tuple(u32, &u8)
 ";
         let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
             from: from.into(),
@@ -4956,8 +5009,8 @@ fn f(n: u32, p: &u8, q: &i8, a: array(u8)):
                     ty: "u32".into()
                 },
                 TypeErrorKind::IntOutOfRange("&u8".into()),
-                cast("(u32, &u8)", "array(u8)"),
-                cast("array(u8)", "(u32, &u8)"),
+                cast("tuple(u32, &u8)", "array(u8)"),
+                cast("array(u8)", "tuple(u32, &u8)"),
             ]
         );
     }

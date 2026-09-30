@@ -133,8 +133,6 @@ pub enum TypeKind {
     Named(String, Vec<Type>),
     /// `()`
     Unit,
-    /// `(A, B)`, with at least two elements.
-    Tuple(Vec<Type>),
     /// `&T`
     Pointer(Box<Type>),
 }
@@ -570,11 +568,8 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.bump();
-                match self.parens(token.span, Self::ty)? {
-                    Parens::Empty => TypeKind::Unit,
-                    Parens::Group(inner) => inner.kind,
-                    Parens::Tuple(items) => TypeKind::Tuple(items),
-                }
+                self.expect(TokenKind::RParen)?;
+                TypeKind::Unit
             }
             TokenKind::Amp => {
                 self.bump();
@@ -1165,10 +1160,6 @@ mod tests {
                 format!("{name}({})", args.join(", "))
             }
             TypeKind::Unit => "()".to_string(),
-            TypeKind::Tuple(elems) => {
-                let elems: Vec<_> = elems.iter().map(render_ty).collect();
-                format!("({})", elems.join(", "))
-            }
             TypeKind::Pointer(pointee) => format!("&{}", render_ty(pointee)),
         }
     }
@@ -1373,17 +1364,20 @@ mod tests {
         assert_eq!(expr("t.0.1"), "(. (. t 0) 1)");
         assert_eq!(expr("f(x).10"), "(. (call f x) 10)");
         assert_eq!(expr("p.*.0"), "(. (.* p) 0)");
-        let src = "fn f(t: (i32, (f32, &u8))) -> ((i32), ()):\n    t.1.0 = 1.0\n";
+        let src = "fn f(t: tuple(i32, tuple(f32, &u8))) -> tuple(i32, ()):\n    t.1.0 = 1.0\n";
         let module = parse_src(src).unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(&f.sig.params[0].ty), "(i32, (f32, &u8))");
-        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "(i32, ())");
+        assert_eq!(
+            render_ty(&f.sig.params[0].ty),
+            "tuple(i32, tuple(f32, &u8))"
+        );
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "tuple(i32, ())");
         assert_eq!(stmt_kinds(&f.body), vec!["assign"]);
         assert_eq!(
-            errors("let _ = (1,)\nfn f(t: (i32,)):\n    pass\n"),
-            vec![ParseErrorKind::OneElementTuple; 2]
+            errors("let _ = (1,)\n"),
+            vec![ParseErrorKind::OneElementTuple]
         );
         assert_eq!(
             errors("fn f():\n    (a, b) = (b, a)\n"),
@@ -1418,7 +1412,7 @@ mod tests {
         assert_eq!(render(&pattern("var (a, _) = t\n")), "(a _)");
         assert_eq!(render(&pattern("let ((a, b), (c)) = t\n")), "((a b) c)");
         assert_eq!(render(&pattern("let () = t\n")), "()");
-        assert_eq!(render(&pattern("let (a, b): (u8, u8) = t\n")), "(a b)");
+        assert_eq!(render(&pattern("let (a, b): tuple(u8, u8) = t\n")), "(a b)");
         assert_eq!(
             errors("let (a,) = t\n"),
             vec![ParseErrorKind::OneElementTuple]
@@ -1474,11 +1468,14 @@ mod tests {
 
     #[test]
     fn generic_types() {
-        let module = parse_src("let x: Map(&K, (V, W), Box(T),) = 1").unwrap();
+        let module = parse_src("let x: Map(&K, tuple(V, W), Box(T),) = 1").unwrap();
         let ItemKind::Binding(x) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(x.ty.as_ref().unwrap()), "Map(&K, (V, W), Box(T))");
+        assert_eq!(
+            render_ty(x.ty.as_ref().unwrap()),
+            "Map(&K, tuple(V, W), Box(T))"
+        );
         assert_eq!(expr("x as Box(i32)"), "(as x Box(i32))");
         assert_eq!(
             expr("Box(&i32)(value: 1)"),
@@ -1487,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn types_are_not_bracketed_or_starred() {
+    fn types_are_not_bracketed_starred_or_parenthesized() {
         assert_eq!(
             errors("let x: [u8] = 1"),
             vec![expected("type", TokenKind::LBracket)]
@@ -1495,6 +1492,11 @@ mod tests {
         assert_eq!(
             errors("let x: *u8 = 1"),
             vec![expected("type", TokenKind::Star)]
+        );
+        let ident = |name: &str| TokenKind::Ident(name.to_string());
+        assert_eq!(
+            errors("let x: (i32, u8) = 1\nlet y: (i32) = 1\n"),
+            vec![expected("`)`", ident("i32")), expected("`)`", ident("i32"))]
         );
     }
 

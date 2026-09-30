@@ -770,10 +770,10 @@ fn f(p: &P) -> f64:
     fn tuples_are_multiple_values() {
         let src = "\
 extern:
-    fn divmod(a: i32, b: i32) -> (i32, u8)
+    fn divmod(a: i32, b: i32) -> tuple(i32, u8)
 pub let (w, h) = (640, 480)
 pub var pos = (1, (2.5, 3))
-pub fn f(p: &(u8, f64)) -> (f64, i32):
+pub fn f(p: &tuple(u8, f64)) -> tuple(f64, i32):
     let (q, r) = divmod(w, h)
     pos.1.0 = p.1
     return (pos.1.0, q + r as i32)
