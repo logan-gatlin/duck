@@ -8,8 +8,8 @@ use crate::lex::Span;
 use crate::parse::BinOp;
 
 use super::{
-    Body, Checker, FuncSig, Prim, Ty, TypeErrorKind, Value, binary, binop_symbol, element_addr,
-    exprs, is_pure, is_stable, scalar, split1,
+    Body, Checker, FuncSig, Prim, Synth, Ty, TypeErrorKind, Value, binary, binop_symbol,
+    element_addr, exprs, is_pure, is_stable, scalar, split1,
 };
 
 /// How one piece of a value is compared, in leaf order.
@@ -65,49 +65,40 @@ impl Checker {
             .any(|part| matches!(part, Part::Array(_)))
     }
 
-    /// The index in `funcs` of the first function [`Self::eq_func`] created.
-    fn first_eq_func(&self) -> usize {
-        self.funcs.len() - self.eq_arrays.len()
-    }
-
     /// The function comparing two arrays of type `ty`, created the first time
-    /// it's asked for and lowered by [`Self::lower_eq_funcs`].
+    /// it's asked for and lowered by [`Self::lower_eq_func`].
     fn eq_func(&mut self, ty: Ty) -> FuncId {
-        if let Some(i) = self.eq_arrays.iter().position(|array| *array == ty) {
-            return FuncId((self.first_eq_func() + i) as u32);
+        if let Some(id) = self.eq_funcs.get(&ty) {
+            return *id;
         }
-        self.eq_arrays.push(ty);
+        let id = FuncId(self.funcs.len() as u32);
         self.funcs.push(FuncSig {
             name: format!("==({})", self.ty_name(ty)),
             params: vec![("a".to_string(), ty), ("b".to_string(), ty)],
             ret: Ty::Prim(Prim::Bool),
         });
-        FuncId(self.funcs.len() as u32 - 1)
+        self.synths.push(Synth::Eq(ty));
+        self.eq_funcs.insert(ty, id);
+        id
     }
 
-    /// Lowers every function [`Self::eq_func`] created, including those that
-    /// lowering the others creates. They come after every defined function.
-    pub(super) fn lower_eq_funcs(&mut self) -> Vec<ir::Func> {
-        let first = self.first_eq_func();
-        let mut funcs = Vec::new();
-        while funcs.len() < self.eq_arrays.len() {
-            let sig = self.funcs[first + funcs.len()].clone();
-            let ty = self.eq_arrays[funcs.len()];
-            let mut body = Body::new(self, sig.ret);
-            let a = body.alloc("a", ty);
-            let b = body.alloc("b", ty);
-            let params = body.locals.iter().map(|local| local.ty).collect();
-            let stmts = body.array_eq_body(ty, [a[0], a[1]], [b[0], b[1]]);
-            funcs.push(ir::Func {
-                export: None,
-                name: sig.name,
-                params,
-                results: vec![ValType::I32],
-                locals: body.locals,
-                body: stmts,
-            });
+    /// Lowers function `id`, which [`Self::eq_func`] created to compare
+    /// arrays of type `ty`.
+    pub(super) fn lower_eq_func(&mut self, id: FuncId, ty: Ty) -> ir::Func {
+        let sig = self.funcs[id.0 as usize].clone();
+        let mut body = Body::new(self, sig.ret);
+        let a = body.alloc("a", ty);
+        let b = body.alloc("b", ty);
+        let params = body.locals.iter().map(|local| local.ty).collect();
+        let stmts = body.array_eq_body(ty, [a[0], a[1]], [b[0], b[1]]);
+        ir::Func {
+            export: None,
+            name: sig.name,
+            params,
+            results: vec![ValType::I32],
+            locals: body.locals,
+            body: stmts,
         }
-        funcs
     }
 }
 

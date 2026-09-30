@@ -4,7 +4,7 @@ use crate::file::FileManager;
 use crate::lex::{LexError, Span};
 use crate::load::ImportError;
 use crate::parse::ParseError;
-use crate::ty::TypeError;
+use crate::ty::{InstanceSite, TypeError};
 
 pub mod emit;
 pub mod file;
@@ -32,6 +32,15 @@ impl Error {
             Self::Parse(e) => Some(e.span),
             Self::Import(e) => Some(e.span),
             Self::Type(e) => e.span,
+        }
+    }
+
+    /// The instances of generic functions the error is in, innermost first,
+    /// each with the call that first used it.
+    pub fn instances(&self) -> &[InstanceSite] {
+        match self {
+            Self::Type(e) => &e.instances,
+            _ => &[],
         }
     }
 }

@@ -7,7 +7,7 @@ use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeKind};
 
 use super::{
-    ARRAY, Body, Checker, Item, StructDef, StructId, TUPLE, Ty, TypeErrorKind, Value,
+    ARRAY, Body, Checker, Item, ParamId, StructDef, StructId, TUPLE, Ty, TypeErrorKind, Value,
     is_builtin_type,
 };
 
@@ -19,10 +19,10 @@ pub(super) struct Instance {
     pub(super) site: Span,
 }
 
-/// A type parameter of a generic struct.
+/// A type parameter of a generic struct or function.
 pub(super) struct ParamDef {
     pub(super) name: String,
-    /// Position in the struct's type parameters.
+    /// Position in its declaration's type parameters.
     pub(super) index: usize,
 }
 
@@ -91,25 +91,48 @@ impl Arity {
 }
 
 impl Checker {
-    /// Brings the type parameters of struct `id` into scope, reporting
-    /// repeated ones and ones named after a type.
-    pub(super) fn declare_type_params(&mut self, id: usize, params: &[Ident]) {
+    /// A new [`Ty::Param`] for each of a declaration's type parameters.
+    pub(super) fn new_params(&mut self, params: &[Ident]) -> Vec<Ty> {
+        params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                self.params.push(ParamDef {
+                    name: param.name.clone(),
+                    index,
+                });
+                Ty::Param(ParamId(self.params.len() as u32 - 1))
+            })
+            .collect()
+    }
+
+    /// The type that type parameter `name` stands for, if one is in scope.
+    pub(super) fn type_param(&self, name: &str) -> Option<Ty> {
+        let param = self.type_params.iter().find(|(param, _)| param == name);
+        param.map(|(_, ty)| *ty)
+    }
+
+    /// The name of type parameter `param`, a [`Ty::Param`].
+    pub(super) fn param_name(&self, param: Ty) -> String {
+        match param {
+            Ty::Param(id) => self.params[id.0 as usize].name.clone(),
+            _ => unreachable!("type parameters are `Ty::Param`"),
+        }
+    }
+
+    /// Brings a declaration's type parameters, whose types are `tys`, into
+    /// scope, reporting repeated ones and ones named after a type or item.
+    pub(super) fn declare_type_params(&mut self, params: &[Ident], tys: &[Ty]) {
         for (i, param) in params.iter().enumerate() {
             if params[..i].iter().any(|p| p.name == param.name) {
                 self.error(
                     TypeErrorKind::DuplicateParam(param.name.clone()),
                     param.span,
                 );
-            } else if is_builtin_type(&param.name)
-                || matches!(
-                    self.items.get(&param.name),
-                    Some(Item::Struct(_) | Item::Enum(_))
-                )
-            {
+            } else if is_builtin_type(&param.name) || self.items.contains_key(&param.name) {
                 self.error(TypeErrorKind::DuplicateItem(param.name.clone()), param.span);
             } else {
-                let ty = self.structs[id].params[i];
-                self.type_params.push((param.name.clone(), ty));
+                self.type_params.push((param.name.clone(), tys[i]));
             }
         }
     }
@@ -218,6 +241,15 @@ impl Checker {
     /// Reads `name(args)`, written as an expression spanning `span`, as the
     /// type `name` given type arguments. `None` after reporting an error.
     fn applied_type_syntax(&mut self, name: &str, args: &[Arg], span: Span) -> Option<parse::Type> {
+        Some(parse::Type {
+            kind: TypeKind::Named(name.to_string(), Some(self.type_args_syntax(args)?)),
+            span,
+        })
+    }
+
+    /// Reads `args`, written as expressions, as a list of type arguments.
+    /// `None` after reporting an error.
+    fn type_args_syntax(&mut self, args: &[Arg]) -> Option<Vec<parse::Type>> {
         let mut types = Vec::new();
         for arg in args {
             if let Some(label) = &arg.label {
@@ -225,11 +257,14 @@ impl Checker {
             }
             types.push(self.type_syntax(&arg.value));
         }
-        let types = types.into_iter().collect::<Option<_>>()?;
-        Some(parse::Type {
-            kind: TypeKind::Named(name.to_string(), Some(types)),
-            span,
-        })
+        types.into_iter().collect()
+    }
+
+    /// Resolves `args`, written as expressions, as a list of type
+    /// arguments. `None` after reporting an error.
+    pub(super) fn type_args(&mut self, args: &[Arg]) -> Option<Vec<Ty>> {
+        let types = self.type_args_syntax(args)?;
+        Some(types.iter().map(|ty| self.resolve_ty(ty)).collect())
     }
 
     /// Which lists of type arguments the type `name` takes. `None` for names
@@ -306,7 +341,7 @@ impl Checker {
     }
 
     /// `ty` with each type parameter replaced by its argument in `args`.
-    fn substitute(&mut self, ty: Ty, args: &[Ty], site: Span) -> Ty {
+    pub(super) fn substitute(&mut self, ty: Ty, args: &[Ty], site: Span) -> Ty {
         match ty {
             Ty::Param(id) => args[self.params[id.0 as usize].index],
             Ty::Struct(id) => match &self.structs[id.0 as usize].instance {

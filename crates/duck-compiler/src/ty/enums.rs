@@ -214,7 +214,10 @@ impl Body<'_> {
         match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.items.get(name) {
                 Some(Item::Enum(id)) => Some(*id),
-                _ => None,
+                _ => match self.ck.type_param(name) {
+                    Some(Ty::Enum(id)) => Some(id),
+                    _ => None,
+                },
             },
             _ => None,
         }

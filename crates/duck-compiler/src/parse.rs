@@ -34,9 +34,11 @@ pub struct FnDecl {
     pub body: Block,
 }
 
-/// `fn name(params) -> ret`, shared by definitions and imports.
+/// `fn(A, B) name(params) -> ret`, shared by definitions and imports. The
+/// type parameters are optional.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnSig {
+    pub type_params: Vec<Ident>,
     pub name: Ident,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
@@ -284,6 +286,8 @@ pub enum ParseErrorKind {
     PubImport,
     /// `(x,)`, which would be a tuple of one element.
     OneElementTuple,
+    /// A function in an `extern` block with type parameters.
+    GenericExtern,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -324,6 +328,12 @@ impl fmt::Display for ParseErrorKind {
             Self::PubExtern => write!(f, "`extern` blocks and their functions cannot be `pub`"),
             Self::PubImport => write!(f, "`import` cannot be `pub`"),
             Self::OneElementTuple => write!(f, "tuples must have at least two elements"),
+            Self::GenericExtern => {
+                write!(
+                    f,
+                    "functions in `extern` blocks cannot have type parameters"
+                )
+            }
         }
     }
 }
@@ -412,6 +422,7 @@ impl<'a> Parser<'a> {
 
     fn fn_sig(&mut self) -> PResult<FnSig> {
         self.expect(TokenKind::Fn)?;
+        let type_params = self.type_params()?;
         let name = self.ident()?;
         self.expect(TokenKind::LParen)?;
         let params = self.comma_list(TokenKind::RParen, Self::param)?;
@@ -420,7 +431,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(FnSig { name, params, ret })
+        Ok(FnSig {
+            type_params,
+            name,
+            params,
+            ret,
+        })
     }
 
     fn extern_block(&mut self) -> PResult<ExternBlock> {
@@ -449,6 +465,13 @@ impl<'a> Parser<'a> {
             self.error(ParseErrorKind::PubExtern, start);
         }
         let sig = self.fn_sig()?;
+        if let (Some(first), Some(last)) = (sig.type_params.first(), sig.type_params.last()) {
+            let span = Span {
+                end: last.span.end,
+                ..first.span
+            };
+            self.error(ParseErrorKind::GenericExtern, span);
+        }
         let import_name = if self.eat(TokenKind::Eq) {
             Some(self.string()?)
         } else {
@@ -1650,6 +1673,39 @@ fn f():
         assert_eq!(
             errors("struct() Box:\n    pass\n"),
             vec![expected("type parameter", TokenKind::RParen)]
+        );
+    }
+
+    #[test]
+    fn generic_fns() {
+        let module = parse_src(
+            "fn(T, U) pair(a: T, b: U) -> tuple(T, U):\n    return (a, b)\nfn f():\n    pass\n",
+        )
+        .unwrap();
+        let ItemKind::Fn(pair) = &module.items[0].kind else {
+            panic!()
+        };
+        let params: Vec<_> = pair
+            .sig
+            .type_params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(params, vec!["T", "U"]);
+        assert_eq!(pair.sig.name.name, "pair");
+        assert_eq!(render_ty(&pair.sig.params[1].ty), "U");
+        let ItemKind::Fn(f) = &module.items[1].kind else {
+            panic!()
+        };
+        assert!(f.sig.type_params.is_empty());
+
+        assert_eq!(
+            errors("fn() f():\n    pass\n"),
+            vec![expected("type parameter", TokenKind::RParen)]
+        );
+        assert_eq!(
+            errors("extern:\n    fn(T) f(x: T)\n"),
+            vec![ParseErrorKind::GenericExtern]
         );
     }
 

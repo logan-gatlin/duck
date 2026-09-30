@@ -22,10 +22,12 @@ use crate::parse::{
 
 use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
+use generic_fn::{FnInstance, GenericFn};
 
 mod enums;
 mod equality;
 mod generic;
+mod generic_fn;
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
 /// signed type `$s` and unsigned counterpart `$u`. Returns from the enclosing
@@ -155,9 +157,13 @@ pub struct TupleId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArrayId(u32);
 
-/// Index of a generic struct's type parameter.
+/// Index of a generic struct's or function's type parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParamId(u32);
+
+/// Index of a generic function declaration, in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GenericFnId(u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
@@ -197,6 +203,16 @@ pub struct TypeError {
     pub kind: TypeErrorKind,
     /// `None` for errors in the [`Settings`], which no source file holds.
     pub span: Option<Span>,
+    /// The instances of generic functions the error is in, innermost first.
+    pub instances: Vec<InstanceSite>,
+}
+
+/// An instance of a generic function, and the call that first used it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceSite {
+    /// The instance as written, such as `id(i32)`.
+    pub name: String,
+    pub call: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +259,19 @@ pub enum TypeErrorKind {
     /// A type that takes a list of type arguments written without one, as
     /// in `array`.
     MissingTypeArgs(String),
+    /// A type parameter of generic function `func` that no argument of a
+    /// call gives a type, so the call must give type arguments.
+    CannotInfer {
+        func: String,
+        param: String,
+    },
+    /// A generic function instantiated within its instances, or those of
+    /// others, too many times over, as recursion with ever larger type
+    /// arguments would be.
+    InstanceTooDeep(String),
+    /// A generic function instantiated with type arguments too large to
+    /// lower, as recursion that doubles them would make.
+    InstanceTooLarge(String),
     /// A type given the wrong number of type arguments.
     TypeArgCount {
         name: String,
@@ -299,6 +328,8 @@ pub enum TypeErrorKind {
     ConstTrap,
     /// A `pub` item whose export name is taken by the module itself.
     ReservedExport(String),
+    /// A `pub` generic function, which has no one function to export.
+    PubGeneric(String),
     /// A start function named in the [`Settings`] that isn't a function.
     UnknownStart(String),
     /// A start function that takes arguments or returns something.
@@ -352,13 +383,24 @@ struct Checker {
     /// Whether every struct's fields are known, so pointer types can be
     /// checked for storability as they are resolved.
     structs_defined: bool,
-    /// Every function, indexed by [`FuncId`].
+    /// Every function, indexed by [`FuncId`]: imports, then definitions,
+    /// then the functions in `synths`.
     funcs: Vec<FuncSig>,
     /// How many of `funcs` are imported. They come first.
     import_count: u32,
-    /// The array types that `==` compares through a function, whose
-    /// signatures end `funcs` in the same order.
-    eq_arrays: Vec<Ty>,
+    /// The functions the checker creates as they are used, whose signatures
+    /// end `funcs` in the same order.
+    synths: Vec<Synth>,
+    /// The function `==` compares each array type through.
+    eq_funcs: HashMap<Ty, FuncId>,
+    /// Generic function declarations, indexed by [`GenericFnId`].
+    generic_fns: Vec<GenericFn>,
+    /// Each instance of a generic function by its declaration and type
+    /// arguments.
+    fn_instances: HashMap<(GenericFnId, Vec<Ty>), FuncId>,
+    /// While lowering an instance of a generic function, it and the
+    /// instances whose calls led to it, innermost first. Given to errors.
+    instance_chain: Vec<InstanceSite>,
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
     ir_globals: Vec<ir::Global>,
@@ -373,6 +415,7 @@ struct Checker {
 #[derive(Debug, Clone, Copy)]
 enum Item {
     Func(FuncId),
+    GenericFn(GenericFnId),
     Struct(StructId),
     Enum(EnumId),
     Global(usize),
@@ -405,6 +448,13 @@ struct FuncSig {
     name: String,
     params: Vec<(String, Ty)>,
     ret: Ty,
+}
+
+/// A function the checker creates, rather than one defined in the source.
+enum Synth {
+    /// Compares two arrays of this type.
+    Eq(Ty),
+    Instance(FnInstance),
 }
 
 struct GlobalDef {
@@ -643,6 +693,22 @@ impl fmt::Display for TypeErrorKind {
                 "struct `{name}` uses itself with ever larger type arguments"
             ),
             Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
+            Self::InstanceTooDeep(name) => write!(
+                f,
+                "instance of `{name}` is nested more than {} instances deep; \
+                 its type arguments may grow without end",
+                generic_fn::MAX_INSTANCE_DEPTH
+            ),
+            Self::InstanceTooLarge(name) => write!(
+                f,
+                "type arguments of `{name}` have more than {} parts; \
+                 they may grow without end",
+                generic_fn::MAX_INSTANCE_SIZE
+            ),
+            Self::CannotInfer { func, param } => write!(
+                f,
+                "cannot infer `{param}` for `{func}`; give its type arguments, as in `{func}(...)(...)`"
+            ),
             Self::MissingTypeArgs(name) => write!(f, "`{name}` needs a list of type arguments"),
             Self::TypeArgCount {
                 name,
@@ -691,6 +757,10 @@ impl fmt::Display for TypeErrorKind {
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
             Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
+            Self::PubGeneric(name) => write!(
+                f,
+                "generic function `{name}` cannot be `pub`: each instance is a separate function"
+            ),
             Self::InvalidStart(name) => write!(
                 f,
                 "start function `{name}` must take no arguments and return nothing"
@@ -713,9 +783,18 @@ impl fmt::Display for TypeErrorKind {
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.span {
-            Some(span) => write!(f, "{} at {}..{}", self.kind, span.start, span.end),
-            None => self.kind.fmt(f),
+            Some(span) => write!(f, "{} at {}..{}", self.kind, span.start, span.end)?,
+            None => self.kind.fmt(f)?,
         }
+        for site in &self.instances {
+            let call = site.call;
+            write!(
+                f,
+                ", in `{}` called at {}..{}",
+                site.name, call.start, call.end
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -739,7 +818,7 @@ pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, 
         .and_then(|name| ck.resolve_start(module, name));
     let imports = ck.lower_imports(module);
     let mut funcs = ck.lower_funcs(module);
-    funcs.extend(ck.lower_eq_funcs());
+    funcs.extend(ck.lower_synths(module));
     if ck.errors.is_empty() {
         Ok(ir::Module {
             memory: ir::Memory {
@@ -763,6 +842,7 @@ impl Checker {
         self.errors.push(TypeError {
             kind,
             span: Some(span),
+            instances: self.instance_chain.clone(),
         });
     }
 
@@ -781,18 +861,7 @@ impl Checker {
             let (name, entry) = match &item.kind {
                 ItemKind::Struct(s) => {
                     let id = StructId(self.structs.len() as u32);
-                    let params = s
-                        .params
-                        .iter()
-                        .enumerate()
-                        .map(|(index, param)| {
-                            self.params.push(ParamDef {
-                                name: param.name.clone(),
-                                index,
-                            });
-                            Ty::Param(ParamId(self.params.len() as u32 - 1))
-                        })
-                        .collect();
+                    let params = self.new_params(&s.params);
                     self.structs.push(StructDef {
                         name: s.name.name.clone(),
                         params,
@@ -801,6 +870,10 @@ impl Checker {
                     });
                     (&s.name, Item::Struct(id))
                 }
+                ItemKind::Fn(f) if !f.sig.type_params.is_empty() => (
+                    &f.sig.name,
+                    Item::GenericFn(self.declare_generic_fn(item, f)),
+                ),
                 ItemKind::Fn(f) => {
                     next_def += 1;
                     (&f.sig.name, Item::Func(FuncId(next_def - 1)))
@@ -856,7 +929,8 @@ impl Checker {
         let mut decl_count = 0;
         for (id, decl) in decls.enumerate() {
             decl_count += 1;
-            self.declare_type_params(id, &decl.params);
+            let params = self.structs[id].params.clone();
+            self.declare_type_params(&decl.params, &params);
             let mut fields: Vec<FieldDef> = Vec::new();
             for field in &decl.fields {
                 let ty = self.resolve_ty(&field.ty);
@@ -986,19 +1060,28 @@ impl Checker {
         }
     }
 
+    /// Resolves the signature of every function, including generic ones.
     fn define_funcs(&mut self, module: &parse::Module) {
         for (id, decl) in fn_sigs(module).enumerate() {
-            let mut params: Vec<(String, Ty)> = Vec::new();
-            for param in &decl.params {
-                if params.iter().any(|(name, _)| *name == param.name.name) {
-                    let kind = TypeErrorKind::DuplicateParam(param.name.name.clone());
-                    self.error(kind, param.name.span);
-                }
-                params.push((param.name.name.clone(), self.resolve_ty(&param.ty)));
-            }
+            let (params, ret) = self.resolve_sig(decl);
             self.funcs[id].params = params;
-            self.funcs[id].ret = decl.ret.as_ref().map_or(Ty::Unit, |ty| self.resolve_ty(ty));
+            self.funcs[id].ret = ret;
         }
+        self.define_generic_fns(module);
+    }
+
+    /// The types of the parameters and result of `sig`.
+    fn resolve_sig(&mut self, sig: &FnSig) -> (Vec<(String, Ty)>, Ty) {
+        let mut params: Vec<(String, Ty)> = Vec::new();
+        for param in &sig.params {
+            if params.iter().any(|(name, _)| *name == param.name.name) {
+                let kind = TypeErrorKind::DuplicateParam(param.name.name.clone());
+                self.error(kind, param.name.span);
+            }
+            params.push((param.name.name.clone(), self.resolve_ty(&param.ty)));
+        }
+        let ret = sig.ret.as_ref().map_or(Ty::Unit, |ty| self.resolve_ty(ty));
+        (params, ret)
     }
 
     /// Checks and folds global initializers and the values of enum members,
@@ -1052,6 +1135,7 @@ impl Checker {
                     min_pages,
                 },
                 span: None,
+                instances: Vec::new(),
             });
         }
         self.ir_globals.push(ir::Global {
@@ -1066,10 +1150,17 @@ impl Checker {
     /// The function `name`, which must take and return nothing. `None` after
     /// reporting an error.
     fn resolve_start(&mut self, module: &parse::Module, name: &str) -> Option<FuncId> {
+        if let Some(&Item::GenericFn(generic)) = self.items.get(name) {
+            let (_, decl) = generic_fn_decls(module).nth(generic.0 as usize).unwrap();
+            let span = decl.sig.name.span;
+            self.error(TypeErrorKind::InvalidStart(name.to_string()), span);
+            return None;
+        }
         let Some(&Item::Func(id)) = self.items.get(name) else {
             self.errors.push(TypeError {
                 kind: TypeErrorKind::UnknownStart(name.to_string()),
                 span: None,
+                instances: Vec::new(),
             });
             return None;
         };
@@ -1106,31 +1197,63 @@ impl Checker {
         let mut funcs = Vec::new();
         for (i, (item, decl)) in fn_decls(module).enumerate() {
             let sig = self.funcs[self.import_count as usize + i].clone();
-            let mut body = Body::new(self, sig.ret);
-            for (name, ty) in &sig.params {
-                let slots = body.alloc(name, *ty);
-                body.bind(name, *ty, false, slots);
-            }
-            let params = body.locals.iter().map(|local| local.ty).collect();
-            let mut stmts = body.block(&decl.body);
-            let locals = body.locals;
-            let results = self.val_types(sig.ret);
-            if !matches!(sig.ret, Ty::Unit | Ty::Error) && !diverges(&decl.body) {
-                self.error(TypeErrorKind::MissingReturn(sig.name.clone()), item.span);
-            }
-            // Wasm validates the end of a function with results as reachable
-            // unless it follows a `return`.
-            if !results.is_empty() && !matches!(stmts.last(), Some(Stmt::Return(_))) {
-                stmts.push(Stmt::Unreachable);
-            }
-            funcs.push(ir::Func {
-                export: item.is_pub.then(|| sig.name.clone()),
-                name: sig.name,
-                params,
-                results,
-                locals,
-                body: stmts,
-            });
+            let export = item.is_pub.then(|| sig.name.clone());
+            funcs.push(self.lower_body(sig, &decl.body, item.span, export));
+        }
+        funcs
+    }
+
+    /// Lowers a function with signature `sig` and body `block`, declared by
+    /// the item spanning `span`, and exported as `export` if given.
+    fn lower_body(
+        &mut self,
+        sig: FuncSig,
+        block: &parse::Block,
+        span: Span,
+        export: Option<String>,
+    ) -> ir::Func {
+        let mut body = Body::new(self, sig.ret);
+        for (name, ty) in &sig.params {
+            let slots = body.alloc(name, *ty);
+            body.bind(name, *ty, false, slots);
+        }
+        let params = body.locals.iter().map(|local| local.ty).collect();
+        let mut stmts = body.block(block);
+        let locals = body.locals;
+        let results = self.val_types(sig.ret);
+        if !matches!(sig.ret, Ty::Unit | Ty::Error) && !diverges(block) {
+            self.error(TypeErrorKind::MissingReturn(sig.name.clone()), span);
+        }
+        // Wasm validates the end of a function with results as reachable
+        // unless it follows a `return`.
+        if !results.is_empty() && !matches!(stmts.last(), Some(Stmt::Return(_))) {
+            stmts.push(Stmt::Unreachable);
+        }
+        ir::Func {
+            export,
+            name: sig.name,
+            params,
+            results,
+            locals,
+            body: stmts,
+        }
+    }
+
+    /// Lowers every function in `synths`, including those that lowering the
+    /// others creates.
+    fn lower_synths(&mut self, module: &parse::Module) -> Vec<ir::Func> {
+        let first = self.funcs.len() - self.synths.len();
+        let mut funcs = Vec::new();
+        while funcs.len() < self.synths.len() {
+            let id = FuncId((first + funcs.len()) as u32);
+            let func = match &self.synths[funcs.len()] {
+                Synth::Eq(ty) => self.lower_eq_func(id, *ty),
+                Synth::Instance(instance) => {
+                    let instance = instance.clone();
+                    self.lower_instance(module, id, instance)
+                }
+            };
+            funcs.push(func);
         }
         funcs
     }
@@ -1924,11 +2047,11 @@ impl<'c> Body<'c> {
                             slots: Slots::Global(global.slots.clone()),
                         })
                     }
-                    Some(Item::Func(_) | Item::Struct(_) | Item::Enum(_)) => {
+                    Some(Item::Func(_) | Item::GenericFn(_) | Item::Struct(_) | Item::Enum(_)) => {
                         self.error(TypeErrorKind::NotAssignable, target.span);
                         None
                     }
-                    None if is_builtin_type(name) => {
+                    None if is_builtin_type(name) || self.ck.type_param(name).is_some() => {
                         self.error(TypeErrorKind::NotAssignable, target.span);
                         None
                     }
@@ -2301,7 +2424,7 @@ impl<'c> Body<'c> {
                 }
             },
             // Struct and enum names are types, which `expr` makes values.
-            Some(Item::Func(_) | Item::Struct(_) | Item::Enum(_)) => {
+            Some(Item::Func(_) | Item::GenericFn(_) | Item::Struct(_) | Item::Enum(_)) => {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
@@ -2319,7 +2442,7 @@ impl<'c> Body<'c> {
         match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.items.get(name) {
                 Some(item) => matches!(item, Item::Struct(_) | Item::Enum(_)),
-                None => is_builtin_type(name),
+                None => is_builtin_type(name) || self.ck.type_param(name).is_some(),
             },
             ExprKind::Call(callee, args) => self.names_type(callee, args),
             ExprKind::AddrOf(pointee) => self.is_type_expr(pointee),
@@ -2619,17 +2742,27 @@ impl<'c> Body<'c> {
             ExprKind::Name(name) if name == TYPE => return self.construct(Ty::Type, args, span),
             ExprKind::Name(name) => match self.ck.items.get(name).copied() {
                 Some(Item::Func(id)) => Ok(Item::Func(id)),
+                Some(Item::GenericFn(generic)) => {
+                    return self.generic_fn_call(generic, None, args, span);
+                }
                 Some(Item::Struct(id)) => Ok(Item::Struct(id)),
                 Some(Item::Enum(_) | Item::Global(_)) => {
                     Err(TypeErrorKind::NotCallable(name.clone()))
                 }
                 None if is_builtin_type(name) => Err(TypeErrorKind::NotCallable(name.clone())),
-                None => Err(TypeErrorKind::UnknownName(name.clone())),
+                None => match self.ck.type_param(name) {
+                    Some(ty) => return self.construct(ty, args, span),
+                    None => Err(TypeErrorKind::UnknownName(name.clone())),
+                },
             },
             // A type given type arguments, such as `array(u8)`.
             ExprKind::Call(inner, targs) if self.names_type(inner, targs) => {
                 let ty = self.expr_type(callee);
                 return self.construct(ty, args, span);
+            }
+            // A function given type arguments, such as `id(u8)`.
+            ExprKind::Call(inner, targs) if self.names_fn(inner) => {
+                return self.explicit_call(callee, inner, targs, args, span);
             }
             _ => Err(TypeErrorKind::NotCallable("expression".to_string())),
         };
@@ -2637,39 +2770,10 @@ impl<'c> Body<'c> {
             Ok(Item::Func(id)) => {
                 let sig = self.ck.funcs[id.0 as usize].clone();
                 let value = self.args(&sig.params, args, false, span);
-                let results = self.ck.val_types(sig.ret);
-                let mut pre = value.pre;
-                let args = exprs(value.scalars);
-                let mut scalars = if let [result] = results[..] {
-                    vec![(result, Expr::Call(id, args))]
-                } else {
-                    let dests: Vec<_> = results.iter().map(|vt| self.temp(*vt)).collect();
-                    let scalars = results
-                        .iter()
-                        .zip(&dests)
-                        .map(|(vt, dest)| (*vt, Expr::Local(*dest)))
-                        .collect();
-                    pre.push(Stmt::Call {
-                        func: id,
-                        args,
-                        dests,
-                    });
-                    scalars
-                };
-                // The host may return any `i32` for a narrow integer or `bool`.
-                if id.0 < self.ck.import_count {
-                    let prims = self.ck.leaf_prims(sig.ret);
-                    for ((_, scalar), prim) in scalars.iter_mut().zip(prims) {
-                        if let Some(prim) = prim {
-                            let expr = mem::replace(scalar, Expr::Const(Const::I32(0)));
-                            *scalar = into_range(prim, expr);
-                        }
-                    }
-                }
-                (sig.ret, Value { pre, scalars })
+                self.call_func(id, value)
             }
             Ok(Item::Struct(id)) => self.construct(Ty::Struct(id), args, span),
-            Ok(Item::Enum(_) | Item::Global(_)) | Err(_) => {
+            Ok(Item::GenericFn(_) | Item::Enum(_) | Item::Global(_)) | Err(_) => {
                 if let Err(kind) = item {
                     self.error(kind, callee.span);
                 }
@@ -2679,6 +2783,42 @@ impl<'c> Body<'c> {
                 (Ty::Error, Value::default())
             }
         }
+    }
+
+    /// A call of function `id` with the scalars of its arguments, in
+    /// parameter order.
+    fn call_func(&mut self, id: FuncId, value: Value) -> (Ty, Value) {
+        let ret = self.ck.funcs[id.0 as usize].ret;
+        let results = self.ck.val_types(ret);
+        let mut pre = value.pre;
+        let args = exprs(value.scalars);
+        let mut scalars = if let [result] = results[..] {
+            vec![(result, Expr::Call(id, args))]
+        } else {
+            let dests: Vec<_> = results.iter().map(|vt| self.temp(*vt)).collect();
+            let scalars = results
+                .iter()
+                .zip(&dests)
+                .map(|(vt, dest)| (*vt, Expr::Local(*dest)))
+                .collect();
+            pre.push(Stmt::Call {
+                func: id,
+                args,
+                dests,
+            });
+            scalars
+        };
+        // The host may return any `i32` for a narrow integer or `bool`.
+        if id.0 < self.ck.import_count {
+            let prims = self.ck.leaf_prims(ret);
+            for ((_, scalar), prim) in scalars.iter_mut().zip(prims) {
+                if let Some(prim) = prim {
+                    let expr = mem::replace(scalar, Expr::Const(Const::I32(0)));
+                    *scalar = into_range(prim, expr);
+                }
+            }
+        }
+        (ret, Value { pre, scalars })
     }
 
     /// A value of a struct, array, or `type` type `ty`, built from its
@@ -2718,13 +2858,33 @@ impl<'c> Body<'c> {
         span: Span,
     ) -> Value {
         let binding = self.bind_args(params, args, require_labels, span);
+        let checked = args.iter().map(|_| None).collect();
+        self.bound_args(params, args, binding, checked)
+    }
+
+    /// Checks call arguments against the parameters `binding` matches them
+    /// with, as [`Self::args`] does. Those `checked` already, with their
+    /// types, are only compared with their parameter's.
+    fn bound_args(
+        &mut self,
+        params: &[(String, Ty)],
+        args: &[Arg],
+        binding: Vec<Option<usize>>,
+        checked: Vec<Option<(Ty, Value)>>,
+    ) -> Value {
         let mut values = Vec::new();
         // Parameter index and scalar count of each value.
         let mut groups = Vec::new();
-        for (arg, param) in args.iter().zip(binding) {
+        for ((arg, param), checked) in args.iter().zip(binding).zip(checked) {
             match param {
                 Some(i) => {
-                    let value = self.check(&arg.value, params[i].1);
+                    let value = match checked {
+                        Some((ty, value)) => {
+                            self.expect(ty, params[i].1, arg.value.span);
+                            value
+                        }
+                        None => self.check(&arg.value, params[i].1),
+                    };
                     groups.push((i, value.scalars.len()));
                     values.push(value);
                 }
@@ -3217,10 +3377,22 @@ fn extern_fns(module: &parse::Module) -> impl Iterator<Item = (&ExternBlock, &Ex
     blocks.flat_map(|block| block.fns.iter().map(move |f| (block, f)))
 }
 
-/// Every defined function, with the item that declares it.
+/// Every defined function that isn't generic, with the item that declares
+/// it.
 fn fn_decls(module: &parse::Module) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
     module.items.iter().filter_map(|item| match &item.kind {
-        ItemKind::Fn(f) => Some((item, f)),
+        ItemKind::Fn(f) if f.sig.type_params.is_empty() => Some((item, f)),
+        _ => None,
+    })
+}
+
+/// Every generic function, in [`Item::GenericFn`] order, with the item that
+/// declares it.
+fn generic_fn_decls(
+    module: &parse::Module,
+) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
+    module.items.iter().filter_map(|item| match &item.kind {
+        ItemKind::Fn(f) if !f.sig.type_params.is_empty() => Some((item, f)),
         _ => None,
     })
 }
@@ -4573,6 +4745,8 @@ fn give() -> tuple():
     return
 fn back() -> i32:
     return 1
+fn(T) generic():
+    pass
 ";
         let start = |name| check_start(src, name).map(|m| m.start);
         assert_eq!(start("init"), Ok(Some(FuncId(2))));
@@ -4586,10 +4760,11 @@ fn back() -> i32:
                 Err(vec![TypeError {
                     kind: TypeErrorKind::UnknownStart(name.into()),
                     span: None,
+                    instances: Vec::new(),
                 }])
             );
         }
-        for name in ["take", "back", "get"] {
+        for name in ["take", "back", "get", "generic"] {
             let errors = start(name).unwrap_err();
             assert_eq!(errors.len(), 1, "{errors:?}");
             assert_eq!(errors[0].kind, TypeErrorKind::InvalidStart(name.into()));
@@ -4887,6 +5062,335 @@ fn f(t: tuple(i32, f32)) -> tuple(i32, i32):
                 },
                 ImmutableAssign("t".into()),
                 mismatch("tuple(i32, i32)", "tuple(i32, f64)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_fns_are_instantiated_per_inferred_type_argument() {
+        let src = "\
+fn(T) id(val: T) -> T:
+    return val
+fn f(x: u8, y: &i32) -> u8:
+    id(y)
+    id(x)
+    return id(x)
+";
+        let module = lower(src);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["f", "id(&i32)", "id(u8)"]);
+        assert_eq!(
+            body(&module, "f"),
+            "(drop (call id(&i32) y)) (drop (call id(u8) x)) (return (call id(u8) x))"
+        );
+        assert_eq!(body(&module, "id(u8)"), "(return val)");
+    }
+
+    #[test]
+    fn literals_take_the_type_arguments_other_arguments_settle() {
+        let src = "\
+fn(T) max(a: T, b: T) -> T:
+    return a
+fn f(x: u8) -> u8:
+    max(1.5, 2)
+    max(1, 2)
+    return max(1, x)
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(drop (call max(f64) 1.5f64 2f64)) (drop (call max(i32) 1 2)) \
+             (return (call max(u8) 1 x))"
+        );
+    }
+
+    #[test]
+    fn type_arguments_are_inferred_from_within_argument_types() {
+        let src = "\
+struct(T) Box:
+    value: T
+fn(T) first(xs: array(T)) -> T:
+    return xs[0]
+fn(A, B) swap(p: &tuple(A, B), b: Box(B)) -> tuple(B, A):
+    return (b.value, p.*.0)
+fn f(xs: array(u16), p: &tuple(u8, bool)) -> tuple(bool, u8):
+    first(xs)
+    return swap(p, Box(bool)(value: true))
+";
+        let module = lower(src);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["f", "first(u16)", "swap(u8, bool)"]);
+    }
+
+    #[test]
+    fn type_arguments_can_be_given_explicitly() {
+        let src = "\
+fn(T) id(val: T) -> T:
+    return val
+fn(T) zero() -> T:
+    return 0 as T
+fn f() -> u8:
+    id(i64)(1)
+    return zero(u8)()
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(drop (call id(i64) 1i64)) (return (call zero(u8) ))"
+        );
+        assert_eq!(
+            errors(
+                "\
+fn(A, B) pair(a: A, b: B):
+    pass
+fn g(x: i32):
+    pass
+fn f():
+    pair(i32)(1, 2)
+    g(i32)(1)
+    pair(i32, 1)(1, 2)
+    pair(i32, b: u8)(1, 2)
+"
+            ),
+            vec![
+                TypeErrorKind::TypeArgCount {
+                    name: "pair".to_string(),
+                    expected: 2,
+                    found: 1
+                },
+                TypeErrorKind::NotGeneric("g".to_string()),
+                TypeErrorKind::NotAType,
+                TypeErrorKind::LabelledTypeArg,
+            ]
+        );
+    }
+
+    #[test]
+    fn type_arguments_no_argument_settles_are_reported() {
+        let src = "\
+fn(T, U) make(x: T) -> U:
+    return x as U
+fn(T) max(a: T, b: T) -> T:
+    return a
+fn f(x: u8, y: i32):
+    make(x)
+    max(x, y)
+    max(x, 1.5)
+";
+        let errors = check_src(src).unwrap_err();
+        let kinds: Vec<_> = errors.iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TypeErrorKind::CannotInfer {
+                    func: "make".to_string(),
+                    param: "U".to_string()
+                },
+                TypeErrorKind::Mismatch {
+                    expected: "u8".to_string(),
+                    found: "i32".to_string()
+                },
+                TypeErrorKind::Mismatch {
+                    expected: "u8".to_string(),
+                    found: "f64".to_string()
+                },
+            ]
+        );
+        let span = errors[0].span.unwrap();
+        assert_eq!(&src[span.start..span.end], "make(x)");
+        let span = errors[1].span.unwrap();
+        assert_eq!(&src[span.start..span.end], "y");
+    }
+
+    #[test]
+    fn generic_fns_cannot_be_exported() {
+        assert_eq!(
+            errors("pub fn(T) id(val: T) -> T:\n    return val\n"),
+            vec![TypeErrorKind::PubGeneric("id".to_string())]
+        );
+    }
+
+    #[test]
+    fn type_parameters_name_their_type_arguments_in_instances() {
+        let src = "\
+struct Point:
+    x: u8
+    y: u8
+struct(T) Box:
+    value: T
+enum(i8) Code:
+    ok
+    bad
+fn(T) sized(x: T) -> u32:
+    let y: T = x
+    let b = Box(T)(value: y)
+    return T.size + (&T).size
+fn(T) make(v: u8) -> T:
+    return T(x: v, y: v)
+fn(T) last() -> T:
+    return T.bad
+fn f():
+    sized(1 as u16)
+    make(Point)(1)
+    last(Code)()
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "sized(u16)"),
+            "(set y x) (set b.value y) (return (I32.Add 2 4))"
+        );
+        assert_eq!(body(&module, "make(Point)"), "(return v v)");
+        assert_eq!(body(&module, "last(Code)"), "(return 1)");
+    }
+
+    #[test]
+    fn errors_in_instances_name_the_instances_they_are_in() {
+        let src = "\
+fn(T) add(a: T, b: T) -> T:
+    return a + b
+fn(T) twice(x: T) -> T:
+    return add(x, x)
+fn(T) unused(x: T):
+    nope()
+fn f():
+    twice(true)
+    twice(false)
+";
+        let errors = check_src(src).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let span = errors[0].span.unwrap();
+        assert_eq!(&src[span.start..span.end], "a + b");
+        let instances: Vec<_> = errors[0]
+            .instances
+            .iter()
+            .map(|site| (site.name.as_str(), &src[site.call.start..site.call.end]))
+            .collect();
+        assert_eq!(
+            instances,
+            vec![("add(bool)", "add(x, x)"), ("twice(bool)", "twice(true)")]
+        );
+    }
+
+    #[test]
+    fn generic_fns_must_have_finitely_many_instances() {
+        let src = "\
+fn(T) deep(x: T):
+    deep((x, 1))
+fn(T) wide(x: T):
+    wide((x, x))
+fn(T) fine(x: T, n: i32):
+    if n > 0:
+        fine(x, n - 1)
+        fine(1 as u8, n - 1)
+fn f():
+    deep(1)
+    wide(1)
+    fine(1, 5)
+";
+        let errors = check_src(src).unwrap_err();
+        let mut kinds: Vec<_> = errors.iter().map(|e| e.kind.clone()).collect();
+        kinds.sort_by_key(|kind| format!("{kind:?}"));
+        assert_eq!(
+            kinds,
+            vec![
+                TypeErrorKind::InstanceTooDeep("deep".to_string()),
+                TypeErrorKind::InstanceTooLarge("wide".to_string()),
+            ]
+        );
+        for error in &errors {
+            let span = error.span.unwrap();
+            assert!(["deep((x, 1))", "wide((x, x))"].contains(&&src[span.start..span.end]));
+        }
+        let deep = errors
+            .iter()
+            .find(|e| e.kind == TypeErrorKind::InstanceTooDeep("deep".to_string()))
+            .unwrap();
+        assert_eq!(deep.instances.len(), generic_fn::MAX_INSTANCE_DEPTH);
+    }
+
+    #[test]
+    fn generic_fn_signatures_are_checked_without_calls() {
+        use TypeErrorKind::*;
+        let src = "\
+struct S:
+    x: i32
+fn g():
+    pass
+fn(T, T) a(x: T):
+    pass
+fn(S) b():
+    pass
+fn(g) c():
+    pass
+fn(i32) d():
+    pass
+fn(T) e(x: Nope) -> T:
+    return nope
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateParam("T".to_string()),
+                DuplicateItem("S".to_string()),
+                DuplicateItem("g".to_string()),
+                DuplicateItem("i32".to_string()),
+                UnknownType("Nope".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn instances_cannot_point_to_what_memory_cannot_hold() {
+        let src = "\
+fn(T) f(p: &T):
+    pass
+fn(T) g() -> array(T):
+    return g(T)()
+fn h():
+    f(externref)(0)
+    g(externref)()
+";
+        let errors = check_src(src).unwrap_err();
+        let found: Vec<_> = errors
+            .iter()
+            .map(|e| {
+                (
+                    e.kind.clone(),
+                    &src[e.span.unwrap().start..e.span.unwrap().end],
+                )
+            })
+            .collect();
+        let not_storable = TypeErrorKind::NotStorable("externref".to_string());
+        assert_eq!(
+            found,
+            vec![
+                (not_storable.clone(), "f(externref)(0)"),
+                (not_storable, "g(externref)()"),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_arguments_are_not_reported_after_the_errors_that_hide_them() {
+        use TypeErrorKind::*;
+        let src = "\
+struct(T) Box:
+    value: T
+fn(T) id(val: T) -> T:
+    return val
+fn(T) g(b: Box(Nope)) -> T:
+    return b.value
+fn f():
+    id(nope)
+    id()
+    g(1)
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                UnknownType("Nope".to_string()),
+                UnknownName("nope".to_string()),
+                MissingArg("val".to_string()),
             ]
         );
     }
@@ -5561,6 +6065,7 @@ fn f():
                     min_pages: 0
                 },
                 span: None,
+                instances: Vec::new(),
             }])
         );
     }

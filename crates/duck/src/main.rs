@@ -87,6 +87,15 @@ fn build() -> ExitCode {
                     "{}:{line}:{col}: error: {error}",
                     files.display_name(span.file)
                 );
+                for site in error.instances() {
+                    let call = site.call;
+                    let (line, col) = line_col(&files.contents(call.file), call.start);
+                    eprintln!(
+                        "{}:{line}:{col}: note: in `{}`, called here",
+                        files.display_name(call.file),
+                        site.name
+                    );
+                }
             }
             return ExitCode::FAILURE;
         }
