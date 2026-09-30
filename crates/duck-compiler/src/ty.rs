@@ -24,6 +24,7 @@ use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
 
 mod enums;
+mod equality;
 mod generic;
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
@@ -355,6 +356,9 @@ struct Checker {
     funcs: Vec<FuncSig>,
     /// How many of `funcs` are imported. They come first.
     import_count: u32,
+    /// The array types that `==` compares through a function, whose
+    /// signatures end `funcs` in the same order.
+    eq_arrays: Vec<Ty>,
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
     ir_globals: Vec<ir::Global>,
@@ -734,7 +738,8 @@ pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, 
         .as_ref()
         .and_then(|name| ck.resolve_start(module, name));
     let imports = ck.lower_imports(module);
-    let funcs = ck.lower_funcs(module);
+    let mut funcs = ck.lower_funcs(module);
+    funcs.extend(ck.lower_eq_funcs());
     if ck.errors.is_empty() {
         Ok(ir::Module {
             memory: ir::Memory {
@@ -2454,11 +2459,11 @@ impl<'c> Body<'c> {
         let bool = Ty::Prim(Prim::Bool);
         let prim = match ty {
             Ty::Prim(prim) => prim,
-            Ty::Enum(_) if matches!(op, BinOp::Eq | BinOp::NotEq) => {
-                return self.enum_eq(op, ty, lhs, rhs, span);
-            }
             // Pointers compare as unsigned addresses.
             Ty::Ptr(_) if is_comparison(op) => Prim::U32,
+            _ if matches!(op, BinOp::Eq | BinOp::NotEq) => {
+                return self.eq_values(op, ty, lhs, rhs, span);
+            }
             _ => return self.invalid_operand(binop_symbol(op), ty, span),
         };
         if matches!(op, BinOp::And | BinOp::Or) {
@@ -4071,7 +4076,6 @@ fn f(a: u32, p: P) -> i32:
     let b = -a
     let c = 1.0 % 2.0
     let d = true + true
-    let e = p == p
     let g = 1 as bool
     let h = p as i32
     let i: u8 = 256
@@ -4087,7 +4091,6 @@ fn f(a: u32, p: P) -> i32:
                 invalid_operand("-", "u32"),
                 invalid_operand("%", "f64"),
                 invalid_operand("+", "bool"),
-                invalid_operand("==", "P"),
                 InvalidCast {
                     from: "i32".into(),
                     to: "bool".into()
@@ -4240,9 +4243,8 @@ fn f() -> i32:
             "(call u [] -> []) (call g [1] -> []) (return 1)"
         );
         assert_eq!(
-            errors("fn u():\n    let a = u() == u()\n    let b = 1 as tuple()\n    let c = -u()\n"),
+            errors("fn u():\n    let b = 1 as tuple()\n    let c = -u()\n"),
             vec![
-                invalid_operand("==", "tuple()"),
                 TypeErrorKind::InvalidCast {
                     from: "i32".into(),
                     to: "tuple()".into()
@@ -4270,9 +4272,8 @@ fn f():
         assert_eq!(body(&module, "u"), "(return )");
         assert_eq!(body(&module, "f"), "(return )");
         assert_eq!(
-            errors("fn f():\n    let a = () == ()\n    let b: i32 = ()\n    let c: unit = ()\n"),
+            errors("fn f():\n    let b: i32 = ()\n    let c: unit = ()\n"),
             vec![
-                invalid_operand("==", "tuple()"),
                 mismatch("i32", "tuple()"),
                 TypeErrorKind::UnknownType("unit".into()),
             ]
@@ -4858,7 +4859,6 @@ fn f(t: tuple(i32, f32)) -> tuple(i32, i32):
     let (a, b, c) = t
     let (d, e) = 1
     let (g, g) = t
-    let z = t == t
     let w = t as tuple(i32, i32)
     t.0 = 1
     return (1, 2.0)
@@ -4881,10 +4881,6 @@ fn f(t: tuple(i32, f32)) -> tuple(i32, i32):
                 mismatch("tuple(_, _, _)", "tuple(i32, f32)"),
                 mismatch("tuple(_, _)", "i32"),
                 DuplicateBinding("g".into()),
-                InvalidOperand {
-                    op: "==",
-                    ty: "tuple(i32, f32)".into()
-                },
                 InvalidCast {
                     from: "tuple(i32, f32)".into(),
                     to: "tuple(i32, i32)".into()
@@ -5354,15 +5350,10 @@ fn k(a: array(Q)) -> i32:
 fn f(a: array(u8), i: i32, n: i32):
     let b = a[i]
     let c = n[0]
-    let d = a == a
 ";
         assert_eq!(
             errors(src),
-            vec![
-                mismatch("u32", "i32"),
-                invalid_operand("[]", "i32"),
-                invalid_operand("==", "array(u8)"),
-            ]
+            vec![mismatch("u32", "i32"), invalid_operand("[]", "i32"),]
         );
     }
 
@@ -5695,6 +5686,158 @@ fn f(r: R):
                 invalid_operand("<", "R"),
                 mismatch("R", "i32"),
                 invalid_operand("+", "R"),
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregates_compare_their_fields() {
+        let src = "\
+struct P:
+    x: i32
+    y: f32
+fn f(p: P, q: P, t: tuple(i8, P), u: tuple(i8, P)) -> bool:
+    let a = p == q
+    let b = t != u
+    return a and b
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set a (I32.And (I32.Eq p.x q.x) (F32.Eq p.y q.y))) \
+             (set b (I32.Or (I32.Or (I32.Ne t.0 u.0) (I32.Ne t.1.x u.1.x)) (F32.Ne t.1.y u.1.y))) \
+             (return (if a b 0))"
+        );
+    }
+
+    #[test]
+    fn units_and_types_compare() {
+        let src = "\
+struct P:
+    x: i32
+    y: f32
+let same = i32 == u32
+let differ = u8 == u16
+let point = P(x: 1, y: 2.0) == P(x: 1, y: 2.0)
+fn u():
+    return
+fn f(t: type) -> bool:
+    let a = u() == u()
+    let b = t != i8
+    return b
+";
+        let module = lower(src);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
+        assert_eq!(
+            globals[..3],
+            [
+                ("same", Const::I32(1)),
+                ("differ", Const::I32(0)),
+                ("point", Const::I32(1)),
+            ]
+        );
+        assert_eq!(
+            body(&module, "f"),
+            "(call u [] -> []) (call u [] -> []) (set a 1) \
+             (set b (I32.Or (I32.Ne t.size 1) (I32.Ne t.align 1))) (return b)"
+        );
+    }
+
+    #[test]
+    fn arrays_compare_their_elements() {
+        let src = "\
+struct S:
+    n: i32
+    name: array(u8)
+fn f(a: array(u8), b: array(u8), s: S, t: S) -> bool:
+    let x = a == b
+    let y = s != t
+    return x and y
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set x (call ==(array(u8)) a.len a.ptr b.len b.ptr)) \
+             (set y (if (I32.Ne s.n t.n) 1 \
+             (I32.Eqz (call ==(array(u8)) s.name.len s.name.ptr t.name.len t.name.ptr)))) \
+             (return (if x y 0))"
+        );
+        let helpers: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(helpers, ["f", "==(array(u8))"]);
+        assert_eq!(
+            body(&module, "==(array(u8))"),
+            "(if (I32.Ne a.len b.len) (then (return 0)) (else )) (set tmp4 0) \
+             (block (loop (br_if 1 (I32.GeU tmp4 a.len)) \
+             (if (I32.Ne (I32.Load8U offset=0 (I32.Add a.ptr tmp4)) \
+             (I32.Load8U offset=0 (I32.Add b.ptr tmp4))) (then (return 0)) (else )) \
+             (set tmp4 (I32.Add tmp4 1)) (br 0))) \
+             (return 1)"
+        );
+    }
+
+    #[test]
+    fn recursive_arrays_compare_through_one_function() {
+        let src = "\
+struct N:
+    v: f32
+    kids: array(N)
+fn f(a: N, b: N) -> bool:
+    return a == b
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(return (if (F32.Eq a.v b.v) \
+             (call ==(array(N)) a.kids.len a.kids.ptr b.kids.len b.kids.ptr) 0))"
+        );
+        assert_eq!(
+            body(&module, "==(array(N))"),
+            "(if (I32.Ne a.len b.len) (then (return 0)) (else )) (set tmp4 0) \
+             (block (loop (br_if 1 (I32.GeU tmp4 a.len)) \
+             (set tmp5 (I32.Add a.ptr (I32.Mul tmp4 12))) \
+             (set tmp7 (F32.Load offset=0 tmp5)) (set tmp8 (I32.Load offset=4 tmp5)) \
+             (set tmp9 (I32.Load offset=8 tmp5)) \
+             (set tmp6 (I32.Add b.ptr (I32.Mul tmp4 12))) \
+             (set tmp10 (F32.Load offset=0 tmp6)) (set tmp11 (I32.Load offset=4 tmp6)) \
+             (set tmp12 (I32.Load offset=8 tmp6)) \
+             (if (if (F32.Ne tmp7 tmp10) 1 (I32.Eqz (call ==(array(N)) tmp8 tmp9 tmp11 tmp12))) \
+             (then (return 0)) (else )) \
+             (set tmp4 (I32.Add tmp4 1)) (br 0))) \
+             (return 1)"
+        );
+    }
+
+    #[test]
+    fn equality_needs_values_to_compare() {
+        let src = "\
+struct H:
+    r: externref
+struct P:
+    x: i32
+let s = \"ab\" == \"ab\"
+let t = (1, \"a\") == (2, \"b\")
+enum(bool) E:
+    a = (1, \"a\") != (2, \"a\")
+fn f(h: H, p: P) -> bool:
+    let a = h == h
+    let b = (1, h) != (1, h)
+    let c = p < p
+    return p == 1
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::NotConstant,
+                TypeErrorKind::NotConstant,
+                TypeErrorKind::NotConstant,
+                invalid_operand("==", "H"),
+                invalid_operand("!=", "tuple(i32, H)"),
+                invalid_operand("<", "P"),
+                mismatch("P", "i32"),
             ]
         );
     }

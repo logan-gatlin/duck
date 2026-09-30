@@ -532,6 +532,30 @@ mod tests {
     }
 
     #[test]
+    fn array_equality_functions_follow_defined_functions() {
+        let src = "\
+struct N:
+    kids: array(N)
+extern:
+    fn log(x: i32)
+pub fn f(a: N, b: N, s: array(u8)) -> bool:
+    return a == b and s == s
+";
+        let bytes = emit_src(src);
+        let wat = wat(&bytes);
+        let funcs: Vec<_> = wat.lines().filter(|l| l.starts_with("  (func $")).collect();
+        assert_eq!(funcs.len(), 3, "{wat}");
+        assert!(funcs[0].contains("(func $f (;1;)"), "{wat}");
+        assert!(funcs[1].contains(r#"(func $"==(array(N))" (;2;)"#), "{wat}");
+        assert!(
+            funcs[2].contains(r#"(func $"==(array(u8))" (;3;)"#),
+            "{wat}"
+        );
+        let own = func_wat(&bytes, r#""==(array(N))""#);
+        assert!(own.contains(r#"call $"==(array(N))""#), "{own}");
+    }
+
+    #[test]
     fn imports_precede_defined_functions() {
         let src = "\
 struct P:

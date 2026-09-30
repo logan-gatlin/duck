@@ -4,13 +4,12 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, UnOp as IrUnOp, ValType};
+use crate::ir::{Const, Expr, Stmt, ValType};
 use crate::lex::Span;
-use crate::parse::{self, BinOp, EnumDecl, ExprKind, Ident, ItemKind};
+use crate::parse::{self, EnumDecl, ExprKind, Ident, ItemKind};
 
 use super::{
-    Body, Checker, EnumId, Item, Label, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, binary,
-    exprs, is_pure, scalar, zero,
+    Body, Checker, EnumId, Item, Label, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, zero,
 };
 
 pub(super) struct EnumDef {
@@ -271,65 +270,6 @@ impl Body<'_> {
             })
             .collect();
         Stmt::Block(copies)
-    }
-
-    /// `lhs == rhs` or `lhs != rhs` for values of the enum type `ty`, which
-    /// are equal when every scalar has the same bits.
-    pub(super) fn enum_eq(
-        &mut self,
-        op: BinOp,
-        ty: Ty,
-        lhs: Value,
-        rhs: Value,
-        span: Span,
-    ) -> (Ty, Value) {
-        let bool = Ty::Prim(Prim::Bool);
-        let symbol = if op == BinOp::Eq { "==" } else { "!=" };
-        // An `externref` has no bits to compare.
-        if !self.ck.storable(ty) {
-            return self.invalid_operand(symbol, ty, span);
-        }
-        let mut value = self.seq(vec![lhs, rhs]);
-        let vts = self.ck.val_types(ty);
-        // Scalars are compared in pairs, out of source order.
-        if vts.len() > 1 {
-            self.spill(&mut value, is_pure);
-        }
-        let mut lhs = exprs(value.scalars);
-        // Only after a type error.
-        if lhs.len() != 2 * vts.len() {
-            return (bool, scalar(ValType::I32, Expr::Const(Const::I32(0))));
-        }
-        let rhs = lhs.split_off(vts.len());
-        let (cmp, join, empty) = match op {
-            BinOp::Eq => (IrBinOp::Eq, IrBinOp::And, 1),
-            _ => (IrBinOp::Ne, IrBinOp::Or, 0),
-        };
-        let expr = vts
-            .into_iter()
-            .zip(lhs.into_iter().zip(rhs))
-            .map(|(vt, (a, b))| {
-                let (bits_vt, a, b) = match vt {
-                    ValType::F32 | ValType::F64 => {
-                        let bits = |e| Expr::Unary(vt, IrUnOp::Reinterpret, Box::new(e));
-                        let int = if vt == ValType::F32 {
-                            ValType::I32
-                        } else {
-                            ValType::I64
-                        };
-                        (int, bits(a), bits(b))
-                    }
-                    _ => (vt, a, b),
-                };
-                binary(bits_vt, cmp, a, b)
-            })
-            .reduce(|acc, e| binary(ValType::I32, join, acc, e))
-            .unwrap_or(Expr::Const(Const::I32(empty)));
-        let value = Value {
-            pre: value.pre,
-            scalars: vec![(ValType::I32, expr)],
-        };
-        (bool, value)
     }
 }
 
