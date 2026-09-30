@@ -2,13 +2,15 @@
 //! type. A value is stored as its member's constant, so each use of a member,
 //! like `ReturnCode.ok`, builds a fresh copy of it.
 
-use crate::ir::{BinOp as IrBinOp, Const, Expr, UnOp as IrUnOp, ValType};
+use std::collections::HashMap;
+
+use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
 use crate::parse::{self, BinOp, EnumDecl, ExprKind, Ident, ItemKind};
 
 use super::{
-    Body, Checker, EnumId, Item, Iteration, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit,
-    binary, exprs, is_pure, scalar, zero,
+    Body, Checker, EnumId, Item, Label, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, binary,
+    exprs, is_pure, scalar, zero,
 };
 
 pub(super) struct EnumDef {
@@ -243,52 +245,32 @@ impl Body<'_> {
         Some((Ty::Enum(id), self.scalars(Ty::Enum(id), consts)))
     }
 
-    /// A `for` loop over the members of enum `id`, in declaration order.
-    pub(super) fn enum_iteration(&mut self, id: EnumId) -> Iteration {
+    /// `for var in E`, where `E` names enum `id`: a copy of `body` per
+    /// member, in declaration order, after setting `var` to it. Each copy is
+    /// in a block that `continue` leaves, and they're all in one that `break`
+    /// leaves.
+    pub(super) fn unrolled_loop(&mut self, id: EnumId, var: &Ident, body: &parse::Block) -> Stmt {
         let ty = Ty::Enum(id);
-        let index = self.temp(ValType::I32);
-        let vts = self.ck.val_types(ty);
-        let members = &self.ck.enums[id.0 as usize].members;
-        // Every member but the last is picked out by its index. Only after a
-        // parse error is there no last one, and then the loop never runs.
-        let (last, rest) = match members.split_last() {
-            Some((last, rest)) => (Some(last), rest),
-            None => (None, &[][..]),
-        };
-        let scalars = vts
-            .into_iter()
-            .enumerate()
-            .map(|(leaf, vt)| {
-                let value = |member: &MemberDef| Expr::Const(member.value[leaf]);
-                let expr = rest.iter().enumerate().rev().fold(
-                    last.map_or(Expr::Const(zero(vt)), value),
-                    |next, (i, member)| {
-                        let at = Expr::Const(Const::I32(i as i32));
-                        Expr::If {
-                            ty: vt,
-                            cond: Box::new(binary(
-                                ValType::I32,
-                                IrBinOp::Eq,
-                                Expr::Local(index),
-                                at,
-                            )),
-                            then_expr: Box::new(value(member)),
-                            else_expr: Box::new(next),
-                        }
-                    },
-                );
-                (vt, expr)
+        let slots = self.alloc(&var.name, ty);
+        self.scopes.push(HashMap::new());
+        self.bind(&var.name, ty, false, slots.clone());
+        self.labels.push(Label::Break);
+        let body = self.labelled(Label::Continue, body);
+        self.labels.pop();
+        self.scopes.pop();
+        let copies = self.ck.enums[id.0 as usize]
+            .members
+            .iter()
+            .map(|member| {
+                let sets = slots.iter().zip(&member.value);
+                let mut copy: Vec<_> = sets
+                    .map(|(slot, c)| Stmt::SetLocal(*slot, Expr::Const(*c)))
+                    .collect();
+                copy.extend(body.iter().cloned());
+                Stmt::Block(copy)
             })
             .collect();
-        Iteration {
-            ty,
-            index,
-            len: Expr::Const(Const::I32(members.len() as i32)),
-            item: Value {
-                pre: Vec::new(),
-                scalars,
-            },
-        }
+        Stmt::Block(copies)
     }
 
     /// `lhs == rhs` or `lhs != rhs` for values of the enum type `ty`, which

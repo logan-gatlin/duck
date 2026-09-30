@@ -931,12 +931,11 @@ pub fn f(p: Point) -> bool:
     return p == Point.origin
 ";
         let func = func_wat(&emit_src(src), "f");
-        for op in [
-            "i64.reinterpret_f64",
-            "i32.reinterpret_f32",
-            "if (result i32)",
-        ] {
+        for op in ["i64.reinterpret_f64", "i32.reinterpret_f32"] {
             assert!(func.contains(op), "missing {op} in {func}");
         }
+        // Unrolled, with a call per member.
+        assert!(!func.contains("loop"), "{func}");
+        assert_eq!(func.matches("call $log").count(), 2, "{func}");
     }
 }

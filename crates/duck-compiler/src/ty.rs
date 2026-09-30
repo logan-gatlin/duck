@@ -474,18 +474,6 @@ enum Slots {
     },
 }
 
-/// What a `for` loop visits, one item at a time.
-struct Iteration {
-    /// The type of every item.
-    ty: Ty,
-    /// A new local that counts the items from zero.
-    index: LocalId,
-    /// How many items there are.
-    len: Expr,
-    /// The item that `index` counts up to.
-    item: Value,
-}
-
 /// A lowered expression: run `pre`, then evaluate `scalars` in order, one per
 /// scalar leaf of the expression's type.
 #[derive(Default)]
@@ -1830,7 +1818,8 @@ impl<'c> Body<'c> {
     }
 
     /// `for var in iter`, which copies each element of the array `iter`, or
-    /// each member of the enum `iter` names, to `var` in turn.
+    /// each member of the enum `iter` names, to `var` in turn. The array's
+    /// `len` and `ptr` are read once, before the first iteration.
     fn for_loop(
         &mut self,
         var: &Ident,
@@ -1838,37 +1827,10 @@ impl<'c> Body<'c> {
         body: &parse::Block,
         out: &mut Vec<Stmt>,
     ) {
-        let Iteration {
-            ty,
-            index,
-            len,
-            item,
-        } = match self.enum_name(iter) {
-            Some(id) => self.enum_iteration(id),
-            None => self.array_iteration(iter, out),
-        };
-        out.push(Stmt::SetLocal(index, Expr::Const(Const::I32(0))));
-        let i = Expr::Local(index);
-        let done = binary(ValType::I32, IrBinOp::GeU, i.clone(), len);
-        let mut inner = vec![Stmt::BrIf(1, done)];
-        let slots = self.alloc(&var.name, ty);
-        inner.extend(item.pre);
-        for (slot, (_, scalar)) in slots.iter().zip(item.scalars) {
-            inner.push(Stmt::SetLocal(*slot, scalar));
+        if let Some(id) = self.enum_name(iter) {
+            out.push(self.unrolled_loop(id, var, body));
+            return;
         }
-        // Advanced before the body, so `continue` moves on too.
-        let next = binary(ValType::I32, IrBinOp::Add, i, Expr::Const(Const::I32(1)));
-        inner.push(Stmt::SetLocal(index, next));
-        self.scopes.push(HashMap::new());
-        self.bind(&var.name, ty, false, slots);
-        let stmt = self.loop_stmt(inner, body);
-        self.scopes.pop();
-        out.push(stmt);
-    }
-
-    /// A `for` loop over the elements of the array `iter`, whose `len` and
-    /// `ptr` are read once, by statements pushed to `out`.
-    fn array_iteration(&mut self, iter: &parse::Expr, out: &mut Vec<Stmt>) -> Iteration {
         let (ty, value) = self.expr(iter, None);
         let elem = match ty {
             Ty::Array(id) => self.ck.element(id),
@@ -1885,13 +1847,25 @@ impl<'c> Body<'c> {
             let scalar = scalars.next().unwrap_or(Expr::Const(Const::I32(0)));
             out.push(Stmt::SetLocal(dest, scalar));
         }
-        let addr = element_addr(Expr::Local(ptr), Expr::Local(index), self.ck.layout(elem).0);
-        Iteration {
-            ty: elem,
-            index,
-            len: Expr::Local(len),
-            item: self.load(scalar(ValType::I32, addr), 0, elem),
+        out.push(Stmt::SetLocal(index, Expr::Const(Const::I32(0))));
+        let i = Expr::Local(index);
+        let done = binary(ValType::I32, IrBinOp::GeU, i.clone(), Expr::Local(len));
+        let mut inner = vec![Stmt::BrIf(1, done)];
+        let addr = element_addr(Expr::Local(ptr), i.clone(), self.ck.layout(elem).0);
+        let element = self.load(scalar(ValType::I32, addr), 0, elem);
+        let slots = self.alloc(&var.name, elem);
+        inner.extend(element.pre);
+        for (slot, (_, scalar)) in slots.iter().zip(element.scalars) {
+            inner.push(Stmt::SetLocal(*slot, scalar));
         }
+        // Advanced before the body, so `continue` moves on too.
+        let next = binary(ValType::I32, IrBinOp::Add, i, Expr::Const(Const::I32(1)));
+        inner.push(Stmt::SetLocal(index, next));
+        self.scopes.push(HashMap::new());
+        self.bind(&var.name, elem, false, slots);
+        let stmt = self.loop_stmt(inner, body);
+        self.scopes.pop();
+        out.push(stmt);
     }
 
     /// A loop that runs `head`, which may leave with `br 1`, then `body`, and
@@ -5814,15 +5788,11 @@ fn f():
 ";
         assert_eq!(
             body(&lower(src), "f"),
-            "(set tmp0 0) (block (loop \
-             (br_if 1 (I32.GeU tmp0 3)) \
-             (set r (if (I32.Eq tmp0 0) 0 (if (I32.Eq tmp0 1) 5 6))) \
-             (set tmp0 (I32.Add tmp0 1)) \
-             (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> []) (br 0))) \
-             (set tmp2 0) (block (loop \
-             (br_if 1 (I32.GeU tmp2 2)) \
-             (set p.0 (if (I32.Eq tmp2 0) 1 3)) (set p.1 (if (I32.Eq tmp2 0) 2 4)) \
-             (set tmp2 (I32.Add tmp2 1)) (br 0)))"
+            "(block \
+             (block (set r 0) (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> [])) \
+             (block (set r 5) (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> [])) \
+             (block (set r 6) (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> []))) \
+             (block (block (set p.0 1) (set p.1 2)) (block (set p.0 3) (set p.1 4)))"
         );
         let src = "\
 enum(i8) R:
