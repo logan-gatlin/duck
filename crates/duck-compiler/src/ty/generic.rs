@@ -101,7 +101,10 @@ impl Checker {
                     param.span,
                 );
             } else if is_builtin_type(&param.name)
-                || matches!(self.items.get(&param.name), Some(Item::Struct(_)))
+                || matches!(
+                    self.items.get(&param.name),
+                    Some(Item::Struct(_) | Item::Enum(_))
+                )
             {
                 self.error(TypeErrorKind::DuplicateItem(param.name.clone()), param.span);
             } else {
@@ -239,6 +242,7 @@ impl Checker {
                 0 => Some(Arity::Plain),
                 n => Some(Arity::Exactly(n)),
             },
+            Some(Item::Enum(_)) => Some(Arity::Plain),
             _ if is_builtin_type(name) => Some(Arity::Plain),
             _ => None,
         }

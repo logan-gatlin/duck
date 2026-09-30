@@ -21,6 +21,7 @@ pub enum ItemKind {
     Fn(FnDecl),
     Extern(ExternBlock),
     Struct(StructDecl),
+    Enum(EnumDecl),
     Binding(Binding),
     /// `import "path"`, which evaluates the items of another file in its
     /// place. Resolved by [`crate::load`], so later stages never see one.
@@ -80,6 +81,22 @@ pub struct Field {
     pub is_pub: bool,
     pub name: Ident,
     pub ty: Type,
+    pub span: Span,
+}
+
+/// `enum(Type) Name:` and its members, whose values have type `Type`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDecl {
+    pub name: Ident,
+    pub ty: Type,
+    pub members: Vec<Member>,
+}
+
+/// A `name` or `name = value` member of an enum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Member {
+    pub name: Ident,
+    pub value: Option<Expr>,
     pub span: Span,
 }
 
@@ -362,6 +379,7 @@ impl<'a> Parser<'a> {
                 ItemKind::Extern(self.extern_block()?)
             }
             TokenKind::Struct => ItemKind::Struct(self.struct_decl()?),
+            TokenKind::Enum => ItemKind::Enum(self.enum_decl()?),
             TokenKind::Let | TokenKind::Var => ItemKind::Binding(self.binding()?),
             TokenKind::Import => {
                 if is_pub {
@@ -472,6 +490,26 @@ impl<'a> Parser<'a> {
             params,
             fields: fields.into_iter().flatten().collect(),
         })
+    }
+
+    fn enum_decl(&mut self) -> PResult<EnumDecl> {
+        self.expect(TokenKind::Enum)?;
+        self.expect(TokenKind::LParen)?;
+        let ty = self.ty()?;
+        self.expect(TokenKind::RParen)?;
+        let name = self.ident()?;
+        let members = self.indented(|p| {
+            let start = p.peek().span;
+            let name = p.ident()?;
+            let value = match p.eat(TokenKind::Eq) {
+                true => Some(p.expr()?),
+                false => None,
+            };
+            let span = p.span_from(start);
+            p.expect(TokenKind::Newline)?;
+            Ok(Member { name, value, span })
+        })?;
+        Ok(EnumDecl { name, ty, members })
     }
 
     fn param(&mut self) -> PResult<Param> {
@@ -1606,6 +1644,53 @@ fn f():
         assert_eq!(
             errors("struct Box():\n    pass\n"),
             vec![expected("type parameter", TokenKind::RParen)]
+        );
+    }
+
+    #[test]
+    fn enums() {
+        let src = "\
+pub enum(i8) ReturnCode:
+    ok
+    error = 5 + 1
+enum(tuple(u8, u8)) Pair:
+    a = (1, 2)
+";
+        let module = parse_src(src).unwrap();
+        assert!(module.items[0].is_pub);
+        let decls: Vec<_> = module
+            .items
+            .iter()
+            .map(|item| match &item.kind {
+                ItemKind::Enum(e) => e,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(decls[0].name.name, "ReturnCode");
+        assert_eq!(render_ty(&decls[0].ty), "i8");
+        let members: Vec<_> = decls[0]
+            .members
+            .iter()
+            .map(|m| (m.name.name.as_str(), m.value.as_ref().map(sexpr)))
+            .collect();
+        assert_eq!(
+            members,
+            [("ok", None), ("error", Some("(Add 5 1)".to_string()))]
+        );
+        let error = &decls[0].members[1];
+        assert_eq!(&src[error.span.start..error.span.end], "error = 5 + 1");
+        assert_eq!(render_ty(&decls[1].ty), "tuple(u8, u8)");
+
+        assert_eq!(
+            errors("enum E:\n    a\n"),
+            vec![expected("`(`", TokenKind::Ident("E".into()))]
+        );
+        assert_eq!(
+            errors("enum(i8) E:\n    pub a\n    pass\n"),
+            vec![
+                expected("identifier", TokenKind::Pub),
+                expected("identifier", TokenKind::Pass),
+            ]
         );
     }
 

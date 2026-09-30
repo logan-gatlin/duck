@@ -377,6 +377,8 @@ fn unary(ty: ValType, op: UnOp) -> Instruction<'static> {
         (I64, ConvertU(F64)) => Instruction::F64ConvertI64U,
         (F64, Demote) => Instruction::F32DemoteF64,
         (F32, Promote) => Instruction::F64PromoteF32,
+        (F32, Reinterpret) => Instruction::I32ReinterpretF32,
+        (F64, Reinterpret) => Instruction::I64ReinterpretF64,
         _ => panic!("no wasm instruction {ty:?}.{op:?}"),
     }
 }
@@ -910,5 +912,31 @@ fn f(a: array(i32)):
       end
     end"
         );
+    }
+
+    #[test]
+    fn enums_compare_bits_and_loop_over_members() {
+        let src = "\
+extern:
+    fn log(text: array(u8))
+enum(array(u8)) Greeting:
+    hi = \"hello\"
+    bye = \"goodbye\"
+enum(tuple(f64, f32)) Point:
+    origin = (0.0, 0.0)
+    unit = (1.0, 1.0)
+pub fn f(p: Point) -> bool:
+    for g in Greeting:
+        log(g as array(u8))
+    return p == Point.origin
+";
+        let func = func_wat(&emit_src(src), "f");
+        for op in [
+            "i64.reinterpret_f64",
+            "i32.reinterpret_f32",
+            "if (result i32)",
+        ] {
+            assert!(func.contains(op), "missing {op} in {func}");
+        }
     }
 }

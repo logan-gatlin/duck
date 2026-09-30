@@ -20,8 +20,10 @@ use crate::parse::{
     PatternKind, StmtKind, TypeKind, UnaryOp,
 };
 
+use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
 
+mod enums;
 mod generic;
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
@@ -136,6 +138,10 @@ pub enum Prim {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StructId(u32);
 
+/// Index of an enum declaration, in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EnumId(u32);
+
 /// Index of an interned pointer type, which records the pointee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PtrId(u32);
@@ -156,6 +162,9 @@ pub struct ParamId(u32);
 pub enum Ty {
     Prim(Prim),
     Struct(StructId),
+    /// An enum, stored as the value of its member, so laid out like the type
+    /// of its values.
+    Enum(EnumId),
     /// `&T`, an address in linear memory, stored as an `i32`.
     Ptr(PtrId),
     /// `tuple(A, B)`, which is laid out like a struct with a field per element.
@@ -193,7 +202,7 @@ pub struct TypeError {
 pub enum TypeErrorKind {
     UnknownName(String),
     UnknownType(String),
-    /// A function or struct used as a value.
+    /// A function used as a value, or a struct or enum called as one.
     NotAValue(String),
     NotCallable(String),
     DuplicateItem(String),
@@ -203,6 +212,27 @@ pub enum TypeErrorKind {
     DuplicateBinding(String),
     /// A struct that contains itself by value.
     RecursiveStruct(String),
+    /// An enum whose values hold the enum itself, outside of any struct.
+    RecursiveEnum(String),
+    DuplicateMember(String),
+    /// Two members of an enum with the same bits.
+    DuplicateValue {
+        member: String,
+        same_as: String,
+    },
+    /// A member without a value in an enum whose values aren't integers,
+    /// which count up.
+    MissingValue(String),
+    /// A member without a value that counts past the largest integer of the
+    /// enum's type.
+    MemberOutOfRange {
+        member: String,
+        ty: String,
+    },
+    NoMember {
+        ty: String,
+        member: String,
+    },
     /// A generic struct that uses itself with ever larger type arguments,
     /// so it has no end of instances.
     ExpansiveRecursion(String),
@@ -261,7 +291,8 @@ pub enum TypeErrorKind {
     MissingReturn(String),
     BreakOutsideLoop,
     ContinueOutsideLoop,
-    /// A global initializer that can't be evaluated at compile time.
+    /// A global initializer or enum member's value that can't be evaluated
+    /// at compile time.
     NotConstant,
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
@@ -300,6 +331,8 @@ struct Checker {
     /// The type parameters in scope, while resolving a generic struct's
     /// fields.
     type_params: Vec<(String, Ty)>,
+    /// Enum declarations in declaration order.
+    enums: Vec<EnumDef>,
     /// Instances whose fields wait on every generic struct's being defined.
     pending: Vec<StructId>,
     /// Whether every generic struct's fields are known, so instances can
@@ -337,6 +370,7 @@ struct Checker {
 enum Item {
     Func(FuncId),
     Struct(StructId),
+    Enum(EnumId),
     Global(usize),
 }
 
@@ -438,6 +472,18 @@ enum Slots {
         addr: Expr,
         offset: u32,
     },
+}
+
+/// What a `for` loop visits, one item at a time.
+struct Iteration {
+    /// The type of every item.
+    ty: Ty,
+    /// A new local that counts the items from zero.
+    index: LocalId,
+    /// How many items there are.
+    len: Expr,
+    /// The item that `index` counts up to.
+    item: Value,
 }
 
 /// A lowered expression: run `pre`, then evaluate `scalars` in order, one per
@@ -587,6 +633,19 @@ impl fmt::Display for TypeErrorKind {
             Self::DuplicateParam(name) => write!(f, "duplicate parameter `{name}`"),
             Self::DuplicateBinding(name) => write!(f, "`{name}` is bound more than once"),
             Self::RecursiveStruct(name) => write!(f, "struct `{name}` contains itself"),
+            Self::RecursiveEnum(name) => write!(f, "enum `{name}` contains itself"),
+            Self::DuplicateMember(name) => write!(f, "duplicate member `{name}`"),
+            Self::DuplicateValue { member, same_as } => {
+                write!(f, "member `{member}` has the same value as `{same_as}`")
+            }
+            Self::MissingValue(name) => write!(
+                f,
+                "member `{name}` needs a value, as only members of integer enums count up"
+            ),
+            Self::MemberOutOfRange { member, ty } => {
+                write!(f, "member `{member}` counts past the largest `{ty}`")
+            }
+            Self::NoMember { ty, member } => write!(f, "`{ty}` has no member `{member}`"),
             Self::ExpansiveRecursion(name) => write!(
                 f,
                 "struct `{name}` uses itself with ever larger type arguments"
@@ -636,7 +695,7 @@ impl fmt::Display for TypeErrorKind {
             Self::MissingReturn(name) => write!(f, "`{name}` can finish without returning"),
             Self::BreakOutsideLoop => write!(f, "`break` outside of a loop"),
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
-            Self::NotConstant => write!(f, "global initializers must be constant"),
+            Self::NotConstant => write!(f, "global initializers and enum members must be constant"),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
             Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
@@ -767,6 +826,7 @@ impl Checker {
                     }
                     continue;
                 }
+                ItemKind::Enum(e) => (&e.name, Item::Enum(self.declare_enum(e))),
                 // Replaced by the imported items when loading.
                 ItemKind::Import(_) => continue,
             };
@@ -791,10 +851,11 @@ impl Checker {
         }
     }
 
-    /// Resolves every struct's fields, reporting generic structs that recurse
-    /// without end and structs that contain themselves, then gives every
-    /// instance used so far its fields.
+    /// Resolves the type of every enum's values and every struct's fields,
+    /// reporting generic structs that recurse without end and types that
+    /// contain themselves, then gives every instance used so far its fields.
     fn define_structs(&mut self, module: &parse::Module) {
+        self.resolve_enums(module);
         let decls = module.items.iter().filter_map(|item| match &item.kind {
             ItemKind::Struct(s) => Some(s),
             _ => None,
@@ -844,6 +905,7 @@ impl Checker {
             self.break_cycles(id, &mut visits, false);
         }
         self.check_field_pointers(0..self.structs.len());
+        self.check_enum_pointers();
         self.structs_defined = true;
     }
 
@@ -921,6 +983,7 @@ impl Checker {
     fn push_inline_structs(&self, ty: Ty, out: &mut Vec<StructId>) {
         match ty {
             Ty::Struct(id) => out.push(id),
+            Ty::Enum(id) => self.push_inline_structs(self.enum_ty(id), out),
             Ty::Tuple(id) => {
                 for elem in &self.tuples[id.0 as usize] {
                     self.push_inline_structs(*elem, out);
@@ -945,14 +1008,20 @@ impl Checker {
         }
     }
 
-    /// Checks and folds global initializers in declaration order.
+    /// Checks and folds global initializers and the values of enum members,
+    /// in declaration order.
     fn define_globals(&mut self, module: &parse::Module) {
-        let decls = module.items.iter().filter_map(|item| match &item.kind {
-            ItemKind::Binding(b) => Some((item, b)),
-            _ => None,
-        });
-        let mut index = 0;
-        for (item, decl) in decls {
+        let (mut index, mut enum_index) = (0, 0);
+        for item in &module.items {
+            let decl = match &item.kind {
+                ItemKind::Binding(decl) => decl,
+                ItemKind::Enum(decl) => {
+                    self.define_members(EnumId(enum_index), decl);
+                    enum_index += 1;
+                    continue;
+                }
+                _ => continue,
+            };
             let mut body = Body::new(self, Ty::Unit);
             body.global = true;
             let (ty, value) = body.binding_value(decl);
@@ -1124,6 +1193,8 @@ impl Checker {
                         true => Ty::Struct(id),
                         false => self.instantiate(id, args, ty.span),
                     }
+                } else if let Some(Item::Enum(id)) = self.items.get(name).copied() {
+                    Ty::Enum(id)
                 } else {
                     unreachable!("`type_arity` knows every type")
                 }
@@ -1145,6 +1216,7 @@ impl Checker {
     fn storable(&self, ty: Ty) -> bool {
         match ty {
             Ty::ExternRef => false,
+            Ty::Enum(id) => self.storable(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) => self
                 .members(ty)
                 .into_iter()
@@ -1240,6 +1312,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
+            Ty::Enum(id) => self.enums[id.0 as usize].name.clone(),
             Ty::Ptr(id) => format!("&{}", self.ty_name(self.pointee(id))),
             Ty::Array(id) => format!("{ARRAY}({})", self.ty_name(self.element(id))),
             Ty::Tuple(id) => {
@@ -1270,6 +1343,7 @@ impl Checker {
             Ty::Prim(prim) => out.push((name, prim.val_type())),
             Ty::Ptr(_) => out.push((name, ValType::I32)),
             Ty::ExternRef => out.push((name, ValType::ExternRef)),
+            Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
             Ty::Struct(id) => {
                 for field in &self.structs[id.0 as usize].fields {
                     self.push_leaves(field.ty, format!("{name}.{}", field.name), out);
@@ -1305,6 +1379,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => out.push(Some(prim)),
             Ty::Ptr(_) | Ty::ExternRef => out.push(None),
+            Ty::Enum(id) => self.push_leaf_prims(self.enum_ty(id), out),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 for member in self.members(ty) {
                     self.push_leaf_prims(member, out);
@@ -1351,6 +1426,27 @@ impl Checker {
             self.error(kind, field.span);
         }
         None
+    }
+
+    /// `value as to`, where `value` has type `from`, and its type: `to`, or
+    /// the error type for an enum whose values' type failed to resolve.
+    /// `None` if the cast isn't allowed.
+    fn cast_value(&self, from: Ty, to: Ty, value: Value) -> Option<(Ty, Value)> {
+        match (from, to) {
+            // Any type casts to itself.
+            (from, to) if from == to => Some((to, value)),
+            // Already reported.
+            (Ty::Error, _) => Some((Ty::Error, Value::default())),
+            (Ty::Prim(from), Ty::Prim(to)) if convertible(from, to) => Some((
+                Ty::Prim(to),
+                map1(value, to.val_type(), |e| convert(from, to, e)),
+            )),
+            (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
+            | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => Some((to, value)),
+            // An enum casts to whatever the type of its values does.
+            (Ty::Enum(id), to) => self.cast_value(self.enum_ty(id), to, value),
+            _ => None,
+        }
     }
 
     /// The names `pattern` binds when it takes apart a value of type `ty`, in
@@ -1410,6 +1506,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => (prim.size(), prim.size()),
             Ty::Ptr(_) => (4, 4),
+            Ty::Enum(id) => self.layout(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 let (_, size, align) = self.aggregate_layout(ty);
                 (size, align)
@@ -1459,6 +1556,7 @@ impl Checker {
                 store: StoreOp::Store,
                 bool: false,
             }),
+            Ty::Enum(id) => self.push_cells(self.enum_ty(id), offset, out),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 let offsets = self.aggregate_layout(ty).0;
                 for (member, member_offset) in self.members(ty).into_iter().zip(offsets) {
@@ -1731,9 +1829,8 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// `for var in iter`, which copies each element of the array `iter` to
-    /// `var` in turn. The array's `len` and `ptr` are read once, before the
-    /// first iteration.
+    /// `for var in iter`, which copies each element of the array `iter`, or
+    /// each member of the enum `iter` names, to `var` in turn.
     fn for_loop(
         &mut self,
         var: &Ident,
@@ -1741,6 +1838,37 @@ impl<'c> Body<'c> {
         body: &parse::Block,
         out: &mut Vec<Stmt>,
     ) {
+        let Iteration {
+            ty,
+            index,
+            len,
+            item,
+        } = match self.enum_name(iter) {
+            Some(id) => self.enum_iteration(id),
+            None => self.array_iteration(iter, out),
+        };
+        out.push(Stmt::SetLocal(index, Expr::Const(Const::I32(0))));
+        let i = Expr::Local(index);
+        let done = binary(ValType::I32, IrBinOp::GeU, i.clone(), len);
+        let mut inner = vec![Stmt::BrIf(1, done)];
+        let slots = self.alloc(&var.name, ty);
+        inner.extend(item.pre);
+        for (slot, (_, scalar)) in slots.iter().zip(item.scalars) {
+            inner.push(Stmt::SetLocal(*slot, scalar));
+        }
+        // Advanced before the body, so `continue` moves on too.
+        let next = binary(ValType::I32, IrBinOp::Add, i, Expr::Const(Const::I32(1)));
+        inner.push(Stmt::SetLocal(index, next));
+        self.scopes.push(HashMap::new());
+        self.bind(&var.name, ty, false, slots);
+        let stmt = self.loop_stmt(inner, body);
+        self.scopes.pop();
+        out.push(stmt);
+    }
+
+    /// A `for` loop over the elements of the array `iter`, whose `len` and
+    /// `ptr` are read once, by statements pushed to `out`.
+    fn array_iteration(&mut self, iter: &parse::Expr, out: &mut Vec<Stmt>) -> Iteration {
         let (ty, value) = self.expr(iter, None);
         let elem = match ty {
             Ty::Array(id) => self.ck.element(id),
@@ -1757,25 +1885,13 @@ impl<'c> Body<'c> {
             let scalar = scalars.next().unwrap_or(Expr::Const(Const::I32(0)));
             out.push(Stmt::SetLocal(dest, scalar));
         }
-        out.push(Stmt::SetLocal(index, Expr::Const(Const::I32(0))));
-        let i = Expr::Local(index);
-        let done = binary(ValType::I32, IrBinOp::GeU, i.clone(), Expr::Local(len));
-        let mut inner = vec![Stmt::BrIf(1, done)];
-        let addr = element_addr(Expr::Local(ptr), i.clone(), self.ck.layout(elem).0);
-        let element = self.load(scalar(ValType::I32, addr), 0, elem);
-        let slots = self.alloc(&var.name, elem);
-        inner.extend(element.pre);
-        for (slot, (_, scalar)) in slots.iter().zip(element.scalars) {
-            inner.push(Stmt::SetLocal(*slot, scalar));
+        let addr = element_addr(Expr::Local(ptr), Expr::Local(index), self.ck.layout(elem).0);
+        Iteration {
+            ty: elem,
+            index,
+            len: Expr::Local(len),
+            item: self.load(scalar(ValType::I32, addr), 0, elem),
         }
-        // Advanced before the body, so `continue` moves on too.
-        let next = binary(ValType::I32, IrBinOp::Add, i, Expr::Const(Const::I32(1)));
-        inner.push(Stmt::SetLocal(index, next));
-        self.scopes.push(HashMap::new());
-        self.bind(&var.name, elem, false, slots);
-        let stmt = self.loop_stmt(inner, body);
-        self.scopes.pop();
-        out.push(stmt);
     }
 
     /// A loop that runs `head`, which may leave with `br 1`, then `body`, and
@@ -1829,7 +1945,7 @@ impl<'c> Body<'c> {
                             slots: Slots::Global(global.slots.clone()),
                         })
                     }
-                    Some(Item::Func(_) | Item::Struct(_)) => {
+                    Some(Item::Func(_) | Item::Struct(_) | Item::Enum(_)) => {
                         self.error(TypeErrorKind::NotAssignable, target.span);
                         None
                     }
@@ -2053,6 +2169,9 @@ impl<'c> Body<'c> {
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expected, expr.span),
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
             ExprKind::Field(inner, field) => {
+                if let Some(member) = self.enum_name(inner).and_then(|id| self.member(id, field)) {
+                    return member;
+                }
                 let (mut ty, mut value) = self.expr(inner, None);
                 // Fields are reached through any number of pointers.
                 while let Ty::Ptr(id) = ty {
@@ -2202,8 +2321,8 @@ impl<'c> Body<'c> {
                     (Ty::Error, Value::default())
                 }
             },
-            // Struct names are types, which `expr` makes values.
-            Some(Item::Func(_) | Item::Struct(_)) => {
+            // Struct and enum names are types, which `expr` makes values.
+            Some(Item::Func(_) | Item::Struct(_) | Item::Enum(_)) => {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
@@ -2220,7 +2339,7 @@ impl<'c> Body<'c> {
     fn is_type_expr(&self, expr: &parse::Expr) -> bool {
         match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.items.get(name) {
-                Some(item) => matches!(item, Item::Struct(_)),
+                Some(item) => matches!(item, Item::Struct(_) | Item::Enum(_)),
                 None => is_builtin_type(name),
             },
             ExprKind::Call(callee, args) => self.names_type(callee, args),
@@ -2361,6 +2480,9 @@ impl<'c> Body<'c> {
         let bool = Ty::Prim(Prim::Bool);
         let prim = match ty {
             Ty::Prim(prim) => prim,
+            Ty::Enum(_) if matches!(op, BinOp::Eq | BinOp::NotEq) => {
+                return self.enum_eq(op, ty, lhs, rhs, span);
+            }
             // Pointers compare as unsigned addresses.
             Ty::Ptr(_) if is_comparison(op) => Prim::U32,
             _ => return self.invalid_operand(binop_symbol(op), ty, span),
@@ -2456,17 +2578,12 @@ impl<'c> Body<'c> {
             _ => None,
         };
         let (from, value) = self.expr(operand, expected);
-        match (from, to) {
-            (Ty::Error, _) | (_, Ty::Error) => (Ty::Error, Value::default()),
-            // Any type casts to itself.
-            (from, to) if from == to => (to, value),
-            (Ty::Prim(from), Ty::Prim(to)) if convertible(from, to) => (
-                Ty::Prim(to),
-                map1(value, to.val_type(), |e| convert(from, to, e)),
-            ),
-            (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
-            | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => (to, value),
-            _ => {
+        if from == Ty::Error || to == Ty::Error {
+            return (Ty::Error, Value::default());
+        }
+        match self.ck.cast_value(from, to, value) {
+            Some(cast) => cast,
+            None => {
                 let kind = TypeErrorKind::InvalidCast {
                     from: self.ck.ty_name(from),
                     to: self.ck.ty_name(to),
@@ -2524,7 +2641,9 @@ impl<'c> Body<'c> {
             ExprKind::Name(name) => match self.ck.items.get(name).copied() {
                 Some(Item::Func(id)) => Ok(Item::Func(id)),
                 Some(Item::Struct(id)) => Ok(Item::Struct(id)),
-                Some(Item::Global(_)) => Err(TypeErrorKind::NotCallable(name.clone())),
+                Some(Item::Enum(_) | Item::Global(_)) => {
+                    Err(TypeErrorKind::NotCallable(name.clone()))
+                }
                 None if is_builtin_type(name) => Err(TypeErrorKind::NotCallable(name.clone())),
                 None => Err(TypeErrorKind::UnknownName(name.clone())),
             },
@@ -2571,7 +2690,7 @@ impl<'c> Body<'c> {
                 (sig.ret, Value { pre, scalars })
             }
             Ok(Item::Struct(id)) => self.construct(Ty::Struct(id), args, span),
-            Ok(Item::Global(_)) | Err(_) => {
+            Ok(Item::Enum(_) | Item::Global(_)) | Err(_) => {
                 if let Err(kind) = item {
                     self.error(kind, callee.span);
                 }
@@ -3178,6 +3297,8 @@ fn fold_unary(op: IrUnOp, c: Const) -> Result<Const, Fold> {
         (IrUnOp::ExtendU, I32(x)) => I64(x as u32 as i64),
         (IrUnOp::Demote, F64(x)) => F32(x as f32),
         (IrUnOp::Promote, F32(x)) => F64(x as f64),
+        (IrUnOp::Reinterpret, F32(x)) => I32(x.to_bits() as i32),
+        (IrUnOp::Reinterpret, F64(x)) => I64(x.to_bits() as i64),
         // Rust's float to int `as` saturates and maps NaN to 0, like wasm's
         // `trunc_sat`.
         (IrUnOp::TruncSatS(to), F32(_) | F64(_)) => {
@@ -5476,6 +5597,323 @@ fn f():
                 },
                 span: None,
             }])
+        );
+    }
+
+    #[test]
+    fn enum_members_are_their_values() {
+        let src = "\
+enum(i8) ReturnCode:
+    ok
+    error = 5
+    fatal
+fn f() -> i8:
+    let r = ReturnCode.fatal
+    return r as i8
+";
+        assert_eq!(body(&lower(src), "f"), "(set r 6) (return r)");
+    }
+
+    #[test]
+    fn enum_members_are_distinct_constants() {
+        use TypeErrorKind::*;
+        let src = "\
+struct P:
+    x: i32
+enum(i8) Count:
+    a = 126
+    b
+    c
+enum(u8) Clash:
+    a = 1
+    b
+    c = 2
+    a = 3
+enum(f32) Zeros:
+    pos = 0.0
+    neg = -0.0
+    same = 0.0
+enum(P) Points:
+    origin = P(x: 0)
+    far
+var v = 1
+fn f() -> i32:
+    return 1
+enum(i32) Bad:
+    call = f()
+    mutable = v
+    own = Bad.call as i32
+    later = Later.x as i32
+    wrong = true
+    after
+enum(i32) Later:
+    x = 1
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                MemberOutOfRange {
+                    member: "c".into(),
+                    ty: "i8".into()
+                },
+                DuplicateValue {
+                    member: "c".into(),
+                    same_as: "b".into()
+                },
+                DuplicateMember("a".into()),
+                DuplicateValue {
+                    member: "same".into(),
+                    same_as: "pos".into()
+                },
+                MissingValue("far".into()),
+                NotConstant,
+                NotConstant,
+                NotConstant,
+                NotConstant,
+                mismatch("i32", "bool"),
+            ]
+        );
+    }
+
+    #[test]
+    fn enums_compare_their_bits() {
+        let src = "\
+enum(i8) R:
+    ok
+    err
+enum(tuple(f32, u8)) T:
+    a = (0.0, 1)
+    b = (-0.0, 1)
+enum(tuple()) U:
+    only = ()
+let same = T.a == T.b
+fn f(r: R, t: T, u: T) -> bool:
+    let x = r == R.ok
+    let y = t != u
+    let z = U.only == U.only
+    return x and y
+";
+        let module = lower(src);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
+        assert_eq!(globals[0], ("same", Const::I32(0)));
+        assert_eq!(
+            body(&module, "f"),
+            "(set x (I32.Eq r 0)) \
+             (set y (I32.Or (I32.Ne (F32.Reinterpret t.0) (F32.Reinterpret u.0)) (I32.Ne t.1 u.1))) \
+             (set z 1) \
+             (return (if x y 0))"
+        );
+        let src = "\
+enum(i8) R:
+    ok
+fn f(r: R):
+    let a = r < R.ok
+    let b = r == 0
+    let c = r + r
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                invalid_operand("<", "R"),
+                mismatch("R", "i32"),
+                invalid_operand("+", "R"),
+            ]
+        );
+    }
+
+    #[test]
+    fn enums_cast_as_the_type_of_their_values() {
+        let src = "\
+enum(i8) R:
+    ok = -1
+    size
+enum(R) S:
+    good = R.ok
+enum(f32) F:
+    half = 0.5
+pub let DEFAULT = S.good
+fn f(s: S) -> i32:
+    let a = s as R
+    let b = s as i32
+    let c = F.half as i64
+    let d = R.size as i8
+    let e = (R as type).size + S.align
+    let t: type = R
+    return b
+";
+        let module = lower(src);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.export.as_deref(), g.init))
+            .collect();
+        assert_eq!(globals[0], ("DEFAULT", Some("DEFAULT"), Const::I32(-1)));
+        assert_eq!(
+            body(&module, "f"),
+            "(set a s) (set b s) (set c (F32.TruncSatS(I64) 0.5f32)) (set d 0) \
+             (set e (I32.Add 1 1)) (set t.size 1) (set t.align 1) (return b)"
+        );
+        let src = "\
+enum(i8) R:
+    ok
+fn f(x: i8, r: R):
+    let a = x as R
+    let b = r as bool
+    let c = R.missing
+    R.ok = r
+    let d = r.ok
+";
+        use TypeErrorKind::*;
+        assert_eq!(
+            errors(src),
+            vec![
+                InvalidCast {
+                    from: "i8".into(),
+                    to: "R".into()
+                },
+                InvalidCast {
+                    from: "R".into(),
+                    to: "bool".into()
+                },
+                NoMember {
+                    ty: "R".into(),
+                    member: "missing".into()
+                },
+                NotAssignable,
+                NoField {
+                    ty: "R".into(),
+                    field: "ok".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn for_loops_visit_each_enum_member() {
+        let src = "\
+extern:
+    fn log(n: i8)
+enum(i8) R:
+    ok
+    err = 5
+    fatal
+enum(tuple(u8, u8)) P:
+    a = (1, 2)
+    b = (3, 4)
+fn f():
+    for r in R:
+        if r == R.err:
+            continue
+        log(r as i8)
+    for p in P:
+        pass
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp0 0) (block (loop \
+             (br_if 1 (I32.GeU tmp0 3)) \
+             (set r (if (I32.Eq tmp0 0) 0 (if (I32.Eq tmp0 1) 5 6))) \
+             (set tmp0 (I32.Add tmp0 1)) \
+             (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> []) (br 0))) \
+             (set tmp2 0) (block (loop \
+             (br_if 1 (I32.GeU tmp2 2)) \
+             (set p.0 (if (I32.Eq tmp2 0) 1 3)) (set p.1 (if (I32.Eq tmp2 0) 2 4)) \
+             (set tmp2 (I32.Add tmp2 1)) (br 0)))"
+        );
+        let src = "\
+enum(i8) R:
+    ok
+struct S:
+    pass
+fn f(E: i32):
+    for a in (R as type):
+        pass
+    for b in S:
+        pass
+    for c in E:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                invalid_operand("for", "type"),
+                invalid_operand("for", "type"),
+                invalid_operand("for", "i32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn enums_are_laid_out_like_their_values() {
+        let src = "\
+extern:
+    fn get() -> R
+enum(i8) R:
+    ok
+    err
+struct S:
+    r: R
+    x: i32
+let codes: array(R) = [R.err, R.ok]
+fn f(p: &S) -> R:
+    p.r = get()
+    return p.r
+";
+        let module = lower(src);
+        assert_eq!(data(&module), [(0, &[1, 0][..])]);
+        assert_eq!(module.imports[0].results, [ValType::I32]);
+        assert_eq!(
+            body(&module, "f"),
+            "(I32.Store8 offset=0 p (I32.Extend8S (call get ))) \
+             (return (I32.Load8S offset=0 p))"
+        );
+    }
+
+    #[test]
+    fn enums_can_not_contain_themselves() {
+        use TypeErrorKind::*;
+        let src = "\
+enum(i8) R:
+    ok
+struct R:
+    pass
+enum(A) A:
+    a = 1
+enum(tuple(C, i8)) C:
+    c = 1
+struct S:
+    e: E
+enum(S) E:
+    a = S(e: 1)
+enum(Nope) Z:
+    z = 1
+enum(&externref) X:
+    x = 1
+struct Box(R):
+    value: R
+enum(tuple(u8, u8)) P:
+    a = (1, 2)
+fn f():
+    let r = R(1)
+    let (a, b) = P.a
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateItem("R".into()),
+                UnknownType("Nope".into()),
+                RecursiveEnum("A".into()),
+                RecursiveEnum("C".into()),
+                DuplicateItem("R".into()),
+                RecursiveStruct("S".into()),
+                NotStorable("externref".into()),
+                NotCallable("R".into()),
+                mismatch("tuple(_, _)", "P"),
+            ]
         );
     }
 }
