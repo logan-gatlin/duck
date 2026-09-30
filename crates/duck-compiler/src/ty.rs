@@ -887,7 +887,7 @@ impl Checker {
             self.fill_instance(id);
         }
         // Type arguments can close a cycle through a declaration, as in
-        // `struct S: w: W(S)` where `struct W(T): x: T`.
+        // `struct S: w: W(S)` where `struct(T) W: x: T`.
         let mut visits: Vec<_> = (0..self.structs.len())
             .map(|id| match self.is_open(StructId(id as u32)) {
                 true => Visit::Done,
@@ -4894,9 +4894,9 @@ fn f(t: tuple(i32, f32)) -> tuple(i32, i32):
     #[test]
     fn generic_structs_are_instantiated_per_type_argument() {
         let src = "\
-struct Box(T):
+struct(T) Box:
     value: T
-struct Pair(A, B):
+struct(A, B) Pair:
     a: A
     b: Box(B)
 fn f(x: Box(i32)) -> Pair(f64, u8):
@@ -4917,7 +4917,7 @@ fn g(p: &Pair(u8, i64)) -> i64:
             "(set b.value 1) (set c.value x.value) (return 2f64 3)"
         );
         assert_eq!(
-            errors("struct Box(T):\n    value: T\nfn f(x: Box(i32)) -> Box(u8):\n    return x\n"),
+            errors("struct(T) Box:\n    value: T\nfn f(x: Box(i32)) -> Box(u8):\n    return x\n"),
             vec![mismatch("Box(u8)", "Box(i32)")]
         );
     }
@@ -4926,15 +4926,15 @@ fn g(p: &Pair(u8, i64)) -> i64:
     fn type_arguments_must_match_type_parameters() {
         use TypeErrorKind::*;
         let src = "\
-struct Box(T):
+struct(T) Box:
     value: T
 struct P:
     x: i32
-struct Bad(T, T, P, i32):
+struct(T, T, P, i32) Bad:
     pass
 struct array:
     pass
-struct Wrap(T):
+struct(T) Wrap:
     w: T()
 fn f(a: Box, b: P(i32), c: Box(i32, u8), d: array, e: i32(u8)):
     let g = Box(i32)
@@ -4996,10 +4996,10 @@ fn g(a: i32(), b: P(), c: Box(), d: array(), e: Foo(), f: Foo):
     #[test]
     fn generic_declarations_report_errors_once_and_uses_report_their_own() {
         let src = "\
-struct Box(T):
+struct(T) Box:
     value: T
     other: Missing
-struct Ptr(T):
+struct(T) Ptr:
     p: &T
 struct Holder:
     h: Ptr(externref)
@@ -5038,29 +5038,29 @@ fn f(a: Ptr(tuple(externref, i32)), b: &Box(externref), c: Box(i32), d: Box(u8))
     fn generic_structs_must_have_finitely_many_finite_instances() {
         use TypeErrorKind::*;
         let src = "\
-struct L(T):
+struct(T) L:
     next: L(T)
-struct A(T):
+struct(T) A:
     b: B(T)
-struct B(T):
+struct(T) B:
     a: A(T)
-struct W(T):
+struct(T) W:
     x: T
 struct S:
     w: W(S)
-struct List(T):
+struct(T) List:
     next: &List(T)
-struct Pair(X, Y):
+struct(X, Y) Pair:
     swap: &Pair(Y, X)
-struct C(T):
+struct(T) C:
     other: &C(i32)
-struct Bad(T):
+struct(T) Bad:
     next: &Bad(&T)
-struct M(T):
+struct(T) M:
     n: &N(Box(T))
-struct N(T):
+struct(T) N:
     m: &M(T)
-struct Box(T):
+struct(T) Box:
     value: T
 fn f(a: List(i32), p: Pair(i32, u8), c: C(u8), b: Bad(i32), m: M(f32)):
     pass
@@ -5091,9 +5091,9 @@ fn f(a: List(i32), p: Pair(i32, u8), c: C(u8), b: Bad(i32), m: M(f32)):
         let src = "\
 struct tuple:
     pass
-struct Box(T):
+struct(T) Box:
     value: T
-struct Bad(tuple):
+struct(tuple) Bad:
     pass
 fn f(a: tuple(i32), b: tuple(), c: tuple) -> tuple():
     let d = Box(tuple(i32, u8))(value: (1, 2))
@@ -5137,7 +5137,7 @@ fn f(a: tuple(i32), b: tuple(), c: tuple) -> tuple():
 struct Point:
     x: f32
     y: f64
-struct Box(T):
+struct(T) Box:
     value: T
 pub let INT = i32
 var heap: u32 = 1024
@@ -5179,7 +5179,7 @@ fn g(i32: u32) -> u32:
         let src = "\
 struct type:
     pass
-struct Box(T):
+struct(T) Box:
     value: T
 fn f(t: type):
     let a = externref
@@ -6006,7 +6006,7 @@ enum(Nope) Z:
     z = 1
 enum(&externref) X:
     x = 1
-struct Box(R):
+struct(R) Box:
     value: R
 enum(tuple(u8, u8)) P:
     a = (1, 2)

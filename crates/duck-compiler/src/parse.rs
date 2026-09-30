@@ -70,7 +70,7 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     pub name: Ident,
-    /// The names of `struct Name(A, B)`'s type parameters, if it has any.
+    /// The names of `struct(A, B) Name`'s type parameters, if it has any.
     pub params: Vec<Ident>,
     pub fields: Vec<Field>,
 }
@@ -468,14 +468,8 @@ impl<'a> Parser<'a> {
 
     fn struct_decl(&mut self) -> PResult<StructDecl> {
         self.expect(TokenKind::Struct)?;
+        let params = self.type_params()?;
         let name = self.ident()?;
-        let mut params = Vec::new();
-        if self.eat(TokenKind::LParen) {
-            if self.at(TokenKind::RParen) {
-                return Err(self.unexpected("type parameter"));
-            }
-            params = self.comma_list(TokenKind::RParen, Self::ident)?;
-        }
         let fields = self.indented(|p| {
             if p.eat(TokenKind::Pass) {
                 p.expect(TokenKind::Newline)?;
@@ -490,6 +484,18 @@ impl<'a> Parser<'a> {
             params,
             fields: fields.into_iter().flatten().collect(),
         })
+    }
+
+    /// The `(A, B)` after `struct` or `fn` that makes a declaration generic,
+    /// if there is one.
+    fn type_params(&mut self) -> PResult<Vec<Ident>> {
+        if !self.eat(TokenKind::LParen) {
+            return Ok(Vec::new());
+        }
+        if self.at(TokenKind::RParen) {
+            return Err(self.unexpected("type parameter"));
+        }
+        self.comma_list(TokenKind::RParen, Self::ident)
     }
 
     fn enum_decl(&mut self) -> PResult<EnumDecl> {
@@ -1630,7 +1636,7 @@ fn f():
     #[test]
     fn type_params() {
         let module =
-            parse_src("struct Pair(A, B,):\n    a: A\n    b: B\nstruct P:\n    pass\n").unwrap();
+            parse_src("struct(A, B,) Pair:\n    a: A\n    b: B\nstruct P:\n    pass\n").unwrap();
         let ItemKind::Struct(pair) = &module.items[0].kind else {
             panic!()
         };
@@ -1642,7 +1648,7 @@ fn f():
         assert!(p.params.is_empty());
 
         assert_eq!(
-            errors("struct Box():\n    pass\n"),
+            errors("struct() Box:\n    pass\n"),
             vec![expected("type parameter", TokenKind::RParen)]
         );
     }
