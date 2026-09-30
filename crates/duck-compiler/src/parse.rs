@@ -129,10 +129,9 @@ pub struct Type {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeKind {
-    /// `Name`, or `Name(A, B)` given type arguments.
-    Named(String, Vec<Type>),
-    /// `()`
-    Unit,
+    /// `Name`, or `Name(A, B)` given a list of type arguments, which may be
+    /// empty as in `Name()`. `None` is no list at all.
+    Named(String, Option<Vec<Type>>),
     /// `&T`
     Pointer(Box<Type>),
 }
@@ -561,15 +560,10 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => {
                 self.bump();
                 let args = match self.eat(TokenKind::LParen) {
-                    true => self.comma_list(TokenKind::RParen, Self::ty)?,
-                    false => Vec::new(),
+                    true => Some(self.comma_list(TokenKind::RParen, Self::ty)?),
+                    false => None,
                 };
                 TypeKind::Named(name.clone(), args)
-            }
-            TokenKind::LParen => {
-                self.bump();
-                self.expect(TokenKind::RParen)?;
-                TypeKind::Unit
             }
             TokenKind::Amp => {
                 self.bump();
@@ -1154,12 +1148,11 @@ mod tests {
 
     fn render_ty(ty: &Type) -> String {
         match &ty.kind {
-            TypeKind::Named(name, args) if args.is_empty() => name.clone(),
-            TypeKind::Named(name, args) => {
+            TypeKind::Named(name, None) => name.clone(),
+            TypeKind::Named(name, Some(args)) => {
                 let args: Vec<_> = args.iter().map(render_ty).collect();
                 format!("{name}({})", args.join(", "))
             }
-            TypeKind::Unit => "()".to_string(),
             TypeKind::Pointer(pointee) => format!("&{}", render_ty(pointee)),
         }
     }
@@ -1182,7 +1175,7 @@ mod tests {
     }
 
     fn named(name: &str) -> TypeKind {
-        TypeKind::Named(name.to_string(), Vec::new())
+        TypeKind::Named(name.to_string(), None)
     }
 
     #[test]
@@ -1364,7 +1357,7 @@ mod tests {
         assert_eq!(expr("t.0.1"), "(. (. t 0) 1)");
         assert_eq!(expr("f(x).10"), "(. (call f x) 10)");
         assert_eq!(expr("p.*.0"), "(. (.* p) 0)");
-        let src = "fn f(t: tuple(i32, tuple(f32, &u8))) -> tuple(i32, ()):\n    t.1.0 = 1.0\n";
+        let src = "fn f(t: tuple(i32, tuple(f32, &u8))) -> tuple(i32, tuple()):\n    t.1.0 = 1.0\n";
         let module = parse_src(src).unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
@@ -1373,7 +1366,10 @@ mod tests {
             render_ty(&f.sig.params[0].ty),
             "tuple(i32, tuple(f32, &u8))"
         );
-        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "tuple(i32, ())");
+        assert_eq!(
+            render_ty(f.sig.ret.as_ref().unwrap()),
+            "tuple(i32, tuple())"
+        );
         assert_eq!(stmt_kinds(&f.body), vec!["assign"]);
         assert_eq!(
             errors("let _ = (1,)\n"),
@@ -1451,13 +1447,22 @@ mod tests {
         assert_eq!(render_ty(&f.sig.params[1].ty), "u8");
         assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "array(f32)");
 
-        let module = parse_src("fn f(a: (), b: &()) -> ():\n\tpass").unwrap();
+        let module = parse_src("fn f(a: tuple(), b: &tuple()) -> tuple():\n\tpass").unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(f.sig.params[0].ty.kind, TypeKind::Unit);
-        assert_eq!(render_ty(&f.sig.params[1].ty), "&()");
-        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "()");
+        assert_eq!(
+            f.sig.params[0].ty.kind,
+            TypeKind::Named("tuple".to_string(), Some(Vec::new()))
+        );
+        assert_eq!(render_ty(&f.sig.params[1].ty), "&tuple()");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "tuple()");
+
+        let module = parse_src("let x: i32() = 1").unwrap();
+        let ItemKind::Binding(x) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(render_ty(x.ty.as_ref().unwrap()), "i32()");
 
         let module = parse_src("let x: i32 = 1").unwrap();
         let ItemKind::Binding(x) = &module.items[0].kind else {
@@ -1493,10 +1498,9 @@ mod tests {
             errors("let x: *u8 = 1"),
             vec![expected("type", TokenKind::Star)]
         );
-        let ident = |name: &str| TokenKind::Ident(name.to_string());
         assert_eq!(
-            errors("let x: (i32, u8) = 1\nlet y: (i32) = 1\n"),
-            vec![expected("`)`", ident("i32")), expected("`)`", ident("i32"))]
+            errors("let x: (i32, u8) = 1\nlet y: (i32) = 1\nlet z: () = 1\n"),
+            vec![expected("type", TokenKind::LParen); 3]
         );
     }
 

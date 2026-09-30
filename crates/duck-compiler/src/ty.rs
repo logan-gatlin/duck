@@ -104,13 +104,19 @@ const TUPLE: &str = "tuple";
 /// The name of the host reference type.
 const EXTERNREF: &str = "externref";
 
+/// The name of the built-in type of types used as values.
+const TYPE: &str = "type";
+
 /// The fields of every array, in order.
 const ARRAY_FIELDS: [&str; 2] = ["len", "ptr"];
+
+/// The fields of a `type`, in order.
+const TYPE_FIELDS: [&str; 2] = ["size", "align"];
 
 /// The module that `extern` blocks without one import from.
 const DEFAULT_IMPORT_MODULE: &str = "env";
 
-/// A primitive stored as exactly one wasm value. `()` is [`Ty::Unit`].
+/// A primitive stored as exactly one wasm value. `tuple()` is [`Ty::Unit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
     I8,
@@ -157,6 +163,10 @@ pub enum Ty {
     /// `array(T)`, a view of elements in linear memory that it doesn't own.
     /// Laid out like a struct with the fields `len: u32` and `ptr: &T`.
     Array(ArrayId),
+    /// `type`, the value of a type written where a value belongs, as in
+    /// `malloc(Point)`. Laid out like a struct with the fields `size: u32`
+    /// and `align: u32`, which describe the type in memory.
+    Type,
     /// A type parameter, which only the fields of its generic struct's
     /// declaration have. Uses of the struct replace it with a type argument.
     Param(ParamId),
@@ -164,7 +174,7 @@ pub enum Ty {
     /// can't be stored in linear memory, so nothing that holds one has a
     /// pointer type.
     ExternRef,
-    /// `()`, the return type of functions without one. Its values have no
+    /// `tuple()`, the return type of functions without one. Its values have no
     /// scalars, so they take no storage in wasm.
     Unit,
     /// The type of an expression that already failed to check. Compatible
@@ -196,13 +206,20 @@ pub enum TypeErrorKind {
     /// A generic struct that uses itself with ever larger type arguments,
     /// so it has no end of instances.
     ExpansiveRecursion(String),
+    /// A type without type parameters given a list of type arguments, as in
+    /// `i32()`.
+    NotGeneric(String),
+    /// A type that takes a list of type arguments written without one, as
+    /// in `array`.
+    MissingTypeArgs(String),
     /// A type given the wrong number of type arguments.
     TypeArgCount {
         name: String,
         expected: usize,
         found: usize,
     },
-    /// A type that takes any number of type arguments given too few.
+    /// A type that takes an empty list of type arguments, or one with at
+    /// least some number, given too few.
     TooFewTypeArgs {
         name: String,
         at_least: usize,
@@ -574,6 +591,8 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "struct `{name}` uses itself with ever larger type arguments"
             ),
+            Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
+            Self::MissingTypeArgs(name) => write!(f, "`{name}` needs a list of type arguments"),
             Self::TypeArgCount {
                 name,
                 expected,
@@ -591,7 +610,7 @@ impl fmt::Display for TypeErrorKind {
                 found,
             } => write!(
                 f,
-                "`{name}` takes at least {at_least} type arguments, found {found}"
+                "`{name}` takes 0 or at least {at_least} type arguments, found {found}"
             ),
             Self::Mismatch { expected, found } => {
                 write!(f, "expected `{expected}`, found `{found}`")
@@ -764,7 +783,8 @@ impl Checker {
     }
 
     fn declare_name(&mut self, name: &Ident, entry: Item) {
-        if self.items.contains_key(&name.name) || [ARRAY, TUPLE].contains(&name.name.as_str()) {
+        if self.items.contains_key(&name.name) || [ARRAY, TUPLE, TYPE].contains(&name.name.as_str())
+        {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
             self.items.insert(name.name.clone(), entry);
@@ -1058,23 +1078,35 @@ impl Checker {
             TypeKind::Named(name, args) => {
                 let param = self.type_params.iter().find(|(p, _)| p == name);
                 let arity = match param {
-                    Some(_) => Arity::Exactly(0),
+                    Some(_) => Some(Arity::Plain),
                     None => self.type_arity(name),
                 };
-                if !arity.accepts(args.len()) {
-                    self.error(arity.mismatch(name, args.len()), ty.span);
+                let Some(arity) = arity else {
+                    self.error(TypeErrorKind::UnknownType(name.clone()), ty.span);
+                    return Ty::Error;
+                };
+                if let Some(kind) = arity.check(name, args.as_ref().map(Vec::len)) {
+                    self.error(kind, ty.span);
                     return Ty::Error;
                 }
                 if let Some((_, param)) = param {
                     return *param;
                 }
-                let args: Vec<_> = args.iter().map(|arg| self.resolve_ty(arg)).collect();
+                let args: Vec<_> = args
+                    .iter()
+                    .flatten()
+                    .map(|arg| self.resolve_ty(arg))
+                    .collect();
                 if args.contains(&Ty::Error) {
                     Ty::Error
                 } else if let Some(prim) = Prim::from_name(name) {
                     Ty::Prim(prim)
                 } else if name == EXTERNREF {
                     Ty::ExternRef
+                } else if name == TYPE {
+                    Ty::Type
+                } else if name == TUPLE && args.is_empty() {
+                    Ty::Unit
                 } else if name == TUPLE {
                     self.tuple_of(args)
                 } else if name == ARRAY {
@@ -1093,11 +1125,9 @@ impl Checker {
                         false => self.instantiate(id, args, ty.span),
                     }
                 } else {
-                    self.error(TypeErrorKind::UnknownType(name.clone()), ty.span);
-                    Ty::Error
+                    unreachable!("`type_arity` knows every type")
                 }
             }
-            TypeKind::Unit => Ty::Unit,
             TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
@@ -1121,12 +1151,13 @@ impl Checker {
                 .all(|member| self.storable(member)),
             // Checked in each instance, once it is known.
             Ty::Param(_) => true,
-            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Unit | Ty::Error => true,
+            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Type | Ty::Unit | Ty::Error => true,
         }
     }
 
-    /// The types of a struct's fields, a tuple's elements, or an array's
-    /// `len` and `ptr`, in order. Empty for any other type.
+    /// The types of a struct's fields, a tuple's elements, an array's `len`
+    /// and `ptr`, or a `type`'s `size` and `align`, in order. Empty for any
+    /// other type.
     fn members(&self, ty: Ty) -> Vec<Ty> {
         match ty {
             Ty::Struct(id) => self.structs[id.0 as usize]
@@ -1136,6 +1167,7 @@ impl Checker {
                 .collect(),
             Ty::Tuple(id) => self.tuples[id.0 as usize].clone(),
             Ty::Array(id) => vec![Ty::Prim(Prim::U32), self.arrays[id.0 as usize]],
+            Ty::Type => vec![Ty::Prim(Prim::U32); TYPE_FIELDS.len()],
             _ => Vec::new(),
         }
     }
@@ -1219,7 +1251,8 @@ impl Checker {
             }
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
             Ty::ExternRef => EXTERNREF.to_string(),
-            Ty::Unit => "()".to_string(),
+            Ty::Type => TYPE.to_string(),
+            Ty::Unit => format!("{TUPLE}()"),
             Ty::Error => "{error}".to_string(),
         }
     }
@@ -1247,8 +1280,8 @@ impl Checker {
                     self.push_leaves(*elem, format!("{name}.{i}"), out);
                 }
             }
-            Ty::Array(_) => {
-                for (field, member) in ARRAY_FIELDS.iter().zip(self.members(ty)) {
+            Ty::Array(_) | Ty::Type => {
+                for (field, member) in builtin_fields(ty).iter().zip(self.members(ty)) {
                     self.push_leaves(member, format!("{name}.{field}"), out);
                 }
             }
@@ -1272,7 +1305,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => out.push(Some(prim)),
             Ty::Ptr(_) | Ty::ExternRef => out.push(None),
-            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 for member in self.members(ty) {
                     self.push_leaf_prims(member, out);
                 }
@@ -1295,7 +1328,9 @@ impl Checker {
                 .parse()
                 .ok()
                 .filter(|i| *i < self.tuples[id.0 as usize].len()),
-            Ty::Array(_) => ARRAY_FIELDS.iter().position(|name| *name == field.name),
+            Ty::Array(_) | Ty::Type => builtin_fields(ty)
+                .iter()
+                .position(|name| *name == field.name),
             _ => None,
         };
         if let Some(index) = index {
@@ -1353,10 +1388,7 @@ impl Checker {
                     _ => {
                         if ty != Ty::Error {
                             let kind = TypeErrorKind::Mismatch {
-                                expected: match elems.len() {
-                                    0 => "()".to_string(),
-                                    n => format!("{TUPLE}({})", vec!["_"; n].join(", ")),
-                                },
+                                expected: format!("{TUPLE}({})", vec!["_"; elems.len()].join(", ")),
                                 found: self.ty_name(ty),
                             };
                             self.error(kind, pattern.span);
@@ -1378,7 +1410,7 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => (prim.size(), prim.size()),
             Ty::Ptr(_) => (4, 4),
-            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 let (_, size, align) = self.aggregate_layout(ty);
                 (size, align)
             }
@@ -1388,7 +1420,7 @@ impl Checker {
         }
     }
 
-    /// Member offsets, size, and alignment of a struct, tuple, or array, laid
+    /// Member offsets, size, and alignment of a struct, tuple, array, or `type`, laid
     /// out as C would: members in order, each at a multiple of its alignment,
     /// and the whole padded to a multiple of the largest.
     fn aggregate_layout(&self, ty: Ty) -> (Vec<u32>, u32, u32) {
@@ -1427,7 +1459,7 @@ impl Checker {
                 store: StoreOp::Store,
                 bool: false,
             }),
-            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 let offsets = self.aggregate_layout(ty).0;
                 for (member, member_offset) in self.members(ty).into_iter().zip(offsets) {
                     self.push_cells(member, offset + member_offset, out);
@@ -1801,6 +1833,10 @@ impl<'c> Body<'c> {
                         self.error(TypeErrorKind::NotAssignable, target.span);
                         None
                     }
+                    None if is_builtin_type(name) => {
+                        self.error(TypeErrorKind::NotAssignable, target.span);
+                        None
+                    }
                     None => {
                         self.error(TypeErrorKind::UnknownName(name.clone()), target.span);
                         None
@@ -2007,6 +2043,10 @@ impl<'c> Body<'c> {
                 }
                 None => (Ty::Error, Value::default()),
             },
+            ExprKind::Name(_) | ExprKind::AddrOf(_) if self.is_type_expr(expr) => {
+                let ty = self.expr_type(expr);
+                self.type_value(ty, expr.span)
+            }
             ExprKind::Name(name) => self.name(name, expr.span),
             ExprKind::Tuple(elems) => self.tuple(elems, expected),
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expected, expr.span),
@@ -2162,11 +2202,8 @@ impl<'c> Body<'c> {
                     (Ty::Error, Value::default())
                 }
             },
+            // Struct names are types, which `expr` makes values.
             Some(Item::Func(_) | Item::Struct(_)) => {
-                self.error(TypeErrorKind::NotAValue(name.to_string()), span);
-                (Ty::Error, Value::default())
-            }
-            None if [ARRAY, TUPLE].contains(&name) => {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
@@ -2175,6 +2212,40 @@ impl<'c> Body<'c> {
                 (Ty::Error, Value::default())
             }
         }
+    }
+
+    /// Whether `expr` is a type written where a value belongs: the name of a
+    /// type that no variable or item shadows, a type given type arguments,
+    /// or a pointer to one of those.
+    fn is_type_expr(&self, expr: &parse::Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.items.get(name) {
+                Some(item) => matches!(item, Item::Struct(_)),
+                None => is_builtin_type(name),
+            },
+            ExprKind::Call(callee, args) => self.names_type(callee, args),
+            ExprKind::AddrOf(pointee) => self.is_type_expr(pointee),
+            _ => false,
+        }
+    }
+
+    /// The `type` value describing `ty`, which must be storable to have a
+    /// size in memory.
+    fn type_value(&mut self, ty: Ty, span: Span) -> (Ty, Value) {
+        if ty == Ty::Error {
+            return (Ty::Error, Value::default());
+        }
+        if !self.ck.storable(ty) {
+            self.error(TypeErrorKind::NotStorable(self.ck.ty_name(ty)), span);
+            return (Ty::Error, Value::default());
+        }
+        let (size, align) = self.ck.layout(ty);
+        let consts = [size, align].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
+        let value = Value {
+            pre: Vec::new(),
+            scalars: consts.to_vec(),
+        };
+        (Ty::Type, value)
     }
 
     /// Pairs `exprs`, one per leaf of `ty`, with their wasm types.
@@ -2446,13 +2517,15 @@ impl<'c> Body<'c> {
             ExprKind::Name(name) if self.lookup(name).is_some() => {
                 Err(TypeErrorKind::NotCallable(name.clone()))
             }
-            ExprKind::Name(name) if self.ck.type_arity(name).takes_args() => {
+            ExprKind::Name(name) if self.ck.takes_type_args(name) => {
                 return self.generic_call(name, callee, args, span);
             }
+            ExprKind::Name(name) if name == TYPE => return self.construct(Ty::Type, args, span),
             ExprKind::Name(name) => match self.ck.items.get(name).copied() {
                 Some(Item::Func(id)) => Ok(Item::Func(id)),
                 Some(Item::Struct(id)) => Ok(Item::Struct(id)),
                 Some(Item::Global(_)) => Err(TypeErrorKind::NotCallable(name.clone())),
+                None if is_builtin_type(name) => Err(TypeErrorKind::NotCallable(name.clone())),
                 None => Err(TypeErrorKind::UnknownName(name.clone())),
             },
             // A type given type arguments, such as `array(u8)`.
@@ -2510,8 +2583,8 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// A value of a struct or array type `ty`, built from its labelled
-    /// fields.
+    /// A value of a struct, array, or `type` type `ty`, built from its
+    /// labelled fields.
     fn construct(&mut self, ty: Ty, args: &[Arg], span: Span) -> (Ty, Value) {
         let fields: Vec<_> = match ty {
             Ty::Struct(id) => self.ck.structs[id.0 as usize]
@@ -2519,7 +2592,7 @@ impl<'c> Body<'c> {
                 .iter()
                 .map(|f| (f.name.clone(), f.ty))
                 .collect(),
-            Ty::Array(_) => ARRAY_FIELDS
+            Ty::Array(_) | Ty::Type => builtin_fields(ty)
                 .iter()
                 .map(|name| name.to_string())
                 .zip(self.ck.members(ty))
@@ -3003,7 +3076,17 @@ fn is_stable(expr: &Expr) -> bool {
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
-    [ARRAY, TUPLE, EXTERNREF].contains(&name) || Prim::from_name(name).is_some()
+    [ARRAY, TUPLE, EXTERNREF, TYPE].contains(&name) || Prim::from_name(name).is_some()
+}
+
+/// The names of the fields of an array or `type`, in order. Empty for any
+/// other type.
+fn builtin_fields(ty: Ty) -> &'static [&'static str] {
+    match ty {
+        Ty::Array(_) => &ARRAY_FIELDS,
+        Ty::Type => &TYPE_FIELDS,
+        _ => &[],
+    }
 }
 
 /// The names `pattern` binds, in source order.
@@ -3630,7 +3713,7 @@ fn f(b: bool, p: &i32, e: externref, s: S):
     let p2 = p as &i32
     let e2 = e as externref
     let s2 = s as S
-    let u2 = u() as ()
+    let u2 = u() as tuple()
 ";
         assert_eq!(
             body(&lower(src), "f"),
@@ -3922,7 +4005,7 @@ fn f(a: u32, p: P) -> i32:
                 IntOutOfRange("i8".into()),
                 invalid_operand("-", "u8"),
                 mismatch("bool", "i32"),
-                mismatch("i32", "()"),
+                mismatch("i32", "tuple()"),
                 mismatch("i32", "bool"),
             ]
         );
@@ -4046,10 +4129,10 @@ let p = P(y: g, x: 2.0)
         let src = "\
 fn u():
     pass
-fn g(a: (), b: i32) -> ():
+fn g(a: tuple(), b: i32) -> tuple():
     return a
 fn f() -> i32:
-    let x: () = u()
+    let x: tuple() = u()
     let y = g(x, 1)
     return 1
 ";
@@ -4062,14 +4145,14 @@ fn f() -> i32:
             "(call u [] -> []) (call g [1] -> []) (return 1)"
         );
         assert_eq!(
-            errors("fn u():\n    let a = u() == u()\n    let b = 1 as ()\n    let c = -u()\n"),
+            errors("fn u():\n    let a = u() == u()\n    let b = 1 as tuple()\n    let c = -u()\n"),
             vec![
-                invalid_operand("==", "()"),
+                invalid_operand("==", "tuple()"),
                 TypeErrorKind::InvalidCast {
                     from: "i32".into(),
-                    to: "()".into()
+                    to: "tuple()".into()
                 },
-                invalid_operand("-", "()"),
+                invalid_operand("-", "tuple()"),
             ]
         );
     }
@@ -4078,11 +4161,11 @@ fn f() -> i32:
     fn unit_literals() {
         let src = "\
 let g = ()
-fn u() -> ():
+fn u() -> tuple():
     return ()
 fn f():
     let a = ()
-    let b: () = a
+    let b: tuple() = a
     return b
 ";
         let module = lower(src);
@@ -4094,8 +4177,8 @@ fn f():
         assert_eq!(
             errors("fn f():\n    let a = () == ()\n    let b: i32 = ()\n    let c: unit = ()\n"),
             vec![
-                invalid_operand("==", "()"),
-                mismatch("i32", "()"),
+                invalid_operand("==", "tuple()"),
+                mismatch("i32", "tuple()"),
                 TypeErrorKind::UnknownType("unit".into()),
             ]
         );
@@ -4214,7 +4297,7 @@ struct S:
     next: &S
     k: i8
     u: u16
-fn f(p: &S, q: &()) -> f64:
+fn f(p: &S, q: &tuple()) -> f64:
     let flag = p.flag
     let n = p.n
     let b = p.inner.b
@@ -4390,7 +4473,7 @@ fn init():
     ready()
 fn take(x: i32):
     pass
-fn give() -> ():
+fn give() -> tuple():
     return
 fn back() -> i32:
     return 1
@@ -4760,6 +4843,8 @@ struct Bad(T, T, P, i32):
     pass
 struct array:
     pass
+struct Wrap(T):
+    w: T()
 fn f(a: Box, b: P(i32), c: Box(i32, u8), d: array, e: i32(u8)):
     let g = Box(i32)
     let h = Box(value: 1)
@@ -4768,6 +4853,8 @@ fn f(a: Box, b: P(i32), c: Box(i32, u8), d: array, e: i32(u8)):
     let k = array
     let l = Box(T: i32)
     let m = P(x: 1)(x: 2)
+fn g(a: i32(), b: P(), c: Box(), d: array(), e: Foo(), f: Foo):
+    pass
 ";
         let count = |name: &str, expected, found| TypeArgCount {
             name: name.into(),
@@ -4781,23 +4868,37 @@ fn f(a: Box, b: P(i32), c: Box(i32, u8), d: array, e: i32(u8)):
                 DuplicateParam("T".into()),
                 DuplicateItem("P".into()),
                 DuplicateItem("i32".into()),
-                count("Box", 1, 0),
-                count("P", 0, 1),
+                NotGeneric("T".into()),
+                MissingTypeArgs("Box".into()),
+                NotGeneric("P".into()),
                 count("Box", 1, 2),
-                count("array", 1, 0),
-                count("i32", 0, 1),
-                NotAValue("Box(i32)".into()),
+                MissingTypeArgs("array".into()),
+                NotGeneric("i32".into()),
+                NotGeneric("i32".into()),
+                NotGeneric("P".into()),
                 count("Box", 1, 0),
+                count("array", 1, 0),
+                UnknownType("Foo".into()),
+                UnknownType("Foo".into()),
+                MissingTypeArgs("Box".into()),
                 LabelledTypeArg,
                 NotAType,
-                NotAValue("array".into()),
-                count("Box", 1, 0),
+                MissingTypeArgs("array".into()),
+                MissingTypeArgs("Box".into()),
                 NotCallable("expression".into()),
             ]
         );
         assert_eq!(
             count("Box", 1, 0).to_string(),
             "`Box` takes 1 type argument, found 0"
+        );
+        assert_eq!(
+            NotGeneric("i32".into()).to_string(),
+            "`i32` has no type parameters"
+        );
+        assert_eq!(
+            MissingTypeArgs("Box".into()).to_string(),
+            "`Box` needs a list of type arguments"
         );
     }
 
@@ -4894,7 +4995,7 @@ fn f(a: List(i32), p: Pair(i32, u8), c: C(u8), b: Bad(i32), m: M(f32)):
     }
 
     #[test]
-    fn tuple_types_take_at_least_two_type_arguments() {
+    fn tuple_types_take_none_or_at_least_two_type_arguments() {
         use TypeErrorKind::*;
         let src = "\
 struct tuple:
@@ -4903,13 +5004,16 @@ struct Box(T):
     value: T
 struct Bad(tuple):
     pass
-fn f(a: tuple(i32), b: tuple(), c: tuple):
+fn f(a: tuple(i32), b: tuple(), c: tuple) -> tuple():
     let d = Box(tuple(i32, u8))(value: (1, 2))
     let e = Box((i32, u8))(value: (1, 2))
     let g = tuple(i32, u8)(1, 2)
     let h = tuple(i32, u8)
     let i = tuple
     let j: Box(tuple(u8, bool)) = d
+    let k: Box(tuple()) = Box(tuple())(value: b)
+    let l = Box(())(value: ())
+    return c
 ";
         let count = |found| TooFewTypeArgs {
             name: "tuple".into(),
@@ -4922,18 +5026,94 @@ fn f(a: tuple(i32), b: tuple(), c: tuple):
                 DuplicateItem("tuple".into()),
                 DuplicateItem("tuple".into()),
                 count(1),
-                count(0),
-                count(0),
+                MissingTypeArgs("tuple".into()),
                 NotAType,
                 NotCallable("tuple(i32, u8)".into()),
-                NotAValue("tuple(i32, u8)".into()),
-                NotAValue("tuple".into()),
+                MissingTypeArgs("tuple".into()),
                 mismatch("Box(tuple(u8, bool))", "Box(tuple(i32, u8))"),
+                NotAType,
             ]
         );
         assert_eq!(
             count(1).to_string(),
-            "`tuple` takes at least 2 type arguments, found 1"
+            "`tuple` takes 0 or at least 2 type arguments, found 1"
+        );
+    }
+
+    #[test]
+    fn types_used_as_values_are_their_size_and_alignment() {
+        let src = "\
+struct Point:
+    x: f32
+    y: f64
+struct Box(T):
+    value: T
+pub let INT = i32
+var heap: u32 = 1024
+fn malloc(t: type) -> &u8:
+    heap = (heap + t.align - 1) / t.align * t.align
+    let p = heap as &u8
+    heap += t.size
+    return p
+fn f() -> u32:
+    let p = malloc(Point)
+    let t: type = type(size: 3, align: 1)
+    let u = tuple().size + (&tuple()).size
+    return Box(u8).size + array(u8).align + tuple(u8, i64).size + (&Point).size + type.size
+fn g(i32: u32) -> u32:
+    return i32
+";
+        let module = lower(src);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
+        assert_eq!(
+            globals[..2],
+            [("INT.size", Const::I32(4)), ("INT.align", Const::I32(4))]
+        );
+        assert_eq!(
+            body(&module, "f"),
+            "(set p (call malloc 16 8)) (set t.size 3) (set t.align 1) \
+             (set u (I32.Add 0 4)) \
+             (return (I32.Add (I32.Add (I32.Add (I32.Add 1 4) 16) 4) 8))"
+        );
+        assert_eq!(body(&module, "g"), "(return i32)");
+    }
+
+    #[test]
+    fn only_storable_types_are_values() {
+        use TypeErrorKind::*;
+        let src = "\
+struct type:
+    pass
+struct Box(T):
+    value: T
+fn f(t: type):
+    let a = externref
+    let b = Box(tuple(externref, i32))
+    let c = Box
+    let d = i32(1)
+    i32 = 1
+    let e = type(size: 1)
+    let g = t.len
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateItem("type".into()),
+                NotStorable("externref".into()),
+                NotStorable("Box(tuple(externref, i32))".into()),
+                MissingTypeArgs("Box".into()),
+                NotCallable("i32".into()),
+                NotAssignable,
+                MissingArg("align".into()),
+                NoField {
+                    ty: "type".into(),
+                    field: "len".into()
+                },
+            ]
         );
     }
 

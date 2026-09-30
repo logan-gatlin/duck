@@ -38,11 +38,15 @@ struct Flow {
     expands: bool,
 }
 
-/// How many type arguments a type takes.
+/// Which lists of type arguments a type takes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Arity {
+    /// No list: the type is written by name alone.
+    Plain,
+    /// A list of exactly this many.
     Exactly(usize),
-    AtLeast(usize),
+    /// A list that is empty or has at least this many.
+    NoneOrAtLeast(usize),
 }
 
 /// A field of a struct, by position.
@@ -53,33 +57,35 @@ struct FieldRef {
 }
 
 impl Arity {
-    /// Whether a type with this arity takes type arguments at all.
+    /// Whether a type with this arity is written with a list of type
+    /// arguments.
     pub(super) fn takes_args(self) -> bool {
-        self != Self::Exactly(0)
+        self != Self::Plain
     }
 
-    pub(super) fn accepts(self, count: usize) -> bool {
-        match self {
-            Self::Exactly(n) => count == n,
-            Self::AtLeast(n) => count >= n,
-        }
-    }
-
-    /// The error for giving the type `name` `found` type arguments, which it
-    /// doesn't accept.
-    pub(super) fn mismatch(self, name: &str, found: usize) -> TypeErrorKind {
+    /// The error for writing the type `name` with `args` type arguments, or
+    /// with no list if `None`. `None` if the type takes them.
+    pub(super) fn check(self, name: &str, args: Option<usize>) -> Option<TypeErrorKind> {
         let name = name.to_string();
-        match self {
-            Self::Exactly(expected) => TypeErrorKind::TypeArgCount {
-                name,
-                expected,
-                found,
-            },
-            Self::AtLeast(at_least) => TypeErrorKind::TooFewTypeArgs {
-                name,
-                at_least,
-                found,
-            },
+        match (self, args) {
+            (Self::Plain, None) => None,
+            (Self::Plain, Some(_)) => Some(TypeErrorKind::NotGeneric(name)),
+            (_, None) => Some(TypeErrorKind::MissingTypeArgs(name)),
+            (Self::Exactly(expected), Some(found)) if found != expected => {
+                Some(TypeErrorKind::TypeArgCount {
+                    name,
+                    expected,
+                    found,
+                })
+            }
+            (Self::NoneOrAtLeast(at_least), Some(found)) if found != 0 && found < at_least => {
+                Some(TypeErrorKind::TooFewTypeArgs {
+                    name,
+                    at_least,
+                    found,
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -186,7 +192,7 @@ impl Checker {
     /// `Box(&i32)(value: p)`. `None` after reporting an error.
     fn type_syntax(&mut self, expr: &parse::Expr) -> Option<parse::Type> {
         let kind = match &expr.kind {
-            ExprKind::Name(name) => TypeKind::Named(name.clone(), Vec::new()),
+            ExprKind::Name(name) => TypeKind::Named(name.clone(), None),
             ExprKind::Call(callee, args) => {
                 let ExprKind::Name(name) = &callee.kind else {
                     self.error(TypeErrorKind::NotAType, callee.span);
@@ -195,7 +201,6 @@ impl Checker {
                 return self.applied_type_syntax(name, args, expr.span);
             }
             ExprKind::AddrOf(pointee) => TypeKind::Pointer(Box::new(self.type_syntax(pointee)?)),
-            ExprKind::Unit => TypeKind::Unit,
             _ => {
                 self.error(TypeErrorKind::NotAType, expr.span);
                 return None;
@@ -219,20 +224,29 @@ impl Checker {
         }
         let types = types.into_iter().collect::<Option<_>>()?;
         Some(parse::Type {
-            kind: TypeKind::Named(name.to_string(), types),
+            kind: TypeKind::Named(name.to_string(), Some(types)),
             span,
         })
     }
 
-    /// How many type arguments the type `name` takes. None for names that
-    /// aren't types.
-    pub(super) fn type_arity(&self, name: &str) -> Arity {
+    /// Which lists of type arguments the type `name` takes. `None` for names
+    /// that aren't types.
+    pub(super) fn type_arity(&self, name: &str) -> Option<Arity> {
         match self.items.get(name) {
-            _ if name == ARRAY => Arity::Exactly(1),
-            _ if name == TUPLE => Arity::AtLeast(2),
-            Some(Item::Struct(id)) => Arity::Exactly(self.structs[id.0 as usize].params.len()),
-            _ => Arity::Exactly(0),
+            _ if name == ARRAY => Some(Arity::Exactly(1)),
+            _ if name == TUPLE => Some(Arity::NoneOrAtLeast(2)),
+            Some(Item::Struct(id)) => match self.structs[id.0 as usize].params.len() {
+                0 => Some(Arity::Plain),
+                n => Some(Arity::Exactly(n)),
+            },
+            _ if is_builtin_type(name) => Some(Arity::Plain),
+            _ => None,
         }
+    }
+
+    /// Whether `name` is a type written with a list of type arguments.
+    pub(super) fn takes_type_args(&self, name: &str) -> bool {
+        self.type_arity(name).is_some_and(Arity::takes_args)
     }
 
     /// The instance of generic struct `generic` with type arguments `args`,
@@ -329,15 +343,14 @@ impl Body<'_> {
                 Some(ty) => self.ck.resolve_ty(&ty),
                 None => Ty::Error,
             };
-            if ty != Ty::Error {
-                self.error(TypeErrorKind::NotAValue(self.ck.ty_name(ty)), span);
-            }
-        } else {
-            // The arguments may be fields or mislabelled type arguments, so
-            // they aren't checked.
-            let kind = self.ck.type_arity(name).mismatch(name, 0);
-            self.error(kind, callee.span);
+            return self.type_value(ty, span);
         }
+        // The arguments may be fields or mislabelled type arguments, so they
+        // aren't checked.
+        self.error(
+            TypeErrorKind::MissingTypeArgs(name.to_string()),
+            callee.span,
+        );
         (Ty::Error, Value::default())
     }
 
@@ -356,7 +369,7 @@ impl Body<'_> {
     pub(super) fn names_type(&self, expr: &parse::Expr, args: &[Arg]) -> bool {
         match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => {
-                self.ck.type_arity(name).takes_args()
+                self.ck.takes_type_args(name)
                     || matches!(self.ck.items.get(name), Some(Item::Struct(_)))
                         && args.iter().all(|arg| arg.label.is_none())
             }
