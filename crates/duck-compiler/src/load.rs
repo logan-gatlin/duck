@@ -576,6 +576,46 @@ mod tests {
     }
 
     #[test]
+    fn functions_of_other_modules_are_pointed_to() {
+        let lib = "\
+pub fn inc(x: i32) -> i32:
+    return x + 1
+pub fn(T) id(x: T) -> T:
+    return x
+pub fn hidden() -> fn(i32) -> i32:
+    return secret
+fn secret(x: i32) -> i32:
+    return x
+";
+        let main = "\
+import \"lib\"
+fn f() -> i32:
+    let a = lib.inc
+    let b: fn(u8) -> u8 = lib.id
+    return lib.hidden()(1) + lib.inc(2) + a(3)
+";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        let module = lower(&mut files);
+        let table = module.table.unwrap().funcs;
+        let names: Vec<_> = table
+            .iter()
+            .map(|id| module.funcs[id.0 as usize].name.as_str())
+            .collect();
+        // Imported modules are lowered first.
+        assert_eq!(names, ["secret", "inc", "id(u8)"]);
+
+        // Function types belong to no module.
+        let main = "import \"lib\"\nlet a: lib.fn(i32) = lib.inc\n";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        let message = "main \"fn\": expected type name, found `fn`";
+        assert_eq!(errors(&mut files), [message]);
+
+        let main = "import \"lib\"\nfn f():\n    let a = lib.secret\n";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        assert_eq!(errors(&mut files), ["main \"secret\": `secret` is private"]);
+    }
+
+    #[test]
     fn modules_are_not_values() {
         let mut files = Memory(vec![
             (

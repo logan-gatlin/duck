@@ -225,6 +225,7 @@ impl Checker {
                 return self.applied_type_syntax(callee, args, expr.span);
             }
             ExprKind::AddrOf(pointee) => TypeKind::Pointer(Box::new(self.type_syntax(pointee)?)),
+            ExprKind::FnType(ty) => return Some(ty.clone()),
             _ => {
                 self.error(TypeErrorKind::NotAType, expr.span);
                 return None;

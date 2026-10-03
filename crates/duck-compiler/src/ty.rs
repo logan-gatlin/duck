@@ -27,6 +27,7 @@ use generic_fn::{FnInstance, GenericFn};
 
 mod enums;
 mod equality;
+mod fn_ptr;
 mod generic;
 mod generic_fn;
 
@@ -93,6 +94,9 @@ macro_rules! fold_float_binary {
 
 /// The export name of the module's memory, which no item may take.
 const MEMORY_EXPORT: &str = "memory";
+
+/// The export name of the module's table, which no item may take either.
+const TABLE_EXPORT: &str = "table";
 
 /// Bytes in a wasm page.
 const PAGE_SIZE: u64 = 64 * 1024;
@@ -161,6 +165,11 @@ pub struct TupleId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArrayId(u32);
 
+/// Index of an interned function type, which records the types of its
+/// parameters and result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FnId(u32);
+
 /// Index of a generic struct's or function's type parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParamId(u32);
@@ -183,6 +192,9 @@ pub enum Ty {
     /// `array(T)`, a view of elements in linear memory that it doesn't own.
     /// Laid out like a struct with the fields `len: u32` and `ptr: &T`.
     Array(ArrayId),
+    /// `fn(A) -> R`, a pointer to a function, stored as an `i32` index into
+    /// the module's table.
+    Fn(FnId),
     /// `type`, the value of a type written where a value belongs, as in
     /// `malloc(Point)`. Laid out like a struct with the fields `size: u32`
     /// and `align: u32`, which describe the type in memory.
@@ -223,7 +235,7 @@ pub struct InstanceSite {
 pub enum TypeErrorKind {
     UnknownName(String),
     UnknownType(String),
-    /// A function used as a value, or a struct or enum called as one.
+    /// A module, or a function of `module`, used as a value.
     NotAValue(String),
     NotCallable(String),
     DuplicateItem(String),
@@ -322,6 +334,15 @@ pub enum TypeErrorKind {
         expected: usize,
         found: usize,
     },
+    /// A call through a function pointer given too few arguments. Its
+    /// parameters have no names to report as missing.
+    TooFewArgs {
+        expected: usize,
+        found: usize,
+    },
+    /// An argument given a label in a call through a function pointer,
+    /// whose parameters have no names.
+    LabelledPointerArg,
     MissingReturn(String),
     BreakOutsideLoop,
     ContinueOutsideLoop,
@@ -412,6 +433,9 @@ struct Checker {
     /// elements.
     arrays: Vec<Ty>,
     array_ids: HashMap<Ty, ArrayId>,
+    /// The parameter types and result type of each function type.
+    fn_tys: Vec<(Vec<Ty>, Ty)>,
+    fn_ty_ids: HashMap<(Vec<Ty>, Ty), FnId>,
     /// Whether every struct's fields are known, so pointer types can be
     /// checked for storability as they are resolved.
     structs_defined: bool,
@@ -425,6 +449,13 @@ struct Checker {
     synths: Vec<Synth>,
     /// The function `==` compares each array type through.
     eq_funcs: HashMap<Ty, FuncId>,
+    /// The functions that pointers call, in the order their pointers are
+    /// first taken. Each is at the table index one past its place here.
+    table: Vec<FuncId>,
+    table_indices: HashMap<FuncId, u32>,
+    /// The function that pointers to each imported function call it
+    /// through, for those whose results the host may give out of range.
+    wrappers: HashMap<FuncId, FuncId>,
     /// Generic function declarations, indexed by [`GenericFnId`].
     generic_fns: Vec<GenericFn>,
     /// Each instance of a generic function by its declaration and type
@@ -510,6 +541,8 @@ enum Synth {
     /// Compares two arrays of this type.
     Eq(Ty),
     Instance(FnInstance),
+    /// Calls this imported function and brings its results into range.
+    Wrapper(FuncId),
 }
 
 struct GlobalDef {
@@ -540,6 +573,8 @@ struct Body<'c> {
     /// Whether this is a global initializer, the only place literals that
     /// need memory can be.
     global: bool,
+    /// The value piped into each enclosing pipe body, innermost last.
+    piped: Vec<(Ty, Vec<(ValType, Expr)>)>,
 }
 
 #[derive(Clone)]
@@ -805,6 +840,15 @@ impl fmt::Display for TypeErrorKind {
             Self::TooManyArgs { expected, found } => {
                 write!(f, "expected {expected} arguments, found {found}")
             }
+            Self::TooFewArgs { expected, found } => {
+                write!(f, "expected {expected} arguments, found {found}")
+            }
+            Self::LabelledPointerArg => {
+                write!(
+                    f,
+                    "arguments of a call through a function pointer can't be labelled"
+                )
+            }
             Self::MissingReturn(name) => write!(f, "`{name}` can finish without returning"),
             Self::BreakOutsideLoop => write!(f, "`break` outside of a loop"),
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
@@ -895,6 +939,10 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
                 export: MEMORY_EXPORT.to_string(),
             },
             data: ck.data,
+            table: (!ck.table.is_empty()).then(|| ir::Table {
+                export: TABLE_EXPORT.to_string(),
+                funcs: ck.table,
+            }),
             globals: ck.ir_globals,
             imports,
             funcs,
@@ -977,7 +1025,7 @@ impl Checker {
     /// Declares a name defined by `item`, which may export it.
     fn declare_item(&mut self, item: &parse::Item, name: &Ident, entry: Item) {
         self.declare_name(name, entry, item.is_pub);
-        if self.exports(item) && name.name == MEMORY_EXPORT {
+        if self.exports(item) && [MEMORY_EXPORT, TABLE_EXPORT].contains(&name.name.as_str()) {
             self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
         }
     }
@@ -1425,6 +1473,7 @@ impl Checker {
                     let instance = instance.clone();
                     self.lower_instance(program, id, instance)
                 }
+                Synth::Wrapper(import) => self.lower_wrapper(id, *import),
             };
             funcs.push(func);
         }
@@ -1451,6 +1500,14 @@ impl Checker {
                 }
                 pointee => self.ptr_to(pointee),
             },
+            TypeKind::Fn(params, ret) => {
+                let params: Vec<_> = params.iter().map(|param| self.resolve_ty(param)).collect();
+                let ret = ret.as_ref().map_or(Ty::Unit, |ret| self.resolve_ty(ret));
+                match params.contains(&Ty::Error) || ret == Ty::Error {
+                    true => Ty::Error,
+                    false => self.fn_of(params, ret),
+                }
+            }
         }
     }
 
@@ -1477,7 +1534,7 @@ impl Checker {
                 }
                 None => Ty::Error,
             },
-            TypeKind::Pointer(_) => unreachable!("only names are qualified"),
+            TypeKind::Pointer(_) | TypeKind::Fn(..) => unreachable!("only names are qualified"),
         }
     }
 
@@ -1567,6 +1624,8 @@ impl Checker {
                 .all(|member| self.storable(member)),
             // Checked in each instance, once it is known.
             Ty::Param(_) => true,
+            // Only the index of a function is stored, whatever it takes.
+            Ty::Fn(_) => true,
             Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Type | Ty::Unit | Ty::Error => true,
         }
     }
@@ -1623,24 +1682,33 @@ impl Checker {
         Ty::Array(id)
     }
 
-    /// The types a pointer, tuple, or array type is made of: its pointee,
-    /// elements, or element type. Empty for any other type.
+    /// The types a pointer, tuple, array, or function type is made of: its
+    /// pointee, elements, element type, or parameters and then result. Empty
+    /// for any other type.
     fn components(&self, ty: Ty) -> Vec<Ty> {
         match ty {
             Ty::Ptr(id) => vec![self.pointee(id)],
             Ty::Tuple(id) => self.tuples[id.0 as usize].clone(),
             Ty::Array(id) => vec![self.element(id)],
+            Ty::Fn(id) => {
+                let (params, ret) = &self.fn_tys[id.0 as usize];
+                params.iter().copied().chain([*ret]).collect()
+            }
             _ => Vec::new(),
         }
     }
 
     /// The type shaped like `ty` but made of `components`, as
     /// [`Self::components`] takes it apart. Any other type is itself.
-    fn rebuild(&mut self, ty: Ty, components: Vec<Ty>) -> Ty {
+    fn rebuild(&mut self, ty: Ty, mut components: Vec<Ty>) -> Ty {
         match ty {
             Ty::Ptr(_) => self.ptr_to(components[0]),
             Ty::Tuple(_) => self.tuple_of(components),
             Ty::Array(_) => self.array_of(components[0]),
+            Ty::Fn(_) => {
+                let ret = components.pop().unwrap();
+                self.fn_of(components, ret)
+            }
             _ => ty,
         }
     }
@@ -1666,6 +1734,15 @@ impl Checker {
                     .collect();
                 format!("{TUPLE}({})", elems.join(", "))
             }
+            Ty::Fn(id) => {
+                let (params, ret) = &self.fn_tys[id.0 as usize];
+                let params: Vec<_> = params.iter().map(|param| self.ty_name(*param)).collect();
+                let ret = match ret {
+                    Ty::Unit => String::new(),
+                    ret => format!(" -> {}", self.ty_name(*ret)),
+                };
+                format!("fn({}){ret}", params.join(", "))
+            }
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
             Ty::ExternRef => EXTERNREF.to_string(),
             Ty::Type => TYPE.to_string(),
@@ -1685,7 +1762,7 @@ impl Checker {
     fn push_leaves(&self, ty: Ty, name: String, out: &mut Vec<(String, ValType)>) {
         match ty {
             Ty::Prim(prim) => out.push((name, prim.val_type())),
-            Ty::Ptr(_) => out.push((name, ValType::I32)),
+            Ty::Ptr(_) | Ty::Fn(_) => out.push((name, ValType::I32)),
             Ty::ExternRef => out.push((name, ValType::ExternRef)),
             Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
             Ty::Struct(id) => {
@@ -1711,8 +1788,8 @@ impl Checker {
         self.leaves(ty, "").into_iter().map(|(_, vt)| vt).collect()
     }
 
-    /// The primitive type of each scalar leaf of `ty`, or `None` for pointers
-    /// and `externref`s.
+    /// The primitive type of each scalar leaf of `ty`, or `None` for
+    /// pointers, function pointers, and `externref`s.
     fn leaf_prims(&self, ty: Ty) -> Vec<Option<Prim>> {
         let mut out = Vec::new();
         self.push_leaf_prims(ty, &mut out);
@@ -1722,7 +1799,7 @@ impl Checker {
     fn push_leaf_prims(&self, ty: Ty, out: &mut Vec<Option<Prim>>) {
         match ty {
             Ty::Prim(prim) => out.push(Some(prim)),
-            Ty::Ptr(_) | Ty::ExternRef => out.push(None),
+            Ty::Ptr(_) | Ty::Fn(_) | Ty::ExternRef => out.push(None),
             Ty::Enum(id) => self.push_leaf_prims(self.enum_ty(id), out),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 for member in self.members(ty) {
@@ -1798,6 +1875,10 @@ impl Checker {
             )),
             (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
             | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => Some((to, value)),
+            // Function pointers convert as pointers do: to each other, and
+            // to and from their index in the table.
+            (Ty::Fn(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Fn(_))
+            | (Ty::Fn(_), Ty::Prim(Prim::U32 | Prim::I32)) => Some((to, value)),
             // An enum casts to whatever the type of its values does.
             (Ty::Enum(id), to) => self.cast_value(self.enum_ty(id), to, value),
             _ => None,
@@ -1860,7 +1941,7 @@ impl Checker {
     fn layout(&self, ty: Ty) -> (u32, u32) {
         match ty {
             Ty::Prim(prim) => (prim.size(), prim.size()),
-            Ty::Ptr(_) => (4, 4),
+            Ty::Ptr(_) | Ty::Fn(_) => (4, 4),
             Ty::Enum(id) => self.layout(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 let (_, size, align) = self.aggregate_layout(ty);
@@ -1904,7 +1985,7 @@ impl Checker {
                 store: prim.store(),
                 bool: prim == Prim::Bool,
             }),
-            Ty::Ptr(_) => out.push(Cell {
+            Ty::Ptr(_) | Ty::Fn(_) => out.push(Cell {
                 offset,
                 ty: ValType::I32,
                 load: LoadOp::Load,
@@ -1985,6 +2066,7 @@ impl Checker {
             },
             Expr::Local(_)
             | Expr::Call(..)
+            | Expr::CallIndirect { .. }
             | Expr::Load { .. }
             | Expr::MemorySize
             | Expr::MemoryGrow(_)
@@ -2002,6 +2084,7 @@ impl<'c> Body<'c> {
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
             global: false,
+            piped: Vec::new(),
         }
     }
 
@@ -2507,13 +2590,13 @@ impl<'c> Body<'c> {
                 }
                 None => (Ty::Error, Value::default()),
             },
-            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::AddrOf(_)
+            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::AddrOf(_) | ExprKind::FnType(_)
                 if self.is_type_expr(expr) =>
             {
                 let ty = self.expr_type(expr);
                 self.type_value(ty, expr.span)
             }
-            ExprKind::Name(name) => self.name(name, expr.span),
+            ExprKind::Name(name) => self.name(name, expected, expr.span),
             ExprKind::Module(name) => self.module_property(name),
             ExprKind::Tuple(elems) => self.tuple(elems, expected),
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expected, expr.span),
@@ -2521,7 +2604,7 @@ impl<'c> Body<'c> {
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
             ExprKind::Field(inner, field) if self.names_module(inner).is_some() => {
                 match self.member(inner, field) {
-                    Some(item) => self.item_value(item, &field.name, field.span),
+                    Some(item) => self.item_value(item, &field.name, expected, field.span),
                     None => (Ty::Error, Value::default()),
                 }
             }
@@ -2562,7 +2645,43 @@ impl<'c> Body<'c> {
             }
             ExprKind::Cast(inner, ty) => self.cast(inner, ty, expr.span),
             ExprKind::AddrOf(inner) => self.addr_of(inner, expr.span),
+            ExprKind::FnType(_) => unreachable!("function types are type expressions"),
+            ExprKind::Pipe(value, body) => self.pipe(value, body, expected),
+            ExprKind::Placeholder => match self.piped.last() {
+                Some((ty, scalars)) => {
+                    let scalars = scalars.clone();
+                    (
+                        *ty,
+                        Value {
+                            pre: Vec::new(),
+                            scalars,
+                        },
+                    )
+                }
+                None => unreachable!("the parser rejects `_` outside a pipe"),
+            },
         }
+    }
+
+    /// `value |> body`. The value is evaluated first and held in temporaries,
+    /// which each `_` in the body reads. A global initializer has no locals
+    /// and must be constant, so there the value is read in place.
+    fn pipe(
+        &mut self,
+        value: &parse::Expr,
+        body: &parse::Expr,
+        expected: Option<Ty>,
+    ) -> (Ty, Value) {
+        let (value_ty, mut value) = self.expr(value, None);
+        if !self.global {
+            self.spill(&mut value, |e| matches!(e, Expr::Const(_) | Expr::Local(_)));
+        }
+        self.piped.push((value_ty, value.scalars));
+        let (ty, mut result) = self.expr(body, expected);
+        self.piped.pop();
+        value.pre.append(&mut result.pre);
+        result.pre = value.pre;
+        (ty, result)
     }
 
     /// A tuple literal, whose elements are typed by those of `expected` and
@@ -2763,14 +2882,16 @@ impl<'c> Body<'c> {
         (Ty::Prim(prim), scalar(prim.val_type(), Expr::Const(value)))
     }
 
-    fn name(&mut self, name: &str, span: Span) -> (Ty, Value) {
+    /// The value of the variable or item `name`. `expected` picks the
+    /// instance of a generic function.
+    fn name(&mut self, name: &str, expected: Option<Ty>, span: Span) -> (Ty, Value) {
         if let Some(var) = self.lookup(name) {
             let ty = var.ty;
             let reads = var.slots.iter().map(|l| Expr::Local(*l)).collect();
             return (ty, self.scalars(ty, reads));
         }
         match self.ck.item(name) {
-            Some(item) => self.item_value(item, name, span),
+            Some(item) => self.item_value(item, name, expected, span),
             None => {
                 self.error(TypeErrorKind::UnknownName(name.to_string()), span);
                 (Ty::Error, Value::default())
@@ -2778,9 +2899,18 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// The value of `item`, named `name` at `span`.
-    fn item_value(&mut self, item: Item, name: &str, span: Span) -> (Ty, Value) {
+    /// The value of `item`, named `name` at `span`. `expected` picks the
+    /// instance of a generic function.
+    fn item_value(
+        &mut self,
+        item: Item,
+        name: &str,
+        expected: Option<Ty>,
+        span: Span,
+    ) -> (Ty, Value) {
         match item {
+            Item::Func(id) => self.func_value(id),
+            Item::GenericFn(generic) => self.generic_fn_value(generic, expected, span),
             Item::Global(index) => match &self.ck.globals[index] {
                 Some(global) => {
                     let ty = global.ty;
@@ -2794,11 +2924,7 @@ impl<'c> Body<'c> {
                 }
             },
             // Struct and enum names are types, which `expr` makes values.
-            Item::Func(_)
-            | Item::GenericFn(_)
-            | Item::Struct(_)
-            | Item::Enum(_)
-            | Item::Module(_) => {
+            Item::Struct(_) | Item::Enum(_) | Item::Module(_) => {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
@@ -2836,7 +2962,7 @@ impl<'c> Body<'c> {
 
     /// Whether `expr` is a type written where a value belongs: the name of a
     /// type that no variable or item shadows, a type given type arguments,
-    /// or a pointer to one of those.
+    /// a pointer to one of those, or a function type.
     fn is_type_expr(&self, expr: &parse::Expr) -> bool {
         match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.item(name) {
@@ -2848,6 +2974,7 @@ impl<'c> Body<'c> {
             }
             ExprKind::Call(callee, args) => self.names_type(callee, args),
             ExprKind::AddrOf(pointee) => self.is_type_expr(pointee),
+            ExprKind::FnType(_) => true,
             _ => false,
         }
     }
@@ -3077,8 +3204,9 @@ impl<'c> Body<'c> {
     fn cast(&mut self, operand: &parse::Expr, ty: &parse::Type, span: Span) -> (Ty, Value) {
         let to = self.ck.resolve_ty(ty);
         let expected = match to {
-            // An integer literal cast to a pointer is an address.
-            Ty::Ptr(_) => Some(Ty::Prim(Prim::U32)),
+            // An integer literal cast to a pointer is an address, and to a
+            // function pointer an index in the table.
+            Ty::Ptr(_) | Ty::Fn(_) => Some(Ty::Prim(Prim::U32)),
             _ => None,
         };
         let (from, value) = self.expr(operand, expected);
@@ -3138,7 +3266,7 @@ impl<'c> Body<'c> {
         let item = match &callee.kind {
             ExprKind::Module(name) => return self.module_call(name, args, span),
             ExprKind::Name(name) if self.lookup(name).is_some() => {
-                Err(Some(TypeErrorKind::NotCallable(name.clone())))
+                return self.call_value(callee, args, span);
             }
             ExprKind::Name(name) if self.ck.takes_type_args(name) => {
                 return self.generic_call(callee, args, span);
@@ -3172,7 +3300,7 @@ impl<'c> Body<'c> {
             ExprKind::Call(inner, targs) if self.names_fn(inner) => {
                 return self.explicit_call(callee, inner, targs, args, span);
             }
-            _ => Err(Some(TypeErrorKind::NotCallable("expression".to_string()))),
+            _ => return self.call_value(callee, args, span),
         };
         match item {
             Ok(Item::Func(id)) => {
@@ -3182,7 +3310,8 @@ impl<'c> Body<'c> {
             }
             Ok(Item::GenericFn(generic)) => self.generic_fn_call(generic, None, args, span),
             Ok(Item::Struct(id)) => self.construct(Ty::Struct(id), args, span),
-            Ok(Item::Enum(_) | Item::Global(_) | Item::Module(_)) | Err(_) => {
+            Ok(Item::Global(_)) => self.call_value(callee, args, span),
+            Ok(Item::Enum(_) | Item::Module(_)) | Err(_) => {
                 let error = match item {
                     Ok(_) => Some(TypeErrorKind::NotCallable(path_text(callee))),
                     Err(error) => error,
@@ -3739,7 +3868,7 @@ fn is_pure(expr: &Expr) -> bool {
             else_expr,
             ..
         } => is_pure(cond) && is_pure(then_expr) && is_pure(else_expr),
-        Expr::Call(..) | Expr::MemoryGrow(_) | Expr::Seq(..) => false,
+        Expr::Call(..) | Expr::CallIndirect { .. } | Expr::MemoryGrow(_) | Expr::Seq(..) => false,
     }
 }
 
@@ -3759,6 +3888,7 @@ fn is_stable(expr: &Expr) -> bool {
         } => is_stable(cond) && is_stable(then_expr) && is_stable(else_expr),
         Expr::Global(_)
         | Expr::Call(..)
+        | Expr::CallIndirect { .. }
         | Expr::Load { .. }
         | Expr::MemorySize
         | Expr::MemoryGrow(_)
@@ -4085,6 +4215,17 @@ mod tests {
                 let name = func_name(m, *func);
                 format!("(call {name} [{}] -> [{}])", list(args), dests.join(" "))
             }
+            Stmt::CallIndirect {
+                args, index, dests, ..
+            } => {
+                let dests: Vec<_> = dests.iter().map(|d| local(f, *d)).collect();
+                let index = e(index);
+                format!(
+                    "(call_indirect {index} [{}] -> [{}])",
+                    list(args),
+                    dests.join(" ")
+                )
+            }
             Stmt::Block(b) => format!("(block {})", stmts(m, f, b)),
             Stmt::Loop(b) => format!("(loop {})", stmts(m, f, b)),
             Stmt::If {
@@ -4124,6 +4265,10 @@ mod tests {
                 let args: Vec<_> = args.iter().map(ex).collect();
                 format!("(call {} {})", func_name(m, *func), args.join(" "))
             }
+            Expr::CallIndirect { args, index, .. } => {
+                let args: Vec<_> = args.iter().map(ex).collect();
+                format!("(call_indirect {} {})", ex(index), args.join(" "))
+            }
             Expr::If {
                 cond,
                 then_expr,
@@ -4141,6 +4286,12 @@ mod tests {
             Const::F32(x) => format!("{x}f32"),
             Const::F64(x) => format!("{x}f64"),
         }
+    }
+
+    /// The name of the function at each index of the table, from 1 up.
+    fn table(module: &Module) -> Vec<&str> {
+        let funcs = module.table.iter().flat_map(|table| &table.funcs);
+        funcs.map(|id| func_name(module, *id)).collect()
     }
 
     /// The offset and bytes of each data segment.
@@ -4380,6 +4531,169 @@ fn h() -> i32:
             "(set tmp0 (call tick )) (set tmp1 @g) (return (call sub tmp1 tmp0))"
         );
         assert_eq!(body(&module, "h"), "(return (call sub @g 1))");
+    }
+
+    #[test]
+    fn pipe_evaluates_its_value_once() {
+        let src = "\
+fn add(a: i32, b: i32) -> i32:
+    return a + b
+fn next() -> i32:
+    return 1
+fn f() -> i32:
+    return next() |> add(_, _)
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp0 (call next )) (return (call add tmp0 tmp0))"
+        );
+    }
+
+    #[test]
+    fn pipe_reads_locals_and_constants_in_place() {
+        let src = "\
+fn add(a: i32, b: i32) -> i32:
+    return a + b
+fn f(x: i32) -> i32:
+    return x |> add(_, 1) |> add(_, _)
+fn g(x: i32) -> i32:
+    return 2 |> add(_, x |> add(_, _))
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set tmp1 (call add x 1)) (return (call add tmp1 tmp1))"
+        );
+        assert_eq!(body(&module, "g"), "(return (call add 2 (call add x x)))");
+    }
+
+    #[test]
+    fn pipe_value_is_evaluated_before_its_body() {
+        let src = "\
+var g = 0
+fn tick() -> i32:
+    g += 1
+    return g
+fn sub(a: i32, b: i32) -> i32:
+    return a - b
+fn f() -> i32:
+    return g |> sub(tick(), _)
+fn h() -> i32:
+    return tick() |> sub(_, 1) |> sub(tick(), _)
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set tmp0 @g) (return (call sub (call tick ) tmp0))"
+        );
+        assert_eq!(
+            body(&module, "h"),
+            "(set tmp0 (call tick )) (set tmp1 (call sub tmp0 1)) \
+             (return (call sub (call tick ) tmp1))"
+        );
+    }
+
+    #[test]
+    fn pipe_types_its_value_like_a_binding() {
+        let src = "\
+fn byte(x: u8) -> u8:
+    return x
+fn f(x: u8) -> u8:
+    let a: u8 = x |> _ + 1
+    return 1 as u8 |> byte(_) |> byte(_ + a)
+";
+        lower(src);
+        let src = "\
+fn byte(x: u8) -> u8:
+    return x
+fn f() -> u8:
+    return 1 |> byte(_)
+";
+        assert_eq!(
+            errors(src),
+            vec![TypeErrorKind::Mismatch {
+                expected: "u8".into(),
+                found: "i32".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn constant_pipes_fold_in_globals() {
+        let src = "\
+let KIB = 4 |> _ * 1024
+let PAIR = (KIB |> _ + _, 1.5 |> -_)
+";
+        let inits: Vec<_> = lower(src).globals.iter().map(|g| konst(g.init)).collect();
+        assert_eq!(inits, vec!["4096", "8192", "-1.5f64"]);
+
+        let src = "\
+fn one() -> i32:
+    return 1
+var v = 1
+let a = one() |> _ + _
+let b = v |> _ + 1
+";
+        assert_eq!(
+            errors(src),
+            vec![TypeErrorKind::NotConstant, TypeErrorKind::NotConstant]
+        );
+    }
+
+    #[test]
+    fn pipes_carry_any_value() {
+        let src = "\
+struct P:
+    x: i32
+    y: i32
+fn make() -> P:
+    return P(x: 1, y: 2)
+fn nothing() -> tuple():
+    return ()
+fn take(u: tuple(), n: i32) -> i32:
+    return n
+fn double(x: i32) -> i32:
+    return x * 2
+fn size(t: type) -> u32:
+    return t.size
+fn sum() -> i32:
+    return make() |> _.x + _.y
+fn unit() -> i32:
+    return nothing() |> take(_, 1)
+fn callee() -> i32:
+    return double |> _(3)
+fn field(p: &P) -> &i32:
+    return p |> &_.y
+fn ty() -> u32:
+    return P |> size(_)
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "sum"),
+            "(call make [] -> [tmp0 tmp1]) (return (I32.Add tmp0 tmp1))"
+        );
+        assert_eq!(
+            body(&module, "unit"),
+            "(call nothing [] -> []) (return (call take 1))"
+        );
+        assert_eq!(body(&module, "callee"), "(return (call_indirect 1 3))");
+        assert_eq!(body(&module, "field"), "(return (I32.Add p 4))");
+        assert_eq!(body(&module, "ty"), "(return (call size 8 4))");
+    }
+
+    #[test]
+    fn placeholder_is_a_value_not_a_place_or_type() {
+        let src = "\
+struct(T) Box:
+    value: T
+fn f(x: i32):
+    let p = x |> &_
+    let b = i32 |> Box(_)(value: 1)
+";
+        assert_eq!(
+            errors(src),
+            vec![TypeErrorKind::NotAddressable, TypeErrorKind::NotAType]
+        );
     }
 
     #[test]
@@ -4702,7 +5016,6 @@ fn P():
                 DuplicateParam("a".into()),
                 UnknownType("Foo".into()),
                 UnknownName("y".into()),
-                NotAValue("f".into()),
                 NotCallable("a".into()),
                 NotAssignable,
                 MissingArg("a".into()),
@@ -7174,6 +7487,417 @@ fn f():
                 NotStorable("externref".into()),
                 NotCallable("R".into()),
                 mismatch("tuple(_, _)", "P"),
+            ]
+        );
+    }
+
+    #[test]
+    fn functions_are_values_called_through_the_table() {
+        let src = "\
+fn inc(x: i32) -> i32:
+    return x + 1
+fn dec(x: i32) -> i32:
+    return x - 1
+fn apply(f: fn(i32) -> i32, x: i32) -> i32:
+    return f(x)
+fn main() -> i32:
+    var g = dec
+    g = inc
+    return apply(g, 1) + apply(dec, 2) + apply(inc, 3)
+";
+        let module = lower(src);
+        // Indices are given in the order pointers are first taken.
+        assert_eq!(table(&module), ["dec", "inc"]);
+        assert_eq!(module.table.as_ref().unwrap().export, "table");
+        assert_eq!(body(&module, "apply"), "(return (call_indirect f x))");
+        assert_eq!(
+            body(&module, "main"),
+            "(set g 1) (set g 2) (return (I32.Add (I32.Add \
+             (call apply g 1) (call apply 1 2)) (call apply 2 3)))"
+        );
+        let func = module.funcs.iter().find(|f| f.name == "apply").unwrap();
+        let Stmt::Return(values) = &func.body[0] else {
+            panic!()
+        };
+        let Expr::CallIndirect { ty, .. } = &values[0] else {
+            panic!()
+        };
+        assert_eq!(ty.params, [ValType::I32]);
+        assert_eq!(ty.results, [ValType::I32]);
+
+        assert_eq!(lower("fn f():\n    pass\n").table, None);
+    }
+
+    #[test]
+    fn any_function_pointer_can_be_called() {
+        let src = "\
+struct S:
+    run: fn(i32) -> i32
+    done: fn()
+fn inc(x: i32) -> i32:
+    return x + 1
+fn nop():
+    pass
+fn pair(x: i32) -> tuple(i32, i32):
+    return (x, x)
+fn pick() -> fn(i32) -> i32:
+    return inc
+var handler = inc
+fn field(s: S) -> i32:
+    s.done()
+    return s.run(1)
+fn element(fs: array(fn(i32) -> i32)) -> i32:
+    return fs[1](2)
+fn result() -> i32:
+    return pick()(3)
+fn deref(p: &fn(i32) -> tuple(i32, i32)) -> i32:
+    let (a, b) = p.*(4)
+    return a
+fn global() -> i32:
+    return handler(5)
+fn param(inc: fn(i32) -> i32) -> i32:
+    return inc(6)
+fn cast(i: u32) -> i32:
+    return (i as fn(i32) -> i32)(7)
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "field"),
+            "(call_indirect s.done [] -> []) (return (call_indirect s.run 1))"
+        );
+        // After the bounds check, which leaves the element's address.
+        let element = body(&module, "element");
+        let call = "(return (call_indirect (I32.Load offset=0 tmp2) 2))";
+        assert!(element.ends_with(call), "{element}");
+        assert_eq!(
+            body(&module, "result"),
+            "(return (call_indirect (call pick ) 3))"
+        );
+        assert_eq!(
+            body(&module, "deref"),
+            "(call_indirect (I32.Load offset=0 p) [4] -> [tmp1 tmp2]) \
+             (set a tmp1) (set b tmp2) (return a)"
+        );
+        assert_eq!(
+            body(&module, "global"),
+            "(return (call_indirect @handler 5))"
+        );
+        // A variable is called before the function it shadows.
+        assert_eq!(body(&module, "param"), "(return (call_indirect inc 6))");
+        assert_eq!(body(&module, "cast"), "(return (call_indirect i 7))");
+    }
+
+    #[test]
+    fn callees_are_evaluated_before_arguments() {
+        let src = "\
+var count = 0
+var handler = inc
+fn inc(x: i32) -> i32:
+    return x + 1
+fn pick() -> fn(i32) -> i32:
+    count += 1
+    return inc
+fn next() -> i32:
+    handler = pick()
+    return count
+fn impure_callee() -> i32:
+    return pick()(count)
+fn changed_callee() -> i32:
+    return handler(next())
+fn stable_callee(f: fn(i32) -> i32) -> i32:
+    return f(next())
+fn pure_both() -> i32:
+    return handler(count)
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "impure_callee"),
+            "(set tmp0 (call pick )) (return (call_indirect tmp0 @count))"
+        );
+        assert_eq!(
+            body(&module, "changed_callee"),
+            "(set tmp0 @handler) (return (call_indirect tmp0 (call next )))"
+        );
+        assert_eq!(
+            body(&module, "stable_callee"),
+            "(return (call_indirect f (call next )))"
+        );
+        assert_eq!(
+            body(&module, "pure_both"),
+            "(return (call_indirect @handler @count))"
+        );
+    }
+
+    #[test]
+    fn pointers_to_imports_bring_results_into_range() {
+        let src = "\
+extern:
+    fn log(n: i32)
+    fn flag() -> bool
+    fn small(x: i32) -> tuple(u8, i64)
+fn f() -> bool:
+    let a = log
+    let b = flag
+    let c = small
+    let d = flag
+    return b()
+";
+        let module = lower(src);
+        // `log` is in the table itself; the others are called through
+        // functions named after them.
+        assert_eq!(table(&module), ["log", "extern flag", "extern small"]);
+        assert_eq!(
+            body(&module, "extern flag"),
+            "(return (I32.Ne (call flag ) 0))"
+        );
+        assert_eq!(
+            body(&module, "extern small"),
+            "(call small [x] -> [tmp1 tmp2]) (return (I32.And tmp1 255) tmp2)"
+        );
+        assert_eq!(
+            body(&module, "f"),
+            "(set a 1) (set b 2) (set c 3) (set d 2) (return (call_indirect b ))"
+        );
+    }
+
+    #[test]
+    fn generic_function_pointers_take_the_expected_type() {
+        let src = "\
+fn(T) id(x: T) -> T:
+    return x
+fn(T, U) apply(x: T, f: fn(T) -> U) -> U:
+    return f(x)
+fn double(x: i32) -> i64:
+    return x as i64 * 2
+fn take(f: fn(f32) -> f32):
+    pass
+fn f(n: i32) -> fn(i64) -> i64:
+    let g: fn(u8) -> u8 = id
+    let a = apply(n, double)
+    let b = apply(i32, i32)(2, id)
+    let c = apply(g(3), g)
+    take(id)
+    return id
+";
+        let module = lower(src);
+        assert_eq!(
+            table(&module),
+            ["id(u8)", "double", "id(i32)", "id(f32)", "id(i64)"]
+        );
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        for instance in ["apply(i32, i64)", "apply(i32, i32)", "apply(u8, u8)"] {
+            assert!(names.contains(&instance), "{instance} in {names:?}");
+        }
+
+        use TypeErrorKind::*;
+        let src = "\
+fn(T) id(x: T) -> T:
+    return x
+fn(T, U) apply(x: T, f: fn(T) -> U) -> U:
+    return f(x)
+fn f():
+    let a = id
+    let b: fn(u8) -> i32 = id
+    let c: fn(u8, u8) -> u8 = id
+    let d: i32 = id
+    let e = apply(1, id)
+";
+        let cannot_infer = |func: &str, param: &str| CannotInfer {
+            func: func.into(),
+            param: param.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                cannot_infer("id", "T"),
+                mismatch("fn(u8) -> i32", "fn(u8) -> u8"),
+                cannot_infer("id", "T"),
+                cannot_infer("id", "T"),
+                cannot_infer("apply", "U"),
+            ]
+        );
+    }
+
+    #[test]
+    fn function_pointers_are_compared_cast_and_stored_as_indices() {
+        let src = "\
+struct S:
+    a: u8
+    f: fn(i32) -> i32
+fn inc(x: i32) -> i32:
+    return x + 1
+fn f(p: &S, g: fn(i32) -> i32) -> bool:
+    p.f = g
+    let i = g as u32
+    let h = i as fn(i32)
+    let k = h as fn() -> f32
+    let z = 0 as fn()
+    let t = fn(i32) -> i32
+    let s = tuple(u8, fn(externref) -> externref)
+    return p.f == inc and g != inc and t.size == 4 and s.align == 4
+";
+        let module = lower(src);
+        let f = body(&module, "f");
+        for part in [
+            "(I32.Store offset=4 p g)",
+            "(set i g) (set h i) (set k h) (set z 0)",
+            "(set t.size 4) (set t.align 4) (set s.size 8) (set s.align 4)",
+            "(I32.Eq (I32.Load offset=4 p) 1)",
+            "(I32.Ne g 1)",
+        ] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+    }
+
+    #[test]
+    fn function_pointers_are_constants() {
+        let src = "\
+fn inc(x: i32) -> i32:
+    return x + 1
+fn dec(x: i32) -> i32:
+    return x - 1
+let first = dec
+pub var current: fn(i32) -> i32 = inc
+let handlers: array(fn(i32) -> i32) = [inc, dec, inc]
+enum(fn(i32) -> i32) Op:
+    up = inc
+    down = dec
+fn f(op: Op) -> i32:
+    var total = 0
+    for o in Op:
+        total = (o as fn(i32) -> i32)(total)
+    return (op as fn(i32) -> i32)(total)
+";
+        let module = lower(src);
+        assert_eq!(table(&module), ["dec", "inc"]);
+        let inits: Vec<_> = module.globals.iter().map(|g| g.init).collect();
+        assert_eq!(inits[..2], [Const::I32(1), Const::I32(2)]);
+        assert_eq!(
+            data(&module),
+            [(0, &[2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0][..])]
+        );
+        assert_eq!(
+            body(&module, "f"),
+            "(set total 0) (block \
+             (block (set o 2) (set total (call_indirect o total))) \
+             (block (set o 1) (set total (call_indirect o total)))) \
+             (return (call_indirect op total))"
+        );
+
+        let src = "\
+fn nop():
+    pass
+enum(fn()) E:
+    a = nop
+    b = nop
+";
+        let duplicate = TypeErrorKind::DuplicateValue {
+            member: "b".into(),
+            same_as: "a".into(),
+        };
+        assert_eq!(errors(src), vec![duplicate]);
+    }
+
+    #[test]
+    fn function_pointer_errors() {
+        use TypeErrorKind::*;
+        let src = "\
+fn inc(x: i32) -> i32:
+    return x + 1
+enum(fn(i32) -> i32) Op:
+    up = inc
+fn f(g: fn(i32) -> i32, n: i32, h: fn(i32)):
+    g(x: 1)
+    g()
+    g(1, 2)
+    g(true)
+    n(1)
+    fn(i32)(1)
+    Op.up(1)
+    let a: fn(i32) = inc
+    let b = g < g
+    let c = g as &i32
+    let d = g.x
+    h(g)
+    let e: fn(Nope) = inc
+    inc(i32)(1)
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                LabelledPointerArg,
+                TooFewArgs {
+                    expected: 1,
+                    found: 0
+                },
+                TooManyArgs {
+                    expected: 1,
+                    found: 2
+                },
+                mismatch("i32", "bool"),
+                NotCallable("n".into()),
+                NotCallable("expression".into()),
+                NotCallable("Op.up".into()),
+                mismatch("fn(i32)", "fn(i32) -> i32"),
+                invalid_operand("<", "fn(i32) -> i32"),
+                InvalidCast {
+                    from: "fn(i32) -> i32".into(),
+                    to: "&i32".into()
+                },
+                NoField {
+                    ty: "fn(i32) -> i32".into(),
+                    field: "x".into()
+                },
+                mismatch("i32", "fn(i32) -> i32"),
+                UnknownType("Nope".into()),
+                NotGeneric("inc".into()),
+            ]
+        );
+        assert_eq!(
+            LabelledPointerArg.to_string(),
+            "arguments of a call through a function pointer can't be labelled"
+        );
+    }
+
+    #[test]
+    fn function_types_are_checked_like_the_types_they_hold() {
+        // A function pointer is an index, so it ends a cycle of structs and
+        // is stored whatever it takes.
+        let src = "\
+struct Node:
+    visit: fn(Node) -> Node
+    host: fn(externref) -> externref
+fn f(p: &Node) -> type:
+    return Node
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "f"), "(return 8 4)");
+
+        use TypeErrorKind::*;
+        let src = "\
+struct Hidden:
+    x: i32
+struct Host:
+    r: externref
+struct(T) Grow:
+    next: fn(Grow(tuple(T, T)))
+pub fn take(f: fn(Hidden) -> i32):
+    pass
+pub fn table():
+    pass
+fn g(f: fn(&Host)):
+    pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                ReservedExport("table".into()),
+                ExpansiveRecursion("Grow".into()),
+                PrivateInPublic {
+                    ty: "Hidden".into(),
+                    item: "take".into()
+                },
+                NotStorable("Host".into()),
             ]
         );
     }

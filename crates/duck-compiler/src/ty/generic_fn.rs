@@ -179,7 +179,8 @@ impl Checker {
             }
             (Ty::Ptr(_), Ty::Ptr(_))
             | (Ty::Tuple(_), Ty::Tuple(_))
-            | (Ty::Array(_), Ty::Array(_)) => {
+            | (Ty::Array(_), Ty::Array(_))
+            | (Ty::Fn(_), Ty::Fn(_)) => {
                 let (p, a) = (self.components(pattern), self.components(actual));
                 if p.len() == a.len() {
                     for (p, a) in p.into_iter().zip(a) {
@@ -262,9 +263,54 @@ impl Body<'_> {
         self.call_func(id, value)
     }
 
-    /// Whether `expr` names a function that no variable shadows.
+    /// A pointer to the instance of generic function `generic`, named at
+    /// `span`, that has the function type `expected`. Nothing else gives
+    /// its type parameters their types.
+    pub(super) fn generic_fn_value(
+        &mut self,
+        generic: GenericFnId,
+        expected: Option<Ty>,
+        span: Span,
+    ) -> (Ty, Value) {
+        let def = &self.ck.generic_fns[generic.0 as usize];
+        let (func, type_params) = (def.sig.name.clone(), def.params.clone());
+        let (params, ret) = (def.sig.params.iter().map(|(_, ty)| *ty), def.sig.ret);
+        let params: Vec<_> = params.collect();
+        // A signature or expected type that failed to resolve is already
+        // reported.
+        if params.contains(&Ty::Error) || ret == Ty::Error || expected == Some(Ty::Error) {
+            return (Ty::Error, Value::default());
+        }
+        let mut bound = vec![None; type_params.len()];
+        if let Some(expected @ Ty::Fn(_)) = expected {
+            let pattern = self.ck.fn_of(params, ret);
+            self.ck.unify(pattern, expected, &mut bound);
+        }
+        for (param, ty) in type_params.iter().zip(&bound) {
+            if ty.is_none() {
+                let (func, param) = (func.clone(), self.ck.param_name(*param));
+                self.error(TypeErrorKind::CannotInfer { func, param }, span);
+            }
+        }
+        let Some(type_args) = bound.into_iter().collect() else {
+            return (Ty::Error, Value::default());
+        };
+        match self.ck.instantiate_fn(generic, type_args, span) {
+            Some(id) => self.func_value(id),
+            None => (Ty::Error, Value::default()),
+        }
+    }
+
+    /// Whether `expr(args)` gives a function its type arguments, rather
+    /// than calling one whose result is then called. A generic function
+    /// always takes type arguments; any other is taken to unless it returns
+    /// a function pointer, so that giving it some is reported.
     pub(super) fn names_fn(&self, expr: &parse::Expr) -> bool {
-        matches!(self.named(expr), Some(Item::Func(_) | Item::GenericFn(_)))
+        match self.named(expr) {
+            Some(Item::GenericFn(_)) => true,
+            Some(Item::Func(id)) => !matches!(self.ck.funcs[id.0 as usize].ret, Ty::Fn(_)),
+            _ => false,
+        }
     }
 
     /// `callee(args)`, where `callee` is the function `func` names given
@@ -302,7 +348,7 @@ impl Body<'_> {
     /// Infers the type arguments of a call of generic function `generic`
     /// from the `args` that `binding` matches with its parameters. Arguments
     /// that aren't literals go first, so that literals take the types they
-    /// settle. Those it checks are kept in `checked`. Type parameters that
+    /// settle, and those naming generic functions are left for last. Those it checks are kept in `checked`. Type parameters that
     /// no argument settles are reported at `span`, and given the error type.
     fn infer_type_args(
         &mut self,
@@ -320,7 +366,13 @@ impl Body<'_> {
                 let Some(i) = *param else {
                     continue;
                 };
-                if is_literal(&arg.value) != literals || !self.ck.has_unbound(patterns[i], &bound) {
+                // A generic function's instance is picked by its parameter's
+                // type, so it settles nothing.
+                let generic = matches!(self.named(&arg.value), Some(Item::GenericFn(_)));
+                if generic
+                    || is_literal(&arg.value) != literals
+                    || !self.ck.has_unbound(patterns[i], &bound)
+                {
                     continue;
                 }
                 let (ty, value) = self.expr(&arg.value, None);

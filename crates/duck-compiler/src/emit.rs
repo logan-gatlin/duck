@@ -4,43 +4,76 @@
 //! statement and expression maps to a fixed instruction sequence. The module
 //! imports its `extern` functions and exports its memory and the `pub fn`s
 //! and `pub` globals of the entry module, names its start function if it has
-//! one, and fills memory with its literals. Source names go in a `name` custom section so tools can show them.
+//! one, and fills memory with its literals. A module that takes pointers to
+//! functions also exports the table that holds them. Source names go in a `name` custom section so tools can show them.
 
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, IndirectNameMap,
-    Instruction, MemArg, MemorySection, MemoryType, NameMap, NameSection, StartSection,
-    TypeSection,
+    BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    IndirectNameMap, Instruction, MemArg, MemorySection, MemoryType, NameMap, NameSection, RefType,
+    StartSection, TableSection, TableType, TypeSection,
 };
 
-use crate::ir::{BinOp, Const, Expr, Func, LoadOp, Module, Stmt, StoreOp, UnOp, ValType};
+use crate::ir::{BinOp, Const, Expr, Func, FuncType, LoadOp, Module, Stmt, StoreOp, UnOp, ValType};
+
+/// The module's function types, each encoded the first time it's asked for.
+#[derive(Default)]
+struct Types {
+    section: TypeSection,
+    ids: HashMap<FuncType, u32>,
+}
+
+impl Types {
+    /// The index of the type of functions from `params` to `results`.
+    fn id(&mut self, params: &[ValType], results: &[ValType]) -> u32 {
+        let ty = FuncType {
+            params: params.to_vec(),
+            results: results.to_vec(),
+        };
+        *self.ids.entry(ty).or_insert_with(|| {
+            let params = params.iter().map(|ty| val_type(*ty));
+            let results = results.iter().map(|ty| val_type(*ty));
+            self.section.ty().function(params, results);
+            self.section.len() - 1
+        })
+    }
+}
 
 /// Encodes a lowered module as the contents of a `.wasm` file.
 pub fn emit(module: &Module) -> Vec<u8> {
-    let mut types = TypeSection::new();
-    let mut type_ids = HashMap::new();
-    let mut type_id = |params: &[ValType], results: &[ValType]| {
-        *type_ids
-            .entry((params.to_vec(), results.to_vec()))
-            .or_insert_with(|| {
-                let params = params.iter().map(|ty| val_type(*ty));
-                let results = results.iter().map(|ty| val_type(*ty));
-                types.ty().function(params, results);
-                types.len() - 1
-            })
-    };
+    let mut types = Types::default();
 
     let mut imports = ImportSection::new();
     for import in &module.imports {
-        let id = type_id(&import.params, &import.results);
+        let id = types.id(&import.params, &import.results);
         imports.import(&import.module, &import.field, EntityType::Function(id));
     }
 
     let mut functions = FunctionSection::new();
     for func in &module.funcs {
-        functions.function(type_id(&func.params, &func.results));
+        functions.function(types.id(&func.params, &func.results));
+    }
+
+    // Index 0 is left empty, so the functions start at 1.
+    let mut tables = TableSection::new();
+    let mut elements = ElementSection::new();
+    if let Some(table) = &module.table {
+        let size = table.funcs.len() as u64 + 1;
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: size,
+            maximum: Some(size),
+            shared: false,
+        });
+        let funcs: Vec<_> = table.funcs.iter().map(|func| func.0).collect();
+        elements.active(
+            None,
+            &ConstExpr::i32_const(1),
+            Elements::Functions(funcs.into()),
+        );
     }
 
     let mut memories = MemorySection::new();
@@ -67,6 +100,9 @@ pub fn emit(module: &Module) -> Vec<u8> {
 
     let mut exports = ExportSection::new();
     exports.export(&module.memory.export, ExportKind::Memory, 0);
+    if let Some(table) = &module.table {
+        exports.export(&table.export, ExportKind::Table, 0);
+    }
     for (i, func) in module.funcs.iter().enumerate() {
         if let Some(name) = &func.export {
             exports.export(name, ExportKind::Func, func_index(i));
@@ -84,7 +120,7 @@ pub fn emit(module: &Module) -> Vec<u8> {
 
     let mut code = CodeSection::new();
     for func in &module.funcs {
-        code.function(&function(func));
+        code.function(&function(func, &mut types));
     }
 
     let mut data = DataSection::new();
@@ -116,35 +152,39 @@ pub fn emit(module: &Module) -> Vec<u8> {
     names.globals(&global_names);
 
     let mut out = wasm_encoder::Module::new();
-    out.section(&types)
+    out.section(&types.section)
         .section(&imports)
-        .section(&functions)
-        .section(&memories)
-        .section(&globals)
-        .section(&exports);
+        .section(&functions);
+    if module.table.is_some() {
+        out.section(&tables);
+    }
+    out.section(&memories).section(&globals).section(&exports);
     if let Some(start) = &start {
         out.section(start);
+    }
+    if module.table.is_some() {
+        out.section(&elements);
     }
     out.section(&code).section(&data).section(&names);
     out.finish()
 }
 
-fn function(func: &Func) -> Function {
+fn function(func: &Func, types: &mut Types) -> Function {
     let locals = func.locals[func.params.len()..].iter();
     let mut f = Function::new_with_locals_types(locals.map(|local| val_type(local.ty)));
-    stmts(&mut f, &func.body);
+    stmts(&mut f, types, &func.body);
     f.instruction(&Instruction::End);
     f
 }
 
-fn stmt(f: &mut Function, stmt: &Stmt) {
+fn stmt(f: &mut Function, types: &mut Types, stmt: &Stmt) {
     match stmt {
         Stmt::SetLocal(local, value) => {
-            expr(f, value);
+            expr(f, types, value);
             f.instruction(&Instruction::LocalSet(local.0));
         }
         Stmt::SetGlobal(global, value) => {
-            expr(f, value);
+            expr(f, types, value);
             f.instruction(&Instruction::GlobalSet(global.0));
         }
         Stmt::Store {
@@ -154,41 +194,54 @@ fn stmt(f: &mut Function, stmt: &Stmt) {
             addr,
             value,
         } => {
-            expr(f, addr);
-            expr(f, value);
+            expr(f, types, addr);
+            expr(f, types, value);
             f.instruction(&store(*ty, *op, *offset));
         }
         Stmt::Drop(value) => {
-            expr(f, value);
+            expr(f, types, value);
             f.instruction(&Instruction::Drop);
         }
         Stmt::MemoryFill { dst, value, len } => {
-            exprs(f, [dst, value, len]);
+            exprs(f, types, [dst, value, len]);
             f.instruction(&Instruction::MemoryFill(0));
         }
         Stmt::MemoryCopy { dst, src, len } => {
-            exprs(f, [dst, src, len]);
+            exprs(f, types, [dst, src, len]);
             f.instruction(&Instruction::MemoryCopy {
                 src_mem: 0,
                 dst_mem: 0,
             });
         }
         Stmt::Call { func, args, dests } => {
-            exprs(f, args);
+            exprs(f, types, args);
             f.instruction(&Instruction::Call(func.0));
             // The last result is on top of the stack.
             for dest in dests.iter().rev() {
                 f.instruction(&Instruction::LocalSet(dest.0));
             }
         }
+        Stmt::CallIndirect {
+            ty,
+            args,
+            index,
+            dests,
+        } => {
+            exprs(f, types, args);
+            expr(f, types, index);
+            f.instruction(&call_indirect(types, ty));
+            for dest in dests.iter().rev() {
+                f.instruction(&Instruction::LocalSet(dest.0));
+            }
+        }
         Stmt::Block(body) => {
             f.instruction(&Instruction::Block(BlockType::Empty));
-            stmts(f, body);
+            stmts(f, types, body);
             f.instruction(&Instruction::End);
         }
         Stmt::Loop(body) => {
             f.instruction(&Instruction::Loop(BlockType::Empty));
-            stmts(f, body);
+            stmts(f, types, body);
             f.instruction(&Instruction::End);
         }
         Stmt::If {
@@ -196,12 +249,12 @@ fn stmt(f: &mut Function, stmt: &Stmt) {
             then_body,
             else_body,
         } => {
-            expr(f, cond);
+            expr(f, types, cond);
             f.instruction(&Instruction::If(BlockType::Empty));
-            stmts(f, then_body);
+            stmts(f, types, then_body);
             if !else_body.is_empty() {
                 f.instruction(&Instruction::Else);
-                stmts(f, else_body);
+                stmts(f, types, else_body);
             }
             f.instruction(&Instruction::End);
         }
@@ -209,11 +262,11 @@ fn stmt(f: &mut Function, stmt: &Stmt) {
             f.instruction(&Instruction::Br(*depth));
         }
         Stmt::BrIf(depth, cond) => {
-            expr(f, cond);
+            expr(f, types, cond);
             f.instruction(&Instruction::BrIf(*depth));
         }
         Stmt::Return(values) => {
-            exprs(f, values);
+            exprs(f, types, values);
             f.instruction(&Instruction::Return);
         }
         Stmt::Unreachable => {
@@ -222,13 +275,13 @@ fn stmt(f: &mut Function, stmt: &Stmt) {
     }
 }
 
-fn stmts(f: &mut Function, body: &[Stmt]) {
+fn stmts(f: &mut Function, types: &mut Types, body: &[Stmt]) {
     for s in body {
-        stmt(f, s);
+        stmt(f, types, s);
     }
 }
 
-fn expr(f: &mut Function, expr: &Expr) {
+fn expr(f: &mut Function, types: &mut Types, expr: &Expr) {
     match expr {
         Expr::Const(c) => {
             f.instruction(&konst(*c));
@@ -240,17 +293,22 @@ fn expr(f: &mut Function, expr: &Expr) {
             f.instruction(&Instruction::GlobalGet(global.0));
         }
         Expr::Unary(ty, op, x) => {
-            self::expr(f, x);
+            self::expr(f, types, x);
             f.instruction(&unary(*ty, *op));
         }
         Expr::Binary(ty, op, a, b) => {
-            self::expr(f, a);
-            self::expr(f, b);
+            self::expr(f, types, a);
+            self::expr(f, types, b);
             f.instruction(&binary(*ty, *op));
         }
         Expr::Call(func, args) => {
-            exprs(f, args);
+            exprs(f, types, args);
             f.instruction(&Instruction::Call(func.0));
+        }
+        Expr::CallIndirect { ty, args, index } => {
+            exprs(f, types, args);
+            self::expr(f, types, index);
+            f.instruction(&call_indirect(types, ty));
         }
         Expr::Load {
             ty,
@@ -258,14 +316,14 @@ fn expr(f: &mut Function, expr: &Expr) {
             offset,
             addr,
         } => {
-            self::expr(f, addr);
+            self::expr(f, types, addr);
             f.instruction(&load(*ty, *op, *offset));
         }
         Expr::MemorySize => {
             f.instruction(&Instruction::MemorySize(0));
         }
         Expr::MemoryGrow(pages) => {
-            self::expr(f, pages);
+            self::expr(f, types, pages);
             f.instruction(&Instruction::MemoryGrow(0));
         }
         Expr::If {
@@ -274,23 +332,31 @@ fn expr(f: &mut Function, expr: &Expr) {
             then_expr,
             else_expr,
         } => {
-            self::expr(f, cond);
+            self::expr(f, types, cond);
             f.instruction(&Instruction::If(BlockType::Result(val_type(*ty))));
-            self::expr(f, then_expr);
+            self::expr(f, types, then_expr);
             f.instruction(&Instruction::Else);
-            self::expr(f, else_expr);
+            self::expr(f, types, else_expr);
             f.instruction(&Instruction::End);
         }
         Expr::Seq(body, value) => {
-            stmts(f, body);
-            self::expr(f, value);
+            stmts(f, types, body);
+            self::expr(f, types, value);
         }
     }
 }
 
-fn exprs<'a>(f: &mut Function, values: impl IntoIterator<Item = &'a Expr>) {
+fn exprs<'a>(f: &mut Function, types: &mut Types, values: impl IntoIterator<Item = &'a Expr>) {
     for value in values {
-        expr(f, value);
+        expr(f, types, value);
+    }
+}
+
+/// `call_indirect` of a function of type `ty` in the one table.
+fn call_indirect(types: &mut Types, ty: &FuncType) -> Instruction<'static> {
+    Instruction::CallIndirect {
+        type_index: types.id(&ty.params, &ty.results),
+        table_index: 0,
     }
 }
 
@@ -1007,5 +1073,72 @@ pub fn f(p: Point) -> bool:
         // Unrolled, with a call per member.
         assert!(!func.contains("loop"), "{func}");
         assert_eq!(func.matches("call $log").count(), 2, "{func}");
+    }
+
+    #[test]
+    fn function_pointers_index_an_exported_table() {
+        let src = "\
+fn inc(x: i32) -> i32:
+    return x + 1
+fn pair(x: i32) -> tuple(i32, f32):
+    return (x, 1.0)
+pub fn apply(f: fn(i32) -> i32, g: fn(i32) -> tuple(i32, f32)) -> i32:
+    let (a, b) = g(1)
+    return f(a)
+pub fn main() -> i32:
+    return apply(inc, pair)
+";
+        let bytes = emit_src(src);
+        let wat = wat(&bytes);
+        for line in [
+            "(table (;0;) 3 3 funcref)",
+            r#"(export "table" (table 0))"#,
+            "(elem (;0;) (i32.const 1) func $inc $pair)",
+        ] {
+            assert!(wat.contains(line), "{line}\n{wat}");
+        }
+        let apply = func_wat(&bytes, "apply");
+        // The type of `pair`, then of `inc`.
+        assert!(apply.contains("call_indirect (type 1)"), "{apply}");
+        assert!(
+            apply.contains("local.get $f\n    call_indirect (type 0)"),
+            "{apply}"
+        );
+        let main = func_wat(&bytes, "main");
+        assert!(
+            main.contains("i32.const 1\n    i32.const 2\n    call $apply"),
+            "{main}"
+        );
+
+        let wat = self::wat(&emit_src("pub fn f():\n    pass\n"));
+        assert!(!wat.contains("table") && !wat.contains("elem"), "{wat}");
+    }
+
+    #[test]
+    fn imports_are_table_elements_unless_their_results_need_wrapping() {
+        let src = "\
+extern:
+    fn log(n: i32)
+    fn flag() -> bool
+pub let handlers: array(fn(i32)) = [log, log]
+pub fn pick(first: bool) -> fn() -> bool:
+    let f = flag
+    return f
+pub fn run(f: fn() -> bool, g: fn(i32)) -> bool:
+    g(1)
+    return f()
+";
+        let bytes = emit_src(src);
+        let wat = wat(&bytes);
+        assert!(
+            wat.contains(r#"(elem (;0;) (i32.const 1) func $log $"extern flag")"#),
+            "{wat}"
+        );
+        let flag = func_wat(&bytes, r#""extern flag""#);
+        assert!(
+            flag.contains("call $flag\n    i32.const 0\n    i32.ne"),
+            "{flag}"
+        );
+        assert!(wat.contains(r#"(data (;0;) (i32.const 0) "\01\00\00\00\01\00\00\00")"#));
     }
 }

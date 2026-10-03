@@ -72,6 +72,8 @@ pub enum TokenKind {
     Percent,
     Amp,
     Pipe,
+    /// `|>`
+    PipeArrow,
     Caret,
     Tilde,
     Shl,
@@ -180,6 +182,7 @@ impl fmt::Display for TokenKind {
             Self::Percent => "%",
             Self::Amp => "&",
             Self::Pipe => "|",
+            Self::PipeArrow => "|>",
             Self::Caret => "^",
             Self::Tilde => "~",
             Self::Shl => "<<",
@@ -233,8 +236,9 @@ impl std::error::Error for LexError {}
 ///
 /// Layout is made explicit: every logical line ends in `Newline`, and changes
 /// in leading whitespace produce `Indent`/`Dedent`. Blank and comment-only
-/// lines are ignored, as are line breaks inside brackets. The stream always
-/// ends with `Eof`, preceded by a `Dedent` for each block still open.
+/// lines are ignored, as are line breaks inside brackets and before a deeper
+/// line that starts with `|>`. The stream always ends with `Eof`, preceded by
+/// a `Dedent` for each block still open.
 pub fn tokenize(file: FileId, src: &str) -> Result<Vec<Token>, LexError> {
     Lexer {
         file,
@@ -305,6 +309,7 @@ impl<'a> Lexer<'a> {
                 '.' if self.eat('*') => TokenKind::DotStar,
                 '.' => TokenKind::Dot,
                 '&' => TokenKind::Amp,
+                '|' if self.eat('>') => TokenKind::PipeArrow,
                 '|' => TokenKind::Pipe,
                 '^' => TokenKind::Caret,
                 '~' => TokenKind::Tilde,
@@ -337,7 +342,9 @@ impl<'a> Lexer<'a> {
     }
 
     /// Consumes blank lines and leading whitespace at the start of a line,
-    /// emitting `Indent`/`Dedent` tokens as needed.
+    /// emitting `Indent`/`Dedent` tokens as needed. A line that starts with
+    /// `|>` and is indented deeper than its block continues the line above
+    /// instead, which takes back that line's `Newline`.
     fn indentation(&mut self) -> Result<(), LexError> {
         let src = self.src;
         let start = loop {
@@ -370,6 +377,10 @@ impl<'a> Lexer<'a> {
                 return Ok(());
             }
             if !dedented && indent.starts_with(top) {
+                if src[self.pos..].starts_with("|>") && self.after(TokenKind::Newline) {
+                    self.tokens.pop();
+                    return Ok(());
+                }
                 self.indents.push(indent);
                 self.push(TokenKind::Indent, start);
                 return Ok(());
@@ -775,6 +786,58 @@ mod tests {
     }
 
     #[test]
+    fn leading_pipe_continues_the_line_above() {
+        let chain = vec![
+            ident("a"),
+            PipeArrow,
+            ident("b"),
+            PipeArrow,
+            ident("c"),
+            Newline,
+            ident("d"),
+            Newline,
+            Eof,
+        ];
+        assert_eq!(kinds("a\n  |> b\n  |> c\nd\n"), chain);
+        // Steps needn't line up, and blank and comment lines may sit between.
+        assert_eq!(
+            kinds("a # one\n  |> b\n\n  # two\n      |> c\r\nd\n"),
+            chain
+        );
+
+        // The block the chain is in stays open.
+        #[rustfmt::skip]
+        let expected = vec![
+            ident("f"), Colon, Newline,
+            Indent, ident("a"), PipeArrow, ident("b"), Newline,
+            ident("c"), Newline,
+            Dedent, Eof,
+        ];
+        assert_eq!(kinds("f:\n  a\n    |> b\n  c\n"), expected);
+    }
+
+    #[test]
+    fn leading_pipe_must_be_indented_deeper() {
+        // At the block's own indentation, or shallower, it starts a line.
+        assert_eq!(
+            kinds("a\n|> b\n"),
+            vec![ident("a"), Newline, PipeArrow, ident("b"), Newline, Eof]
+        );
+        #[rustfmt::skip]
+        let expected = vec![
+            ident("f"), Colon, Newline,
+            Indent, ident("a"), Newline,
+            Dedent, PipeArrow, ident("b"), Newline,
+            Eof,
+        ];
+        assert_eq!(kinds("f:\n  a\n|> b\n"), expected);
+        assert_eq!(
+            error("f:\n    a\n  |> b\n"),
+            LexErrorKind::InconsistentIndent
+        );
+    }
+
+    #[test]
     fn crlf_line_endings() {
         let src = "a:\r\n\tb\r\n";
         assert_eq!(
@@ -867,6 +930,22 @@ mod tests {
             vec![
                 Arrow, EqEq, NotEq, Le, Ge, Shl, Shr, PlusEq, MinusEq, StarEq, SlashEq, PercentEq,
                 Lt, Gt, Eq, Minus, Plus, Star, Slash, Percent, Amp, Pipe, Caret, Tilde, Newline,
+                Eof
+            ]
+        );
+        assert_eq!(
+            kinds("a |> b | > c |>= d"),
+            vec![
+                ident("a"),
+                PipeArrow,
+                ident("b"),
+                Pipe,
+                Gt,
+                ident("c"),
+                PipeArrow,
+                Eq,
+                ident("d"),
+                Newline,
                 Eof
             ]
         );

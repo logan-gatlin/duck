@@ -213,6 +213,56 @@ fn f():
           (integer))))))
 
 ====================
+Pipe lines
+====================
+
+fn f():
+    let a = load()
+        # first
+        |> clean(_)
+
+      |> render(_)
+    if a
+        |> ok(_):
+        pass
+    return a
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (binding
+        (identifier)
+        (pipe_expression
+          (pipe_expression
+            (call_expression
+              (identifier)
+              (arguments))
+            (comment)
+            (call_expression
+              (identifier)
+              (arguments
+                (placeholder))))
+          (call_expression
+            (identifier)
+            (arguments
+              (placeholder)))))
+      (if_statement
+        (pipe_expression
+          (identifier)
+          (call_expression
+            (identifier)
+            (arguments
+              (placeholder))))
+        (block
+          (pass_statement)))
+      (return_statement
+        (identifier)))))
+
+====================
 No trailing newline
 ====================
 

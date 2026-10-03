@@ -359,14 +359,140 @@ let _ = ""
     (string)))
 
 ====================
-Discard as a name
+Pipes
 ====================
 
-let _ = _
+let _ = x |> f(_, 1)
+let _ = a or b |> _ + 1 |> f(_, _)
+let _ = f(x |> _.a)
+let _ = f(_: 1)
 
 ---
 
 (source_file
   (binding
     (discard)
-    (identifier)))
+    (pipe_expression
+      (identifier)
+      (call_expression
+        (identifier)
+        (arguments
+          (placeholder)
+          (integer)))))
+  (binding
+    (discard)
+    (pipe_expression
+      (pipe_expression
+        (binary_expression
+          (identifier)
+          (identifier))
+        (binary_expression
+          (placeholder)
+          (integer)))
+      (call_expression
+        (identifier)
+        (arguments
+          (placeholder)
+          (placeholder)))))
+  (binding
+    (discard)
+    (call_expression
+      (identifier)
+      (arguments
+        (pipe_expression
+          (identifier)
+          (field_expression
+            (placeholder)
+            (identifier))))))
+  (binding
+    (discard)
+    (call_expression
+      (identifier)
+      (arguments
+        (labeled_argument
+          (identifier)
+          (integer))))))
+
+====================
+Function types
+====================
+
+let f: fn(i32, &u8) -> bool = g
+let _ = malloc(fn())
+let _ = x as fn(A) -> fn(B) -> C
+let _ = array(fn(i32) -> u8)(len: 1, ptr: p)
+let _: &fn(lib.T) -> &R = pick()(1)
+
+---
+
+(source_file
+  (binding
+    (identifier)
+    (function_type
+      (parameter_types
+        (named_type
+          (identifier))
+        (pointer_type
+          (named_type
+            (identifier))))
+      (named_type
+        (identifier)))
+    (identifier))
+  (binding
+    (discard)
+    (call_expression
+      (identifier)
+      (arguments
+        (function_type
+          (parameter_types)))))
+  (binding
+    (discard)
+    (cast_expression
+      (identifier)
+      (function_type
+        (parameter_types
+          (named_type
+            (identifier)))
+        (function_type
+          (parameter_types
+            (named_type
+              (identifier)))
+          (named_type
+            (identifier))))))
+  (binding
+    (discard)
+    (call_expression
+      (call_expression
+        (identifier)
+        (arguments
+          (function_type
+            (parameter_types
+              (named_type
+                (identifier)))
+            (named_type
+              (identifier)))))
+      (arguments
+        (labeled_argument
+          (identifier)
+          (integer))
+        (labeled_argument
+          (identifier)
+          (identifier)))))
+  (binding
+    (discard)
+    (pointer_type
+      (function_type
+        (parameter_types
+          (qualified_type
+            (identifier)
+            (named_type
+              (identifier))))
+        (pointer_type
+          (named_type
+            (identifier)))))
+    (call_expression
+      (call_expression
+        (identifier)
+        (arguments))
+      (arguments
+        (integer)))))

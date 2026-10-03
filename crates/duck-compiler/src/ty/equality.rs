@@ -43,7 +43,7 @@ impl Checker {
     fn push_parts(&self, ty: Ty, out: &mut Vec<Part>) {
         match ty {
             Ty::Prim(prim) => out.push(Part::Scalar(prim.val_type())),
-            Ty::Ptr(_) => out.push(Part::Scalar(ValType::I32)),
+            Ty::Ptr(_) | Ty::Fn(_) => out.push(Part::Scalar(ValType::I32)),
             Ty::Enum(id) => {
                 out.extend(self.val_types(self.enum_ty(id)).into_iter().map(Part::Bits))
             }

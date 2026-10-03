@@ -1,7 +1,8 @@
 // Layout tokens for Duck: the newline that ends a logical line, and the
 // indent/dedent around a block. Mirrors `Lexer::indentation` in
 // `crates/duck-compiler/src/lex.rs`: blank and comment-only lines are ignored,
-// as are line breaks inside brackets.
+// as are line breaks inside brackets and before a deeper line that starts with
+// `|>`.
 
 #include "tree_sitter/array.h"
 #include "tree_sitter/parser.h"
@@ -115,6 +116,16 @@ bool tree_sitter_duck_external_scanner_scan(void *payload, TSLexer *lexer, const
     }
 
     uint16_t current = *array_back(&scanner->indents);
+
+    // A deeper line starting with `|>` continues the line above, so the line
+    // break is only whitespace. The token's end is already marked, so looking
+    // past the `|` doesn't change what is produced otherwise.
+    if (indent > current && lexer->lookahead == '|') {
+        skip(lexer);
+        if (lexer->lookahead == '>') {
+            return false;
+        }
+    }
 
     if (valid_symbols[INDENT] && indent > current) {
         array_push(&scanner->indents, (uint16_t)indent);

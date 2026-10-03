@@ -53,7 +53,8 @@ cached under `$XDG_CACHE_HOME/duck/git`, or `~/.cache/duck/git`.
 - Blocks start with `:` at the end of a line and are indented under it, as in
   Python. Use tabs or spaces, but each line's indentation must extend or match
   an enclosing block's. Line breaks and indentation mean nothing inside
-  `()` and `[]`. There are no semicolons.
+  `()` and `[]`. A line that starts with `|>` and is indented deeper than the
+  statement above it continues that statement. There are no semicolons.
 - An empty block is written `pass`.
 - Comments run from `#` to the end of the line.
 - Integers: `42`, `1_000`, `0xff`, `0o17`, `0b1010`. Floats: `1.5`, `2e3`,
@@ -92,8 +93,9 @@ pub fn main():
 - Items are private to their file unless marked `pub`. Struct fields are
   private unless marked `pub`.
 - Every `pub` function and global of the entry file is exported from the wasm
-  module. The memory is exported as `memory`, so no `pub` item may be named
-  that. Generic functions are never exported.
+  module. The memory is exported as `memory` and the table of function
+  pointers as `table`, so no `pub` item may be named either. Generic functions
+  are never exported.
 - Items may be used before they are declared, except that a global's
   initializer can only read earlier globals.
 
@@ -108,6 +110,7 @@ pub fn main():
 | `tuple(A, B, ...)` | Two or more elements. Built with `(a, b)`, read with `t.0`. Structural. |
 | `&T` | A pointer: a `u32` address into linear memory. Nothing checks it. |
 | `array(T)` | A slice that owns nothing: the fields `len: u32` then `ptr: &T`. |
+| `fn(A, B) -> R` | A function pointer: an index into the module's table. Leave out `-> R` for a function that returns nothing. Structural. |
 | `type` | A type used as a value: the fields `size: u32` and `align: u32`. |
 | `externref` | An opaque host reference. It can never be stored in memory. |
 | `Name`, `Name(T, ...)` | Structs and enums, plain or generic. |
@@ -146,6 +149,7 @@ associative.
 
 | Precedence | Operators |
 | --- | --- |
+| 0 | `\|>` (see Pipes) |
 | 1 | `or` (short-circuits, `bool` only) |
 | 2 | `and` (short-circuits, `bool` only) |
 | 3 | `not` (prefix) |
@@ -177,14 +181,50 @@ Rules for each operator:
   `~` works on integers.
 - `< <= > >=` compare numbers, and pointers as unsigned addresses.
 - `==` and `!=` compare values of any one type: structs and tuples field by
-  field, arrays by length and elements, enums by bits, and types by size and
-  alignment. Anything that holds an `externref` can't be compared.
+  field, arrays by length and elements, enums by bits, types by size and
+  alignment, and function pointers by the function they point to. Anything
+  that holds an `externref` can't be compared.
 - `as` converts between any two numeric types. Float to integer saturates,
   and NaN becomes 0. `bool` converts to integers. `i32` and `u32` convert to
-  and from pointers. Any pointer converts to any other pointer, and any enum to
+  and from pointers and function pointers. Any pointer converts to any other
+  pointer, any function pointer to any other function pointer, and any enum to
   its value type. Every type converts to itself. Nothing converts to `bool` or
   to an enum, so write `x != 0` instead.
 - There is no ternary or conditional expression. `if` is a statement.
+
+## Pipes
+
+`value |> body` evaluates `value` once, then `body`, in which each `_` is that
+value.
+
+```duck
+fn add(a: i32, b: i32) -> i32:
+	return a + b
+
+fn demo(n: i32) -> i32:
+	let a = n |> add(_, 1)          # add(n, 1)
+	let b = a * 2 |> add(_, _) - 1  # add(a * 2, a * 2) - 1, multiplying once
+	return b
+		|> add(_, a)                # a line starting with `|>` continues
+		# comments and blank lines may come between
+		|> _ / 2                    # the statement above it
+```
+
+- The body is any expression, and must use `_` at least once. `x |> f` is an
+  error: write `x |> f(_)`.
+- `|>` binds looser than every other operator and is left associative, so
+  `a or b |> f(_)` is `(a or b) |> f(_)`, and a chain runs top to bottom.
+- A `_` belongs to the nearest pipe whose body it is in. In
+  `x |> f(_, y |> g(_))` the second `_` is `y`.
+- `_` is a copy of the value, like a `let` binding: it can't be assigned to,
+  and a literal is typed before the body is looked at. `1 |> byte(_)` passes an
+  `i32`, so write `1 as u8 |> byte(_)`.
+- A line starting with `|>` must be indented deeper than the first line of the
+  statement it continues. It may continue any statement, and the head of an
+  `if`, `while` or `for`. No other operator continues a line, and `|>` can't
+  end one.
+- Anywhere else, `_` is not an expression. It still discards in a pattern.
+- A pipe in a global initializer is constant when its value and body are.
 
 ## Statements
 
@@ -239,10 +279,65 @@ fn caller() -> f64:
 
 - Arguments are evaluated in the order they are written, whatever order the
   labels put them in.
-- Functions are not values. There are no closures, methods, overloading,
-  default arguments or varargs. Recursion is fine.
+- There are no closures, methods, overloading, default arguments or varargs.
+  Recursion is fine.
 - Structs, tuples and arrays are passed and returned by value. The function
   copies them, and each one is split into its scalars at the wasm boundary.
+
+## Function pointers
+
+Naming a function where a value belongs gives a pointer to it, of the type
+`fn(A, B) -> R`.
+
+```duck
+extern:
+	fn log(n: i32)
+
+struct Button:
+	id: i32
+	on_click: fn(i32)            # no `-> R`: the function returns nothing
+
+fn double(x: i32) -> i32:
+	return x * 2
+
+fn(T) id(x: T) -> T:
+	return x
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32:
+	return f(x)                  # anything of a function type can be called
+
+let steps: array(fn(i32) -> i32) = [double, id] # pointers are constants
+
+fn demo(b: Button) -> i32:
+	b.on_click(b.id)
+	let f = double
+	let g: fn(u8) -> u8 = id     # a generic function takes the type expected of it
+	var total = apply(f, 1)
+	for step in steps:
+		total = step(total)
+	return total + g(1) as i32
+
+fn press() -> i32:
+	return demo(Button(id: 7, on_click: log)) # extern functions have pointers too
+```
+
+- Two function types are the same when their parameter and result types are.
+  Parameter names aren't part of the type, so the arguments of a call through
+  a pointer can't be labelled.
+- A pointer is the function's index in the module's table. A function gets
+  the next index, from 1, the first time its pointer is taken. Pointers are 4
+  bytes in memory, are compared with `==`, and are allowed in global
+  initializers.
+- Nothing is at index 0, so calling a zeroed pointer traps. A call also traps
+  when the function it finds doesn't take and return the wasm values the
+  pointer's type does, which catches most wrong casts.
+- The callee is evaluated before the arguments.
+- A variable shadows a function of the same name. `f(x)(y)` calls what `f(x)`
+  returns when `f` returns a function pointer. For a generic `f` it gives type
+  arguments instead, so bind the result to a name first.
+- Only functions declared in a file, `extern` functions and instances of
+  generic functions have pointers. The functions of `module` don't. There are
+  no closures and no anonymous functions.
 
 ## Structs
 
@@ -427,6 +522,9 @@ fn demo() -> u8:
   members (`T.ok`).
 - A call that gives a type parameter no argument type to infer from must give
   explicit type arguments.
+- A generic function named as a value becomes the instance with the function
+  type expected there, so `let f = id` is an error. Passed to another generic
+  function, it infers none of that function's type arguments.
 - Recursion must not instantiate ever larger types, as in `f((x, x))`.
 
 ## Types as values
@@ -460,7 +558,7 @@ How Duck types map to wasm values:
 
 | Duck | wasm |
 | --- | --- |
-| `i8 i16 i32 u8 u16 u32 bool`, pointers, enums of those | `i32` |
+| `i8 i16 i32 u8 u16 u32 bool`, pointers, function pointers, enums of those | `i32` |
 | `i64 u64` | `i64` |
 | `f32` | `f32` |
 | `f64` | `f64` |
@@ -471,6 +569,10 @@ How Duck types map to wasm values:
 So `fn f(s: array(u8)) -> Point` is `(i32 len, i32 ptr) -> (f32, f64)` in
 wasm. A host function's narrow results are masked or sign-extended into
 range.
+
+A module that takes a pointer to any function exports its table as `table`.
+The host calls a function pointer `i` it was given as `table.get(i)(...)`.
+The table has a fixed size and can't grow.
 
 Exported globals that are aggregates are split into one global per scalar,
 named with dots: `pub let origin = Point(...)` exports `origin.x` and
@@ -498,7 +600,7 @@ Each file is a module with its own namespace.
 
 ## Not in the language
 
-There are no heap allocators, garbage collection, closures, first-class
+There are no heap allocators, garbage collection, closures, anonymous
 functions, methods, traits or interfaces, operator overloading, `match`,
 exceptions or panics, null safety, ranges, a char type, string operations, a
 standard library, or compile-time `const` beyond globals. Don't write any of
@@ -515,4 +617,6 @@ them. Build what you need from structs, pointers, `while` and host functions.
 - Forgetting to label struct constructor arguments, or to give type arguments
   to a generic struct: `Box(i32)(value: 1)`, not `Box(value: 1)`.
 - Writing `&= |= <<=`. Write `a = a & b`.
-- Naming a `pub` item `memory`.
+- Naming a `pub` item `memory` or `table`.
+- Writing `let f = &double`. A function's name is already its pointer.
+- Writing `x |> f`. The body of a pipe needs a `_`: `x |> f(_)`.

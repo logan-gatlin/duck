@@ -173,6 +173,8 @@ pub enum TypeKind {
     /// `module.T`, a type in another module, where `T` is a name or itself
     /// qualified.
     Qualified(Ident, Box<Type>),
+    /// `fn(A, B) -> R`, a pointer to a function. `None` is no result written.
+    Fn(Vec<Type>, Option<Box<Type>>),
 }
 
 pub type Block = Vec<Stmt>;
@@ -245,6 +247,13 @@ pub enum ExprKind {
     AddrOf(Box<Expr>),
     /// `value as Type`
     Cast(Box<Expr>, Type),
+    /// `fn(A) -> R`, a function type written where a value belongs.
+    FnType(Type),
+    /// `value |> body`, which evaluates `value` once and then `body`, where
+    /// each [`ExprKind::Placeholder`] stands for it.
+    Pipe(Box<Expr>, Box<Expr>),
+    /// `_`, the value piped into the nearest pipe whose body it's in.
+    Placeholder,
 }
 
 /// A call argument, optionally labelled as in `f(name: value)`.
@@ -310,6 +319,13 @@ pub enum ParseErrorKind {
     OneElementTuple,
     /// A function in an `extern` block with type parameters.
     GenericExtern,
+    /// A pipe whose body has no `_` of its own.
+    PipeWithoutPlaceholder,
+    /// `_` as an expression that isn't in the body of a pipe.
+    PlaceholderOutsidePipe,
+    /// A line starting with `|>` that isn't indented deeper than the
+    /// statement above it, so it continues nothing.
+    LeadingPipe,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -322,6 +338,9 @@ struct Parser<'a> {
     /// don't stretch over trailing newlines and dedents.
     last_end: usize,
     errors: Vec<ParseError>,
+    /// Whether each pipe body being parsed has had a placeholder yet,
+    /// innermost last.
+    placeholder_used: Vec<bool>,
 }
 
 /// What a parenthesized list turned out to be.
@@ -356,6 +375,16 @@ impl fmt::Display for ParseErrorKind {
                     "functions in `extern` blocks cannot have type parameters"
                 )
             }
+            Self::PipeWithoutPlaceholder => {
+                write!(f, "the right side of `|>` must use `_`, e.g. `x |> f(_)`")
+            }
+            Self::PlaceholderOutsidePipe => {
+                write!(f, "`_` can only be used on the right side of `|>`")
+            }
+            Self::LeadingPipe => write!(
+                f,
+                "a line starting with `|>` must be indented deeper than the statement it continues"
+            ),
         }
     }
 }
@@ -378,6 +407,7 @@ pub fn parse(tokens: &[Token]) -> Result<Module, Vec<ParseError>> {
         pos: 0,
         last_end: 0,
         errors: Vec::new(),
+        placeholder_used: Vec::new(),
     };
     let module = parser.module();
     if parser.errors.is_empty() {
@@ -680,6 +710,16 @@ impl<'a> Parser<'a> {
                 self.bump();
                 TypeKind::Pointer(Box::new(self.ty()?))
             }
+            TokenKind::Fn => {
+                self.bump();
+                self.expect(TokenKind::LParen)?;
+                let params = self.comma_list(TokenKind::RParen, Self::ty)?;
+                let ret = match self.eat(TokenKind::Arrow) {
+                    true => Some(Box::new(self.ty()?)),
+                    false => None,
+                };
+                TypeKind::Fn(params, ret)
+            }
             _ => return Err(self.unexpected("type")),
         };
         Ok(Type {
@@ -807,8 +847,25 @@ impl<'a> Parser<'a> {
         Ok(StmtKind::Assign { target, op, value })
     }
 
+    /// A chain of pipes, which bind looser than every other operator and
+    /// group to the left.
     fn expr(&mut self) -> PResult<Expr> {
-        self.binary(0)
+        let mut expr = self.binary(0)?;
+        while self.eat(TokenKind::PipeArrow) {
+            self.placeholder_used.push(false);
+            let body = self.binary(0);
+            let used = self.placeholder_used.pop();
+            let body = body?;
+            if used == Some(false) {
+                self.error(ParseErrorKind::PipeWithoutPlaceholder, body.span);
+            }
+            let span = self.span_from(expr.span);
+            expr = Expr {
+                kind: ExprKind::Pipe(Box::new(expr), Box::new(body)),
+                span,
+            };
+        }
+        Ok(expr)
     }
 
     /// Precedence climbing over the binary operators and `not`, parsing only
@@ -932,6 +989,13 @@ impl<'a> Parser<'a> {
             TokenKind::Str(s) => ExprKind::Str(s.clone()),
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
+            TokenKind::Ident(name) if name == "_" => {
+                match self.placeholder_used.last_mut() {
+                    Some(used) => *used = true,
+                    None => self.error(ParseErrorKind::PlaceholderOutsidePipe, token.span),
+                }
+                ExprKind::Placeholder
+            }
             TokenKind::Ident(name) => ExprKind::Name(name.clone()),
             TokenKind::LParen => {
                 self.bump();
@@ -952,6 +1016,13 @@ impl<'a> Parser<'a> {
                 return Ok(Expr {
                     kind: ExprKind::Module(name),
                     span: self.span_from(token.span),
+                });
+            }
+            TokenKind::Fn => {
+                let ty = self.ty()?;
+                return Ok(Expr {
+                    span: ty.span,
+                    kind: ExprKind::FnType(ty),
                 });
             }
             TokenKind::LBracket => {
@@ -1104,6 +1175,16 @@ impl<'a> Parser<'a> {
         self.peek().kind == kind
     }
 
+    /// Whether [`Self::peek`] is the first token of its line.
+    fn at_line_start(&self) -> bool {
+        self.pos.checked_sub(1).is_none_or(|prev| {
+            matches!(
+                self.tokens[prev].kind,
+                TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent
+            )
+        })
+    }
+
     fn bump(&mut self) -> &'a Token {
         let token = self.peek();
         if token.kind != TokenKind::Eof {
@@ -1139,6 +1220,7 @@ impl<'a> Parser<'a> {
         let token = self.peek();
         let kind = match token.kind {
             TokenKind::Indent => ParseErrorKind::UnexpectedIndent,
+            TokenKind::PipeArrow if self.at_line_start() => ParseErrorKind::LeadingPipe,
             _ => ParseErrorKind::Expected {
                 expected: expected.into(),
                 found: token.kind.clone(),
@@ -1264,6 +1346,9 @@ mod tests {
             ExprKind::Deref(e) => format!("(.* {})", sexpr(e)),
             ExprKind::AddrOf(e) => format!("(& {})", sexpr(e)),
             ExprKind::Cast(e, ty) => format!("(as {} {})", sexpr(e), render_ty(ty)),
+            ExprKind::FnType(ty) => render_ty(ty),
+            ExprKind::Pipe(value, body) => format!("(|> {} {})", sexpr(value), sexpr(body)),
+            ExprKind::Placeholder => "_".to_string(),
         }
     }
 
@@ -1276,6 +1361,11 @@ mod tests {
             }
             TypeKind::Pointer(pointee) => format!("&{}", render_ty(pointee)),
             TypeKind::Qualified(module, ty) => format!("{}.{}", module.name, render_ty(ty)),
+            TypeKind::Fn(params, ret) => {
+                let params: Vec<_> = params.iter().map(render_ty).collect();
+                let ret = ret.as_ref().map(|ret| format!(" -> {}", render_ty(ret)));
+                format!("fn({}){}", params.join(", "), ret.unwrap_or_default())
+            }
         }
     }
 
@@ -1552,6 +1642,95 @@ mod tests {
     }
 
     #[test]
+    fn pipes() {
+        assert_eq!(expr("x |> f(_, 1)"), "(|> x (call f _ 1))");
+        assert_eq!(
+            expr("x |> _ + 1 |> f(_, _)"),
+            "(|> (|> x (Add _ 1)) (call f _ _))"
+        );
+        assert_eq!(expr("a or b |> not _"), "(|> (Or a b) (Not _))");
+        assert_eq!(expr("a | b |> _ | c"), "(|> (BitOr a b) (BitOr _ c))");
+        assert_eq!(expr("f(x |> _.a, 2)"), "(call f (|> x (. _ a)) 2)");
+        assert_eq!(
+            expr("h |> _(1)[_ as u8]"),
+            "(|> h (index (call _ 1) (as _ u8)))"
+        );
+        // The value of a nested pipe is still in the body of the outer one.
+        assert_eq!(expr("x |> (_ |> g(_))"), "(|> x (|> _ (call g _)))");
+        assert_eq!(
+            expr("x |> f(_, y |> g(_))"),
+            "(|> x (call f _ (|> y (call g _))))"
+        );
+    }
+
+    #[test]
+    fn pipe_body_must_use_placeholder() {
+        for src in ["x |> f", "x |> f()", "x |> f(y |> g(_))", "x |> f(_) |> g"] {
+            let src = format!("let _ = {src}");
+            assert_eq!(
+                errors(&src),
+                vec![ParseErrorKind::PipeWithoutPlaceholder],
+                "{src}"
+            );
+        }
+        let src = "let a = x |> f(1)\n";
+        let span = parse_src(src).unwrap_err()[0].span;
+        assert_eq!(&src[span.start..span.end], "f(1)");
+    }
+
+    #[test]
+    fn placeholder_outside_pipe() {
+        for src in [
+            "let a = _",
+            "let a = f(_)",
+            "let a = _ |> f(_)",
+            "let a = f(_) + (x |> _)",
+        ] {
+            assert_eq!(
+                errors(src),
+                vec![ParseErrorKind::PlaceholderOutsidePipe],
+                "{src}"
+            );
+        }
+        // Patterns, labels and other names are not expressions.
+        parse_src("fn f(_: i32):\n    for _ in xs:\n        let _ = g(_: 1)\n").unwrap();
+    }
+
+    #[test]
+    fn pipe_lines() {
+        let module = parse_src("fn f():\n    let a = 1\n        |> g(_)\n    return a\n").unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        let StmtKind::Binding(binding) = &f.body[0].kind else {
+            panic!()
+        };
+        assert_eq!(sexpr(&binding.value), "(|> 1 (call g _))");
+        assert_eq!(f.body.len(), 2);
+
+        // In the head of a block, the body of the block is indented as usual.
+        parse_src("fn f():\n    if x\n        |> g(_):\n        pass\n    pass\n").unwrap();
+
+        for src in [
+            "let a = 1\n|> g(_)\nlet b = 2\n",
+            "fn f():\n    let a = 1\n    |> g(_)\n    return a\n",
+            "fn f():\n    pass\n|> g(_)\n",
+            "|> g(_)\n",
+        ] {
+            assert_eq!(errors(src), vec![ParseErrorKind::LeadingPipe], "{src}");
+        }
+        // Only at the start of a line.
+        assert_eq!(
+            errors("let a = 1 + |> g(_)\n"),
+            vec![expected("expression", TokenKind::PipeArrow)]
+        );
+        assert_eq!(
+            errors("let a = 1 |>\n    g(_)\n"),
+            vec![expected("expression", TokenKind::Newline)]
+        );
+    }
+
+    #[test]
     fn comparisons_do_not_chain() {
         assert_eq!(
             errors("let _ = a < b < c"),
@@ -1617,6 +1796,40 @@ mod tests {
         assert_eq!(
             expr("Box(&i32)(value: 1)"),
             "(call (call Box (& i32)) value:1)"
+        );
+    }
+
+    #[test]
+    fn function_types() {
+        let ty = |src: &str| {
+            let module = parse_src(&format!("let x: {src} = 1")).unwrap();
+            let ItemKind::Binding(x) = &module.items[0].kind else {
+                panic!()
+            };
+            render_ty(x.ty.as_ref().unwrap())
+        };
+        assert_eq!(ty("fn()"), "fn()");
+        assert_eq!(ty("fn(i32, &u8,) -> bool"), "fn(i32, &u8) -> bool");
+        // The result takes everything it can.
+        assert_eq!(ty("fn(A) -> fn(B) -> C"), "fn(A) -> fn(B) -> C");
+        assert_eq!(ty("&fn(A) -> &B"), "&fn(A) -> &B");
+        assert_eq!(ty("array(fn(A))"), "array(fn(A))");
+
+        assert_eq!(expr("fn(i32) -> i32"), "fn(i32) -> i32");
+        assert_eq!(expr("malloc(fn(i32))"), "(call malloc fn(i32))");
+        assert_eq!(
+            expr("array(fn(i32) -> u8)(len: 1, ptr: p)"),
+            "(call (call array fn(i32) -> u8) len:1 ptr:p)"
+        );
+        assert_eq!(expr("x as fn(i32) -> u8"), "(as x fn(i32) -> u8)");
+        assert_eq!(expr("(fn(i32)).size"), "(. fn(i32) size)");
+        assert_eq!(
+            errors("let x: fn = 1\nlet y = fn\nlet z: fn(a: i32) = 1\n"),
+            vec![
+                expected("`(`", TokenKind::Eq),
+                expected("`(`", TokenKind::Newline),
+                expected("`)`", TokenKind::Colon),
+            ]
         );
     }
 
@@ -1899,6 +2112,14 @@ fn h() -> i32:
     fn invalid_assign_target() {
         assert_eq!(
             errors("fn f():\n    g() = 1\n    a + b += 1\n"),
+            vec![
+                ParseErrorKind::InvalidAssignTarget,
+                ParseErrorKind::InvalidAssignTarget
+            ]
+        );
+        // The piped value is not a place.
+        assert_eq!(
+            errors("fn f():\n    x |> _ = 1\n    x |> _.a += 1\n"),
             vec![
                 ParseErrorKind::InvalidAssignTarget,
                 ParseErrorKind::InvalidAssignTarget

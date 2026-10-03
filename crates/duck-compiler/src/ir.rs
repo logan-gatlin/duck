@@ -2,9 +2,9 @@
 //!
 //! Everything here is already resolved and type checked, and shaped after
 //! wasm: values are the four numeric wasm value types and `externref`, structs
-//! have been split into one local or global per scalar field, and control flow
-//! is wasm's structured `block`/`loop`/`if` with branch targets given as label
-//! depths.
+//! have been split into one local or global per scalar field, function
+//! pointers are indices into the module's table, and control flow is wasm's
+//! structured `block`/`loop`/`if` with branch targets given as label depths.
 
 /// A wasm function index: [`Module::imports`] come first, then
 /// [`Module::funcs`].
@@ -24,6 +24,8 @@ pub struct Module {
     pub memory: Memory,
     /// What memory holds when the module is instantiated, in address order.
     pub data: Vec<Data>,
+    /// `None` if the module calls nothing through its table.
+    pub table: Option<Table>,
     pub globals: Vec<Global>,
     pub imports: Vec<Import>,
     pub funcs: Vec<Func>,
@@ -41,6 +43,15 @@ pub struct Memory {
     pub export: String,
 }
 
+/// The module's one table, which function pointers index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Table {
+    pub export: String,
+    /// The function at each index from 1 up. Nothing is at index 0, so
+    /// calling it traps.
+    pub funcs: Vec<FuncId>,
+}
+
 /// Bytes copied into memory at `offset` when the module is instantiated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Data {
@@ -56,6 +67,13 @@ pub enum ValType {
     F64,
     /// An opaque reference from the host. Nothing constant has this type.
     ExternRef,
+}
+
+/// The wasm type of a function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FuncType {
+    pub params: Vec<ValType>,
+    pub results: Vec<ValType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,6 +163,14 @@ pub enum Stmt {
         args: Vec<Expr>,
         dests: Vec<LocalId>,
     },
+    /// [`Expr::CallIndirect`] with zero results, or more than one, which are
+    /// stored to `dests` in order.
+    CallIndirect {
+        ty: FuncType,
+        args: Vec<Expr>,
+        index: Expr,
+        dests: Vec<LocalId>,
+    },
     /// A label that `Br` jumps to the end of.
     Block(Vec<Stmt>),
     /// A label that `Br` jumps to the start of.
@@ -173,6 +199,14 @@ pub enum Expr {
     /// The instruction `<ty>.<op>`, where `ty` is the operand type.
     Binary(ValType, BinOp, Box<Expr>, Box<Expr>),
     Call(FuncId, Vec<Expr>),
+    /// `call_indirect`, calling the function at `index` in the table, and
+    /// trapping unless one of type `ty` is there. `args` are evaluated in
+    /// order, then `index`.
+    CallIndirect {
+        ty: FuncType,
+        args: Vec<Expr>,
+        index: Box<Expr>,
+    },
     /// `<ty>.<op> offset=<offset>`, reading from `addr + offset` with the
     /// natural alignment of the access.
     Load {

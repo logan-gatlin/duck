@@ -48,6 +48,7 @@
 (escape_sequence) @string.escape
 (import path: (string) @string.special.path)
 (discard) @variable.builtin
+(placeholder) @variable.builtin
 "module" @variable.builtin
 
 (comment) @comment
@@ -98,6 +99,7 @@
   "%"
   "&"
   "|"
+  "|>"
   "^"
   "~"
   "<<"

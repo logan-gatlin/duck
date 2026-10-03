@@ -9,8 +9,10 @@
 // @ts-check
 
 // Binary operator precedence, as in `binary_op` in parse.rs; higher binds
-// tighter. `not`, casts, prefix and postfix operators slot in around them.
+// tighter. `not`, casts, prefix and postfix operators slot in around them, and
+// pipes sit below them all.
 const PREC = {
+  pipe: 0,
   or: 1,
   and: 2,
   not: 3,
@@ -195,7 +197,12 @@ module.exports = grammar({
 
     // Types
 
-    _type: $ => choice($.named_type, $.qualified_type, $.pointer_type),
+    _type: $ => choice(
+      $.named_type,
+      $.qualified_type,
+      $.pointer_type,
+      $.function_type,
+    ),
 
     // The precedence keeps the `(` after `x as Name` as the type's arguments
     // rather than a call of the cast.
@@ -214,6 +221,16 @@ module.exports = grammar({
     type_arguments: $ => prec(PREC.type, seq('(', commaSep($._type), ')')),
 
     pointer_type: $ => seq('&', field('pointee', $._type)),
+
+    // `fn(A, B) -> R`, a pointer to a function. The result takes everything
+    // it can, so `fn(A) -> fn(B) -> C` returns a function.
+    function_type: $ => prec.right(PREC.type, seq(
+      'fn',
+      field('parameters', $.parameter_types),
+      optional(seq('->', field('return_type', $._type))),
+    )),
+
+    parameter_types: $ => seq('(', commaSep($._type), ')'),
 
     // Statements
 
@@ -291,10 +308,13 @@ module.exports = grammar({
       $.string,
       $.boolean,
       $.module_property,
+      $.function_type,
       $.unit,
       $.tuple,
       $.list,
       $.parenthesized_expression,
+      $.placeholder,
+      $.pipe_expression,
       $.unary_expression,
       $.binary_expression,
       $.cast_expression,
@@ -315,6 +335,17 @@ module.exports = grammar({
     list: $ => seq('[', commaSep($._expression), ']'),
 
     parenthesized_expression: $ => seq('(', $._expression, ')'),
+
+    // `_`, the value piped into the nearest pipe whose body it's in.
+    placeholder: _ => '_',
+
+    // `value |> body`. The scanner lets a deeper line that starts with `|>`
+    // continue the line above.
+    pipe_expression: $ => prec.left(PREC.pipe, seq(
+      field('value', $._expression),
+      '|>',
+      field('body', $._expression),
+    )),
 
     unary_expression: $ => choice(
       prec(PREC.not, seq(
@@ -371,8 +402,9 @@ module.exports = grammar({
       ')',
     ),
 
+    // `_` is a name here, not a placeholder.
     labeled_argument: $ => seq(
-      field('label', $.identifier),
+      field('label', choice($.identifier, alias('_', $.identifier))),
       ':',
       field('value', $._expression),
     ),

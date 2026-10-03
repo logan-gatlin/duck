@@ -6,6 +6,7 @@
 (parameter) @parameter.inside
 (labeled_argument) @parameter.inside
 (arguments (_expression) @parameter.inside)
+(parameter_types (_type) @parameter.inside)
 
 (comment) @comment.inside
 (comment)+ @comment.around
