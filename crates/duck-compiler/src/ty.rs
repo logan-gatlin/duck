@@ -103,7 +103,24 @@ const PAGE_SIZE: u64 = 64 * 1024;
 
 /// The functions of `module`, which are lowered inline at each call rather
 /// than to wasm functions.
-const MODULE_FUNCS: [&str; 6] = ["memory", "size", "grow", "fill", "copy", "unreachable"];
+const MODULE_FUNCS: [&str; 8] = [
+    "memory",
+    "size",
+    "grow",
+    "fill",
+    "copy",
+    "unreachable",
+    COUNT_LEADING_ZEROS,
+    COUNT_TRAILING_ZEROS,
+];
+
+/// The function of `module` that counts the zero bits above an integer's
+/// highest set bit.
+const COUNT_LEADING_ZEROS: &str = "count_leading_zeros";
+
+/// The function of `module` that counts the zero bits below an integer's
+/// lowest set bit.
+const COUNT_TRAILING_ZEROS: &str = "count_trailing_zeros";
 
 /// The constants of `module`.
 const MODULE_CONSTS: [&str; 4] = ["static", "page_size", "min", "max"];
@@ -376,7 +393,7 @@ pub enum TypeErrorKind {
     InvalidStart(String),
     /// Literal data that doesn't fit in the static data section.
     DataTooLarge {
-        bytes: u32,
+        bytes: u64,
         capacity: u32,
     },
     /// A static data section that ends past the memory's initial pages.
@@ -476,7 +493,7 @@ struct Checker {
     data: Vec<ir::Data>,
     /// The first address after `data`, or the start of the static data
     /// section if there is none.
-    data_end: u32,
+    data_end: u64,
     errors: Vec<TypeError>,
 }
 
@@ -921,7 +938,7 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
         entry: program.entry,
         memory: settings.memory,
         static_section: settings.static_section,
-        data_end: settings.static_section.start,
+        data_end: settings.static_section.start.into(),
         ..Checker::default()
     };
     ck.declare(program);
@@ -1369,9 +1386,9 @@ impl Checker {
         if u64::from(end) > u64::from(min_pages) * PAGE_SIZE {
             errors.push(TypeErrorKind::StaticOutsideMemory { end, min_pages });
         }
-        if self.data_end > end {
+        if !self.data_fits() {
             errors.push(TypeErrorKind::DataTooLarge {
-                bytes: self.data_end - start,
+                bytes: self.data_end - u64::from(start),
                 capacity: end - start,
             });
         }
@@ -2025,13 +2042,29 @@ impl Checker {
     /// multiple of `align`, or right at the end if there are none. Returns the
     /// array of them.
     fn push_data(&mut self, bytes: Vec<u8>, align: u32, len: u32) -> Value {
-        let mut offset = self.data_end;
+        let offset = self.reserve_data(bytes.len() as u64, align);
         if !bytes.is_empty() {
-            offset = offset.next_multiple_of(align);
-            self.data_end = offset + bytes.len() as u32;
             self.data.push(ir::Data { offset, bytes });
         }
         array_value(len, offset)
+    }
+
+    /// Makes room in memory for `size` bytes at the next multiple of `align`,
+    /// or right at the end if there are none. Returns their address, which
+    /// is only meaningful while the data fits.
+    fn reserve_data(&mut self, size: u64, align: u32) -> u32 {
+        let mut offset = self.data_end;
+        if size > 0 {
+            offset = offset.next_multiple_of(align.into());
+            self.data_end = offset + size;
+        }
+        offset as u32
+    }
+
+    /// Whether every literal placed so far is within the static data
+    /// section.
+    fn data_fits(&self) -> bool {
+        self.data_end <= self.static_section.end.into()
     }
 
     /// Evaluates each scalar of a lowered constant at compile time, reporting
@@ -2589,12 +2622,13 @@ impl<'c> Body<'c> {
                 scalar(ValType::I32, Expr::Const(Const::I32(*b as i32))),
             ),
             ExprKind::Unit => (Ty::Unit, Value::default()),
-            ExprKind::Str(_) | ExprKind::List(_) if !self.global => {
+            ExprKind::Str(_) | ExprKind::List(_) | ExprKind::Repeat(..) if !self.global => {
                 self.error(TypeErrorKind::LiteralOutsideGlobal, expr.span);
                 (Ty::Error, Value::default())
             }
             ExprKind::Str(s) => self.string(s),
             ExprKind::List(items) => self.list(items, expected, expr.span),
+            ExprKind::Repeat(value, len) => self.repeat(value, len, expected),
             ExprKind::Index(..) => match self.place(expr) {
                 Some(place) => {
                     let value = self.read_place(&place);
@@ -2763,7 +2797,12 @@ impl<'c> Body<'c> {
     /// `array(u8)`, `size()` its size in pages, and `grow(pages)` adds pages,
     /// giving the old size or -1 if it can't. `fill(dst, value, len)` and
     /// `copy(dst, src, len)` set and copy bytes. `unreachable()` traps.
+    /// `count_leading_zeros(value)` and `count_trailing_zeros(value)` are
+    /// [`Self::count_zeros`].
     fn module_call(&mut self, name: &Ident, args: &[Arg], span: Span) -> (Ty, Value) {
+        if [COUNT_LEADING_ZEROS, COUNT_TRAILING_ZEROS].contains(&name.name.as_str()) {
+            return self.count_zeros(name, args, span);
+        }
         let byte = Ty::Prim(Prim::U8);
         let count = Ty::Prim(Prim::U32);
         let addr = self.ck.ptr_to(byte);
@@ -2829,6 +2868,60 @@ impl<'c> Body<'c> {
         (ty, Value { pre, scalars })
     }
 
+    /// `module.count_leading_zeros(value)` and
+    /// `module.count_trailing_zeros(value)`, wasm's `clz` and `ctz`: how many
+    /// zero bits are above the highest set bit of an integer, or below its
+    /// lowest, as a value of its own type. For 0 that is every bit of the
+    /// type.
+    fn count_zeros(&mut self, name: &Ident, args: &[Arg], span: Span) -> (Ty, Value) {
+        let leading = name.name == COUNT_LEADING_ZEROS;
+        // The operand may be of any integer type, so it's inferred rather
+        // than checked against a parameter's.
+        let params = [("value".to_string(), Ty::Error)];
+        let binding = self.bind_args(&params, args, false, span);
+        let mut ty = Ty::Error;
+        let mut checked = Vec::new();
+        for (arg, param) in args.iter().zip(&binding) {
+            checked.push(param.map(|_| {
+                let operand = self.expr(&arg.value, None);
+                ty = operand.0;
+                operand
+            }));
+        }
+        let value = self.bound_args(&params, args, binding, checked);
+        let prim = match ty {
+            Ty::Prim(prim) if prim.is_int() => prim,
+            _ => {
+                let op = match leading {
+                    true => "module.count_leading_zeros",
+                    false => "module.count_trailing_zeros",
+                };
+                return self.invalid_operand(op, ty, span);
+            }
+        };
+        let vt = prim.val_type();
+        let bits = prim.size() * 8;
+        let count = |op, e| Expr::Unary(vt, op, Box::new(e));
+        let konst = |n: u32| Expr::Const(Const::I32(n as i32));
+        let lowered = |e| match (leading, bits < 32) {
+            (true, false) => count(IrUnOp::Clz, e),
+            (false, false) => count(IrUnOp::Ctz, e),
+            // A narrow integer is held in an `i32`, whose bits above the
+            // type's aren't counted. Those of a signed one are copies of its
+            // sign, and are cleared first.
+            (true, true) => {
+                let low = match prim.is_signed() {
+                    true => binary(vt, IrBinOp::And, e, konst((1 << bits) - 1)),
+                    false => e,
+                };
+                binary(vt, IrBinOp::Sub, count(IrUnOp::Clz, low), konst(32 - bits))
+            }
+            // A set bit just above the type's ends the count there.
+            (false, true) => count(IrUnOp::Ctz, binary(vt, IrBinOp::Or, e, konst(1 << bits))),
+        };
+        (ty, map1(value, vt, lowered))
+    }
+
     /// An array literal, whose elements are typed like those of `expected`,
     /// or else like the first element, and must be constant. Its elements are
     /// placed in memory after any literals within them.
@@ -2867,6 +2960,53 @@ impl<'c> Body<'c> {
         }
         let value = self.ck.push_data(bytes, align, items.len() as u32);
         (self.ck.array_of(elem), value)
+    }
+
+    /// `[value; len]`, an array of `len` copies of `value`, which is typed
+    /// like the elements of `expected`. Both must be constant. A literal
+    /// within `value` is placed in memory once, and every copy views it.
+    fn repeat(
+        &mut self,
+        value: &parse::Expr,
+        len: &parse::Expr,
+        expected: Option<Ty>,
+    ) -> (Ty, Value) {
+        let want = match expected {
+            Some(Ty::Array(id)) => Some(self.ck.element(id)),
+            // An array type that failed to resolve, already reported.
+            Some(Ty::Error) => Some(Ty::Error),
+            _ => None,
+        };
+        let (ty, lowered) = self.expr(value, want);
+        let elem = want.unwrap_or(ty);
+        self.expect(ty, elem, value.span);
+        let consts = self.ck.fold_value(&lowered, value.span);
+        let lowered = self.check(len, Ty::Prim(Prim::U32));
+        let count = self.ck.fold_value(&lowered, len.span);
+        // Nothing holding an `externref` is constant, so that's reported.
+        if ty != elem || elem == Ty::Error || !self.ck.storable(elem) {
+            return (Ty::Error, Value::default());
+        }
+        let [Const::I32(count)] = count[..] else {
+            return (Ty::Error, Value::default());
+        };
+        let count = count as u32;
+        let (size, align) = self.ck.layout(elem);
+        let mut bytes = vec![0; size as usize];
+        for (cell, c) in self.ck.cells(elem).iter().zip(consts) {
+            write_const(&mut bytes[cell.offset as usize..], cell.store, c);
+        }
+        let offset = self
+            .ck
+            .reserve_data(u64::from(size) * u64::from(count), align);
+        // Memory starts out zeroed, and data that doesn't fit is an error, so
+        // neither is written out.
+        let zeroed = count == 0 || bytes.iter().all(|&byte| byte == 0);
+        if !zeroed && self.ck.data_fits() {
+            let bytes = bytes.repeat(count as usize);
+            self.ck.data.push(ir::Data { offset, bytes });
+        }
+        (self.ck.array_of(elem), array_value(count, offset))
     }
 
     /// An integer literal, typed by `expected` and defaulting to `i32`. Where
@@ -4047,6 +4187,10 @@ fn fold_unary(op: IrUnOp, c: Const) -> Result<Const, Fold> {
     Ok(match (op, c) {
         (IrUnOp::Eqz, I32(x)) => I32((x == 0) as i32),
         (IrUnOp::Eqz, I64(x)) => I32((x == 0) as i32),
+        (IrUnOp::Clz, I32(x)) => I32(x.leading_zeros() as i32),
+        (IrUnOp::Clz, I64(x)) => I64(x.leading_zeros() as i64),
+        (IrUnOp::Ctz, I32(x)) => I32(x.trailing_zeros() as i32),
+        (IrUnOp::Ctz, I64(x)) => I64(x.trailing_zeros() as i64),
         (IrUnOp::Neg, F32(x)) => F32(-x),
         (IrUnOp::Neg, F64(x)) => F64(-x),
         (IrUnOp::Extend8S, I32(x)) => I32(x as i8 as i32),
@@ -6842,6 +6986,87 @@ pub let nested: array(array(i8)) = [[], [-1]]
     }
 
     #[test]
+    fn repeated_array_literals_copy_one_element() {
+        let src = "\
+pub struct P:
+    a: u8
+    b: i32
+let n: u32 = 2
+pub let bytes: array(u8) = [7; 3]
+pub let points = [P(a: 1, b: -2); n + 1]
+pub let zeros: array(u64) = [0; 1000]
+pub let names = [\"ab\"; 2]
+pub let none = [1.5; 0]
+pub let last: array(u8) = [1; 1]
+";
+        let module = lower(src);
+        let point = [1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff];
+        // `"ab"` is at 8032, which is 0x1f60.
+        let name = [2, 0, 0, 0, 0x60, 0x1f, 0, 0];
+        assert_eq!(
+            data(&module),
+            [
+                (0, &[7, 7, 7][..]),
+                (4, &point.repeat(3)),
+                // Nothing is written for `zeros`, which memory already is.
+                (8032, b"ab"),
+                (8036, &name.repeat(2)),
+                (8052, &[1]),
+            ]
+        );
+        let inits: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
+        for global in [
+            ("points.len", Const::I32(3)),
+            ("points.ptr", Const::I32(4)),
+            ("zeros.len", Const::I32(1000)),
+            ("zeros.ptr", Const::I32(32)),
+            ("none.len", Const::I32(0)),
+            ("none.ptr", Const::I32(8052)),
+        ] {
+            assert!(inits.contains(&global), "{global:?} in {inits:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_array_literal_errors() {
+        use TypeErrorKind::*;
+        let src = "\
+fn get() -> u8:
+    return 1
+var n: u32 = 2
+let i = 3
+let a = [get(); 2]
+let b = [0; n]
+let c = [0; i]
+let d = [0; 2.5]
+let e = [0; -1]
+let g: array(u8) = [256; 2]
+let h: array(u8) = [true; 2]
+let j = [0; 1 / 0]
+fn f():
+    let l = [1; 2]
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                NotConstant,
+                NotConstant,
+                mismatch("u32", "i32"),
+                mismatch("u32", "f64"),
+                invalid_operand("-", "u32"),
+                IntOutOfRange("u8".into()),
+                mismatch("u8", "bool"),
+                ConstTrap,
+                LiteralOutsideGlobal,
+            ]
+        );
+    }
+
+    #[test]
     fn literal_errors() {
         use TypeErrorKind::*;
         let src = "\
@@ -7005,6 +7230,80 @@ fn g():
     }
 
     #[test]
+    fn module_counts_zeros_of_any_integer() {
+        let src = "\
+pub let top = module.count_leading_zeros(1)
+pub let wide: u64 = module.count_trailing_zeros(0 as u64)
+pub let narrow = module.count_leading_zeros(-1 as i8)
+pub let none = module.count_trailing_zeros(0 as u16)
+fn a(x: u32) -> u32:
+    return module.count_leading_zeros(x)
+fn b(x: i64) -> i64:
+    return module.count_trailing_zeros(value: x)
+fn c(x: u8) -> u8:
+    return module.count_leading_zeros(x)
+fn d(x: i16) -> i16:
+    return module.count_leading_zeros(x)
+fn e(x: i8) -> i8:
+    return module.count_trailing_zeros(x)
+";
+        let module = lower(src);
+        assert_eq!(module.funcs.len(), 5);
+        let inits: Vec<_> = module.globals.iter().map(|g| g.init).collect();
+        assert_eq!(
+            inits,
+            [
+                Const::I32(31),
+                Const::I64(64),
+                Const::I32(0),
+                Const::I32(16)
+            ]
+        );
+        assert_eq!(body(&module, "a"), "(return (I32.Clz x))");
+        assert_eq!(body(&module, "b"), "(return (I64.Ctz x))");
+        // The bits an `i32` has above a narrow integer's aren't counted.
+        assert_eq!(body(&module, "c"), "(return (I32.Sub (I32.Clz x) 24))");
+        assert_eq!(
+            body(&module, "d"),
+            "(return (I32.Sub (I32.Clz (I32.And x 65535)) 16))"
+        );
+        assert_eq!(body(&module, "e"), "(return (I32.Ctz (I32.Or x 256)))");
+    }
+
+    #[test]
+    fn module_counts_zeros_of_integers_only() {
+        use TypeErrorKind::*;
+        let src = "\
+fn f(x: f32, p: &u8, n: u64):
+    module.count_leading_zeros(x)
+    module.count_trailing_zeros(p)
+    module.count_leading_zeros(true)
+    module.count_trailing_zeros()
+    module.count_leading_zeros(1, 2)
+    let a = module.count_trailing_zeros
+    let b: u32 = module.count_leading_zeros(n)
+";
+        assert_eq!(
+            errors(src),
+            [
+                invalid_operand("module.count_leading_zeros", "f32"),
+                invalid_operand("module.count_trailing_zeros", "&u8"),
+                invalid_operand("module.count_leading_zeros", "bool"),
+                MissingArg("value".into()),
+                TooManyArgs {
+                    expected: 1,
+                    found: 2
+                },
+                NotAValue("module.count_trailing_zeros".into()),
+                Mismatch {
+                    expected: "u32".into(),
+                    found: "u64".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn module_functions_and_constants_are_not_interchangeable() {
         use TypeErrorKind::*;
         let src = "\
@@ -7069,6 +7368,20 @@ fn f(p: &u8):
             [spanless(DataTooLarge {
                 bytes: 8,
                 capacity: 6
+            })]
+        );
+        // Nothing so large is built to find that it doesn't fit, zeroed or
+        // not.
+        assert_eq!(
+            errors(
+                "let a: array(u64) = [0; 4294967295]\nlet b: array(u64) = [1; 4294967295]\n",
+                8,
+                16,
+                1
+            ),
+            [spanless(DataTooLarge {
+                bytes: 68719476720,
+                capacity: 8
             })]
         );
         assert_eq!(

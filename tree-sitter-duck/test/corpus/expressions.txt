@@ -277,6 +277,7 @@ Lists
 
 let _ = []
 let _ = [1, 2,]
+let _ = [0; n + 1]
 
 ---
 
@@ -288,7 +289,14 @@ let _ = [1, 2,]
     (discard)
     (list
       (integer)
-      (integer))))
+      (integer)))
+  (binding
+    (discard)
+    (repeated_list
+      (integer)
+      (binary_expression
+        (identifier)
+        (integer)))))
 
 ====================
 Module properties

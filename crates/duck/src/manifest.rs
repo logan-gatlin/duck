@@ -6,7 +6,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use duck_compiler::file::{MemoryLimits, StaticSection};
+use duck_compiler::file::{MemoryLimits, Settings, StaticSection};
 use duck_compiler::lex;
 use serde::Deserialize;
 
@@ -239,6 +239,15 @@ impl RawDependency {
 }
 
 impl Module {
+    /// How the module is compiled.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            memory: self.memory,
+            static_section: self.static_section,
+            start: self.start.clone(),
+        }
+    }
+
     fn parse(module: RawModule, memory: RawMemory) -> Result<Self, ManifestError> {
         let RawMemory {
             min,
@@ -273,6 +282,24 @@ impl Module {
             },
             static_section,
         })
+    }
+}
+
+impl Library {
+    /// How the library is checked on its own: with room for any data, as
+    /// the memory is that of whichever module imports it.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            memory: MemoryLimits {
+                min_pages: MAX_PAGES,
+                max_pages: None,
+            },
+            static_section: StaticSection {
+                start: 0,
+                end: u32::MAX,
+            },
+            start: None,
+        }
     }
 }
 

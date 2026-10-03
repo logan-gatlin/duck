@@ -236,6 +236,8 @@ pub enum ExprKind {
     /// `(a, b)`, with at least two elements.
     Tuple(Vec<Expr>),
     List(Vec<Expr>),
+    /// `[value; len]`, an array of `len` copies of `value`.
+    Repeat(Box<Expr>, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),
@@ -1027,9 +1029,9 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LBracket => {
                 self.bump();
-                let items = self.comma_list(TokenKind::RBracket, Self::expr)?;
+                let kind = self.brackets()?;
                 return Ok(Expr {
-                    kind: ExprKind::List(items),
+                    kind,
                     span: self.span_from(token.span),
                 });
             }
@@ -1064,6 +1066,27 @@ impl<'a> Parser<'a> {
             return Ok(Parens::Group(items.pop().unwrap()));
         }
         Ok(Parens::Tuple(items))
+    }
+
+    /// Parses the rest of an array literal after its `[`: a list of elements,
+    /// or `value; len`.
+    fn brackets(&mut self) -> PResult<ExprKind> {
+        if self.eat(TokenKind::RBracket) {
+            return Ok(ExprKind::List(Vec::new()));
+        }
+        let first = self.expr()?;
+        if self.eat(TokenKind::Semi) {
+            let len = self.expr()?;
+            self.expect(TokenKind::RBracket)?;
+            return Ok(ExprKind::Repeat(Box::new(first), Box::new(len)));
+        }
+        let mut items = vec![first];
+        if self.eat(TokenKind::Comma) {
+            items.extend(self.comma_list(TokenKind::RBracket, Self::expr)?);
+        } else {
+            self.expect(TokenKind::RBracket)?;
+        }
+        Ok(ExprKind::List(items))
     }
 
     /// Parses `item, item, ... close` after the opening bracket. A trailing
@@ -1328,6 +1351,7 @@ mod tests {
             ExprKind::Module(name) => format!("module.{}", name.name),
             ExprKind::Tuple(items) => format!("(tuple {})", list(items)),
             ExprKind::List(items) => format!("[{}]", list(items)),
+            ExprKind::Repeat(value, len) => format!("[{}; {}]", sexpr(value), sexpr(len)),
             ExprKind::Unary(op, e) => format!("({op:?} {})", sexpr(e)),
             ExprKind::Binary(op, l, r) => format!("({op:?} {} {})", sexpr(l), sexpr(r)),
             ExprKind::Call(f, args) => {
@@ -1558,6 +1582,20 @@ mod tests {
         assert_eq!(
             expr(r#"[1.5, "hi", true, false]"#),
             r#"[1.5 "hi" true false]"#
+        );
+        assert_eq!(expr("[0; 4]"), "[0; 4]");
+        assert_eq!(expr("[[a, b]; n + 1]"), "[[a b]; (Add n 1)]");
+        assert_eq!(
+            errors("let a = [1; 2, 3]\n"),
+            vec![expected("`]`", TokenKind::Comma)]
+        );
+        assert_eq!(
+            errors("let a = [1, 2; 3]\n"),
+            vec![expected("`]`", TokenKind::Semi)]
+        );
+        assert_eq!(
+            errors("let a = [; 3]\n"),
+            vec![expected("expression", TokenKind::Semi)]
         );
     }
 

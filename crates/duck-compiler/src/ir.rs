@@ -240,6 +240,12 @@ pub enum Expr {
 pub enum UnOp {
     /// Integer `== 0`.
     Eqz,
+    /// The number of zero bits above the highest set bit of an integer: all
+    /// of its bits for 0.
+    Clz,
+    /// The number of zero bits below the lowest set bit of an integer: all
+    /// of its bits for 0.
+    Ctz,
     /// Float negation.
     Neg,
     Extend8S,

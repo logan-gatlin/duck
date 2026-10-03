@@ -434,6 +434,10 @@ fn unary(ty: ValType, op: UnOp) -> Instruction<'static> {
     match (ty, op) {
         (I32, Eqz) => Instruction::I32Eqz,
         (I64, Eqz) => Instruction::I64Eqz,
+        (I32, Clz) => Instruction::I32Clz,
+        (I64, Clz) => Instruction::I64Clz,
+        (I32, Ctz) => Instruction::I32Ctz,
+        (I64, Ctz) => Instruction::I64Ctz,
         (F32, Neg) => Instruction::F32Neg,
         (F64, Neg) => Instruction::F64Neg,
         (I32, Extend8S) => Instruction::I32Extend8S,
@@ -892,6 +896,21 @@ pub fn f(p: &u8, q: &u8, n: u32) -> i32:
         let func = func_wat(&emit_src(src), "f");
         assert!(!func.contains("call"), "{func}");
         for instr in ["memory.fill", "memory.copy", "memory.size", "memory.grow"] {
+            assert!(func.contains(instr), "{instr}\n{func}");
+        }
+    }
+
+    #[test]
+    fn module_zero_counts_are_instructions() {
+        let src = "\
+pub fn f(a: u32, b: i64, c: u8) -> u32:
+    let wide = module.count_leading_zeros(b) + module.count_trailing_zeros(b)
+    let narrow = module.count_leading_zeros(c) + module.count_trailing_zeros(c)
+    return module.count_leading_zeros(a) + module.count_trailing_zeros(a)
+";
+        let func = func_wat(&emit_src(src), "f");
+        assert!(!func.contains("call"), "{func}");
+        for instr in ["i32.clz", "i32.ctz", "i64.clz", "i64.ctz"] {
             assert!(func.contains(instr), "{instr}\n{func}");
         }
     }

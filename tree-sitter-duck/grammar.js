@@ -312,6 +312,7 @@ module.exports = grammar({
       $.unit,
       $.tuple,
       $.list,
+      $.repeated_list,
       $.parenthesized_expression,
       $.placeholder,
       $.pipe_expression,
@@ -333,6 +334,15 @@ module.exports = grammar({
     tuple: $ => seq('(', commaSep2($._expression), ')'),
 
     list: $ => seq('[', commaSep($._expression), ']'),
+
+    // `[value; length]`, an array of `length` copies of `value`.
+    repeated_list: $ => seq(
+      '[',
+      field('value', $._expression),
+      ';',
+      field('length', $._expression),
+      ']',
+    ),
 
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 

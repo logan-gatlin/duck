@@ -136,5 +136,6 @@
 [
   ","
   ":"
+  ";"
   "."
 ] @punctuation.delimiter

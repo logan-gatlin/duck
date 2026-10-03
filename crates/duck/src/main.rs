@@ -1,9 +1,5 @@
 mod agents;
-mod files;
-mod git;
-mod manifest;
 mod new;
-mod package;
 
 use std::fmt::Display;
 use std::fs;
@@ -12,10 +8,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use duck_compiler::file::{FileManager, MemoryLimits, Settings, StaticSection};
-
-use crate::files::Files;
-use crate::manifest::{MANIFEST, MAX_PAGES, Manifest};
+use duck::files::Files;
+use duck::manifest::{MANIFEST, Manifest};
+use duck::{git, package};
+use duck_compiler::file::FileManager;
 
 #[derive(Parser)]
 #[command(version, about = "The duck programming language")]
@@ -82,30 +78,10 @@ fn build() -> ExitCode {
     };
     let manifest = &packages.root().manifest;
 
-    // A package without a module is only checked, with room for any data.
+    // A package without a module is only checked.
     let (entry, settings) = match (&manifest.module, &manifest.library) {
-        (Some(module), _) => (
-            &module.entry,
-            Settings {
-                memory: module.memory,
-                static_section: module.static_section,
-                start: module.start.clone(),
-            },
-        ),
-        (None, Some(library)) => (
-            &library.entry,
-            Settings {
-                memory: MemoryLimits {
-                    min_pages: MAX_PAGES,
-                    max_pages: None,
-                },
-                static_section: StaticSection {
-                    start: 0,
-                    end: u32::MAX,
-                },
-                start: None,
-            },
-        ),
+        (Some(module), _) => (&module.entry, module.settings()),
+        (None, Some(library)) => (&library.entry, library.settings()),
         (None, None) => unreachable!("every manifest has a module or a library"),
     };
     let entry = root.join(entry);

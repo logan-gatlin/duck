@@ -72,6 +72,10 @@
         "named": true
       },
       {
+        "type": "repeated_list",
+        "named": true
+      },
+      {
         "type": "string",
         "named": true
       },
@@ -1263,6 +1267,32 @@
     }
   },
   {
+    "type": "repeated_list",
+    "named": true,
+    "fields": {
+      "length": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_expression",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_expression",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "return_statement",
     "named": true,
     "fields": {
@@ -1556,6 +1586,10 @@
   },
   {
     "type": ":",
+    "named": false
+  },
+  {
+    "type": ";",
     "named": false
   },
   {

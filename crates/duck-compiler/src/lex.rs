@@ -59,6 +59,7 @@ pub enum TokenKind {
     RBrace,
     Comma,
     Colon,
+    Semi,
     Dot,
     /// `.*`, lexed as one token so that `p.*= 1` isn't `p.` then `*=`.
     DotStar,
@@ -172,6 +173,7 @@ impl fmt::Display for TokenKind {
             Self::RBrace => "}",
             Self::Comma => ",",
             Self::Colon => ":",
+            Self::Semi => ";",
             Self::Dot => ".",
             Self::DotStar => ".*",
             Self::Arrow => "->",
@@ -306,6 +308,7 @@ impl<'a> Lexer<'a> {
 
                 ',' => TokenKind::Comma,
                 ':' => TokenKind::Colon,
+                ';' => TokenKind::Semi,
                 '.' if self.eat('*') => TokenKind::DotStar,
                 '.' => TokenKind::Dot,
                 '&' => TokenKind::Amp,
@@ -948,6 +951,10 @@ mod tests {
                 Newline,
                 Eof
             ]
+        );
+        assert_eq!(
+            kinds("[0; n]"),
+            vec![LBracket, Int(0), Semi, ident("n"), RBracket, Newline, Eof]
         );
         assert_eq!(error("!"), LexErrorKind::UnexpectedChar('!'));
     }

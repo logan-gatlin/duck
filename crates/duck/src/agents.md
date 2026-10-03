@@ -54,7 +54,8 @@ cached under `$XDG_CACHE_HOME/duck/git`, or `~/.cache/duck/git`.
   Python. Use tabs or spaces, but each line's indentation must extend or match
   an enclosing block's. Line breaks and indentation mean nothing inside
   `()` and `[]`. A line that starts with `|>` and is indented deeper than the
-  statement above it continues that statement. There are no semicolons.
+  statement above it continues that statement. Nothing ends a statement but
+  the end of its line: `;` is only used in `[value; len]`.
 - An empty block is written `pass`.
 - Comments run from `#` to the end of the line.
 - Integers: `42`, `1_000`, `0xff`, `0o17`, `0b1010`. Floats: `1.5`, `2e3`,
@@ -131,12 +132,18 @@ with `as`.
 - **String and array literals are only allowed in global initializers.** They
   are placed in the static data section, and the global holds the resulting
   `array`. To use one in a function, bind it to a global first.
+- `[value; len]` is an array of `len` copies of `value`. Both must be constant,
+  and `len` is a `u32`. An array of zeros adds nothing to the wasm, so
+  `[0; n]` is the way to set aside a buffer.
 
 ```duck
 let greeting = "hello"                    # array(u8)
 let primes: array(u16) = [2, 3, 5, 7]
 let names = ["ann", "bob"]                # array(array(u8))
 let empty: array(i32) = []                # [] needs a type annotation
+let SIZE: u32 = 1024
+let buffer: array(u8) = [0; SIZE]         # 1024 zeroed bytes
+let ones = [1.0; 4]                       # array(f64)
 
 fn first_prime() -> u16:
 	return primes[0]
@@ -408,8 +415,9 @@ fn second_field(n: &Node) -> &&Node:
 - Nothing checks pointers. The only runtime checks are array bounds and
   division by zero, which trap.
 
-`module` has the memory's constants and functions. The functions compile to
-single wasm instructions at each call, not to wasm functions.
+`module` has the memory's constants and functions, and functions that count
+an integer's zero bits. The functions compile to single wasm instructions at
+each call, not to wasm functions.
 
 ```duck
 fn reserve(bytes: u32) -> bool:
@@ -431,6 +439,10 @@ fn clear(buf: array(u8)):
   `memory.copy`. `copy` handles overlap. Out-of-bounds ranges trap.
 - `module.unreachable()` traps. As a statement of its own, it ends a function,
   so a function that returns a value needs no `return` after it.
+- `module.count_leading_zeros(value)` and `module.count_trailing_zeros(value)`
+  count the zero bits above the highest set bit of an integer and below its
+  lowest (`clz`, `ctz`). They take any integer type and give a count of that
+  same type. For 0 the count is the width of the type, so 8 for a `u8`.
 
 ## Arrays and strings
 

@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::manifest::MANIFEST;
+use duck::manifest::MANIFEST;
 
 const DEFAULT_MANIFEST: &str = r#"# Build using the `duck` cli
 
@@ -82,9 +82,9 @@ mod tests {
     use duck_compiler::file::{MemoryLimits, StaticSection};
 
     use super::*;
-    use crate::files::Files;
-    use crate::manifest::{Library, Module};
-    use crate::package;
+    use duck::files::Files;
+    use duck::manifest::{Library, Module};
+    use duck::package;
 
     #[test]
     fn new_module_builds() {
@@ -93,7 +93,7 @@ mod tests {
         new(&module, Kind::Module).unwrap();
         let again = new(&module, Kind::Module).unwrap_err();
 
-        let packages = package::resolve(&module, &crate::git::Cache::new(dir.join("cache")));
+        let packages = package::resolve(&module, &duck::git::Cache::new(dir.join("cache")));
         let manifest = packages
             .as_ref()
             .map(|packages| packages.root().manifest.clone());
@@ -142,7 +142,7 @@ mod tests {
         new(&library, Kind::Library).unwrap();
         let again = new(&library, Kind::Library).unwrap_err();
 
-        let packages = package::resolve(&library, &crate::git::Cache::new(dir.join("cache")));
+        let packages = package::resolve(&library, &duck::git::Cache::new(dir.join("cache")));
         let manifest = packages
             .as_ref()
             .map(|packages| packages.root().manifest.clone());

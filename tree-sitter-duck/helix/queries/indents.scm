@@ -12,6 +12,7 @@
   (type_arguments)
   (arguments)
   (list)
+  (repeated_list)
   (tuple)
   (tuple_pattern)
   (parenthesized_expression)

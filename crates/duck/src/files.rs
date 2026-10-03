@@ -69,6 +69,11 @@ impl Files {
         Ok(files)
     }
 
+    /// The canonical path of an opened file.
+    pub fn path(&self, id: FileId) -> &Path {
+        &self.get(id).canonical
+    }
+
     /// Reads the file at `path`, of package `package` unless it has been
     /// read already.
     fn read(&mut self, path: PathBuf, package: usize) -> io::Result<FileId> {
