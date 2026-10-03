@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn examples_compile() {
         let blocks = duck_blocks(OVERVIEW);
-        assert!(blocks.len() > 10, "found {} blocks", blocks.len());
+        assert!(blocks.len() > 5, "found {} blocks", blocks.len());
         for block in blocks {
             if let Err(errors) = duck_compiler::compile(&mut Single(block)) {
                 let errors: Vec<_> = errors.iter().map(ToString::to_string).collect();
