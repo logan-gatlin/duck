@@ -291,6 +291,22 @@ let _ = [1, 2,]
       (integer))))
 
 ====================
+Module properties
+====================
+
+let _ = module.static.len
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (field_expression
+      (module_property
+        (identifier))
+      (identifier))))
+
+====================
 Numbers
 ====================
 

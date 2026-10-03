@@ -9,7 +9,7 @@ use std::fmt;
 use std::mem;
 use std::ops::Range;
 
-use crate::file::{FileId, Settings};
+use crate::file::{FileId, MemoryLimits, Settings, StaticSection};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
     UnOp as IrUnOp, ValType,
@@ -94,12 +94,15 @@ macro_rules! fold_float_binary {
 /// The export name of the module's memory, which no item may take.
 const MEMORY_EXPORT: &str = "memory";
 
-/// The name of the global holding the first address after literal data, and
-/// its export name, which no item may take.
-const DATA_END_EXPORT: &str = "data_end";
-
 /// Bytes in a wasm page.
 const PAGE_SIZE: u64 = 64 * 1024;
+
+/// The functions of `module`, which are lowered inline at each call rather
+/// than to wasm functions.
+const MODULE_FUNCS: [&str; 6] = ["memory", "size", "grow", "fill", "copy", "unreachable"];
+
+/// The constants of `module`.
+const MODULE_CONSTS: [&str; 4] = ["static", "page_size", "min", "max"];
 
 /// The name of the built-in array type.
 const ARRAY: &str = "array";
@@ -350,11 +353,18 @@ pub enum TypeErrorKind {
     UnknownStart(String),
     /// A start function that takes arguments or returns something.
     InvalidStart(String),
-    /// Literal data that doesn't fit in the memory's initial pages.
+    /// Literal data that doesn't fit in the static data section.
     DataTooLarge {
         bytes: u32,
+        capacity: u32,
+    },
+    /// A static data section that ends past the memory's initial pages.
+    StaticOutsideMemory {
+        end: u32,
         min_pages: u32,
     },
+    /// `module.name` naming nothing.
+    UnknownModuleProperty(String),
     /// A string or array literal outside a global initializer.
     LiteralOutsideGlobal,
     /// `[]` with no type to give its elements.
@@ -426,10 +436,15 @@ struct Checker {
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
     ir_globals: Vec<ir::Global>,
+    /// The memory's size limits, which `module.min` and `module.max` are.
+    memory: MemoryLimits,
+    /// Where literals are placed, which `module.static` is.
+    static_section: StaticSection,
     /// The contents of literals, placed in memory in the order they are
     /// lowered.
     data: Vec<ir::Data>,
-    /// The first address after `data`.
+    /// The first address after `data`, or the start of the static data
+    /// section if there is none.
     data_end: u32,
     errors: Vec<TypeError>,
 }
@@ -807,10 +822,15 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "start function `{name}` must take no arguments and return nothing"
             ),
-            Self::DataTooLarge { bytes, min_pages } => write!(
+            Self::DataTooLarge { bytes, capacity } => write!(
                 f,
-                "literals take {bytes} bytes, more than the {min_pages} pages memory starts with"
+                "literals take {bytes} bytes, more than the {capacity} bytes of the static data section"
             ),
+            Self::StaticOutsideMemory { end, min_pages } => write!(
+                f,
+                "the static data section ends at address {end}, past the {min_pages} pages memory starts with"
+            ),
+            Self::UnknownModuleProperty(name) => write!(f, "`module` has no property `{name}`"),
             Self::LiteralOutsideGlobal => write!(
                 f,
                 "string and array literals are only allowed in global initializers"
@@ -850,13 +870,16 @@ impl std::error::Error for TypeError {}
 pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
     let mut ck = Checker {
         entry: program.entry,
+        memory: settings.memory,
+        static_section: settings.static_section,
+        data_end: settings.static_section.start,
         ..Checker::default()
     };
     ck.declare(program);
     ck.define_structs(program);
     ck.define_funcs(program);
     ck.define_globals(program);
-    ck.end_data(settings);
+    ck.check_static_section(settings);
     let start = settings
         .start
         .as_ref()
@@ -954,7 +977,7 @@ impl Checker {
     /// Declares a name defined by `item`, which may export it.
     fn declare_item(&mut self, item: &parse::Item, name: &Ident, entry: Item) {
         self.declare_name(name, entry, item.is_pub);
-        if self.exports(item) && [MEMORY_EXPORT, DATA_END_EXPORT].contains(&name.name.as_str()) {
+        if self.exports(item) && name.name == MEMORY_EXPORT {
             self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
         }
     }
@@ -1272,27 +1295,26 @@ impl Checker {
         }
     }
 
-    /// Checks that literal data fits in the memory's initial pages, and
-    /// exports where it ends.
-    fn end_data(&mut self, settings: &Settings) {
+    /// Checks that the static data section is in the memory's initial
+    /// pages, and that literal data fits in it.
+    fn check_static_section(&mut self, settings: &Settings) {
+        let StaticSection { start, end } = self.static_section;
         let min_pages = settings.memory.min_pages;
-        if u64::from(self.data_end) > u64::from(min_pages) * PAGE_SIZE {
-            self.errors.push(TypeError {
-                kind: TypeErrorKind::DataTooLarge {
-                    bytes: self.data_end,
-                    min_pages,
-                },
-                span: None,
-                instances: Vec::new(),
+        let mut errors = Vec::new();
+        if u64::from(end) > u64::from(min_pages) * PAGE_SIZE {
+            errors.push(TypeErrorKind::StaticOutsideMemory { end, min_pages });
+        }
+        if self.data_end > end {
+            errors.push(TypeErrorKind::DataTooLarge {
+                bytes: self.data_end - start,
+                capacity: end - start,
             });
         }
-        self.ir_globals.push(ir::Global {
-            name: DATA_END_EXPORT.to_string(),
-            ty: ValType::I32,
-            mutable: false,
-            init: Const::I32(self.data_end as i32),
-            export: Some(DATA_END_EXPORT.to_string()),
-        });
+        self.errors.extend(errors.into_iter().map(|kind| TypeError {
+            kind,
+            span: None,
+            instances: Vec::new(),
+        }));
     }
 
     /// The function `name`, which must take and return nothing. `None` after
@@ -1375,8 +1397,9 @@ impl Checker {
             self.error(TypeErrorKind::MissingReturn(sig.name.clone()), span);
         }
         // Wasm validates the end of a function with results as reachable
-        // unless it follows a `return`.
-        if !results.is_empty() && !matches!(stmts.last(), Some(Stmt::Return(_))) {
+        // unless it follows a `return` or `unreachable`.
+        let ends_unreachable = matches!(stmts.last(), Some(Stmt::Return(_) | Stmt::Unreachable));
+        if !results.is_empty() && !ends_unreachable {
             stmts.push(Stmt::Unreachable);
         }
         ir::Func {
@@ -1910,11 +1933,7 @@ impl Checker {
             self.data_end = offset + bytes.len() as u32;
             self.data.push(ir::Data { offset, bytes });
         }
-        let consts = [len, offset].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
-        Value {
-            pre: Vec::new(),
-            scalars: consts.to_vec(),
-        }
+        array_value(len, offset)
     }
 
     /// Evaluates each scalar of a lowered constant at compile time, reporting
@@ -1964,9 +1983,12 @@ impl Checker {
                 Const::I32(0) => self.fold(else_expr),
                 _ => self.fold(then_expr),
             },
-            Expr::Local(_) | Expr::Call(..) | Expr::Load { .. } | Expr::Seq(..) => {
-                Err(Fold::NotConstant)
-            }
+            Expr::Local(_)
+            | Expr::Call(..)
+            | Expr::Load { .. }
+            | Expr::MemorySize
+            | Expr::MemoryGrow(_)
+            | Expr::Seq(..) => Err(Fold::NotConstant),
         }
     }
 }
@@ -2492,6 +2514,7 @@ impl<'c> Body<'c> {
                 self.type_value(ty, expr.span)
             }
             ExprKind::Name(name) => self.name(name, expr.span),
+            ExprKind::Module(name) => self.module_property(name),
             ExprKind::Tuple(elems) => self.tuple(elems, expected),
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expected, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expected, expr.span),
@@ -2569,6 +2592,107 @@ impl<'c> Body<'c> {
             ty,
             self.ck.push_data(s.as_bytes().to_vec(), 1, s.len() as u32),
         )
+    }
+
+    /// `module.name`, one of `module`'s constants. `module.static` is the
+    /// static data section, as an `array(u8)`. `page_size` is the bytes in a
+    /// wasm page, and `min` and `max` are the pages memory starts with and
+    /// may grow to, `max` being the largest `u32` if it's unlimited.
+    fn module_property(&mut self, name: &Ident) -> (Ty, Value) {
+        let page_count = |pages: u32| {
+            let value = scalar(ValType::I32, Expr::Const(Const::I32(pages as i32)));
+            (Ty::Prim(Prim::U32), value)
+        };
+        match name.name.as_str() {
+            "static" => {
+                let StaticSection { start, end } = self.ck.static_section;
+                let ty = self.ck.array_of(Ty::Prim(Prim::U8));
+                (ty, array_value(end - start, start))
+            }
+            "page_size" => page_count(PAGE_SIZE as u32),
+            "min" => page_count(self.ck.memory.min_pages),
+            "max" => page_count(self.ck.memory.max_pages.unwrap_or(u32::MAX)),
+            other => {
+                let kind = if MODULE_FUNCS.contains(&other) {
+                    TypeErrorKind::NotAValue(format!("module.{other}"))
+                } else {
+                    TypeErrorKind::UnknownModuleProperty(other.to_string())
+                };
+                self.error(kind, name.span);
+                (Ty::Error, Value::default())
+            }
+        }
+    }
+
+    /// `module.name(args)`, one of `module`'s functions, lowered to the
+    /// memory instruction it stands for. `memory()` is all of memory as an
+    /// `array(u8)`, `size()` its size in pages, and `grow(pages)` adds pages,
+    /// giving the old size or -1 if it can't. `fill(dst, value, len)` and
+    /// `copy(dst, src, len)` set and copy bytes. `unreachable()` traps.
+    fn module_call(&mut self, name: &Ident, args: &[Arg], span: Span) -> (Ty, Value) {
+        let byte = Ty::Prim(Prim::U8);
+        let count = Ty::Prim(Prim::U32);
+        let addr = self.ck.ptr_to(byte);
+        let params: &[(&str, Ty)] = match name.name.as_str() {
+            "memory" | "size" | "unreachable" => &[],
+            "grow" => &[("pages", count)],
+            "fill" => &[("dst", addr), ("value", byte), ("len", count)],
+            "copy" => &[("dst", addr), ("src", addr), ("len", count)],
+            other => {
+                let kind = if MODULE_CONSTS.contains(&other) {
+                    TypeErrorKind::NotCallable(format!("module.{other}"))
+                } else {
+                    TypeErrorKind::UnknownModuleProperty(other.to_string())
+                };
+                self.error(kind, name.span);
+                for arg in args {
+                    self.expr(&arg.value, None);
+                }
+                return (Ty::Error, Value::default());
+            }
+        };
+        let params: Vec<_> = params.iter().map(|(n, ty)| (n.to_string(), *ty)).collect();
+        let Value { mut pre, scalars } = self.args(&params, args, false, span);
+        // Missing or mistyped arguments, already reported.
+        if scalars.len() != params.len() {
+            return (Ty::Error, Value::default());
+        }
+        let mut operands = exprs(scalars).into_iter();
+        let mut operand = || operands.next().unwrap();
+        let (ty, scalars) = match name.name.as_str() {
+            "memory" => {
+                // Wraps to 0 if memory is the full 4 GiB.
+                let len = binary(
+                    ValType::I32,
+                    IrBinOp::Mul,
+                    Expr::MemorySize,
+                    Expr::Const(Const::I32(PAGE_SIZE as i32)),
+                );
+                let ptr = Expr::Const(Const::I32(0));
+                let ty = self.ck.array_of(byte);
+                (ty, vec![(ValType::I32, len), (ValType::I32, ptr)])
+            }
+            "size" => (count, vec![(ValType::I32, Expr::MemorySize)]),
+            "grow" => {
+                let grow = Expr::MemoryGrow(Box::new(operand()));
+                (Ty::Prim(Prim::I32), vec![(ValType::I32, grow)])
+            }
+            "fill" => {
+                let (dst, value, len) = (operand(), operand(), operand());
+                pre.push(Stmt::MemoryFill { dst, value, len });
+                (Ty::Unit, Vec::new())
+            }
+            "copy" => {
+                let (dst, src, len) = (operand(), operand(), operand());
+                pre.push(Stmt::MemoryCopy { dst, src, len });
+                (Ty::Unit, Vec::new())
+            }
+            _ => {
+                pre.push(Stmt::Unreachable);
+                (Ty::Unit, Vec::new())
+            }
+        };
+        (ty, Value { pre, scalars })
     }
 
     /// An array literal, whose elements are typed like those of `expected`,
@@ -3012,6 +3136,7 @@ impl<'c> Body<'c> {
     fn call(&mut self, callee: &parse::Expr, args: &[Arg], span: Span) -> (Ty, Value) {
         // `Err(None)` once the callee has been reported.
         let item = match &callee.kind {
+            ExprKind::Module(name) => return self.module_call(name, args, span),
             ExprKind::Name(name) if self.lookup(name).is_some() => {
                 Err(Some(TypeErrorKind::NotCallable(name.clone())))
             }
@@ -3346,6 +3471,15 @@ fn scalar(ty: ValType, expr: Expr) -> Value {
     }
 }
 
+/// The constant array of `len` elements at `ptr`.
+fn array_value(len: u32, ptr: u32) -> Value {
+    let consts = [len, ptr].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
+    Value {
+        pre: Vec::new(),
+        scalars: consts.to_vec(),
+    }
+}
+
 fn exprs(scalars: Vec<(ValType, Expr)>) -> Vec<Expr> {
     scalars.into_iter().map(|(_, e)| e).collect()
 }
@@ -3596,7 +3730,7 @@ fn convert(from: Prim, to: Prim, expr: Expr) -> Expr {
 /// Whether evaluating `expr` has no side effects.
 fn is_pure(expr: &Expr) -> bool {
     match expr {
-        Expr::Const(_) | Expr::Local(_) | Expr::Global(_) => true,
+        Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => true,
         Expr::Unary(_, _, x) | Expr::Load { addr: x, .. } => is_pure(x),
         Expr::Binary(_, _, a, b) => is_pure(a) && is_pure(b),
         Expr::If {
@@ -3605,7 +3739,7 @@ fn is_pure(expr: &Expr) -> bool {
             else_expr,
             ..
         } => is_pure(cond) && is_pure(then_expr) && is_pure(else_expr),
-        Expr::Call(..) | Expr::Seq(..) => false,
+        Expr::Call(..) | Expr::MemoryGrow(_) | Expr::Seq(..) => false,
     }
 }
 
@@ -3623,7 +3757,12 @@ fn is_stable(expr: &Expr) -> bool {
             else_expr,
             ..
         } => is_stable(cond) && is_stable(then_expr) && is_stable(else_expr),
-        Expr::Global(_) | Expr::Call(..) | Expr::Load { .. } | Expr::Seq(..) => false,
+        Expr::Global(_)
+        | Expr::Call(..)
+        | Expr::Load { .. }
+        | Expr::MemorySize
+        | Expr::MemoryGrow(_)
+        | Expr::Seq(..) => false,
     }
 }
 
@@ -3728,6 +3867,7 @@ fn fn_sigs(program: &Program) -> impl Iterator<Item = (bool, &FnSig)> {
 fn diverges(block: &[parse::Stmt]) -> bool {
     block.iter().any(|stmt| match &stmt.kind {
         StmtKind::Return(_) => true,
+        StmtKind::Expr(expr) => is_unreachable_call(expr),
         StmtKind::If {
             then_body,
             else_body: Some(else_body),
@@ -3738,6 +3878,14 @@ fn diverges(block: &[parse::Stmt]) -> bool {
         }
         _ => false,
     })
+}
+
+/// Whether `expr` is `module.unreachable()`, which traps.
+fn is_unreachable_call(expr: &parse::Expr) -> bool {
+    let ExprKind::Call(callee, _) = &expr.kind else {
+        return false;
+    };
+    matches!(&callee.kind, ExprKind::Module(name) if name.name == "unreachable")
 }
 
 /// Whether `block` can break out of the loop it's directly in.
@@ -3858,7 +4006,7 @@ fn wasm_max(a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{DummyManager, FileManager, MemoryLimits};
+    use crate::file::{DummyManager, FileManager, MemoryLimits, StaticSection};
     use crate::ir::{Const, Expr, Func, Module, Stmt, ValType};
     use crate::lex::tokenize;
 
@@ -3926,6 +4074,12 @@ mod tests {
                 value,
             } => format!("({ty:?}.{op:?} offset={offset} {} {})", e(addr), e(value)),
             Stmt::Drop(v) => format!("(drop {})", e(v)),
+            Stmt::MemoryFill { dst, value, len } => {
+                format!("(memory.fill {} {} {})", e(dst), e(value), e(len))
+            }
+            Stmt::MemoryCopy { dst, src, len } => {
+                format!("(memory.copy {} {} {})", e(dst), e(src), e(len))
+            }
             Stmt::Call { func, args, dests } => {
                 let dests: Vec<_> = dests.iter().map(|d| local(f, *d)).collect();
                 let name = func_name(m, *func);
@@ -3963,6 +4117,8 @@ mod tests {
                 offset,
                 addr,
             } => format!("({ty:?}.{op:?} offset={offset} {})", ex(addr)),
+            Expr::MemorySize => "memory.size".to_string(),
+            Expr::MemoryGrow(pages) => format!("(memory.grow {})", ex(pages)),
             Expr::Binary(ty, op, a, b) => format!("({ty:?}.{op:?} {} {})", ex(a), ex(b)),
             Expr::Call(func, args) => {
                 let args: Vec<_> = args.iter().map(ex).collect();
@@ -4049,7 +4205,6 @@ mod tests {
                 ("greeting.ptr", false, Const::I32(0)),
                 ("primes.len", false, Const::I32(4)),
                 ("primes.ptr", false, Const::I32(12)),
-                ("data_end", false, Const::I32(16)),
             ]
         );
     }
@@ -4369,7 +4524,6 @@ var v = 1.5 as f32
             ("origin.y", false, "2"),
             ("flag", false, "1"),
             ("v", true, "1.5f32"),
-            ("data_end", false, "0"),
         ];
         let expected: Vec<_> = expected
             .into_iter()
@@ -4716,7 +4870,7 @@ let g: f32 = 1.0
 let p = P(y: g, x: 2.0)
 ";
         let inits: Vec<_> = lower(src).globals.iter().map(|g| konst(g.init)).collect();
-        assert_eq!(inits, vec!["1f32", "2f32", "1f32", "0"]);
+        assert_eq!(inits, vec!["1f32", "2f32", "1f32"]);
     }
 
     #[test]
@@ -4763,8 +4917,7 @@ fn f():
     return b
 ";
         let module = lower(src);
-        let globals: Vec<_> = module.globals.iter().map(|g| g.name.as_str()).collect();
-        assert_eq!(globals, ["data_end"]);
+        assert!(module.globals.is_empty());
         assert!(module.funcs[1].locals.is_empty());
         assert_eq!(body(&module, "u"), "(return )");
         assert_eq!(body(&module, "f"), "(return )");
@@ -4800,7 +4953,6 @@ let hidden = 2
                 named("origin.x"),
                 named("origin.y"),
                 ("hidden".to_string(), None),
-                named("data_end"),
             ]
         );
     }
@@ -4839,7 +4991,6 @@ pub fn f(p: &P, a: u32, n: i32) -> &u32:
             vec![
                 (ValType::I32, Const::I32(0)),
                 (ValType::I32, Const::I32(-1)),
-                (ValType::I32, Const::I32(0)),
             ]
         );
         assert_eq!(
@@ -5317,7 +5468,6 @@ let (_, hidden) = (1, pos.1.1)
                 global("pos.1.0", true, Const::I32(480)),
                 global("pos.1.1", true, Const::F64(1.5)),
                 global("hidden", false, Const::F64(1.5)),
-                global("data_end", true, Const::I32(0)),
             ]
         );
     }
@@ -6356,47 +6506,210 @@ fn f():
     }
 
     #[test]
-    fn data_end_is_the_first_free_address() {
-        let data_end = |src: &str| {
-            let global = lower(src).globals.pop().unwrap();
-            (global.name, global.export, global.mutable, global.init)
+    fn module_static_is_the_static_data_section() {
+        let settings = Settings {
+            static_section: StaticSection {
+                start: 1025,
+                end: 2048,
+            },
+            ..Settings::default()
         };
-        let exported = |end| {
-            let name = "data_end".to_string();
-            (name.clone(), Some(name), false, Const::I32(end))
-        };
-        assert_eq!(data_end("pub let a = 1\n"), exported(0));
+        let src = "\
+pub let s = \"abc\"
+let t: array(i32) = [1]
+pub let all = module.static
+fn f() -> u32:
+    return module.static.len
+";
+        let module = check_with(src, &settings).unwrap();
         assert_eq!(
-            data_end("let s = \"abc\"\nlet t: array(i32) = []\n"),
-            exported(3)
+            data(&module),
+            [(1025, &b"abc"[..]), (1028, &[1, 0, 0, 0][..])]
         );
-        assert_eq!(data_end("let data_end = 1\n"), exported(0));
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
         assert_eq!(
-            errors("pub let data_end = 1\n"),
-            [TypeErrorKind::ReservedExport("data_end".into())]
+            globals,
+            [
+                ("s.len", Const::I32(3)),
+                ("s.ptr", Const::I32(1025)),
+                ("t.len", Const::I32(1)),
+                ("t.ptr", Const::I32(1028)),
+                ("all.len", Const::I32(1023)),
+                ("all.ptr", Const::I32(1025)),
+            ]
+        );
+        assert_eq!(body(&module, "f"), "(return 1023)");
+        // Nothing is exported but what the source makes `pub`.
+        assert!(check_src("pub let data_end = 1\n").is_ok());
+        assert_eq!(
+            errors("let x = module.heap\n"),
+            [TypeErrorKind::UnknownModuleProperty("heap".into())]
         );
     }
 
     #[test]
-    fn data_must_fit_in_the_initial_memory() {
-        let pages = |min_pages| Settings {
+    fn module_constants_describe_memory() {
+        let settings = |max_pages| Settings {
             memory: MemoryLimits {
-                min_pages,
-                max_pages: None,
+                min_pages: 2,
+                max_pages,
             },
             ..Settings::default()
         };
-        assert!(check_with("let s = \"\"\n", &pages(0)).is_ok());
+        let src = "\
+pub let page = module.page_size
+pub let min = module.min
+pub let max = module.max
+";
+        let inits = |max_pages| -> Vec<_> {
+            let module = check_with(src, &settings(max_pages)).unwrap();
+            module.globals.iter().map(|g| g.init).collect()
+        };
         assert_eq!(
-            check_with("let s = \"a\"\n", &pages(0)),
-            Err(vec![TypeError {
-                kind: TypeErrorKind::DataTooLarge {
-                    bytes: 1,
-                    min_pages: 0
+            inits(Some(16)),
+            [Const::I32(65536), Const::I32(2), Const::I32(16)]
+        );
+        // `u32::MAX` when memory may grow without limit.
+        assert_eq!(
+            inits(None),
+            [Const::I32(65536), Const::I32(2), Const::I32(-1)]
+        );
+    }
+
+    #[test]
+    fn module_functions_are_inlined() {
+        let src = "\
+fn all() -> array(u8):
+    return module.memory()
+fn size() -> u32:
+    return module.size()
+fn grow(n: u32) -> i32:
+    return module.grow(n)
+fn fill(p: &u8, n: u32):
+    module.fill(p, 7, n)
+fn copy(a: array(u8), b: array(u8)):
+    module.copy(src: b.ptr, dst: a.ptr, len: a.len)
+";
+        let module = lower(src);
+        assert_eq!(module.funcs.len(), 5);
+        assert_eq!(
+            body(&module, "all"),
+            "(return (I32.Mul memory.size 65536) 0)"
+        );
+        assert_eq!(body(&module, "size"), "(return memory.size)");
+        assert_eq!(body(&module, "grow"), "(return (memory.grow n))");
+        assert_eq!(body(&module, "fill"), "(memory.fill p 7 n)");
+        assert_eq!(body(&module, "copy"), "(memory.copy a.ptr b.ptr a.len)");
+    }
+
+    #[test]
+    fn module_unreachable_traps_and_diverges() {
+        let src = "\
+fn f(x: u32) -> u32:
+    if x == 0:
+        return 1
+    module.unreachable()
+fn g():
+    module.unreachable()
+    pass
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(if (I32.Eq x 0) (then (return 1)) (else )) unreachable"
+        );
+        assert_eq!(body(&module, "g"), "unreachable");
+        // Only a statement of its own ends a function.
+        assert_eq!(
+            errors("fn h() -> u32:\n    let u = module.unreachable()\n"),
+            [TypeErrorKind::MissingReturn("h".into())]
+        );
+        assert_eq!(
+            errors("fn k():\n    module.unreachable(1)\n"),
+            [TypeErrorKind::TooManyArgs {
+                expected: 0,
+                found: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn module_functions_and_constants_are_not_interchangeable() {
+        use TypeErrorKind::*;
+        let src = "\
+fn f(p: &u8):
+    let a = module.size
+    let b = module.page_size()
+    let c = module.heap()
+    module.fill(p, 0)
+    module.grow(1, 2)
+    let d: u32 = module.grow(1)
+";
+        assert_eq!(
+            errors(src),
+            [
+                NotAValue("module.size".into()),
+                NotCallable("module.page_size".into()),
+                UnknownModuleProperty("heap".into()),
+                MissingArg("len".into()),
+                TooManyArgs {
+                    expected: 1,
+                    found: 2
                 },
-                span: None,
-                instances: Vec::new(),
-            }])
+                Mismatch {
+                    expected: "u32".into(),
+                    found: "i32".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn data_must_fit_in_the_static_section() {
+        use TypeErrorKind::{DataTooLarge, StaticOutsideMemory};
+        let errors = |src: &str, start, end, min_pages| -> Vec<TypeError> {
+            let settings = Settings {
+                memory: MemoryLimits {
+                    min_pages,
+                    max_pages: None,
+                },
+                static_section: StaticSection { start, end },
+                ..Settings::default()
+            };
+            check_with(src, &settings).err().unwrap_or_default()
+        };
+        let spanless = |kind| TypeError {
+            kind,
+            span: None,
+            instances: Vec::new(),
+        };
+        assert_eq!(errors("let s = \"\"\n", 0, 0, 0), []);
+        assert_eq!(errors("let s = \"ab\"\n", 4, 6, 1), []);
+        assert_eq!(
+            errors("let s = \"abc\"\n", 4, 6, 1),
+            [spanless(DataTooLarge {
+                bytes: 3,
+                capacity: 2
+            })]
+        );
+        // Padding to align the `u32`s counts.
+        assert_eq!(
+            errors("let s = \"a\"\nlet t: array(u32) = [1]\n", 0, 6, 1),
+            [spanless(DataTooLarge {
+                bytes: 8,
+                capacity: 6
+            })]
+        );
+        assert_eq!(
+            errors("let s = \"\"\n", 0, 65537, 1),
+            [spanless(StaticOutsideMemory {
+                end: 65537,
+                min_pages: 1
+            })]
         );
     }
 

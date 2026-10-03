@@ -376,7 +376,7 @@ mod tests {
             ("app/Duck.toml", &library("tool = { path = \"../tool\" }\n")),
             (
                 "tool/Duck.toml",
-                "[module]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmin = \"1pgs\"\n",
+                "[module]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmin = \"1pgs\"\nstatic = { start = \"0B\", end = \"64KiB\" }\n",
             ),
         ]);
         let error = resolve(&root, &no_cache(&root)).unwrap_err().to_string();

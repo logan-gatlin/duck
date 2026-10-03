@@ -1,0 +1,65 @@
+//! `duck agents`: an overview of the language for coding agents.
+
+/// The overview, in Markdown. Every ```duck block in it compiles on its own.
+pub const OVERVIEW: &str = include_str!("agents.md");
+
+#[cfg(test)]
+mod tests {
+    use duck_compiler::file::{FileId, FileManager, OpenError, Settings};
+
+    use super::*;
+
+    /// One file, which imports nothing.
+    struct Single(&'static str);
+
+    impl FileManager for Single {
+        fn entry_point(&mut self) -> FileId {
+            Self::mint_file_id(0)
+        }
+
+        fn display_name(&mut self, _id: FileId) -> String {
+            "agents.md".to_string()
+        }
+
+        fn contents(&mut self, _id: FileId) -> String {
+            self.0.to_string()
+        }
+
+        fn open(&mut self, _from: FileId, _path: &str) -> Result<FileId, OpenError> {
+            Err(OpenError::NotFound)
+        }
+
+        fn open_package(&mut self, _from: FileId, _name: &str) -> Option<FileId> {
+            None
+        }
+
+        fn settings(&mut self) -> Settings {
+            Settings::default()
+        }
+    }
+
+    /// The contents of every ```duck block in `markdown`.
+    fn duck_blocks(markdown: &'static str) -> Vec<&'static str> {
+        let mut blocks = Vec::new();
+        let mut rest = markdown;
+        while let Some(start) = rest.find("\n```duck\n") {
+            let body = &rest[start + "\n```duck\n".len()..];
+            let end = body.find("\n```").expect("unclosed code block");
+            blocks.push(&body[..=end]);
+            rest = &body[end..];
+        }
+        blocks
+    }
+
+    #[test]
+    fn examples_compile() {
+        let blocks = duck_blocks(OVERVIEW);
+        assert!(blocks.len() > 10, "found {} blocks", blocks.len());
+        for block in blocks {
+            if let Err(errors) = duck_compiler::compile(&mut Single(block)) {
+                let errors: Vec<_> = errors.iter().map(ToString::to_string).collect();
+                panic!("{block}\n{errors:#?}");
+            }
+        }
+    }
+}

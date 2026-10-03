@@ -52,6 +52,10 @@
         "named": true
       },
       {
+        "type": "module_property",
+        "named": true
+      },
+      {
         "type": "parenthesized_expression",
         "named": true
       },
@@ -1002,6 +1006,22 @@
     }
   },
   {
+    "type": "module_property",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "named_type",
     "named": true,
     "fields": {
@@ -1568,6 +1588,10 @@
   },
   {
     "type": "let",
+    "named": false
+  },
+  {
+    "type": "module",
     "named": false
   },
   {

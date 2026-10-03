@@ -10,6 +10,7 @@
 (field_expression field: (identifier) @variable.other.member)
 (field_expression field: (tuple_index) @constant.numeric.integer)
 (labeled_argument label: (identifier) @variable.other.member)
+(module_property name: (identifier) @variable.other.member)
 
 (enum_member name: (identifier) @type.enum.variant)
 
@@ -49,6 +50,7 @@
 (escape_sequence) @constant.character.escape
 (import path: (string) @string.special.path)
 (discard) @variable.builtin
+"module" @variable.builtin
 
 (comment) @comment.line
 

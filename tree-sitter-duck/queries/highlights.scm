@@ -8,6 +8,7 @@
 (field_expression field: (identifier) @property)
 (field_expression field: (tuple_index) @number)
 (labeled_argument label: (identifier) @property)
+(module_property name: (identifier) @property)
 
 (enum_member name: (identifier) @constant)
 
@@ -47,6 +48,7 @@
 (escape_sequence) @string.escape
 (import path: (string) @string.special.path)
 (discard) @variable.builtin
+"module" @variable.builtin
 
 (comment) @comment
 

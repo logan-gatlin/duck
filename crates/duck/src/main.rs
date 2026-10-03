@@ -1,3 +1,4 @@
+mod agents;
 mod files;
 mod git;
 mod manifest;
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use duck_compiler::file::{FileManager, MemoryLimits, Settings};
+use duck_compiler::file::{FileManager, MemoryLimits, Settings, StaticSection};
 
 use crate::files::Files;
 use crate::manifest::{MANIFEST, MAX_PAGES, Manifest};
@@ -28,23 +29,39 @@ enum Command {
     /// Compile the package described by the nearest Duck.toml: build its
     /// module, or check its library if it has no module
     Build,
-    /// Create a new module in a new directory
+    /// Create a new package in a new directory: a module, or a library with --lib
     New {
         /// The directory to create
         path: PathBuf,
+        /// Create a library for other packages to import, not a module
+        #[arg(long)]
+        lib: bool,
     },
+    /// Print an overview of the duck language for coding agents
+    Agents,
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Build => build(),
-        Command::New { path } => match new::new(&path) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                fail(format_args!("{} already exists", path.display()))
+        Command::New { path, lib } => {
+            let kind = if lib {
+                new::Kind::Library
+            } else {
+                new::Kind::Module
+            };
+            match new::new(&path, kind) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    fail(format_args!("{} already exists", path.display()))
+                }
+                Err(e) => fail(format_args!("cannot create {}: {e}", path.display())),
             }
-            Err(e) => fail(format_args!("cannot create {}: {e}", path.display())),
-        },
+        }
+        Command::Agents => {
+            print!("{}", agents::OVERVIEW);
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -71,6 +88,7 @@ fn build() -> ExitCode {
             &module.entry,
             Settings {
                 memory: module.memory,
+                static_section: module.static_section,
                 start: module.start.clone(),
             },
         ),
@@ -80,6 +98,10 @@ fn build() -> ExitCode {
                 memory: MemoryLimits {
                     min_pages: MAX_PAGES,
                     max_pages: None,
+                },
+                static_section: StaticSection {
+                    start: 0,
+                    end: u32::MAX,
                 },
                 start: None,
             },

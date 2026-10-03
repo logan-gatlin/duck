@@ -124,6 +124,20 @@ pub enum Stmt {
     },
     /// Evaluates `expr` and discards its value.
     Drop(Expr),
+    /// `memory.fill`, setting the `len` bytes from `dst` to the low byte of
+    /// `value`. Operands are evaluated in order.
+    MemoryFill {
+        dst: Expr,
+        value: Expr,
+        len: Expr,
+    },
+    /// `memory.copy`, copying `len` bytes from `src` to `dst`, which may
+    /// overlap. Operands are evaluated in order.
+    MemoryCopy {
+        dst: Expr,
+        src: Expr,
+        len: Expr,
+    },
     /// A call whose results (zero, or more than one) are stored to `dests`
     /// in order. Single-result calls are [`Expr::Call`].
     Call {
@@ -167,6 +181,11 @@ pub enum Expr {
         offset: u32,
         addr: Box<Expr>,
     },
+    /// `memory.size`, the memory's current size in pages, as an `i32`.
+    MemorySize,
+    /// `memory.grow`, adding the `i32` number of pages and producing the old
+    /// size, or -1 if the memory can't grow that much.
+    MemoryGrow(Box<Expr>),
     /// `if (result ty)`. A label, but nothing inside can branch.
     If {
         ty: ValType,

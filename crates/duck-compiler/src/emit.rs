@@ -162,6 +162,17 @@ fn stmt(f: &mut Function, stmt: &Stmt) {
             expr(f, value);
             f.instruction(&Instruction::Drop);
         }
+        Stmt::MemoryFill { dst, value, len } => {
+            exprs(f, [dst, value, len]);
+            f.instruction(&Instruction::MemoryFill(0));
+        }
+        Stmt::MemoryCopy { dst, src, len } => {
+            exprs(f, [dst, src, len]);
+            f.instruction(&Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+        }
         Stmt::Call { func, args, dests } => {
             exprs(f, args);
             f.instruction(&Instruction::Call(func.0));
@@ -250,6 +261,13 @@ fn expr(f: &mut Function, expr: &Expr) {
             self::expr(f, addr);
             f.instruction(&load(*ty, *op, *offset));
         }
+        Expr::MemorySize => {
+            f.instruction(&Instruction::MemorySize(0));
+        }
+        Expr::MemoryGrow(pages) => {
+            self::expr(f, pages);
+            f.instruction(&Instruction::MemoryGrow(0));
+        }
         Expr::If {
             ty,
             cond,
@@ -270,7 +288,7 @@ fn expr(f: &mut Function, expr: &Expr) {
     }
 }
 
-fn exprs(f: &mut Function, values: &[Expr]) {
+fn exprs<'a>(f: &mut Function, values: impl IntoIterator<Item = &'a Expr>) {
     for value in values {
         expr(f, value);
     }
@@ -643,7 +661,6 @@ pub fn shown():
                 r#"  (export "memory" (memory 0))"#,
                 r#"  (export "shown" (func $shown))"#,
                 r#"  (export "a" (global $a))"#,
-                r#"  (export "data_end" (global $data_end))"#,
             ]
         );
         assert!(wat.contains("(memory (;0;) 1)"), "{wat}");
@@ -796,6 +813,34 @@ fn f(p: &P) -> f64:
     }
 
     #[test]
+    fn module_functions_are_memory_instructions() {
+        let src = "\
+pub fn f(p: &u8, q: &u8, n: u32) -> i32:
+    module.fill(p, 0, n)
+    module.copy(p, q, n)
+    let all = module.memory()
+    return module.grow(all.len / module.page_size - module.size())
+";
+        let func = func_wat(&emit_src(src), "f");
+        assert!(!func.contains("call"), "{func}");
+        for instr in ["memory.fill", "memory.copy", "memory.size", "memory.grow"] {
+            assert!(func.contains(instr), "{instr}\n{func}");
+        }
+    }
+
+    #[test]
+    fn module_unreachable_ends_a_function_with_results() {
+        let src = "\
+pub fn f(x: u32) -> u32:
+    if x == 0:
+        return 1
+    module.unreachable()
+";
+        let func = func_wat(&emit_src(src), "f");
+        assert!(func.contains("unreachable"), "{func}");
+    }
+
+    #[test]
     fn tuples_are_multiple_values() {
         let src = "\
 extern:
@@ -882,8 +927,6 @@ let table: array(u16) = [1, 2]
             r#"(data (;1;) (i32.const 4) "\01\00\02\00")"#,
             r#"(export "greeting.len" (global $greeting.len))"#,
             r#"(export "greeting.ptr" (global $greeting.ptr))"#,
-            r#"(export "data_end" (global $data_end))"#,
-            "(global $data_end (;4;) i32 i32.const 8)",
         ] {
             assert!(wat.contains(line), "{line}\n{wat}");
         }

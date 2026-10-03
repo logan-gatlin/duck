@@ -290,6 +290,7 @@ module.exports = grammar({
       $.float,
       $.string,
       $.boolean,
+      $.module_property,
       $.unit,
       $.tuple,
       $.list,
@@ -303,6 +304,9 @@ module.exports = grammar({
       $.field_expression,
       $.dereference_expression,
     ),
+
+    // `module.name`, a property of the module being compiled.
+    module_property: $ => seq('module', '.', field('name', $.identifier)),
 
     unit: _ => seq('(', ')'),
 

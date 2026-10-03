@@ -36,6 +36,7 @@ pub enum OpenError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub memory: MemoryLimits,
+    pub static_section: StaticSection,
     /// The function the module runs when it is instantiated, which takes no
     /// arguments and returns nothing.
     pub start: Option<String>,
@@ -47,6 +48,14 @@ pub struct MemoryLimits {
     pub min_pages: u32,
     /// `None` lets the memory grow without limit.
     pub max_pages: Option<u32>,
+}
+
+/// The addresses `start..end` that literals are placed in, from `start` up.
+/// `start` is at most `end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticSection {
+    pub start: u32,
+    pub end: u32,
 }
 
 pub(crate) struct DummyManager;
@@ -63,6 +72,16 @@ impl Default for MemoryLimits {
         Self {
             min_pages: 1,
             max_pages: None,
+        }
+    }
+}
+
+impl Default for StaticSection {
+    /// The first page, all of the default memory.
+    fn default() -> Self {
+        Self {
+            start: 0,
+            end: 64 * 1024,
         }
     }
 }

@@ -229,6 +229,8 @@ pub enum ExprKind {
     /// `()`
     Unit,
     Name(String),
+    /// `module.name`, a property of the module being compiled.
+    Module(Ident),
     /// `(a, b)`, with at least two elements.
     Tuple(Vec<Expr>),
     List(Vec<Expr>),
@@ -943,6 +945,15 @@ impl<'a> Parser<'a> {
                     span: self.span_from(token.span),
                 });
             }
+            TokenKind::Module => {
+                self.bump();
+                self.expect(TokenKind::Dot)?;
+                let name = self.ident()?;
+                return Ok(Expr {
+                    kind: ExprKind::Module(name),
+                    span: self.span_from(token.span),
+                });
+            }
             TokenKind::LBracket => {
                 self.bump();
                 let items = self.comma_list(TokenKind::RBracket, Self::expr)?;
@@ -1232,6 +1243,7 @@ mod tests {
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Unit => "()".to_string(),
             ExprKind::Name(name) => name.clone(),
+            ExprKind::Module(name) => format!("module.{}", name.name),
             ExprKind::Tuple(items) => format!("(tuple {})", list(items)),
             ExprKind::List(items) => format!("[{}]", list(items)),
             ExprKind::Unary(op, e) => format!("({op:?} {})", sexpr(e)),
@@ -1457,6 +1469,16 @@ mod tests {
             expr(r#"[1.5, "hi", true, false]"#),
             r#"[1.5 "hi" true false]"#
         );
+    }
+
+    #[test]
+    fn module_properties() {
+        assert_eq!(expr("module.static"), "module.static");
+        assert_eq!(expr("module.static.len"), "(. module.static len)");
+        assert_eq!(expr("module.static[0]"), "(index module.static 0)");
+        for src in ["let x = module\n", "let x = module.0\n", "let module = 1\n"] {
+            assert!(parse_src(src).is_err(), "{src:?}");
+        }
     }
 
     #[test]

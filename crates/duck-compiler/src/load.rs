@@ -377,11 +377,7 @@ mod tests {
         ]);
         let module = lower(&mut files);
         let inits: Vec<_> = module.globals.iter().map(|g| g.init).collect();
-        // `data_end` comes last.
-        assert_eq!(
-            inits,
-            [Const::I32(1), Const::I32(2), Const::I32(3), Const::I32(0)]
-        );
+        assert_eq!(inits, [Const::I32(1), Const::I32(2), Const::I32(3)]);
     }
 
     #[test]
@@ -623,7 +619,7 @@ mod tests {
             ),
         ]);
         let module = lower(&mut files);
-        assert_eq!(exports(&module), ["f", "x", "data_end"]);
+        assert_eq!(exports(&module), ["f", "x"]);
     }
 
     #[test]
