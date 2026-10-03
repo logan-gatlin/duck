@@ -20,7 +20,7 @@ var count: i32 = 0               # mutable global
 
 pub struct Point:                # items and fields are private unless `pub`
 	pub x: f32
-	pub y: f32
+	pub y: f32 = 0.0             # a default: a constructor may leave `y` out
 
 enum(u8) Color:
 	red                          # 0
@@ -32,7 +32,7 @@ fn area(w: f64, h: f64) -> f64:
 
 pub fn main():                   # no `->`: returns `tuple()`, the unit type
 	let a = area(2.0, h: 3.0)    # labels may reorder; positional ones first
-	var p = Point(x: 1, y: 2)    # every field, labelled
+	var p = Point(x: 1, y: 2)    # labelled: every field without a default
 	p.x += a as f32              # also -= *= /= %=, and no others
 	let (q, _) = (count / 3, p)
 	if q > 10 and not p.x == p.y:
@@ -84,8 +84,8 @@ type as a whole only: a `tuple(&var T, i32)` is not a `tuple(&T, i32)`, and a
 
 ## Literals and globals
 
-**String and array literals belong in global initializers only.** In a
-function, name a global.
+**String and array literals belong in global initializers and field defaults
+only.** In a function, name a global.
 
 ```duck
 let greeting = "hello"             # array(u8)
@@ -105,6 +105,11 @@ fn f(i: u32) -> u8:
   `f64` by default and has a digit on each side of the `.`.
 - A global initializer is constant: literals, operators, casts, constructors,
   function names and earlier `let` globals. Calls and `var` globals are out.
+- A field default is constant too. It and other initializers use only the
+  defaults of structs declared earlier. A `varray` literal in one is empty,
+  as every value would share its elements.
+- Only a constructor applies defaults. Memory that is cast to a struct holds
+  whatever was there.
 
 ## Operators
 
@@ -201,6 +206,8 @@ fn demo() -> u8:
 
 - In a generic body `T` is also a value (`T.size`), a constructor (`T(x: 1)`)
   and an enum (`T.ok`).
+- A field default never names `T`, and a field holding a `T` by value has
+  none. `head: &var T = 0` and `items: varray(T) = []` are fine.
 - `p: &T` takes a `&var i32` with `T` as `i32`, and `array(T)` a `varray(i32)`.
   Nothing is generic over writability: write both, or cast.
 
@@ -250,8 +257,9 @@ fn demo(n: i32) -> i32:
 - `import json` binds the library of the `Duck.toml` dependency `json`. Files
   of one package import each other by path only.
 - `pub` items are reached as `mod.item`: `geo.Point(x: 1, y: 2)`,
-  `geo.Color.red`. A `pub` item's signature uses only `pub` types, and a
-  struct with a private field is constructed only in its own file.
+  `geo.Color.red`. A `pub` item's signature uses only `pub` types.
+- Another file constructs a struct only if every private field has a default,
+  and never gives a private field a value.
 - `pub import "x.duck"` exposes `x` to importers, as `this.x.item`.
 - Imports form no cycles.
 

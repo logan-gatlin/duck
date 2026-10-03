@@ -686,6 +686,32 @@ fn f() -> i32:
     }
 
     #[test]
+    fn private_fields_with_defaults_are_constructed_from_other_modules() {
+        let lib = "pub struct Counter:\n    pub step: i32 = 1\n    count: i32 = 5\npub struct Sealed:\n    pub open: i32\n    key: i32\n    pad: i32 = 0\npub fn new() -> Counter:\n    return Counter(count: 3)\n";
+        let main = "import \"a\"\npub fn f() -> a.Counter:\n    return a.Counter(step: 2)\n";
+        let mut files = Memory(vec![("main", main), ("a", lib)]);
+        let module = lower(&mut files);
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        let ir::Stmt::Return(values) = &f.body[0] else {
+            panic!("{:?}", f.body)
+        };
+        let consts = [2, 5].map(|x| ir::Expr::Const(Const::I32(x)));
+        assert_eq!(values, &consts);
+
+        // A default can't be replaced where its field can't be named, and a
+        // private field without one still seals its struct.
+        let main = "import \"a\"\nfn f():\n    let c = a.Counter(count: 1)\n    let s = a.Sealed(open: 1, key: 2, pad: 3)\n";
+        let mut files = Memory(vec![("main", main), ("a", lib)]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"count\": field `count` of `Counter` is private",
+                "main \"a.Sealed(open: 1, key: 2, pad: 3)\": field `key` of `Sealed` is private",
+            ]
+        );
+    }
+
+    #[test]
     fn private_types_cannot_be_in_pub_signatures() {
         let mut files = Memory(vec![(
             "main",

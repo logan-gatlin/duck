@@ -21,10 +21,12 @@ use crate::parse::{
     PatternKind, StmtKind, TypeKind, UnaryOp,
 };
 
+use defaults::FieldDefault;
 use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
 use generic_fn::{FnInstance, GenericFn};
 
+mod defaults;
 mod enums;
 mod equality;
 mod fn_ptr;
@@ -384,8 +386,8 @@ pub enum TypeErrorKind {
     MissingReturn(String),
     BreakOutsideLoop,
     ContinueOutsideLoop,
-    /// A global initializer or enum member's value that can't be evaluated
-    /// at compile time.
+    /// A global initializer, enum member's value or field default that
+    /// can't be evaluated at compile time.
     NotConstant,
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
@@ -433,8 +435,15 @@ pub enum TypeErrorKind {
     SelfSizedStatic,
     /// `module.name` naming nothing.
     UnknownModuleProperty(String),
-    /// A string or array literal outside a global initializer.
+    /// A string or array literal outside a global initializer or field
+    /// default.
     LiteralOutsideGlobal,
+    /// A `varray` literal with elements in a field default, which every
+    /// value of the struct would share.
+    SharedLiteral,
+    /// A field default that names this type parameter of its struct, or
+    /// whose value one lays out.
+    DefaultUsesParam(String),
     /// `[]` with no type to give its elements.
     UntypedEmptyArray,
     /// An expression where a type argument should be.
@@ -582,6 +591,9 @@ struct FieldDef {
     ty: Ty,
     /// Whether modules other than the struct's can use it.
     is_pub: bool,
+    /// What it is where a constructor gives it no value, if anything. An
+    /// instance's is its declaration's, as it was when the instance was made.
+    default: Option<FieldDefault>,
     span: Span,
 }
 
@@ -629,6 +641,9 @@ struct Body<'c> {
     /// Whether this is a global initializer, the only place literals that
     /// need memory can be.
     global: bool,
+    /// Whether this is a field default, a kind of global initializer whose
+    /// value every instance of the struct has.
+    default: bool,
     /// The value piped into each enclosing pipe body, innermost last.
     piped: Vec<(Ty, Vec<(ValType, Expr)>)>,
 }
@@ -934,7 +949,10 @@ impl fmt::Display for TypeErrorKind {
             Self::MissingReturn(name) => write!(f, "`{name}` can finish without returning"),
             Self::BreakOutsideLoop => write!(f, "`break` outside of a loop"),
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
-            Self::NotConstant => write!(f, "global initializers and enum members must be constant"),
+            Self::NotConstant => write!(
+                f,
+                "global initializers, enum members and field defaults must be constant"
+            ),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
             Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
@@ -967,7 +985,15 @@ impl fmt::Display for TypeErrorKind {
             Self::UnknownModuleProperty(name) => write!(f, "`module` has no property `{name}`"),
             Self::LiteralOutsideGlobal => write!(
                 f,
-                "string and array literals are only allowed in global initializers"
+                "string and array literals are only allowed in global initializers and field defaults"
+            ),
+            Self::SharedLiteral => write!(
+                f,
+                "a writable literal in a field default is shared by every instance, so it must be empty"
+            ),
+            Self::DefaultUsesParam(param) => write!(
+                f,
+                "a field default can't depend on the type parameter `{param}`"
             ),
             Self::UntypedEmptyArray => write!(f, "can't infer the element type of `[]`"),
             Self::NotAType => write!(f, "expected a type"),
@@ -1214,6 +1240,7 @@ impl Checker {
                     name: field.name.name.clone(),
                     ty,
                     is_pub: field.is_pub,
+                    default: field.default.as_ref().map(|_| FieldDefault::Pending),
                     span: field.span,
                 });
             }
@@ -1402,10 +1429,10 @@ impl Checker {
         (params, ret)
     }
 
-    /// Checks and folds global initializers and the values of enum members,
-    /// in declaration order.
+    /// Checks and folds global initializers, the values of enum members and
+    /// the defaults of struct fields, in declaration order.
     fn define_globals(&mut self, program: &Program) {
-        let (mut index, mut enum_index) = (0, 0);
+        let (mut index, mut enum_index, mut struct_index) = (0, 0, 0);
         for item in &program.items {
             self.module = item.span.file;
             let decl = match &item.kind {
@@ -1413,6 +1440,11 @@ impl Checker {
                 ItemKind::Enum(decl) => {
                     self.define_members(EnumId(enum_index), decl);
                     enum_index += 1;
+                    continue;
+                }
+                ItemKind::Struct(decl) => {
+                    self.define_defaults(StructId(struct_index), decl);
+                    struct_index += 1;
                     continue;
                 }
                 _ => continue,
@@ -2289,6 +2321,7 @@ impl<'c> Body<'c> {
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
             global: false,
+            default: false,
             piped: Vec::new(),
         }
     }
@@ -2808,9 +2841,9 @@ impl<'c> Body<'c> {
                 self.error(TypeErrorKind::LiteralOutsideGlobal, expr.span);
                 (Ty::Error, Value::default())
             }
-            ExprKind::Str(s) => self.string(s, expected),
+            ExprKind::Str(s) => self.string(s, expected, expr.span),
             ExprKind::List(items) => self.list(items, expected, expr.span),
-            ExprKind::Repeat(value, len) => self.repeat(value, len, expected),
+            ExprKind::Repeat(value, len) => self.repeat(value, len, expected, expr.span),
             ExprKind::Index(..) => match self.place(expr) {
                 Some(place) => {
                     let value = self.read_place(&place);
@@ -2946,9 +2979,19 @@ impl<'c> Body<'c> {
         matches!(expected, Some(ty @ Ty::Array(_)) if self.ck.writes(ty))
     }
 
+    /// Reports a literal of `len` elements at `span` that is `mutable` in a
+    /// field default, unless it's empty: its elements would be those of
+    /// every value of the struct.
+    fn check_shared(&mut self, mutable: bool, len: usize, span: Span) {
+        if self.default && mutable && len > 0 {
+            self.error(TypeErrorKind::SharedLiteral, span);
+        }
+    }
+
     /// A string literal: an array of its UTF-8 bytes.
-    fn string(&mut self, s: &str, expected: Option<Ty>) -> (Ty, Value) {
+    fn string(&mut self, s: &str, expected: Option<Ty>, span: Span) -> (Ty, Value) {
         let mutable = self.literal_writes(expected);
+        self.check_shared(mutable, s.len(), span);
         let ty = self.ck.array_of(Ty::Prim(Prim::U8), mutable);
         (
             ty,
@@ -3127,6 +3170,7 @@ impl<'c> Body<'c> {
     /// one is expected.
     fn list(&mut self, items: &[parse::Expr], expected: Option<Ty>, span: Span) -> (Ty, Value) {
         let mutable = self.literal_writes(expected);
+        self.check_shared(mutable, items.len(), span);
         let mut elem = match expected {
             Some(Ty::Array(id)) => Some(self.ck.element(id)),
             // An array type that failed to resolve, already reported.
@@ -3175,6 +3219,7 @@ impl<'c> Body<'c> {
         value: &parse::Expr,
         len: &parse::Expr,
         expected: Option<Ty>,
+        span: Span,
     ) -> (Ty, Value) {
         let mutable = self.literal_writes(expected);
         let want = match expected {
@@ -3197,6 +3242,7 @@ impl<'c> Body<'c> {
             return (Ty::Error, Value::default());
         };
         let count = count as u32;
+        self.check_shared(mutable, count as usize, span);
         let (size, align) = self.ck.layout(elem);
         let mut bytes = vec![0; size as usize];
         for (cell, c) in self.ck.cells(elem).iter().zip(consts) {
@@ -3742,19 +3788,7 @@ impl<'c> Body<'c> {
     /// labelled fields.
     fn construct(&mut self, ty: Ty, args: &[Arg], span: Span) -> (Ty, Value) {
         let fields: Vec<_> = match ty {
-            Ty::Struct(id) => {
-                let def = &self.ck.structs[id.0 as usize];
-                let private = def.fields.iter().find(|f| !f.is_pub);
-                if let Some(field) = private.filter(|_| def.module != self.ck.module) {
-                    let kind = TypeErrorKind::PrivateField {
-                        ty: def.name.clone(),
-                        field: field.name.clone(),
-                    };
-                    self.error(kind, span);
-                }
-                let def = &self.ck.structs[id.0 as usize];
-                def.fields.iter().map(|f| (f.name.clone(), f.ty)).collect()
-            }
+            Ty::Struct(id) => return (ty, self.construct_struct(id, args, span)),
             Ty::Array(_) | Ty::Type => builtin_fields(ty)
                 .iter()
                 .map(|name| name.to_string())
@@ -3797,6 +3831,21 @@ impl<'c> Body<'c> {
         binding: Vec<Option<usize>>,
         checked: Vec<Option<(Ty, Value)>>,
     ) -> Value {
+        let defaults = vec![Vec::new(); params.len()];
+        self.filled_args(params, args, binding, checked, defaults)
+    }
+
+    /// Checks call arguments as [`Self::bound_args`] does. A parameter that
+    /// no argument is bound to has its scalars of `defaults`, which are
+    /// constant.
+    fn filled_args(
+        &mut self,
+        params: &[(String, Ty)],
+        args: &[Arg],
+        binding: Vec<Option<usize>>,
+        checked: Vec<Option<(Ty, Value)>>,
+        defaults: Vec<Vec<(ValType, Expr)>>,
+    ) -> Value {
         let mut values = Vec::new();
         // Parameter index and scalar count of each value.
         let mut groups = Vec::new();
@@ -3825,7 +3874,7 @@ impl<'c> Body<'c> {
         if reordered && !value.scalars.iter().all(|(_, e)| is_pure(e)) {
             self.spill(&mut value, is_stable);
         }
-        let mut by_param = vec![Vec::new(); params.len()];
+        let mut by_param = defaults;
         let mut scalars = value.scalars.into_iter();
         for (i, count) in groups {
             by_param[i] = scalars.by_ref().take(count).collect();
@@ -3834,14 +3883,31 @@ impl<'c> Body<'c> {
         value
     }
 
-    /// Matches each argument to a parameter, returning its index. Positional
-    /// arguments fill parameters in order, then labels fill the rest.
+    /// Matches each argument to a parameter as [`Self::match_args`] does,
+    /// reporting each parameter left without one at `span`.
     fn bind_args(
         &mut self,
         params: &[(String, Ty)],
         args: &[Arg],
         require_labels: bool,
         span: Span,
+    ) -> Vec<Option<usize>> {
+        let binding = self.match_args(params, args, require_labels);
+        for (i, (name, _)) in params.iter().enumerate() {
+            if !binding.contains(&Some(i)) {
+                self.error(TypeErrorKind::MissingArg(name.clone()), span);
+            }
+        }
+        binding
+    }
+
+    /// Matches each argument to a parameter, returning its index. Positional
+    /// arguments fill parameters in order, then labels fill the rest.
+    fn match_args(
+        &mut self,
+        params: &[(String, Ty)],
+        args: &[Arg],
+        require_labels: bool,
     ) -> Vec<Option<usize>> {
         let mut bound = vec![false; params.len()];
         let mut labelled = false;
@@ -3889,11 +3955,6 @@ impl<'c> Body<'c> {
                     self.error(kind, arg.value.span);
                     binding.push(None);
                 }
-            }
-        }
-        for (i, bound) in bound.into_iter().enumerate() {
-            if !bound {
-                self.error(TypeErrorKind::MissingArg(params[i].0.clone()), span);
             }
         }
         binding
@@ -8768,5 +8829,187 @@ fn g(f: fn(&Host)):
                 NotStorable("Host".into()),
             ]
         );
+    }
+
+    #[test]
+    fn omitted_fields_have_their_defaults() {
+        let src = "\
+pub enum(u8) Mode:
+    off
+    on = 3
+let BASE = 10
+fn inc(x: i32) -> i32:
+    return x + 1
+pub struct Inner:
+    a: i32 = BASE * 2
+    b: f32 = 1
+pub struct Conf:
+    pub n: i32
+    step: i64 = 1
+    mode: Mode = Mode.on
+    inner: Inner = Inner(b: 2)
+    name: array(u8) = \"duck\"
+    next: &Conf = 0
+    cb: fn(i32) -> i32 = inc
+pub let made = Conf(n: 7)
+fn f(x: i32) -> Conf:
+    return Conf(mode: Mode.off, n: x)
+fn g() -> Inner:
+    return Inner()
+";
+        let module = lower(src);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| format!("{} {}", g.name, konst(g.init)))
+            .collect();
+        let expected = [
+            "made.n 7",
+            "made.step 1i64",
+            "made.mode 3",
+            "made.inner.a 20",
+            "made.inner.b 2f32",
+            "made.name.len 4",
+            "made.name.ptr 0",
+            "made.next 0",
+            "made.cb 1",
+        ];
+        assert_eq!(globals, expected);
+        assert_eq!(body(&module, "f"), "(return x 1i64 0 20 2f32 4 0 0 1)");
+        assert_eq!(body(&module, "g"), "(return 20 1f32)");
+    }
+
+    #[test]
+    fn defaults_are_constant_and_folded_in_declaration_order() {
+        use TypeErrorKind::*;
+        let src = "\
+fn call() -> i32:
+    return 1
+let early = Late()
+struct Late:
+    x: i32 = LATER
+    y: i32 = 1
+let LATER = 2
+let fine = Late(x: 1)
+struct A:
+    a: i32 = B().b
+struct B:
+    b: i32 = A().a
+struct C:
+    c: i32 = 1 / 0
+    d: i32 = call()
+    e: u8 = 300
+    f: bool = 1
+    g: i32
+fn f() -> i32:
+    return Late().x + C(g: 1).c + C().d
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                NotConstant,
+                NotConstant,
+                NotConstant,
+                ConstTrap,
+                NotConstant,
+                IntOutOfRange("u8".into()),
+                mismatch("bool", "i32"),
+                MissingArg("g".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn instances_share_the_defaults_of_a_generic_struct() {
+        let src = "\
+let pad = \"abc\"
+struct(T) Vec:
+    items: varray(T) = []
+    head: &var T = 0
+    len: u32 = 0
+    elem: T
+fn f() -> Vec(i64):
+    return Vec(i64)(elem: 5)
+fn g() -> Vec(u8):
+    return Vec(u8)(len: 2, elem: 1)
+";
+        let module = lower(src);
+        // The empty literal is at the end of the data so far.
+        assert_eq!(body(&module, "f"), "(return 0 3 0 0 5i64)");
+        assert_eq!(body(&module, "g"), "(return 0 3 0 2 1)");
+    }
+
+    #[test]
+    fn defaults_cannot_depend_on_type_parameters() {
+        use TypeErrorKind::*;
+        let src = "\
+fn(T) id(x: T) -> T:
+    return x
+struct(T) Box:
+    value: &T = 0
+struct(T, U) Bad:
+    size: u32 = T.size
+    value: U = 0
+    pair: tuple(T, i32) = (0, 1)
+    cast: &T = 0 as &U
+    cb: fn(T) -> T = id
+    inner: Box(U) = 0
+    arg: Box(i32) = Box(T)()
+    ok: &T = 0
+fn f() -> Bad(u8, u8):
+    return Bad(u8, u8)()
+";
+        let errors = check_src(src).unwrap_err();
+        let found: Vec<_> = errors
+            .iter()
+            .map(|e| {
+                let span = e.span.unwrap();
+                (e.kind.clone(), &src[span.start..span.end])
+            })
+            .collect();
+        let uses = |param: &str, text: &'static str| (DefaultUsesParam(param.into()), text);
+        assert_eq!(
+            found,
+            vec![
+                uses("T", "T"),
+                uses("U", "0"),
+                uses("T", "(0, 1)"),
+                uses("U", "U"),
+                uses("T", "id"),
+                uses("U", "0"),
+                uses("T", "T"),
+            ]
+        );
+    }
+
+    #[test]
+    fn writable_literals_in_defaults_are_empty() {
+        let src = "\
+let N: u32 = 0
+let SHARED: varray(u8) = [0; 4]
+struct S:
+    a: array(u8) = \"ro\"
+    b: varray(u8) = \"\"
+    c: varray(i32) = []
+    d: varray(i32) = [0; N]
+    e: varray(varray(u8)) = []
+    f: varray(u8) = SHARED
+    g: varray(u8) = \"abc\" as varray(u8)
+    h: array(array(u8)) = [\"x\", \"y\"]
+fn f() -> S:
+    return S()
+";
+        lower(src);
+
+        let src = "\
+struct S:
+    a: varray(u8) = \"abc\"
+    b: varray(i32) = [1, 2]
+    c: varray(i32) = [0; 4]
+    d: varray(array(u8)) = [\"a\"]
+    e: array(varray(u8)) = [\"a\"]
+    f: tuple(varray(u8), i32) = (\"a\", 1)
+";
+        assert_eq!(errors(src), vec![TypeErrorKind::SharedLiteral; 6]);
     }
 }

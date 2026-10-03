@@ -292,9 +292,17 @@ impl Body<'_> {
                 self.error(TypeErrorKind::CannotInfer { func, param }, span);
             }
         }
-        let Some(type_args) = bound.into_iter().collect() else {
+        let Some(type_args): Option<Vec<Ty>> = bound.into_iter().collect() else {
             return (Ty::Error, Value::default());
         };
+        // Only the default of a generic struct's field is expected to have
+        // a type that holds a type parameter.
+        let mut held = type_args.iter();
+        if let Some(param) = held.find_map(|arg| self.ck.held_param(*arg, false)) {
+            let kind = TypeErrorKind::DefaultUsesParam(self.ck.param_name(param));
+            self.error(kind, span);
+            return (Ty::Error, Value::default());
+        }
         match self.ck.instantiate_fn(generic, type_args, span) {
             Some(id) => self.func_value(id),
             None => (Ty::Error, Value::default()),

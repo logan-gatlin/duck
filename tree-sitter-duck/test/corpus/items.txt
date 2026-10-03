@@ -89,6 +89,44 @@ struct Unit:
     (pass_statement)))
 
 ====================
+Field defaults
+====================
+
+struct Counter:
+    pub step: i32 = 1
+    items: varray(u8) = []
+    next: &Counter = 0 as &Counter
+
+---
+
+(source_file
+  (struct_declaration
+    (identifier)
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier))
+      (integer))
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier)
+        (type_arguments
+          (named_type
+            (identifier))))
+      (list))
+    (field_declaration
+      (identifier)
+      (pointer_type
+        (named_type
+          (identifier)))
+      (cast_expression
+        (integer)
+        (pointer_type
+          (named_type
+            (identifier)))))))
+
+====================
 Generic struct
 ====================
 

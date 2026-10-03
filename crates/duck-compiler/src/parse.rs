@@ -94,12 +94,15 @@ pub struct StructDecl {
     pub fields: Vec<Field>,
 }
 
-/// A `name: Type` struct field, optionally marked `pub`.
+/// A `name: Type` or `name: Type = default` struct field, optionally marked
+/// `pub`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field {
     pub is_pub: bool,
     pub name: Ident,
     pub ty: Type,
+    /// The value the field has where a constructor gives it none.
+    pub default: Option<Expr>,
     pub span: Span,
 }
 
@@ -623,10 +626,15 @@ impl<'a> Parser<'a> {
         let start = self.peek().span;
         let is_pub = self.eat(TokenKind::Pub);
         let (name, ty) = self.typed_name()?;
+        let default = match self.eat(TokenKind::Eq) {
+            true => Some(self.expr()?),
+            false => None,
+        };
         Ok(Field {
             is_pub,
             name,
             ty,
+            default,
             span: self.span_from(start),
         })
     }
@@ -1984,6 +1992,33 @@ fn f():
         assert_eq!(
             errors("fn f(pub x: i32):\n    pass\n"),
             vec![expected("identifier", TokenKind::Pub)]
+        );
+    }
+
+    #[test]
+    fn field_defaults() {
+        let src = "struct P:\n    pub x: f32 = 1.5 * 2.0\n    y: &P = 0\n    z: i32\n";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Struct(p) = &module.items[0].kind else {
+            panic!()
+        };
+        let defaults: Vec<_> = p
+            .fields
+            .iter()
+            .map(|f| f.default.as_ref().map(sexpr))
+            .collect();
+        let want = [Some("(Mul 1.5 2)"), Some("0"), None].map(|d| d.map(str::to_string));
+        assert_eq!(defaults, want);
+        let span = p.fields[0].span;
+        assert_eq!(&src[span.start..span.end], "pub x: f32 = 1.5 * 2.0");
+
+        assert_eq!(
+            errors("struct P:\n    x: i32 =\n"),
+            vec![expected("expression", TokenKind::Newline)]
+        );
+        assert_eq!(
+            errors("struct P:\n    x = 1\n"),
+            vec![expected("`:`", TokenKind::Eq)]
         );
     }
 
