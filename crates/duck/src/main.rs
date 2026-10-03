@@ -1,6 +1,7 @@
 mod files;
 mod manifest;
 mod new;
+mod package;
 
 use std::fmt::Display;
 use std::fs;
@@ -9,10 +10,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use duck_compiler::file::{FileManager, Settings};
+use duck_compiler::file::{FileManager, MemoryLimits, Settings};
 
 use crate::files::Files;
-use crate::manifest::{MANIFEST, Manifest};
+use crate::manifest::{MANIFEST, MAX_PAGES, Manifest};
 
 #[derive(Parser)]
 #[command(version, about = "The duck programming language")]
@@ -23,7 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compile the module described by the nearest Duck.toml
+    /// Compile the package described by the nearest Duck.toml: build its
+    /// module, or check its library if it has no module
     Build,
     /// Create a new module in a new directory
     New {
@@ -56,21 +58,35 @@ fn build() -> ExitCode {
         Err(e) => return fail(format_args!("cannot find {MANIFEST}: {e}")),
     };
     let manifest_path = root.join(MANIFEST);
-    let manifest = match fs::read_to_string(&manifest_path) {
-        Ok(src) => Manifest::parse(&src),
-        Err(e) => return fail(format_args!("cannot read {}: {e}", manifest_path.display())),
+    let packages = match package::resolve(&root) {
+        Ok(packages) => packages,
+        Err(e) => return fail(e),
     };
-    let manifest = match manifest {
-        Ok(manifest) => manifest,
-        Err(e) => return fail(format_args!("{}: {e}", manifest_path.display())),
-    };
+    let manifest = &packages.root().manifest;
 
-    let entry = root.join(&manifest.entry);
-    let settings = Settings {
-        memory: manifest.memory,
-        start: manifest.start,
+    // A package without a module is only checked, with room for any data.
+    let (entry, settings) = match (&manifest.module, &manifest.library) {
+        (Some(module), _) => (
+            &module.entry,
+            Settings {
+                memory: module.memory,
+                start: module.start.clone(),
+            },
+        ),
+        (None, Some(library)) => (
+            &library.entry,
+            Settings {
+                memory: MemoryLimits {
+                    min_pages: MAX_PAGES,
+                    max_pages: None,
+                },
+                start: None,
+            },
+        ),
+        (None, None) => unreachable!("every manifest has a module or a library"),
     };
-    let mut files = match Files::new(&entry, settings) {
+    let entry = root.join(entry);
+    let mut files = match Files::new(&packages, &entry, settings) {
         Ok(files) => files,
         Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
     };
@@ -101,7 +117,10 @@ fn build() -> ExitCode {
         }
     };
 
-    let output = root.join(&manifest.output);
+    let Some(module) = &manifest.module else {
+        return ExitCode::SUCCESS;
+    };
+    let output = root.join(&module.output);
     if let Some(dir) = output.parent()
         && let Err(e) = fs::create_dir_all(dir)
     {

@@ -8,8 +8,8 @@ use std::fmt;
 use std::path::Path;
 
 use crate::Error;
-use crate::file::{FileId, FileManager};
-use crate::lex::{self, Span, TokenKind};
+use crate::file::{FileId, FileManager, OpenError};
+use crate::lex::{self, Span};
 use crate::parse::{self, Ident, ImportTarget, Item, ItemKind};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +22,8 @@ pub struct ImportError {
 pub enum ImportErrorKind {
     /// No file was found at the path.
     NotFound(String),
+    /// A path to a file of another package.
+    OutsidePackage(String),
     /// The importing package has no dependency by this name.
     NoDependency(String),
     /// A module that imports itself, through the modules named in order,
@@ -75,6 +77,10 @@ impl fmt::Display for ImportErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(path) => write!(f, "cannot find `{path}`"),
+            Self::OutsidePackage(path) => write!(
+                f,
+                "`{path}` is outside this package; import its package by name"
+            ),
             Self::NoDependency(name) => write!(f, "no dependency is named `{name}`"),
             Self::Cycle(modules) => write!(f, "import cycle: {}", modules.join(" -> ")),
             Self::Unnamed(path) => write!(
@@ -173,13 +179,17 @@ impl<F: FileManager> Loader<'_, F> {
     ) -> Result<(), ImportErrorKind> {
         let (target, name) = match &import.target {
             ImportTarget::File(path) => {
-                let target = self.files.open(from, path);
-                let target = target.ok_or_else(|| ImportErrorKind::NotFound(path.clone()))?;
+                let target = self.files.open(from, path).map_err(|e| match e {
+                    OpenError::NotFound => ImportErrorKind::NotFound(path.clone()),
+                    OpenError::OutsidePackage => ImportErrorKind::OutsidePackage(path.clone()),
+                })?;
                 let stem = Path::new(path).file_stem().and_then(|stem| stem.to_str());
-                let name = stem.filter(|stem| is_ident(stem)).map(|stem| Ident {
-                    name: stem.to_string(),
-                    span: item.span,
-                });
+                let name = stem
+                    .filter(|stem| lex::is_identifier(stem))
+                    .map(|stem| Ident {
+                        name: stem.to_string(),
+                        span: item.span,
+                    });
                 (
                     target,
                     name.ok_or_else(|| ImportErrorKind::Unnamed(path.clone())),
@@ -216,21 +226,12 @@ impl<F: FileManager> Loader<'_, F> {
     }
 }
 
-/// Whether `s` lexes as one identifier, and so isn't a keyword.
-fn is_ident(s: &str) -> bool {
-    let Ok(tokens) = lex::tokenize(FileId::default(), s) else {
-        return false;
-    };
-    matches!(&tokens[..], [first, rest @ ..]
-        if first.kind == TokenKind::Ident(s.to_string())
-            && rest.iter().all(|t| matches!(t.kind, TokenKind::Newline | TokenKind::Eof)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::file::Settings;
     use crate::ir::{self, Const};
+    use crate::lex::TokenKind;
     use crate::parse::{ParseErrorKind, PatternKind};
     use crate::ty::{self, TypeErrorKind};
 
@@ -268,13 +269,13 @@ mod tests {
             self.0[self.index(id)].1.to_string()
         }
 
-        fn open(&mut self, _from: FileId, path: &str) -> Option<FileId> {
-            let index = self.0.iter().position(|f| f.0 == path)?;
-            Some(Self::mint_file_id(index))
+        fn open(&mut self, _from: FileId, path: &str) -> Result<FileId, OpenError> {
+            let index = self.0.iter().position(|f| f.0 == path);
+            Ok(Self::mint_file_id(index.ok_or(OpenError::NotFound)?))
         }
 
         fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId> {
-            self.open(from, &format!("@{name}"))
+            self.open(from, &format!("@{name}")).ok()
         }
 
         fn settings(&mut self) -> Settings {

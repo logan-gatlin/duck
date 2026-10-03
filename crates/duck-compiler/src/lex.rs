@@ -246,6 +246,16 @@ pub fn tokenize(file: FileId, src: &str) -> Result<Vec<Token>, LexError> {
     .run()
 }
 
+/// Whether `s` is an identifier: one that isn't a keyword.
+pub fn is_identifier(s: &str) -> bool {
+    let Ok(tokens) = tokenize(FileId::default(), s) else {
+        return false;
+    };
+    matches!(&tokens[..], [first, rest @ ..]
+        if first.kind == TokenKind::Ident(s.to_string())
+            && rest.iter().all(|t| matches!(t.kind, TokenKind::Newline | TokenKind::Eof)))
+}
+
 impl<'a> Lexer<'a> {
     fn run(mut self) -> Result<Vec<Token>, LexError> {
         loop {

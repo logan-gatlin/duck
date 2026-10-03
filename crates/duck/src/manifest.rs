@@ -1,10 +1,13 @@
-//! `Duck.toml`, the metadata of a duck module.
+//! `Duck.toml`, the metadata of a duck package: the module it builds, the
+//! library it offers other packages, and the packages it depends on.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
 use duck_compiler::file::MemoryLimits;
+use duck_compiler::lex;
 use serde::Deserialize;
 
 /// The name of the manifest file at the root of every module.
@@ -14,11 +17,20 @@ pub const MANIFEST: &str = "Duck.toml";
 const PAGE_SIZE: u64 = 64 * 1024;
 
 /// The most pages a 32-bit wasm memory can hold: 4 GiB.
-const MAX_PAGES: u64 = 1 << 16;
+pub const MAX_PAGES: u32 = 1 << 16;
 
-/// A validated `Duck.toml`.
+/// A validated `Duck.toml`. It has a module, a library, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
+    pub module: Option<Module>,
+    pub library: Option<Library>,
+    /// Each package this one can import, by the name it imports it as.
+    pub dependencies: BTreeMap<String, Dependency>,
+}
+
+/// The wasm module a package builds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Module {
     /// The file the module is compiled from, relative to the manifest.
     pub entry: PathBuf,
     /// Where the wasm module is written, relative to the manifest.
@@ -26,6 +38,20 @@ pub struct Manifest {
     /// The function run when the module is instantiated.
     pub start: Option<String>,
     pub memory: MemoryLimits,
+}
+
+/// What a package offers the packages that depend on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Library {
+    /// The file other packages import, relative to the manifest.
+    pub entry: PathBuf,
+}
+
+/// Where a dependency is found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dependency {
+    /// The directory holding its manifest, relative to this manifest.
+    Path(PathBuf),
 }
 
 #[derive(Debug)]
@@ -41,6 +67,14 @@ pub enum ManifestError {
         min: String,
         max: String,
     },
+    /// Neither a `[module]` nor a `[library]`.
+    Empty,
+    /// A `[module]` without a `[memory]`.
+    MissingMemory,
+    /// A `[memory]` without a `[module]` to give it to.
+    MemoryWithoutModule,
+    /// A dependency named something that can't be imported.
+    DependencyName(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +89,11 @@ pub enum SizeErrorKind {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    module: RawModule,
-    memory: RawMemory,
+    module: Option<RawModule>,
+    memory: Option<RawMemory>,
+    library: Option<RawLibrary>,
+    #[serde(default)]
+    dependencies: BTreeMap<String, RawDependency>,
 }
 
 #[derive(Deserialize)]
@@ -74,28 +111,44 @@ struct RawMemory {
     max: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLibrary {
+    entry: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDependency {
+    path: PathBuf,
+}
+
 impl Manifest {
     pub fn parse(src: &str) -> Result<Self, ManifestError> {
         let raw: Raw = toml::from_str(src).map_err(ManifestError::Toml)?;
-        let RawMemory { min, max } = raw.memory;
-        let min_pages = pages("memory.min", &min)?;
-        let max_pages = max
-            .as_deref()
-            .map(|max| pages("memory.max", max))
-            .transpose()?;
-        if let Some(max) = max
-            && max_pages.is_some_and(|max_pages| min_pages > max_pages)
-        {
-            return Err(ManifestError::MinExceedsMax { min, max });
+        let module = match (raw.module, raw.memory) {
+            (Some(module), Some(memory)) => Some(Module::parse(module, memory)?),
+            (Some(_), None) => return Err(ManifestError::MissingMemory),
+            (None, Some(_)) => return Err(ManifestError::MemoryWithoutModule),
+            (None, None) => None,
+        };
+        let library = raw.library.map(|library| Library {
+            entry: library.entry,
+        });
+        if module.is_none() && library.is_none() {
+            return Err(ManifestError::Empty);
+        }
+        let mut dependencies = BTreeMap::new();
+        for (name, dependency) in raw.dependencies {
+            if !lex::is_identifier(&name) {
+                return Err(ManifestError::DependencyName(name));
+            }
+            dependencies.insert(name, Dependency::Path(dependency.path));
         }
         Ok(Self {
-            entry: raw.module.entry,
-            output: raw.module.output,
-            start: raw.module.start,
-            memory: MemoryLimits {
-                min_pages,
-                max_pages,
-            },
+            module,
+            library,
+            dependencies,
         })
     }
 
@@ -109,6 +162,31 @@ impl Manifest {
             .position(|dir| dir.join(MANIFEST).is_file())
             .map(|depth| (0..depth).map(|_| "..").collect());
         Ok(found)
+    }
+}
+
+impl Module {
+    fn parse(module: RawModule, memory: RawMemory) -> Result<Self, ManifestError> {
+        let RawMemory { min, max } = memory;
+        let min_pages = pages("memory.min", &min)?;
+        let max_pages = max
+            .as_deref()
+            .map(|max| pages("memory.max", max))
+            .transpose()?;
+        if let Some(max) = max
+            && max_pages.is_some_and(|max_pages| min_pages > max_pages)
+        {
+            return Err(ManifestError::MinExceedsMax { min, max });
+        }
+        Ok(Self {
+            entry: module.entry,
+            output: module.output,
+            start: module.start,
+            memory: MemoryLimits {
+                min_pages,
+                max_pages,
+            },
+        })
     }
 }
 
@@ -141,7 +219,7 @@ fn pages(key: &'static str, value: &str) -> Result<u32, ManifestError> {
         return Err(error(SizeErrorKind::NotPageMultiple));
     }
     let pages = bytes / PAGE_SIZE;
-    if pages > MAX_PAGES {
+    if pages > u64::from(MAX_PAGES) {
         return Err(error(SizeErrorKind::TooLarge));
     }
     Ok(pages as u32)
@@ -154,6 +232,12 @@ impl fmt::Display for ManifestError {
             Self::Size { key, value, kind } => write!(f, "{key} \"{value}\" {kind}"),
             Self::MinExceedsMax { min, max } => {
                 write!(f, "memory.min \"{min}\" exceeds memory.max \"{max}\"")
+            }
+            Self::Empty => write!(f, "needs a [module] or [library] table"),
+            Self::MissingMemory => write!(f, "[module] needs a [memory] table"),
+            Self::MemoryWithoutModule => write!(f, "[memory] needs a [module] table"),
+            Self::DependencyName(name) => {
+                write!(f, "dependency name `{name}` is not an identifier")
             }
         }
     }
@@ -232,26 +316,78 @@ mod tests {
         assert_eq!(
             manifest,
             Manifest {
-                entry: "src/main.duck".into(),
-                output: "build/out.wasm".into(),
-                start: None,
-                memory: MemoryLimits {
-                    min_pages: 1,
-                    max_pages: Some(256),
-                },
+                module: Some(Module {
+                    entry: "src/main.duck".into(),
+                    output: "build/out.wasm".into(),
+                    start: None,
+                    memory: MemoryLimits {
+                        min_pages: 1,
+                        max_pages: Some(256),
+                    },
+                }),
+                library: None,
+                dependencies: BTreeMap::new(),
             }
         );
         let manifest = with_memory("min = \"64KiB\"\n").unwrap();
-        assert_eq!(manifest.memory.max_pages, None);
+        assert_eq!(manifest.module.unwrap().memory.max_pages, None);
         let manifest = Manifest::parse(
             "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\nstart = \"init\"\n\n[memory]\nmin = \"1pgs\"\n",
         )
         .unwrap();
-        assert_eq!(manifest.start.as_deref(), Some("init"));
+        assert_eq!(manifest.module.unwrap().start.as_deref(), Some("init"));
     }
 
     #[test]
-    fn errors() {
+    fn libraries_and_dependencies() {
+        let manifest = Manifest::parse(
+            "[library]\nentry = \"src/lib.duck\"\n\n[dependencies]\nmath = { path = \"../math\" }\nutil = { path = \"/abs/util\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest,
+            Manifest {
+                module: None,
+                library: Some(Library {
+                    entry: "src/lib.duck".into(),
+                }),
+                dependencies: BTreeMap::from([
+                    ("math".to_string(), Dependency::Path("../math".into())),
+                    ("util".to_string(), Dependency::Path("/abs/util".into())),
+                ]),
+            }
+        );
+        let both = Manifest::parse(
+            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n[memory]\nmin = \"1pgs\"\n[library]\nentry = \"lib.duck\"\n",
+        )
+        .unwrap();
+        assert!(both.module.is_some() && both.library.is_some());
+    }
+
+    #[test]
+    fn package_errors() {
+        let error = |src: &str| Manifest::parse(src).unwrap_err().to_string();
+        assert_eq!(error(""), "needs a [module] or [library] table");
+        assert_eq!(
+            error("[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n"),
+            "[module] needs a [memory] table"
+        );
+        assert_eq!(
+            error("[library]\nentry = \"a.duck\"\n[memory]\nmin = \"1pgs\"\n"),
+            "[memory] needs a [module] table"
+        );
+        assert_eq!(
+            error("[library]\nentry = \"a.duck\"\n[dependencies]\nmy-lib = { path = \"x\" }\n"),
+            "dependency name `my-lib` is not an identifier"
+        );
+        assert!(
+            error("[library]\nentry = \"a.duck\"\n[dependencies]\nx = { route = \"x\" }\n")
+                .contains("unknown field `route`")
+        );
+    }
+
+    #[test]
+    fn memory_errors() {
         let error = |memory| with_memory(memory).unwrap_err().to_string();
         assert_eq!(
             error("min = \"2MiB\"\nmax = \"1MiB\"\n"),
