@@ -217,6 +217,16 @@
     "type": "address_of_expression",
     "named": true,
     "fields": {
+      "mutability": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "var",
+            "named": false
+          }
+        ]
+      },
       "operand": {
         "multiple": false,
         "required": true,
@@ -1224,6 +1234,16 @@
     "type": "pointer_type",
     "named": true,
     "fields": {
+      "mutability": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "var",
+            "named": false
+          }
+        ]
+      },
       "pointee": {
         "multiple": false,
         "required": true,

@@ -7,8 +7,8 @@ use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeKind};
 
 use super::{
-    ARRAY, Body, Checker, Item, ParamId, StructDef, StructId, TUPLE, Ty, TypeErrorKind, Value,
-    is_builtin_type, module_path, path_text,
+    ARRAY, Body, Checker, Item, ParamId, StructDef, StructId, TUPLE, Ty, TypeErrorKind, VARRAY,
+    Value, is_builtin_type, module_path, path_text,
 };
 
 /// A use of a generic struct with type arguments.
@@ -224,7 +224,9 @@ impl Checker {
             ExprKind::Call(callee, args) => {
                 return self.applied_type_syntax(callee, args, expr.span);
             }
-            ExprKind::AddrOf(pointee) => TypeKind::Pointer(Box::new(self.type_syntax(pointee)?)),
+            ExprKind::AddrOf(mutability, pointee) => {
+                TypeKind::Pointer(*mutability, Box::new(self.type_syntax(pointee)?))
+            }
             ExprKind::FnType(ty) => return Some(ty.clone()),
             _ => {
                 self.error(TypeErrorKind::NotAType, expr.span);
@@ -319,7 +321,7 @@ impl Checker {
     /// that aren't types.
     pub(super) fn type_arity(&self, name: &str) -> Option<Arity> {
         match self.item(name) {
-            _ if name == ARRAY => Some(Arity::Exactly(1)),
+            _ if name == ARRAY || name == VARRAY => Some(Arity::Exactly(1)),
             _ if name == TUPLE => Some(Arity::NoneOrAtLeast(2)),
             Some(item @ (Item::Struct(_) | Item::Enum(_))) => self.item_arity(item),
             _ if is_builtin_type(name) => Some(Arity::Plain),

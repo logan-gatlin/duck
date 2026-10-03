@@ -36,23 +36,27 @@ pub enum OpenError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub memory: MemoryLimits,
-    pub static_section: StaticSection,
+    /// `None` places literals from address 0, in a section that ends where
+    /// they do.
+    pub static_section: Option<StaticSection>,
     /// The function the module runs when it is instantiated, which takes no
     /// arguments and returns nothing.
     pub start: Option<String>,
 }
 
 /// Sizes of the module's linear memory, in 64 KiB pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemoryLimits {
-    pub min_pages: u32,
+    /// `None` starts the memory with the fewest pages that hold the static
+    /// data section.
+    pub min_pages: Option<u32>,
     /// `None` lets the memory grow without limit.
     pub max_pages: Option<u32>,
 }
 
 /// The addresses `start..end` that literals are placed in, from `start` up.
 /// `start` is at most `end`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StaticSection {
     pub start: u32,
     pub end: u32,
@@ -63,26 +67,6 @@ pub(crate) struct DummyManager;
 impl DummyManager {
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for MemoryLimits {
-    /// One page, which may grow without limit.
-    fn default() -> Self {
-        Self {
-            min_pages: 1,
-            max_pages: None,
-        }
-    }
-}
-
-impl Default for StaticSection {
-    /// The first page, all of the default memory.
-    fn default() -> Self {
-        Self {
-            start: 0,
-            end: 64 * 1024,
-        }
     }
 }
 

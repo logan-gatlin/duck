@@ -220,7 +220,12 @@ module.exports = grammar({
 
     type_arguments: $ => prec(PREC.type, seq('(', commaSep($._type), ')')),
 
-    pointer_type: $ => seq('&', field('pointee', $._type)),
+    // `&T`, or `&var T`, which can be written through.
+    pointer_type: $ => seq(
+      '&',
+      optional(field('mutability', 'var')),
+      field('pointee', $._type),
+    ),
 
     // `fn(A, B) -> R`, a pointer to a function. The result takes everything
     // it can, so `fn(A) -> fn(B) -> C` returns a function.
@@ -368,8 +373,10 @@ module.exports = grammar({
       )),
     ),
 
+    // `&place`, or `&var place`, which can be written through.
     address_of_expression: $ => prec(PREC.unary, seq(
       '&',
+      optional(field('mutability', 'var')),
       field('operand', $._expression),
     )),
 

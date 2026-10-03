@@ -455,12 +455,12 @@ pub(crate) mod tests {
                 &format!("{LIBRARY}[dependencies]\nutil = {{ path = \"../util\" }}\n"),
             ),
             ("app/lib.duck", ""),
-            ("util/Duck.toml", "[memory]\n"),
+            ("util/Duck.toml", "[library]\n"),
         ]);
         let problems = check(&dir, &[]);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
-            problems[0].starts_with("util/Duck.toml:0:0-0:8: missing field `min`"),
+            problems[0].starts_with("util/Duck.toml:0:0-0:9: missing field `entry`"),
             "{problems:?}"
         );
 
