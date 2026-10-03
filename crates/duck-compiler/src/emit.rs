@@ -814,7 +814,9 @@ pub fn f(a: externref) -> Handle:
 
     #[test]
     fn globals_have_constant_initializers() {
-        let wat = wat(&emit_src("let a = 1\nvar b: i64 = -2\nvar c: f32 = 1.5\n"));
+        let wat = wat(&emit_src(
+            "pub let a = 1\nvar b: i64 = -2\nvar c: f32 = 1.5\n",
+        ));
         assert!(wat.contains("(global $a (;0;) i32 i32.const 1)"), "{wat}");
         assert!(wat.contains("(global $b (;1;) (mut i64) i64.const -2)"));
         assert!(wat.contains("(global $c (;2;) (mut f32) f32.const 0x1.8p+0 (;=1.5;))"));

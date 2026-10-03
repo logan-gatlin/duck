@@ -576,10 +576,12 @@ The table has a fixed size and can't grow.
 
 Exported globals that are aggregates are split into one global per scalar,
 named with dots: `pub let origin = Point(...)` exports `origin.x` and
-`origin.y`, and a `pub let` string exports `name.len` and `name.ptr`. A
-global's initializer must be a compile-time constant. It may use literals,
-operators, casts, struct and tuple constructors, and earlier `let` globals. It
-may not use calls or `var` globals.
+`origin.y`, and a `pub let` string exports `name.len` and `name.ptr`. The
+value of a `let` global is inlined wherever it is used, and only an exported
+one is also a wasm global. A global's initializer must be a compile-time
+constant. It may use literals, operators, casts, struct and tuple
+constructors, and earlier `let` globals. It may not use calls or `var`
+globals.
 
 ## Modules and packages
 

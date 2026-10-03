@@ -548,8 +548,8 @@ enum Synth {
 struct GlobalDef {
     ty: Ty,
     mutable: bool,
-    /// One wasm global per scalar leaf of `ty`.
-    slots: Vec<GlobalId>,
+    /// [`Slots::Global`] for a `var`, and [`Slots::Const`] for a `let`.
+    slots: Slots,
 }
 
 /// A name bound by a pattern.
@@ -607,9 +607,14 @@ struct Place {
     slots: Slots,
 }
 
+#[derive(Clone)]
 enum Slots {
     Local(Vec<LocalId>),
+    /// One wasm global per scalar leaf.
     Global(Vec<GlobalId>),
+    /// The value of each scalar leaf of a `let` global, which every use of
+    /// it is replaced with.
+    Const(Vec<Const>),
     /// `offset` bytes past `addr`, which is a local or constant so that it
     /// can be reused.
     Memory {
@@ -1319,20 +1324,32 @@ impl Checker {
             let (ty, value) = body.binding_value(decl);
             let mutable = decl.mutability == Mutability::Var;
             let inits = self.fold_value(&value, decl.value.span);
+            let exported = self.exports(item);
             // Each name gets its own globals, in the order `declare` gave them.
             for bound in self.destructure(&decl.pattern, ty) {
-                let mut slots = Vec::new();
+                let (mut wasm, mut consts) = (Vec::new(), Vec::new());
                 let leaves = self.leaves(bound.ty, bound.name);
                 for ((name, vt), i) in leaves.into_iter().zip(bound.leaves) {
-                    slots.push(GlobalId(self.ir_globals.len() as u32));
-                    self.ir_globals.push(ir::Global {
-                        export: self.exports(item).then(|| name.clone()),
-                        name,
-                        ty: vt,
-                        mutable,
-                        init: inits.get(i).copied().unwrap_or(zero(vt)),
-                    });
+                    let init = inits.get(i).copied().unwrap_or(zero(vt));
+                    consts.push(init);
+                    // Only a wasm global can be assigned or exported.
+                    if mutable || exported {
+                        wasm.push(GlobalId(self.ir_globals.len() as u32));
+                        self.ir_globals.push(ir::Global {
+                            export: exported.then(|| name.clone()),
+                            name,
+                            ty: vt,
+                            mutable,
+                            init,
+                        });
+                    }
                 }
+                // A `let` is its value wherever it is used, so an exported
+                // one's wasm globals are only read by the host.
+                let slots = match mutable {
+                    true => Slots::Global(wasm),
+                    false => Slots::Const(consts),
+                };
                 let ty = bound.ty;
                 if item.is_pub {
                     self.check_public(ty, bound.span, bound.name);
@@ -2045,14 +2062,6 @@ impl Checker {
     fn fold(&self, expr: &Expr) -> Result<Const, Fold> {
         match expr {
             Expr::Const(c) => Ok(*c),
-            Expr::Global(id) => {
-                let global = &self.ir_globals[id.0 as usize];
-                if global.mutable {
-                    Err(Fold::NotConstant)
-                } else {
-                    Ok(global.init)
-                }
-            }
             Expr::Unary(_, op, x) => fold_unary(*op, self.fold(x)?),
             Expr::Binary(_, op, a, b) => fold_binary(*op, self.fold(a)?, self.fold(b)?),
             Expr::If {
@@ -2064,7 +2073,9 @@ impl Checker {
                 Const::I32(0) => self.fold(else_expr),
                 _ => self.fold(then_expr),
             },
+            // Only a `var` is read from a global.
             Expr::Local(_)
+            | Expr::Global(_)
             | Expr::Call(..)
             | Expr::CallIndirect { .. }
             | Expr::Load { .. }
@@ -2402,6 +2413,7 @@ impl<'c> Body<'c> {
                 let slots = match place.slots {
                     Slots::Local(slots) => Slots::Local(slots[range].to_vec()),
                     Slots::Global(slots) => Slots::Global(slots[range].to_vec()),
+                    Slots::Const(consts) => Slots::Const(consts[range].to_vec()),
                     Slots::Memory { addr, offset } => Slots::Memory {
                         addr,
                         offset: offset + field_offset,
@@ -2437,7 +2449,7 @@ impl<'c> Body<'c> {
             ty: global.ty,
             mutable: global.mutable,
             pre: Vec::new(),
-            slots: Slots::Global(global.slots.clone()),
+            slots: global.slots.clone(),
         })
     }
 
@@ -2512,6 +2524,7 @@ impl<'c> Body<'c> {
         let reads = match &place.slots {
             Slots::Local(slots) => slots.iter().map(|l| Expr::Local(*l)).collect(),
             Slots::Global(slots) => slots.iter().map(|g| Expr::Global(*g)).collect(),
+            Slots::Const(consts) => consts.iter().map(|c| Expr::Const(*c)).collect(),
             Slots::Memory { addr, offset } => {
                 let ptr = scalar(ValType::I32, addr.clone());
                 return self.load(ptr, *offset, place.ty);
@@ -2542,6 +2555,8 @@ impl<'c> Body<'c> {
                     out.push(Stmt::SetGlobal(*slot, scalar));
                 }
             }
+            // Only after an error: an inlined global is immutable.
+            Slots::Const(_) => {}
             Slots::Memory { addr, offset } => {
                 for (cell, scalar) in self.ck.cells(place.ty).into_iter().zip(scalars) {
                     out.push(Stmt::Store {
@@ -2911,12 +2926,8 @@ impl<'c> Body<'c> {
         match item {
             Item::Func(id) => self.func_value(id),
             Item::GenericFn(generic) => self.generic_fn_value(generic, expected, span),
-            Item::Global(index) => match &self.ck.globals[index] {
-                Some(global) => {
-                    let ty = global.ty;
-                    let reads = global.slots.iter().map(|g| Expr::Global(*g)).collect();
-                    (ty, self.scalars(ty, reads))
-                }
+            Item::Global(_) => match self.item_place(item, name, span) {
+                Some(place) => (place.ty, self.read_place(&place)),
                 // Only reachable from an earlier global's initializer.
                 None => {
                     self.error(TypeErrorKind::NotConstant, span);
@@ -4334,7 +4345,7 @@ mod tests {
         assert!(
             main.contains(
                 "(call logi [c] -> []) (call logf [1.5f32] -> []) \
-                 (call logs [@greeting.len @greeting.ptr] -> [])"
+                 (call logs [12 0] -> [])"
             ),
             "{main}"
         );
@@ -4621,8 +4632,8 @@ fn f() -> u8:
     #[test]
     fn constant_pipes_fold_in_globals() {
         let src = "\
-let KIB = 4 |> _ * 1024
-let PAIR = (KIB |> _ + _, 1.5 |> -_)
+pub let KIB = 4 |> _ * 1024
+pub let PAIR = (KIB |> _ + _, 1.5 |> -_)
 ";
         let inits: Vec<_> = lower(src).globals.iter().map(|g| konst(g.init)).collect();
         assert_eq!(inits, vec!["4096", "8192", "-1.5f64"]);
@@ -4817,13 +4828,13 @@ fn f(x: i64, y: f32):
     #[test]
     fn global_initializers_are_folded() {
         let src = "\
-struct P:
+pub struct P:
     x: i32
     y: i32
-let a: u8 = 200 + 100
-let b = a as i64 * 2
-let origin = P(y: 2, x: -1)
-let flag = a > 3 and not false
+pub let a: u8 = 200 + 100
+pub let b = a as i64 * 2
+pub let origin = P(y: 2, x: -1)
+pub let flag = a > 3 and not false
 var v = 1.5 as f32
 ";
         let globals: Vec<_> = lower(src)
@@ -5176,11 +5187,11 @@ fn f(b: bool) -> i32:
     #[test]
     fn reordered_pure_arguments_stay_constant() {
         let src = "\
-struct P:
+pub struct P:
     x: f32
     y: f32
-let g: f32 = 1.0
-let p = P(y: g, x: 2.0)
+pub let g: f32 = 1.0
+pub let p = P(y: g, x: 2.0)
 ";
         let inits: Vec<_> = lower(src).globals.iter().map(|g| konst(g.init)).collect();
         assert_eq!(inits, vec!["1f32", "2f32", "1f32"]);
@@ -5251,7 +5262,7 @@ pub struct P:
     y: i32
 pub let a = 1
 pub var origin = P(x: 0, y: 0)
-let hidden = 2
+var hidden = 2
 ";
         let exports: Vec<_> = lower(src)
             .globals
@@ -5271,12 +5282,55 @@ let hidden = 2
     }
 
     #[test]
+    fn lets_are_inlined() {
+        let src = "\
+struct P:
+    x: i32
+    y: f32
+let limit = 10
+let origin = P(x: 1, y: 2.0)
+let name = \"duck\"
+var count = limit
+pub let top = limit + origin.x
+fn f() -> u32:
+    count += limit
+    let p = origin
+    let y = origin.y
+    let t = top
+    return name.len
+";
+        let module = lower(src);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
+        assert_eq!(
+            globals,
+            [("count", Const::I32(10)), ("top", Const::I32(11))]
+        );
+        assert_eq!(data(&module), [(0, &b"duck"[..])]);
+        assert_eq!(
+            body(&module, "f"),
+            "(set @count (I32.Add @count 10)) (set p.x 1) (set p.y 2f32) \
+             (set y 2f32) (set t 11) (return 4)"
+        );
+        assert_eq!(
+            errors("let a = (1, 2)\nfn f():\n    a = (3, 4)\n    a.0 = 5\n"),
+            vec![
+                TypeErrorKind::ImmutableAssign("a".into()),
+                TypeErrorKind::ImmutableAssign("a".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn pointers_are_i32_addresses() {
         let src = "\
 pub struct P:
     x: f64
 var null = 0 as &u32
-let top = 4294967295 as &&P
+pub let top = 4294967295 as &&P
 pub fn f(p: &P, a: u32, n: i32) -> &u32:
     let q = a as &P
     let b = p as u32
@@ -5585,7 +5639,7 @@ fn f():
     #[test]
     fn narrow_shift_amounts_wrap_at_their_width() {
         let src = "\
-let g: u8 = 1 << 9
+pub let g: u8 = 1 << 9
 fn f(a: i16, b: i16, c: u8, d: i32):
     let s = a << b
     let t = c >> 9
@@ -5764,7 +5818,7 @@ fn f() -> i64:
         let src = "\
 pub let (w, h) = (640, 480)
 pub let pos = (w, (h, 1.5))
-let (_, hidden) = (1, pos.1.1)
+var (_, hidden) = (1, pos.1.1)
 ";
         let globals: Vec<_> = lower(src)
             .globals
@@ -6746,15 +6800,15 @@ var duck = \"🦆\"
     #[test]
     fn array_literals_are_aligned_data_placed_inner_first() {
         let src = "\
-struct P:
+pub struct P:
     a: u8
     b: i32
-let names = [\"foo\", \"bar\"]
+pub let names = [\"foo\", \"bar\"]
 let table: array(u16) = [1, 2, 65535]
-let points = [P(a: 1, b: -2)]
-let empty: array(f64) = []
-let flags = [true, false]
-let nested: array(array(i8)) = [[], [-1]]
+pub let points = [P(a: 1, b: -2)]
+pub let empty: array(f64) = []
+pub let flags = [true, false]
+pub let nested: array(array(i8)) = [[], [-1]]
 ";
         let module = lower(src);
         assert_eq!(
@@ -6829,7 +6883,7 @@ fn f():
         };
         let src = "\
 pub let s = \"abc\"
-let t: array(i32) = [1]
+pub let t: array(i32) = [1]
 pub let all = module.static
 fn f() -> u32:
     return module.static.len
@@ -7112,7 +7166,7 @@ enum(tuple(f32, u8)) T:
     b = (-0.0, 1)
 enum(tuple()) U:
     only = ()
-let same = T.a == T.b
+pub let same = T.a == T.b
 fn f(r: R, t: T, u: T) -> bool:
     let x = r == R.ok
     let y = t != u
@@ -7177,9 +7231,9 @@ fn f(p: P, q: P, t: tuple(i8, P), u: tuple(i8, P)) -> bool:
 struct P:
     x: i32
     y: f32
-let same = i32 == u32
-let differ = u8 == u16
-let point = P(x: 1, y: 2.0) == P(x: 1, y: 2.0)
+pub let same = i32 == u32
+pub let differ = u8 == u16
+pub let point = P(x: 1, y: 2.0) == P(x: 1, y: 2.0)
 fn u():
     return
 fn f(t: type) -> bool:
@@ -7756,7 +7810,7 @@ fn inc(x: i32) -> i32:
     return x + 1
 fn dec(x: i32) -> i32:
     return x - 1
-let first = dec
+pub let first = dec
 pub var current: fn(i32) -> i32 = inc
 let handlers: array(fn(i32) -> i32) = [inc, dec, inc]
 enum(fn(i32) -> i32) Op:

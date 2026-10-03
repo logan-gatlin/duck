@@ -84,6 +84,8 @@ pub enum Const {
     F64(f64),
 }
 
+/// A `var`, or an exported `let`. A `let` is a [`Expr::Const`] wherever it
+/// is used, so only the host reads an exported one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Global {
     /// Source name, with a `.field` suffix per level for split structs.

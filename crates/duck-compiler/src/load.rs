@@ -371,13 +371,14 @@ mod tests {
     #[test]
     fn globals_are_initialized_after_those_they_import() {
         let mut files = Memory(vec![
-            ("main", "import \"b\"\nlet c = b.b + 1\n"),
+            ("main", "import \"b\"\npub let c = b.b + 1\n"),
             ("b", "import \"a\"\npub let b = a.a + 1\n"),
             ("a", "pub let a = 1\n"),
         ]);
         let module = lower(&mut files);
         let inits: Vec<_> = module.globals.iter().map(|g| g.init).collect();
-        assert_eq!(inits, [Const::I32(1), Const::I32(2), Const::I32(3)]);
+        // Only the entry module's are exported, so only they are wasm globals.
+        assert_eq!(inits, [Const::I32(3)]);
     }
 
     #[test]
