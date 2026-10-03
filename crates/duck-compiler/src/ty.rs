@@ -128,6 +128,9 @@ const MODULE_CONSTS: [&str; 4] = ["static", "page_size", "min", "max"];
 /// The name of the built-in array type.
 const ARRAY: &str = "array";
 
+/// The name of the built-in type of arrays whose elements can be written.
+const VARRAY: &str = "varray";
+
 /// The name of the built-in tuple type.
 const TUPLE: &str = "tuple";
 
@@ -170,7 +173,8 @@ pub struct StructId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EnumId(u32);
 
-/// Index of an interned pointer type, which records the pointee.
+/// Index of an interned pointer type, which records the pointee and whether
+/// it can be written through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PtrId(u32);
 
@@ -202,12 +206,15 @@ pub enum Ty {
     /// An enum, stored as the value of its member, so laid out like the type
     /// of its values.
     Enum(EnumId),
-    /// `&T`, an address in linear memory, stored as an `i32`.
+    /// `&T`, an address in linear memory, stored as an `i32`. `&var T` is
+    /// one that can be written through.
     Ptr(PtrId),
     /// `tuple(A, B)`, which is laid out like a struct with a field per element.
     Tuple(TupleId),
     /// `array(T)`, a view of elements in linear memory that it doesn't own.
     /// Laid out like a struct with the fields `len: u32` and `ptr: &T`.
+    /// `varray(T)` is one whose elements can be written, so its `ptr` is a
+    /// `&var T`.
     Array(ArrayId),
     /// `fn(A) -> R`, a pointer to a function, stored as an `i32` index into
     /// the module's table.
@@ -341,6 +348,20 @@ pub enum TypeErrorKind {
     /// A pointer to a type holding an `externref`, which can't be in memory.
     NotStorable(String),
     ImmutableAssign(String),
+    /// A write to memory behind `ty`, a `&T` or `array(T)`, which only read
+    /// it. `needs` is the type that writes, and `element` is whether `ty` is
+    /// the array.
+    ReadOnlyWrite {
+        ty: String,
+        needs: String,
+        element: bool,
+    },
+    /// `&var` of memory behind `ty`, as [`Self::ReadOnlyWrite`] has it.
+    ReadOnlyAddr {
+        ty: String,
+        needs: String,
+        element: bool,
+    },
     MissingArg(String),
     UnknownLabel(String),
     DuplicateArg(String),
@@ -401,6 +422,15 @@ pub enum TypeErrorKind {
         end: u32,
         min_pages: u32,
     },
+    /// A static data section that ends past the pages the memory may grow
+    /// to, where it starts with as many as hold the section.
+    StaticOutsideMax {
+        end: u32,
+        max_pages: u32,
+    },
+    /// A static data section fitted to literals that it is too small for
+    /// once they are given its size.
+    SelfSizedStatic,
     /// `module.name` naming nothing.
     UnknownModuleProperty(String),
     /// A string or array literal outside a global initializer.
@@ -440,14 +470,14 @@ struct Checker {
     /// Whether every generic struct's fields are known, so instances can
     /// be given theirs.
     generics_defined: bool,
-    /// The pointee of each pointer type.
-    pointees: Vec<Ty>,
-    ptr_ids: HashMap<Ty, PtrId>,
+    /// The pointee of each pointer type, and whether it's a `&var`.
+    pointees: Vec<(Ty, bool)>,
+    ptr_ids: HashMap<(Ty, bool), PtrId>,
     /// The element types of each tuple type.
     tuples: Vec<Vec<Ty>>,
     tuple_ids: HashMap<Vec<Ty>, TupleId>,
     /// The type of each array type's `ptr` field, which points to its
-    /// elements.
+    /// elements. A `varray`'s is a `&var`.
     arrays: Vec<Ty>,
     array_ids: HashMap<Ty, ArrayId>,
     /// The parameter types and result type of each function type.
@@ -486,8 +516,17 @@ struct Checker {
     ir_globals: Vec<ir::Global>,
     /// The memory's size limits, which `module.min` and `module.max` are.
     memory: MemoryLimits,
-    /// Where literals are placed, which `module.static` is.
+    /// Where literals are placed, which `module.static` is. While
+    /// `unfitted`, it is empty.
     static_section: StaticSection,
+    /// Whether the static data section is yet to be fitted to the literals,
+    /// which it is once every global is defined.
+    unfitted: bool,
+    /// Whether anything was given the size of the static data section, or
+    /// the pages that hold it, while it was `unfitted`.
+    read_unfitted: bool,
+    /// The address literals must end by.
+    data_limit: u32,
     /// The contents of literals, placed in memory in the order they are
     /// lowered.
     data: Vec<ir::Data>,
@@ -618,6 +657,8 @@ struct Place {
     name: String,
     ty: Ty,
     mutable: bool,
+    /// The pointer or array whose memory this is, if it's in memory.
+    behind: Option<Ty>,
     /// Computes the address of a `Slots::Memory` place. Runs before anything
     /// else in the assignment.
     pre: Vec<Stmt>,
@@ -852,6 +893,25 @@ impl fmt::Display for TypeErrorKind {
             Self::NotAddressable => write!(f, "only memory behind a pointer has an address"),
             Self::NotStorable(ty) => write!(f, "`{ty}` can't be stored in memory"),
             Self::ImmutableAssign(name) => write!(f, "can't assign to immutable `{name}`"),
+            Self::ReadOnlyWrite { ty, needs, element } => {
+                let through = if *element {
+                    "to an element of"
+                } else {
+                    "through"
+                };
+                write!(f, "can't write {through} `{ty}`; it needs a `{needs}`")
+            }
+            Self::ReadOnlyAddr { ty, needs, element } => {
+                let through = if *element {
+                    "of an element of"
+                } else {
+                    "through"
+                };
+                write!(
+                    f,
+                    "can't take `&var` {through} `{ty}`; it needs a `{needs}`"
+                )
+            }
             Self::MissingArg(name) => write!(f, "missing argument `{name}`"),
             Self::UnknownLabel(name) => write!(f, "no parameter named `{name}`"),
             Self::DuplicateArg(name) => write!(f, "argument `{name}` given twice"),
@@ -896,6 +956,14 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "the static data section ends at address {end}, past the {min_pages} pages memory starts with"
             ),
+            Self::StaticOutsideMax { end, max_pages } => write!(
+                f,
+                "the static data section ends at address {end}, past the {max_pages} pages memory may grow to"
+            ),
+            Self::SelfSizedStatic => write!(
+                f,
+                "the static data section is fitted to literals whose size depends on its own"
+            ),
             Self::UnknownModuleProperty(name) => write!(f, "`module` has no property `{name}`"),
             Self::LiteralOutsideGlobal => write!(
                 f,
@@ -934,18 +1002,29 @@ impl std::error::Error for TypeError {}
 /// Checking continues past errors, so every error in the program is reported
 /// at once.
 pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
-    let mut ck = Checker {
-        entry: program.entry,
-        memory: settings.memory,
-        static_section: settings.static_section,
-        data_end: settings.static_section.start.into(),
-        ..Checker::default()
-    };
-    ck.declare(program);
-    ck.define_structs(program);
-    ck.define_funcs(program);
-    ck.define_globals(program);
-    ck.check_static_section(settings);
+    let mut ck = Checker::define(program, settings, None);
+    if ck.unfitted {
+        // Literals are only in globals, so every one has been placed.
+        let fitted = StaticSection {
+            start: 0,
+            end: ck.data_end.min(u32::MAX.into()) as u32,
+        };
+        if ck.read_unfitted {
+            // A global was given a size the section doesn't have.
+            ck = Checker::define(program, settings, Some(fitted));
+            if ck.data_fits() && ck.data_end != u64::from(fitted.end) {
+                ck.errors.push(TypeError {
+                    kind: TypeErrorKind::SelfSizedStatic,
+                    span: None,
+                    instances: Vec::new(),
+                });
+            }
+        } else {
+            ck.static_section = fitted;
+            ck.unfitted = false;
+        }
+    }
+    ck.check_static_section();
     let start = settings
         .start
         .as_ref()
@@ -956,7 +1035,7 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
     if ck.errors.is_empty() {
         Ok(ir::Module {
             memory: ir::Memory {
-                min_pages: settings.memory.min_pages,
+                min_pages: ck.min_pages(),
                 max_pages: settings.memory.max_pages,
                 export: MEMORY_EXPORT.to_string(),
             },
@@ -1055,7 +1134,9 @@ impl Checker {
     /// Declares `name` in the current module.
     fn declare_name(&mut self, name: &Ident, item: Item, is_pub: bool) {
         let scope = self.scopes.entry(self.module).or_default();
-        if scope.contains_key(&name.name) || [ARRAY, TUPLE, TYPE].contains(&name.name.as_str()) {
+        if scope.contains_key(&name.name)
+            || [ARRAY, VARRAY, TUPLE, TYPE].contains(&name.name.as_str())
+        {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
             scope.insert(name.name.clone(), Entry { item, is_pub });
@@ -1377,19 +1458,54 @@ impl Checker {
         }
     }
 
+    /// Declares and defines every item of `program`, which places its
+    /// literals. `fitted` is the static data section, if the settings leave
+    /// it to be fitted to the literals and it has been.
+    fn define(program: &Program, settings: &Settings, fitted: Option<StaticSection>) -> Self {
+        let static_section = settings.static_section.or(fitted).unwrap_or_default();
+        let mut ck = Self {
+            entry: program.entry,
+            memory: settings.memory,
+            static_section,
+            unfitted: settings.static_section.is_none() && fitted.is_none(),
+            data_limit: settings
+                .static_section
+                .map_or(u32::MAX, |section| section.end),
+            data_end: static_section.start.into(),
+            ..Self::default()
+        };
+        ck.declare(program);
+        ck.define_structs(program);
+        ck.define_funcs(program);
+        ck.define_globals(program);
+        ck
+    }
+
+    /// The pages memory starts with, which `module.min` is: those of the
+    /// settings, or else the fewest that hold the static data section.
+    fn min_pages(&self) -> u32 {
+        let fewest = u64::from(self.static_section.end).div_ceil(PAGE_SIZE) as u32;
+        self.memory.min_pages.unwrap_or(fewest)
+    }
+
     /// Checks that the static data section is in the memory's initial
     /// pages, and that literal data fits in it.
-    fn check_static_section(&mut self, settings: &Settings) {
+    fn check_static_section(&mut self) {
         let StaticSection { start, end } = self.static_section;
-        let min_pages = settings.memory.min_pages;
         let mut errors = Vec::new();
-        if u64::from(end) > u64::from(min_pages) * PAGE_SIZE {
-            errors.push(TypeErrorKind::StaticOutsideMemory { end, min_pages });
+        match (self.memory.min_pages, self.memory.max_pages) {
+            (Some(min_pages), _) if u64::from(end) > u64::from(min_pages) * PAGE_SIZE => {
+                errors.push(TypeErrorKind::StaticOutsideMemory { end, min_pages });
+            }
+            (None, Some(max_pages)) if self.min_pages() > max_pages => {
+                errors.push(TypeErrorKind::StaticOutsideMax { end, max_pages });
+            }
+            _ => {}
         }
         if !self.data_fits() {
             errors.push(TypeErrorKind::DataTooLarge {
                 bytes: self.data_end - u64::from(start),
-                capacity: end - start,
+                capacity: self.data_limit - start,
             });
         }
         self.errors.extend(errors.into_iter().map(|kind| TypeError {
@@ -1524,7 +1640,7 @@ impl Checker {
                     Ty::Error
                 }
             },
-            TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
+            TypeKind::Pointer(mutability, pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
                 pointee if self.structs_defined && !self.storable(pointee) => {
@@ -1532,7 +1648,7 @@ impl Checker {
                     self.error(kind, ty.span);
                     Ty::Error
                 }
-                pointee => self.ptr_to(pointee),
+                pointee => self.ptr_to(pointee, *mutability == Mutability::Var),
             },
             TypeKind::Fn(params, ret) => {
                 let params: Vec<_> = params.iter().map(|param| self.resolve_ty(param)).collect();
@@ -1568,7 +1684,7 @@ impl Checker {
                 }
                 None => Ty::Error,
             },
-            TypeKind::Pointer(_) | TypeKind::Fn(..) => unreachable!("only names are qualified"),
+            TypeKind::Pointer(..) | TypeKind::Fn(..) => unreachable!("only names are qualified"),
         }
     }
 
@@ -1632,7 +1748,7 @@ impl Checker {
             Ty::Unit
         } else if name == TUPLE {
             self.tuple_of(args)
-        } else if name == ARRAY {
+        } else if name == ARRAY || name == VARRAY {
             match args[0] {
                 // Struct fields are checked once every struct is defined.
                 elem if self.structs_defined && !self.storable(elem) => {
@@ -1640,7 +1756,7 @@ impl Checker {
                     self.error(kind, span);
                     Ty::Error
                 }
-                elem => self.array_of(elem),
+                elem => self.array_of(elem, name == VARRAY),
             }
         } else {
             unreachable!("`type_arity` knows every type")
@@ -1691,29 +1807,65 @@ impl Checker {
         Ty::Tuple(id)
     }
 
-    /// The interned type `*pointee`.
-    fn ptr_to(&mut self, pointee: Ty) -> Ty {
+    /// The interned type `&pointee`, or `&var pointee` if it's `mutable`.
+    fn ptr_to(&mut self, pointee: Ty, mutable: bool) -> Ty {
         let next = PtrId(self.pointees.len() as u32);
-        let id = *self.ptr_ids.entry(pointee).or_insert(next);
+        let id = *self.ptr_ids.entry((pointee, mutable)).or_insert(next);
         if id == next {
-            self.pointees.push(pointee);
+            self.pointees.push((pointee, mutable));
         }
         Ty::Ptr(id)
     }
 
     fn pointee(&self, id: PtrId) -> Ty {
-        self.pointees[id.0 as usize]
+        self.pointees[id.0 as usize].0
     }
 
-    /// The interned type `[elem]`.
-    fn array_of(&mut self, elem: Ty) -> Ty {
-        let ptr = self.ptr_to(elem);
+    /// The interned type `array(elem)`, or `varray(elem)` if it's `mutable`.
+    fn array_of(&mut self, elem: Ty, mutable: bool) -> Ty {
+        let ptr = self.ptr_to(elem, mutable);
         let next = ArrayId(self.arrays.len() as u32);
-        let id = *self.array_ids.entry(elem).or_insert(next);
+        let id = *self.array_ids.entry(ptr).or_insert(next);
         if id == next {
             self.arrays.push(ptr);
         }
         Ty::Array(id)
+    }
+
+    /// Whether `ty` is a `&var T` or a `varray(T)`, whose memory can be
+    /// written.
+    fn writes(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Ptr(id) => self.pointees[id.0 as usize].1,
+            Ty::Array(id) => self.writes(self.arrays[id.0 as usize]),
+            _ => false,
+        }
+    }
+
+    /// The pointer or array `ty` as one whose memory can be written if
+    /// `mutable`, and only read otherwise. Any other type is itself.
+    fn with_writes(&mut self, ty: Ty, mutable: bool) -> Ty {
+        match ty {
+            Ty::Ptr(id) => self.ptr_to(self.pointee(id), mutable),
+            Ty::Array(id) => self.array_of(self.element(id), mutable),
+            _ => ty,
+        }
+    }
+
+    /// Whether a `found` can stand where a `want` is expected: it is the
+    /// same type, or the `&var T` or `varray(T)` of a `want` that only reads.
+    /// Nothing within a type converts.
+    fn fits(&self, found: Ty, want: Ty) -> bool {
+        found == want
+            || match (found, want) {
+                (Ty::Ptr(f), Ty::Ptr(w)) => {
+                    self.pointee(f) == self.pointee(w) && !self.writes(want)
+                }
+                (Ty::Array(f), Ty::Array(w)) => {
+                    self.fits(self.arrays[f.0 as usize], self.arrays[w.0 as usize])
+                }
+                _ => false,
+            }
     }
 
     /// The types a pointer, tuple, array, or function type is made of: its
@@ -1736,9 +1888,9 @@ impl Checker {
     /// [`Self::components`] takes it apart. Any other type is itself.
     fn rebuild(&mut self, ty: Ty, mut components: Vec<Ty>) -> Ty {
         match ty {
-            Ty::Ptr(_) => self.ptr_to(components[0]),
+            Ty::Ptr(_) => self.ptr_to(components[0], self.writes(ty)),
             Ty::Tuple(_) => self.tuple_of(components),
-            Ty::Array(_) => self.array_of(components[0]),
+            Ty::Array(_) => self.array_of(components[0], self.writes(ty)),
             Ty::Fn(_) => {
                 let ret = components.pop().unwrap();
                 self.fn_of(components, ret)
@@ -1759,8 +1911,12 @@ impl Checker {
             Ty::Prim(prim) => prim.name().to_string(),
             Ty::Struct(id) => self.structs[id.0 as usize].name.clone(),
             Ty::Enum(id) => self.enums[id.0 as usize].name.clone(),
+            Ty::Ptr(id) if self.writes(ty) => format!("&var {}", self.ty_name(self.pointee(id))),
             Ty::Ptr(id) => format!("&{}", self.ty_name(self.pointee(id))),
-            Ty::Array(id) => format!("{ARRAY}({})", self.ty_name(self.element(id))),
+            Ty::Array(id) => {
+                let name = if self.writes(ty) { VARRAY } else { ARRAY };
+                format!("{name}({})", self.ty_name(self.element(id)))
+            }
             Ty::Tuple(id) => {
                 let elems: Vec<_> = self.tuples[id.0 as usize]
                     .iter()
@@ -1909,6 +2065,11 @@ impl Checker {
             )),
             (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
             | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => Some((to, value)),
+            // An array and a `varray` of the same elements convert to each
+            // other.
+            (Ty::Array(from), Ty::Array(as_)) if self.element(from) == self.element(as_) => {
+                Some((to, value))
+            }
             // Function pointers convert as pointers do: to each other, and
             // to and from their index in the table.
             (Ty::Fn(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Fn(_))
@@ -2062,9 +2223,9 @@ impl Checker {
     }
 
     /// Whether every literal placed so far is within the static data
-    /// section.
+    /// section, or within memory if the section is fitted to them.
     fn data_fits(&self) -> bool {
-        self.data_end <= self.static_section.end.into()
+        self.data_end <= self.data_limit.into()
     }
 
     /// Evaluates each scalar of a lowered constant at compile time, reporting
@@ -2136,9 +2297,10 @@ impl<'c> Body<'c> {
         self.ck.error(kind, span);
     }
 
-    /// Reports a mismatch unless `found` is `want` or either is an error.
+    /// Reports a mismatch unless `found` fits where `want` is expected or
+    /// either is an error.
     fn expect(&mut self, found: Ty, want: Ty, span: Span) {
-        if found != want && found != Ty::Error && want != Ty::Error {
+        if !self.ck.fits(found, want) && found != Ty::Error && want != Ty::Error {
             let kind = TypeErrorKind::Mismatch {
                 expected: self.ck.ty_name(want),
                 found: self.ck.ty_name(found),
@@ -2235,10 +2397,14 @@ impl<'c> Body<'c> {
                 };
                 out.append(&mut place.pre);
                 if !place.mutable {
-                    self.error(
-                        TypeErrorKind::ImmutableAssign(place.name.clone()),
-                        target.span,
-                    );
+                    let kind = match place.behind {
+                        Some(ty) => {
+                            let (ty, needs, element) = self.read_only(ty);
+                            TypeErrorKind::ReadOnlyWrite { ty, needs, element }
+                        }
+                        None => TypeErrorKind::ImmutableAssign(place.name.clone()),
+                    };
+                    self.error(kind, target.span);
                 }
                 let value = match op {
                     None => self.check(value, place.ty),
@@ -2388,6 +2554,15 @@ impl<'c> Body<'c> {
         }
     }
 
+    /// What an error says of `ty`, a pointer or array that only reads its
+    /// memory: its name, that of the type that writes it, and whether it's
+    /// the array.
+    fn read_only(&mut self, ty: Ty) -> (String, String, bool) {
+        let needs = self.ck.with_writes(ty, true);
+        let element = matches!(ty, Ty::Array(_));
+        (self.ck.ty_name(ty), self.ck.ty_name(needs), element)
+    }
+
     /// Resolves an assignment target. `None` after reporting an error.
     fn place(&mut self, target: &parse::Expr) -> Option<Place> {
         match &target.kind {
@@ -2397,6 +2572,7 @@ impl<'c> Body<'c> {
                         name: name.clone(),
                         ty: var.ty,
                         mutable: var.mutable,
+                        behind: None,
                         pre: Vec::new(),
                         slots: Slots::Local(var.slots.clone()),
                     });
@@ -2424,7 +2600,7 @@ impl<'c> Body<'c> {
                     | ExprKind::Deref(_)
                     | ExprKind::Index(..) => self.place(inner)?,
                     _ => match self.expr(inner, None) {
-                        (Ty::Ptr(id), ptr) => self.deref_place(ptr, self.ck.pointee(id)),
+                        (ty @ Ty::Ptr(_), ptr) => self.deref_place(ptr, ty),
                         (Ty::Error, _) => return None,
                         _ => {
                             self.error(TypeErrorKind::NotAssignable, target.span);
@@ -2433,9 +2609,9 @@ impl<'c> Body<'c> {
                     },
                 };
                 // Fields are reached through any number of pointers.
-                while let Ty::Ptr(id) = place.ty {
+                while let Ty::Ptr(_) = place.ty {
                     let ptr = self.read_place(&place);
-                    let mut deref = self.deref_place(ptr, self.ck.pointee(id));
+                    let mut deref = self.deref_place(ptr, place.ty);
                     place.pre.append(&mut deref.pre);
                     place = Place {
                         pre: place.pre,
@@ -2455,7 +2631,7 @@ impl<'c> Body<'c> {
                 Some(Place { ty, slots, ..place })
             }
             ExprKind::Deref(inner) => match self.expr(inner, None) {
-                (Ty::Ptr(id), ptr) => Some(self.deref_place(ptr, self.ck.pointee(id))),
+                (ty @ Ty::Ptr(_), ptr) => Some(self.deref_place(ptr, ty)),
                 (ty, _) => {
                     self.invalid_operand(".*", ty, target.span);
                     None
@@ -2481,6 +2657,7 @@ impl<'c> Body<'c> {
             name: name.to_string(),
             ty: global.ty,
             mutable: global.mutable,
+            behind: None,
             pre: Vec::new(),
             slots: global.slots.clone(),
         })
@@ -2519,7 +2696,8 @@ impl<'c> Body<'c> {
         Some(Place {
             name: String::new(),
             ty: elem,
-            mutable: true,
+            mutable: self.ck.writes(ty),
+            behind: Some(ty),
             pre,
             slots: Slots::Memory {
                 addr: Expr::Local(tmp),
@@ -2528,13 +2706,17 @@ impl<'c> Body<'c> {
         })
     }
 
-    /// The memory a pointer points to, as a place.
-    fn deref_place(&mut self, ptr: Value, pointee: Ty) -> Place {
+    /// The memory that `ptr`, a pointer of type `ty`, points to, as a place.
+    fn deref_place(&mut self, ptr: Value, ty: Ty) -> Place {
         let (pre, addr) = self.reusable_addr(ptr);
+        let Ty::Ptr(id) = ty else {
+            unreachable!("only pointers are dereferenced")
+        };
         Place {
             name: String::new(),
-            ty: pointee,
-            mutable: true,
+            ty: self.ck.pointee(id),
+            mutable: self.ck.writes(ty),
+            behind: Some(ty),
             pre,
             slots: Slots::Memory { addr, offset: 0 },
         }
@@ -2626,7 +2808,7 @@ impl<'c> Body<'c> {
                 self.error(TypeErrorKind::LiteralOutsideGlobal, expr.span);
                 (Ty::Error, Value::default())
             }
-            ExprKind::Str(s) => self.string(s),
+            ExprKind::Str(s) => self.string(s, expected),
             ExprKind::List(items) => self.list(items, expected, expr.span),
             ExprKind::Repeat(value, len) => self.repeat(value, len, expected),
             ExprKind::Index(..) => match self.place(expr) {
@@ -2639,7 +2821,10 @@ impl<'c> Body<'c> {
                 }
                 None => (Ty::Error, Value::default()),
             },
-            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::AddrOf(_) | ExprKind::FnType(_)
+            ExprKind::Name(_)
+            | ExprKind::Field(..)
+            | ExprKind::AddrOf(..)
+            | ExprKind::FnType(_)
                 if self.is_type_expr(expr) =>
             {
                 let ty = self.expr_type(expr);
@@ -2693,7 +2878,7 @@ impl<'c> Body<'c> {
                 }
             }
             ExprKind::Cast(inner, ty) => self.cast(inner, ty, expr.span),
-            ExprKind::AddrOf(inner) => self.addr_of(inner, expr.span),
+            ExprKind::AddrOf(mutability, inner) => self.addr_of(*mutability, inner, expr.span),
             ExprKind::FnType(_) => unreachable!("function types are type expressions"),
             ExprKind::Pipe(value, body) => self.pipe(value, body, expected),
             ExprKind::Placeholder => match self.piped.last() {
@@ -2744,7 +2929,9 @@ impl<'c> Body<'c> {
         let mut values = Vec::new();
         for (i, elem) in elems.iter().enumerate() {
             let (ty, value) = self.expr(elem, expected.get(i).copied());
-            tys.push(ty);
+            // An element is of the type expected if it fits there.
+            let want = expected.get(i).filter(|want| self.ck.fits(ty, **want));
+            tys.push(want.copied().unwrap_or(ty));
             values.push(value);
         }
         if tys.contains(&Ty::Error) {
@@ -2753,9 +2940,16 @@ impl<'c> Body<'c> {
         (self.ck.tuple_of(tys), self.seq(values))
     }
 
+    /// Whether a literal that is expected to be an `expected` is a `varray`,
+    /// as it only is where one is expected.
+    fn literal_writes(&self, expected: Option<Ty>) -> bool {
+        matches!(expected, Some(ty @ Ty::Array(_)) if self.ck.writes(ty))
+    }
+
     /// A string literal: an array of its UTF-8 bytes.
-    fn string(&mut self, s: &str) -> (Ty, Value) {
-        let ty = self.ck.array_of(Ty::Prim(Prim::U8));
+    fn string(&mut self, s: &str, expected: Option<Ty>) -> (Ty, Value) {
+        let mutable = self.literal_writes(expected);
+        let ty = self.ck.array_of(Ty::Prim(Prim::U8), mutable);
         (
             ty,
             self.ck.push_data(s.as_bytes().to_vec(), 1, s.len() as u32),
@@ -2763,7 +2957,7 @@ impl<'c> Body<'c> {
     }
 
     /// `module.name`, one of `module`'s constants. `module.static` is the
-    /// static data section, as an `array(u8)`. `page_size` is the bytes in a
+    /// static data section, as an `array(u8)`, which only reads it. `page_size` is the bytes in a
     /// wasm page, and `min` and `max` are the pages memory starts with and
     /// may grow to, `max` being the largest `u32` if it's unlimited.
     fn module_property(&mut self, name: &Ident) -> (Ty, Value) {
@@ -2773,12 +2967,16 @@ impl<'c> Body<'c> {
         };
         match name.name.as_str() {
             "static" => {
+                self.ck.read_unfitted |= self.ck.unfitted;
                 let StaticSection { start, end } = self.ck.static_section;
-                let ty = self.ck.array_of(Ty::Prim(Prim::U8));
+                let ty = self.ck.array_of(Ty::Prim(Prim::U8), false);
                 (ty, array_value(end - start, start))
             }
             "page_size" => page_count(PAGE_SIZE as u32),
-            "min" => page_count(self.ck.memory.min_pages),
+            "min" => {
+                self.ck.read_unfitted |= self.ck.unfitted && self.ck.memory.min_pages.is_none();
+                page_count(self.ck.min_pages())
+            }
             "max" => page_count(self.ck.memory.max_pages.unwrap_or(u32::MAX)),
             other => {
                 let kind = if MODULE_FUNCS.contains(&other) {
@@ -2793,8 +2991,8 @@ impl<'c> Body<'c> {
     }
 
     /// `module.name(args)`, one of `module`'s functions, lowered to the
-    /// memory instruction it stands for. `memory()` is all of memory as an
-    /// `array(u8)`, `size()` its size in pages, and `grow(pages)` adds pages,
+    /// memory instruction it stands for. `memory()` is all of memory as a
+    /// `varray(u8)`, `size()` its size in pages, and `grow(pages)` adds pages,
     /// giving the old size or -1 if it can't. `fill(dst, value, len)` and
     /// `copy(dst, src, len)` set and copy bytes. `unreachable()` traps.
     /// `count_leading_zeros(value)` and `count_trailing_zeros(value)` are
@@ -2805,12 +3003,13 @@ impl<'c> Body<'c> {
         }
         let byte = Ty::Prim(Prim::U8);
         let count = Ty::Prim(Prim::U32);
-        let addr = self.ck.ptr_to(byte);
+        let src = self.ck.ptr_to(byte, false);
+        let dst = self.ck.ptr_to(byte, true);
         let params: &[(&str, Ty)] = match name.name.as_str() {
             "memory" | "size" | "unreachable" => &[],
             "grow" => &[("pages", count)],
-            "fill" => &[("dst", addr), ("value", byte), ("len", count)],
-            "copy" => &[("dst", addr), ("src", addr), ("len", count)],
+            "fill" => &[("dst", dst), ("value", byte), ("len", count)],
+            "copy" => &[("dst", dst), ("src", src), ("len", count)],
             other => {
                 let kind = if MODULE_CONSTS.contains(&other) {
                     TypeErrorKind::NotCallable(format!("module.{other}"))
@@ -2842,7 +3041,7 @@ impl<'c> Body<'c> {
                     Expr::Const(Const::I32(PAGE_SIZE as i32)),
                 );
                 let ptr = Expr::Const(Const::I32(0));
-                let ty = self.ck.array_of(byte);
+                let ty = self.ck.array_of(byte, true);
                 (ty, vec![(ValType::I32, len), (ValType::I32, ptr)])
             }
             "size" => (count, vec![(ValType::I32, Expr::MemorySize)]),
@@ -2924,8 +3123,10 @@ impl<'c> Body<'c> {
 
     /// An array literal, whose elements are typed like those of `expected`,
     /// or else like the first element, and must be constant. Its elements are
-    /// placed in memory after any literals within them.
+    /// placed in memory after any literals within them. It's a `varray` where
+    /// one is expected.
     fn list(&mut self, items: &[parse::Expr], expected: Option<Ty>, span: Span) -> (Ty, Value) {
+        let mutable = self.literal_writes(expected);
         let mut elem = match expected {
             Some(Ty::Array(id)) => Some(self.ck.element(id)),
             // An array type that failed to resolve, already reported.
@@ -2939,7 +3140,10 @@ impl<'c> Body<'c> {
             self.expect(ty, want, item.span);
             let item_consts = self.ck.fold_value(&value, item.span);
             // A mistyped element's scalars don't fit the cells.
-            consts.push(if ty == want { item_consts } else { Vec::new() });
+            consts.push(match self.ck.fits(ty, want) {
+                true => item_consts,
+                false => Vec::new(),
+            });
         }
         let Some(elem) = elem else {
             self.error(TypeErrorKind::UntypedEmptyArray, span);
@@ -2959,18 +3163,20 @@ impl<'c> Body<'c> {
             }
         }
         let value = self.ck.push_data(bytes, align, items.len() as u32);
-        (self.ck.array_of(elem), value)
+        (self.ck.array_of(elem, mutable), value)
     }
 
     /// `[value; len]`, an array of `len` copies of `value`, which is typed
     /// like the elements of `expected`. Both must be constant. A literal
-    /// within `value` is placed in memory once, and every copy views it.
+    /// within `value` is placed in memory once, and every copy views it. It's
+    /// a `varray` where one is expected.
     fn repeat(
         &mut self,
         value: &parse::Expr,
         len: &parse::Expr,
         expected: Option<Ty>,
     ) -> (Ty, Value) {
+        let mutable = self.literal_writes(expected);
         let want = match expected {
             Some(Ty::Array(id)) => Some(self.ck.element(id)),
             // An array type that failed to resolve, already reported.
@@ -2984,7 +3190,7 @@ impl<'c> Body<'c> {
         let lowered = self.check(len, Ty::Prim(Prim::U32));
         let count = self.ck.fold_value(&lowered, len.span);
         // Nothing holding an `externref` is constant, so that's reported.
-        if ty != elem || elem == Ty::Error || !self.ck.storable(elem) {
+        if !self.ck.fits(ty, elem) || elem == Ty::Error || !self.ck.storable(elem) {
             return (Ty::Error, Value::default());
         }
         let [Const::I32(count)] = count[..] else {
@@ -3006,7 +3212,7 @@ impl<'c> Body<'c> {
             let bytes = bytes.repeat(count as usize);
             self.ck.data.push(ir::Data { offset, bytes });
         }
-        (self.ck.array_of(elem), array_value(count, offset))
+        (self.ck.array_of(elem, mutable), array_value(count, offset))
     }
 
     /// An integer literal, typed by `expected` and defaulting to `i32`. Where
@@ -3124,7 +3330,7 @@ impl<'c> Body<'c> {
                 matches!(self.named(expr), Some(Item::Struct(_) | Item::Enum(_)))
             }
             ExprKind::Call(callee, args) => self.names_type(callee, args),
-            ExprKind::AddrOf(pointee) => self.is_type_expr(pointee),
+            ExprKind::AddrOf(_, pointee) => self.is_type_expr(pointee),
             ExprKind::FnType(_) => true,
             _ => false,
         }
@@ -3241,13 +3447,25 @@ impl<'c> Body<'c> {
             // `x + 1` and `1 + x` work for any integer `x`.
             if is_literal(lhs) && !is_literal(rhs) {
                 let (ty, rhs) = self.expr(rhs, expected);
+                let ty = self.compared(op, ty);
                 (ty, self.check(lhs, ty), rhs)
             } else {
                 let (ty, lhs) = self.expr(lhs, expected);
+                let ty = self.compared(op, ty);
                 (ty, lhs, self.check(rhs, ty))
             }
         };
         self.binary_values(op, ty, lhs, rhs, span)
+    }
+
+    /// The type both operands of `op` have when one is a `ty`. Comparing
+    /// writes nothing, so a `&var T` compares as a `&T`, with either, and a
+    /// `varray(T)` as an `array(T)`.
+    fn compared(&mut self, op: BinOp, ty: Ty) -> Ty {
+        match is_comparison(op) {
+            true => self.ck.with_writes(ty, false),
+            false => ty,
+        }
     }
 
     /// Applies `op` to operands that both have type `ty`.
@@ -3377,8 +3595,9 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// `&place`, the address of memory reached through a pointer or array.
-    fn addr_of(&mut self, inner: &parse::Expr, span: Span) -> (Ty, Value) {
+    /// `&place` or `&var place`, the address of memory reached through a
+    /// pointer or array, which must write its memory for `&var`.
+    fn addr_of(&mut self, mutability: Mutability, inner: &parse::Expr, span: Span) -> (Ty, Value) {
         if !matches!(
             inner.kind,
             ExprKind::Field(..) | ExprKind::Deref(_) | ExprKind::Index(..)
@@ -3396,6 +3615,11 @@ impl<'c> Body<'c> {
         if place.ty == Ty::Error {
             return (Ty::Error, Value::default());
         }
+        let mutable = mutability == Mutability::Var;
+        if let Some(ty) = place.behind.filter(|_| mutable && !place.mutable) {
+            let (ty, needs, element) = self.read_only(ty);
+            self.error(TypeErrorKind::ReadOnlyAddr { ty, needs, element }, span);
+        }
         let addr = match offset {
             0 => addr,
             _ => binary(
@@ -3409,7 +3633,7 @@ impl<'c> Body<'c> {
             pre: place.pre,
             scalars: vec![(ValType::I32, addr)],
         };
-        (self.ck.ptr_to(place.ty), value)
+        (self.ck.ptr_to(place.ty, mutable), value)
     }
 
     fn call(&mut self, callee: &parse::Expr, args: &[Arg], span: Span) -> (Ty, Value) {
@@ -4076,7 +4300,7 @@ fn module_path(expr: &parse::Expr) -> Option<Vec<Ident>> {
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
-    [ARRAY, TUPLE, EXTERNREF, TYPE].contains(&name) || Prim::from_name(name).is_some()
+    [ARRAY, VARRAY, TUPLE, EXTERNREF, TYPE].contains(&name) || Prim::from_name(name).is_some()
 }
 
 /// The names of the fields of an array or `type`, in order. Empty for any
@@ -5491,7 +5715,7 @@ pub fn f(p: &P, a: u32, n: i32) -> &u32:
         assert_eq!(
             module.memory,
             ir::Memory {
-                min_pages: 1,
+                min_pages: 0,
                 max_pages: None,
                 export: "memory".to_string()
             }
@@ -5624,12 +5848,12 @@ struct P:
     x: i32
     y: u8
     z: i64
-var q = 0 as &P
+var q = 0 as &var P
 fn make() -> P:
     return P(x: 1, y: 2, z: 3)
 fn tick() -> i32:
     return 1
-fn f(p: &P, pp: &&P):
+fn f(p: &var P, pp: &&var P):
     p.x = 1
     p.y += 1
     p.z = 5
@@ -5986,7 +6210,7 @@ var (_, hidden) = (1, pos.1.1)
     #[test]
     fn tuples_behind_pointers_use_c_layout() {
         let src = "\
-fn f(p: &tuple(u8, tuple(f64, i16)), q: &&tuple(i32, i32)) -> &i16:
+fn f(p: &var tuple(u8, tuple(f64, i16)), q: &&var tuple(i32, i32)) -> &i16:
     let a = p.0
     let b = p.1.1
     p.1.0 = 2.0
@@ -6726,7 +6950,7 @@ fn f(a: array(u8)) -> array(u8):
 struct S:
     tag: u8
     name: array(u16)
-fn f(a: array(u8), s: &S) -> u32:
+fn f(a: array(u8), s: &var S) -> u32:
     var b = a
     b.len = 2
     s.name.ptr = b.ptr as &u16
@@ -6858,7 +7082,7 @@ fn f(a: array(u8), i: i32, n: i32):
 struct P:
     x: i32
     y: f64
-fn f(a: array(P), i: u32) -> &P:
+fn f(a: varray(P), i: u32) -> &P:
     a[i].x += 1
     a[0] = P(x: 1, y: 2.0)
     return &a[i]
@@ -6876,6 +7100,170 @@ fn f(a: array(P), i: u32) -> &P:
                 check("0"),
                 check("i"),
             )
+        );
+    }
+
+    #[test]
+    fn var_pointers_and_varrays_fit_where_readers_are_expected() {
+        let src = "\
+struct Node:
+    val: i32
+    next: &var Node
+struct View:
+    bytes: array(u8)
+let text: varray(u8) = \"duck\"
+let zeros: varray(i32) = [0; 4]
+let nested: varray(varray(u8)) = [\"a\", \"b\"]
+let views: array(array(u8)) = [text]
+var kept: &Node = 0
+fn read(n: &Node) -> i32:
+    return n.val
+fn len(a: array(u8)) -> u32:
+    return a.len
+fn(T) first(a: array(T)) -> T:
+    return a[0]
+fn(T) at(p: &T) -> T:
+    return p.*
+fn(T) same(a: T, b: T):
+    pass
+fn f(p: &var Node, q: &Node, b: varray(u8)) -> &Node:
+    let r: &Node = p
+    var s: array(u8) = b
+    s = b
+    kept = p
+    let v = View(bytes: b)
+    let t: tuple(&Node, array(u8)) = (p, b)
+    let n = read(p) + at(p).val + first(b) as i32
+    same(q, p)
+    let eq = p == q and q == p and p < q and b == s and s == b
+    let w = q.next
+    w.val = n
+    q.next.val = 1
+    let x = &var p.val
+    x.* = 2
+    let y: &i32 = &var p.val
+    let c = q as &var Node
+    c.val = 3
+    let d = s as varray(u8)
+    d[0] = 1
+    let e = (&var Node).size + varray(u8).size
+    let z: &var u8 = 16
+    text[0] = 68
+    zeros[1] += 1
+    nested[0][0] = 1
+    module.copy(dst: b.ptr, src: s.ptr, len: len(b))
+    return p
+";
+        let module = lower(src);
+        // A `varray` compares through the function of its `array`.
+        let eq_funcs = module.funcs.iter().filter(|f| f.name.starts_with("=="));
+        assert_eq!(
+            eq_funcs.map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["==(array(u8))"]
+        );
+    }
+
+    #[test]
+    fn read_only_memory_is_not_written() {
+        use TypeErrorKind::*;
+        let src = "\
+struct Node:
+    val: i32
+    next: &Node
+let text = \"duck\"
+fn g(p: &var Node):
+    pass
+fn h(a: varray(u8)):
+    pass
+fn r(p: &Node):
+    pass
+fn(T) k(p: &var T):
+    pass
+fn(T) same(a: T, b: T):
+    pass
+fn f(p: &Node, a: array(u8), v: &var Node, pp: &var &Node):
+    p.val = 1
+    p.* = Node(val: 1, next: 0)
+    a[0] = 1
+    text[0] += 1
+    v.next.val = 1
+    pp.*.val = 2
+    let x = &var p.val
+    let y = &var a[0]
+    g(p)
+    h(a)
+    k(p)
+    same(v, p)
+    let t: tuple(&var Node, i32) = (p, 1)
+    let m: &&Node = 0 as &&var Node
+    let fp: fn(&var Node) = r
+    let w = a as varray(u16)
+    let s: &var u8 = \"duck\"
+";
+        let write = |ty: &str, needs: &str, element| ReadOnlyWrite {
+            ty: ty.into(),
+            needs: needs.into(),
+            element,
+        };
+        let addr = |ty: &str, needs: &str, element| ReadOnlyAddr {
+            ty: ty.into(),
+            needs: needs.into(),
+            element,
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                write("&Node", "&var Node", false),
+                write("&Node", "&var Node", false),
+                write("array(u8)", "varray(u8)", true),
+                write("array(u8)", "varray(u8)", true),
+                write("&Node", "&var Node", false),
+                write("&Node", "&var Node", false),
+                addr("&Node", "&var Node", false),
+                addr("array(u8)", "varray(u8)", true),
+                mismatch("&var Node", "&Node"),
+                mismatch("varray(u8)", "array(u8)"),
+                mismatch("&var Node", "&Node"),
+                mismatch("&var Node", "&Node"),
+                mismatch("tuple(&var Node, i32)", "tuple(&Node, i32)"),
+                mismatch("&&Node", "&&var Node"),
+                mismatch("fn(&var Node)", "fn(&Node)"),
+                InvalidCast {
+                    from: "array(u8)".into(),
+                    to: "varray(u16)".into()
+                },
+                LiteralOutsideGlobal,
+            ]
+        );
+        assert_eq!(
+            write("&Node", "&var Node", false).to_string(),
+            "can't write through `&Node`; it needs a `&var Node`"
+        );
+        assert_eq!(
+            write("array(u8)", "varray(u8)", true).to_string(),
+            "can't write to an element of `array(u8)`; it needs a `varray(u8)`"
+        );
+        assert_eq!(
+            addr("&Node", "&var Node", false).to_string(),
+            "can't take `&var` through `&Node`; it needs a `&var Node`"
+        );
+        assert_eq!(
+            addr("array(u8)", "varray(u8)", true).to_string(),
+            "can't take `&var` of an element of `array(u8)`; it needs a `varray(u8)`"
+        );
+        let src = "\
+let s: &var u8 = \"duck\"
+let a: varray(&var u8) = [0 as &u8]
+fn varray():
+    pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateItem("varray".into()),
+                mismatch("&var u8", "array(u8)"),
+                mismatch("&var u8", "&u8"),
+            ]
         );
     }
 
@@ -7100,10 +7488,10 @@ fn f():
     #[test]
     fn module_static_is_the_static_data_section() {
         let settings = Settings {
-            static_section: StaticSection {
+            static_section: Some(StaticSection {
                 start: 1025,
                 end: 2048,
-            },
+            }),
             ..Settings::default()
         };
         let src = "\
@@ -7147,7 +7535,7 @@ fn f() -> u32:
     fn module_constants_describe_memory() {
         let settings = |max_pages| Settings {
             memory: MemoryLimits {
-                min_pages: 2,
+                min_pages: Some(2),
                 max_pages,
             },
             ..Settings::default()
@@ -7175,15 +7563,15 @@ pub let max = module.max
     #[test]
     fn module_functions_are_inlined() {
         let src = "\
-fn all() -> array(u8):
+fn all() -> varray(u8):
     return module.memory()
 fn size() -> u32:
     return module.size()
 fn grow(n: u32) -> i32:
     return module.grow(n)
-fn fill(p: &u8, n: u32):
+fn fill(p: &var u8, n: u32):
     module.fill(p, 7, n)
-fn copy(a: array(u8), b: array(u8)):
+fn copy(a: varray(u8), b: array(u8)):
     module.copy(src: b.ptr, dst: a.ptr, len: a.len)
 ";
         let module = lower(src);
@@ -7307,7 +7695,7 @@ fn f(x: f32, p: &u8, n: u64):
     fn module_functions_and_constants_are_not_interchangeable() {
         use TypeErrorKind::*;
         let src = "\
-fn f(p: &u8):
+fn f(p: &var u8):
     let a = module.size
     let b = module.page_size()
     let c = module.heap()
@@ -7340,10 +7728,10 @@ fn f(p: &u8):
         let errors = |src: &str, start, end, min_pages| -> Vec<TypeError> {
             let settings = Settings {
                 memory: MemoryLimits {
-                    min_pages,
+                    min_pages: Some(min_pages),
                     max_pages: None,
                 },
-                static_section: StaticSection { start, end },
+                static_section: Some(StaticSection { start, end }),
                 ..Settings::default()
             };
             check_with(src, &settings).err().unwrap_or_default()
@@ -7389,6 +7777,119 @@ fn f(p: &u8):
             [spanless(StaticOutsideMemory {
                 end: 65537,
                 min_pages: 1
+            })]
+        );
+    }
+
+    #[test]
+    fn an_unset_static_section_fits_the_literals() {
+        let spanless = |kind| TypeError {
+            kind,
+            span: None,
+            instances: Vec::new(),
+        };
+        let limits = |min_pages, max_pages| Settings {
+            memory: MemoryLimits {
+                min_pages,
+                max_pages,
+            },
+            ..Settings::default()
+        };
+        let globals = |module: &Module| -> Vec<_> {
+            let globals = module.globals.iter();
+            globals.map(|g| (g.name.clone(), g.init)).collect()
+        };
+
+        // Without literals it is empty, and memory starts with nothing.
+        let module = lower("fn f() -> array(u8):\n    return module.static\n");
+        assert_eq!(module.memory.min_pages, 0);
+        assert_eq!(body(&module, "f"), "(return 0 0)");
+
+        // It starts at address 0 and ends where the literals do, however
+        // early it is read.
+        let src = "\
+pub let all = module.static
+pub let pages = module.min
+pub let s = \"abc\"
+pub let t: array(i32) = [1]
+fn f() -> u32:
+    return module.static.len + module.min
+";
+        let module = lower(src);
+        assert_eq!(data(&module), [(0, &b"abc"[..]), (4, &[1, 0, 0, 0][..])]);
+        assert_eq!(module.memory.min_pages, 1);
+        assert_eq!(
+            globals(&module)[..3],
+            [
+                ("all.len".to_string(), Const::I32(8)),
+                ("all.ptr".to_string(), Const::I32(0)),
+                ("pages".to_string(), Const::I32(1)),
+            ]
+        );
+        assert_eq!(body(&module, "f"), "(return (I32.Add 8 1))");
+
+        // Memory starts with the pages that hold it, unless told otherwise.
+        let src = "pub let a: array(u8) = [0; 65537]\npub let pages = module.min\n";
+        let module = lower(src);
+        assert_eq!(module.memory.min_pages, 2);
+        assert_eq!(globals(&module)[2].1, Const::I32(2));
+        let module = check_with(src, &limits(Some(3), None)).unwrap();
+        assert_eq!(module.memory.min_pages, 3);
+        assert_eq!(globals(&module)[2].1, Const::I32(3));
+        assert_eq!(
+            check_with(src, &limits(Some(1), None)).unwrap_err(),
+            [spanless(TypeErrorKind::StaticOutsideMemory {
+                end: 65537,
+                min_pages: 1
+            })]
+        );
+        assert_eq!(
+            check_with(src, &limits(None, Some(1))).unwrap_err(),
+            [spanless(TypeErrorKind::StaticOutsideMax {
+                end: 65537,
+                max_pages: 1
+            })]
+        );
+        assert!(check_with(src, &limits(None, Some(2))).is_ok());
+
+        // A section that is set is not fitted, but still sets where memory
+        // starts.
+        let settings = Settings {
+            static_section: Some(StaticSection {
+                start: 4,
+                end: 65537,
+            }),
+            ..Settings::default()
+        };
+        let module = check_with("pub let s = \"abc\"\n", &settings).unwrap();
+        assert_eq!(data(&module), [(4, &b"abc"[..])]);
+        assert_eq!(module.memory.min_pages, 2);
+
+        // A literal may be sized by the section only if that leaves the
+        // section as large as it was.
+        let module = lower("pub let a: array(u8) = [1; module.static.len]\n");
+        assert_eq!(globals(&module)[0].1, Const::I32(0));
+        assert_eq!(
+            check_src("let a: array(u8) = [1; module.static.len + 1]\n").unwrap_err(),
+            [spanless(TypeErrorKind::SelfSizedStatic)]
+        );
+        assert_eq!(
+            check_src("let a: array(u8) = [1; module.min + 1]\n").unwrap_err(),
+            [spanless(TypeErrorKind::SelfSizedStatic)]
+        );
+        // What the first guess at its size got wrong is not reported.
+        let src = "let s = \"abc\"\nlet a: array(u8) = [1; 6 / module.static.len]\n";
+        assert_eq!(
+            check_src(src).unwrap_err(),
+            [spanless(TypeErrorKind::SelfSizedStatic)]
+        );
+
+        // Literals still have to fit in memory.
+        assert_eq!(
+            check_src("let a: array(u64) = [1; 4294967295]\n").unwrap_err(),
+            [spanless(TypeErrorKind::DataTooLarge {
+                bytes: 34359738360,
+                capacity: u32::MAX
             })]
         );
     }
@@ -7800,7 +8301,7 @@ struct S:
     r: R
     x: i32
 let codes: array(R) = [R.err, R.ok]
-fn f(p: &S) -> R:
+fn f(p: &var S) -> R:
     p.r = get()
     return p.r
 ";
@@ -8093,7 +8594,7 @@ struct S:
     f: fn(i32) -> i32
 fn inc(x: i32) -> i32:
     return x + 1
-fn f(p: &S, g: fn(i32) -> i32) -> bool:
+fn f(p: &var S, g: fn(i32) -> i32) -> bool:
     p.f = g
     let i = g as u32
     let h = i as fn(i32)

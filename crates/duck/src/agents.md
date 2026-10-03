@@ -1,10 +1,10 @@
 # Duck: an overview for agents
 
 Duck is a small, statically typed language with Python-like indentation that
-compiles to a WebAssembly module. It has no runtime, no garbage collector and
-no standard library. Values live in wasm locals and globals. Memory is only
-reached through raw pointers into linear memory, and the host supplies all I/O
-through `extern` imports.
+compiles to a WebAssembly 2.0 module. It has no runtime, and no garbage
+collector. Values live in wasm locals and globals. Memory is only reached
+through raw pointers into linear memory, which read it unless they are
+`&var`, and the host supplies all I/O through `extern` imports.
 
 Every ```duck block below compiles as a file of its own.
 
@@ -32,10 +32,10 @@ entry = "src/main.duck"  # relative to Duck.toml
 output = "build/out.wasm"
 start = "main"           # optional: run on instantiation; takes and returns nothing
 
-[memory]                 # required with [module], forbidden without it
-min = "1pgs"             # sizes: B, KiB, MiB, GiB, or pgs (64 KiB pages)
-max = "16MiB"            # optional; omit to grow without limit
-static = { start = "0B", end = "64KiB" }  # where literals go; must end within `min`
+[memory]                 # optional, with every key in it; forbidden without [module]
+min = "1pgs"             # omit to start with just the pages that hold `static`
+max = "16MiB"            # omit to grow without limit
+static = { start = "0B", end = "64KiB" }  # where literals go; omit to start at 0 and fit them exactly
 
 [library]                # optional: what other packages `import` by name
 entry = "src/lib.duck"
@@ -45,7 +45,8 @@ json = { path = "../json" }
 xml = { git = "https://example.com/xml.git", tag = "v1.0" }  # or rev = "<hash>"; no branches
 ```
 
-A package needs a `[module]`, a `[library]`, or both. Git dependencies are
+Sizes are a number followed by `B`, `KiB`, `MiB`, `GiB`, or `pgs` (64 KiB
+pages). A package needs a `[module]`, a `[library]`, or both. Git dependencies are
 cached under `$XDG_CACHE_HOME/duck/git`, or `~/.cache/duck/git`.
 
 ## Lexical structure
@@ -109,17 +110,25 @@ pub fn main():
 | `bool` | `true`, `false`. |
 | `tuple()` | Unit: the return type of functions without one. Its value is `()`. There is no `unit` or `void`. |
 | `tuple(A, B, ...)` | Two or more elements. Built with `(a, b)`, read with `t.0`. Structural. |
-| `&T` | A pointer: a `u32` address into linear memory. Nothing checks it. |
-| `array(T)` | A slice that owns nothing: the fields `len: u32` then `ptr: &T`. |
+| `&T` | A pointer: a `u32` address into linear memory. Nothing checks it. It only reads what it points to. |
+| `&var T` | A pointer that can also be written through. |
+| `array(T)` | A slice that owns nothing: the fields `len: u32` then `ptr: &T`. Its elements are only read. |
+| `varray(T)` | An array whose elements can also be written: its `ptr` is a `&var T`. |
 | `fn(A, B) -> R` | A function pointer: an index into the module's table. Leave out `-> R` for a function that returns nothing. Structural. |
 | `type` | A type used as a value: the fields `size: u32` and `align: u32`. |
 | `externref` | An opaque host reference. It can never be stored in memory. |
 | `Name`, `Name(T, ...)` | Structs and enums, plain or generic. |
 | `mod.Name` | A type from an imported module. |
 
-There are no implicit conversions. Integers of different widths or
-signedness don't mix, so `a + b` with `a: u8` and `b: i32` is an error. Convert
-with `as`.
+Integers of different widths or signedness don't mix, so `a + b` with `a: u8`
+and `b: i32` is an error. Convert with `as`.
+
+There is one implicit conversion: a `&var T` is accepted wherever a `&T` is
+expected, and a `varray(T)` wherever an `array(T)` is. It applies to the type
+as a whole and to nothing within it, so a `tuple(&var T, i32)` is not a
+`tuple(&T, i32)`, a `&&var T` is not a `&&T`, and a `fn(&T)` is not a
+`fn(&var T)`. A value with no type expected of it keeps its own, so `let q = p`
+is a `&var T` if `p` is.
 
 ## Literals and inference
 
@@ -127,14 +136,16 @@ with `as`.
   annotation, a parameter, or the other operand of a binary operator. With
   nothing to go by it is `i32`. A float literal is `f64` by default.
 - An integer literal can stand where a float is expected (`let x: f32 = 1`) or
-  where a pointer is expected (`let p: &u8 = 16`).
+  where a pointer of either kind is expected (`let p: &u8 = 16`).
 - Out-of-range literals are errors: `let b: u8 = 256`.
 - **String and array literals are only allowed in global initializers.** They
   are placed in the static data section, and the global holds the resulting
   `array`. To use one in a function, bind it to a global first.
+- A literal is an `array`, which can't be written. Annotate the global as a
+  `varray` to get one that can. Each literal has its own bytes.
 - `[value; len]` is an array of `len` copies of `value`. Both must be constant,
   and `len` is a `u32`. An array of zeros adds nothing to the wasm, so
-  `[0; n]` is the way to set aside a buffer.
+  a `varray` of `[0; n]` is the way to set aside a buffer.
 
 ```duck
 let greeting = "hello"                    # array(u8)
@@ -142,10 +153,11 @@ let primes: array(u16) = [2, 3, 5, 7]
 let names = ["ann", "bob"]                # array(array(u8))
 let empty: array(i32) = []                # [] needs a type annotation
 let SIZE: u32 = 1024
-let buffer: array(u8) = [0; SIZE]         # 1024 zeroed bytes
+let scratch: varray(u8) = [0; SIZE]       # 1024 zeroed bytes, writable
 let ones = [1.0; 4]                       # array(f64)
 
 fn first_prime() -> u16:
+	scratch[0] = 1
 	return primes[0]
 ```
 
@@ -168,7 +180,7 @@ associative.
 | 9 | `+ -` |
 | 10 | `* / %` |
 | 11 | `x as T` |
-| 12 | prefix `-`, `~`, `&` |
+| 12 | prefix `-`, `~`, `&`, `&var` |
 | 13 | postfix: call `f(x)`, index `a[i]`, field `x.f`, `t.0`, deref `p.*` |
 
 Some consequences of this table:
@@ -186,7 +198,9 @@ Rules for each operator:
   logical on unsigned ones. The shift amount wraps at the type's width.
 - Unary `-` works on signed integers and floats, but not unsigned integers.
   `~` works on integers.
-- `< <= > >=` compare numbers, and pointers as unsigned addresses.
+- `< <= > >=` compare numbers, and pointers as unsigned addresses. A
+  comparison takes a `&T` with a `&var T`, and an `array(T)` with a
+  `varray(T)`, on either side.
 - `==` and `!=` compare values of any one type: structs and tuples field by
   field, arrays by length and elements, enums by bits, types by size and
   alignment, and function pointers by the function they point to. Anything
@@ -194,8 +208,9 @@ Rules for each operator:
 - `as` converts between any two numeric types. Float to integer saturates,
   and NaN becomes 0. `bool` converts to integers. `i32` and `u32` convert to
   and from pointers and function pointers. Any pointer converts to any other
-  pointer, any function pointer to any other function pointer, and any enum to
-  its value type. Every type converts to itself. Nothing converts to `bool` or
+  pointer, which is how a `&T` becomes a `&var T`. An `array(T)` and a
+  `varray(T)` of the same `T` convert to each other. Any function pointer
+  converts to any other function pointer, and any enum to its value type. Every type converts to itself. Nothing converts to `bool` or
   to an enum, so write `x != 0` instead.
 - There is no ternary or conditional expression. `if` is a statement.
 
@@ -263,8 +278,8 @@ fn demo(n: i32) -> i32:
 ```
 
 - Conditions must be `bool`.
-- `for x in xs:` iterates over an `array(T)`, copying each element into an
-  immutable `x`. `for m in SomeEnum:` visits each member in order, and the
+- `for x in xs:` iterates over an `array(T)` or `varray(T)`, copying each
+  element into an immutable `x`. `for m in SomeEnum:` visits each member in order, and the
   loop is unrolled at compile time. There are no ranges, so count with
   `while`.
 - A function with a return type must return on every path. `while true:`
@@ -366,14 +381,19 @@ fn shift(v: Vec2) -> Vec2:
   field can only be constructed inside its own module.
 - A struct may not contain itself by value. Use a pointer, as in
   `next: &Node`.
+- Whether a field can be assigned depends on where the struct is: in a `var`,
+  or behind a `&var` or in a `varray`.
 - A `pub` item's signature or type may only use `pub` types.
 
 ## Pointers and memory
 
-Linear memory starts as `min` pages. Literals occupy the static section
-(`[memory] static`), which by default is the first 64 KiB, starting at
-address 0. **There is no allocator.** Bump-allocate from an address you pick
-past the static section, or ask the host for memory.
+Literals occupy the static section (`[memory] static`), which unless
+Duck.toml sets it starts at address 0 and ends where the literals do. Linear
+memory starts as `min` pages, which unless Duck.toml sets it is the fewest
+that hold the static section: none at all in a module without literals. So
+by default there is at most part of a page past the static section until
+`module.grow` adds more. **There is no allocator.** Bump-allocate from an
+address you pick past the static section, or ask the host for memory.
 
 ```duck
 struct Node:
@@ -382,32 +402,44 @@ struct Node:
 
 var heap: u32 = 65536 # past the default static section; needs min > 1 page
 
-fn alloc(t: type) -> &u8:
+fn alloc(t: type) -> &var u8:
 	heap = (heap + t.align - 1) / t.align * t.align
-	let p = heap as &u8
+	let p = heap as &var u8        # an address becomes a pointer of either kind
 	heap += t.size
 	return p
 
 fn push(head: &Node, v: i32) -> &Node:
-	let n = alloc(Node) as &Node
-	n.* = Node(val: v, next: head) # store a whole struct through a pointer
-	return n
+	let n = alloc(Node) as &var Node
+	n.* = Node(val: v, next: head) # store a whole struct through a &var
+	return n                       # a &var Node is accepted as a &Node
 
 fn sum(list: &Node) -> i32:
 	var total = 0
-	var p = list
+	var p = list                   # `var` lets p be reassigned, not written through
 	while p != 0:                  # 0 is the null address
 		total += p.val             # fields auto-dereference through any number of &
 		p = p.next
 	return total
 
-fn second_field(n: &Node) -> &&Node:
-	return &n.next                 # & only takes addresses of memory behind a pointer
+fn bump(n: &var Node) -> &var i32:
+	n.val += 1
+	return &var n.val              # & and &var only take addresses of memory behind a pointer
 ```
 
-- `p.*` reads or writes the whole pointee.
-- `&place` works on `p.field`, `p.*` and `a[i]`. It does not work on locals,
-  parameters or globals, which aren't in memory.
+- `p.*` reads the whole pointee, and writes it if `p` is a `&var`.
+- Writing through a `&T`, or to an element of an `array(T)`, is an error:
+  ``can't write through `&Node`; it needs a `&var Node` ``. So is assigning a
+  field reached through one, and `+=` and the like.
+- Only the last pointer or array on the way to a place decides. With
+  `next: &var Node`, `p.next.val = 1` is allowed even when `p` is a `&Node`,
+  and with `next: &Node` it is an error even when `p` is a `&var Node`.
+- `let` and `var` are about the binding, not what it points to: a
+  `let p: &var T` can be written through but not reassigned, and a
+  `var p: &T` the other way around.
+- `&place` gives a `&T` and `&var place` a `&var T`. Both work on `p.field`,
+  `p.*` and `a[i]`, and `&var` needs a place that can be written. Neither
+  works on locals, parameters or globals, which aren't in memory.
+- `p as &var T` makes a `&T` writable. Nothing checks that it should be.
 - There is no pointer arithmetic. Write `((p as u32) + 4) as &T`.
 - Memory layout follows C: fields in declaration order, each aligned to its
   own alignment, with the struct padded to its largest alignment. `bool` is 1
@@ -424,18 +456,18 @@ fn reserve(bytes: u32) -> bool:
 	let pages = (bytes + module.page_size - 1) / module.page_size
 	return module.grow(pages) != -1  # grow gives the old size in pages, or -1
 
-fn clear(buf: array(u8)):
+fn clear(buf: varray(u8)):
 	module.fill(buf.ptr, 0, buf.len)
 ```
 
 - `module.page_size`, `module.min` and `module.max` are `u32` constants:
   bytes per page, and the pages memory starts with and may grow to. `max` is
   the largest `u32` when Duck.toml sets none.
-- `module.memory()` is an `array(u8)` of all current memory, from address 0.
+- `module.memory()` is a `varray(u8)` of all current memory, from address 0.
 - `module.size() -> u32` is the current size in pages, and
   `module.grow(pages: u32) -> i32` adds pages (`memory.size`, `memory.grow`).
-- `module.fill(dst: &u8, value: u8, len: u32)` and
-  `module.copy(dst: &u8, src: &u8, len: u32)` are `memory.fill` and
+- `module.fill(dst: &var u8, value: u8, len: u32)` and
+  `module.copy(dst: &var u8, src: &u8, len: u32)` are `memory.fill` and
   `memory.copy`. `copy` handles overlap. Out-of-bounds ranges trap.
 - `module.unreachable()` traps. As a statement of its own, it ends a function,
   so a function that returns a value needs no `return` after it.
@@ -459,6 +491,13 @@ fn count(s: array(u8), c: u8) -> u32:
 fn view(p: &i32, len: u32) -> array(i32):
 	return array(i32)(len: len, ptr: p) # build a view over existing memory
 
+fn zero(a: varray(u8)) -> u32:
+	var i: u32 = 0
+	while i < a.len:
+		a[i] = 0                        # only a varray's elements can be assigned
+		i += 1
+	return count(a, 0)                  # a varray(u8) is accepted as an array(u8)
+
 fn demo() -> u32:
 	let i: u32 = 2
 	let c = text[i]                     # the index must be u32; it is bounds checked
@@ -467,9 +506,16 @@ fn demo() -> u32:
 
 - `a.len` and `a.ptr` are ordinary fields. Slice by building a new
   `array(T)(len:, ptr:)`.
+- A `varray(T)` is an `array(T)` in every other way: the same layout,
+  indexing, `for` and `==`. Its `ptr` is a `&var T`, so
+  `varray(T)(len:, ptr:)` needs one. `a as varray(T)` makes an `array(T)`
+  writable.
 - Strings are `array(u8)` of UTF-8. There are no string operations, so write
   them over bytes.
-- `module.static` is an `array(u8)` covering the whole static section.
+- `module.static` is an `array(u8)` covering the whole static section. Where
+  the section is fitted to the literals, a literal sized by `module.static`
+  or `module.min` is an error if that changes how large the section is.
+- No item may be named `array`, `varray`, `tuple` or `type`.
 
 ## Enums
 
@@ -534,6 +580,9 @@ fn demo() -> u8:
   members (`T.ok`).
 - A call that gives a type parameter no argument type to infer from must give
   explicit type arguments.
+- A parameter `p: &T` takes a `&var i32` with `T` as `i32`, and `a: array(T)`
+  takes a `varray(i32)` likewise. Nothing is generic over whether a pointer
+  can be written through, so write the function for each kind, or cast.
 - A generic function named as a value becomes the instance with the function
   type expected there, so `let f = id` is an error. Passed to another generic
   function, it infers none of that function's type arguments.
@@ -575,7 +624,7 @@ How Duck types map to wasm values:
 | `f32` | `f32` |
 | `f64` | `f64` |
 | `externref` | `externref` |
-| structs, tuples, `array(T)`, `type` | one wasm value per field, in order |
+| structs, tuples, `array(T)`, `varray(T)`, `type` | one wasm value per field, in order |
 | `tuple()` | nothing |
 
 So `fn f(s: array(u8)) -> Point` is `(i32 len, i32 ptr) -> (f32, f64)` in
@@ -628,6 +677,9 @@ them. Build what you need from structs, pointers, `while` and host functions.
 - Writing `unit` or `void`. The unit type is `tuple()`.
 - Expecting `x as bool`. Write `x != 0`.
 - Expecting `&local`. Only memory behind a pointer has an address.
+- Writing through a `&T` or into an `array(T)`. Declare a `&var T` or a
+  `varray(T)`, and take addresses to write through with `&var place`.
+- Expecting a literal to be writable. Annotate its global as a `varray`.
 - Forgetting to label struct constructor arguments, or to give type arguments
   to a generic struct: `Box(i32)(value: 1)`, not `Box(value: 1)`.
 - Writing `&= |= <<=`. Write `a = a & b`.

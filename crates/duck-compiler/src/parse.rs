@@ -168,8 +168,8 @@ pub enum TypeKind {
     /// `Name`, or `Name(A, B)` given a list of type arguments, which may be
     /// empty as in `Name()`. `None` is no list at all.
     Named(String, Option<Vec<Type>>),
-    /// `&T`
-    Pointer(Box<Type>),
+    /// `&T`, or `&var T`, which can be written through.
+    Pointer(Mutability, Box<Type>),
     /// `module.T`, a type in another module, where `T` is a name or itself
     /// qualified.
     Qualified(Ident, Box<Type>),
@@ -245,8 +245,8 @@ pub enum ExprKind {
     Field(Box<Expr>, Ident),
     /// `pointer.*`
     Deref(Box<Expr>),
-    /// `&place`
-    AddrOf(Box<Expr>),
+    /// `&place`, or `&var place`, which can be written through.
+    AddrOf(Mutability, Box<Expr>),
     /// `value as Type`
     Cast(Box<Expr>, Type),
     /// `fn(A) -> R`, a function type written where a value belongs.
@@ -710,7 +710,8 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Amp => {
                 self.bump();
-                TypeKind::Pointer(Box::new(self.ty()?))
+                let mutability = self.pointer_mutability();
+                TypeKind::Pointer(mutability, Box::new(self.ty()?))
             }
             TokenKind::Fn => {
                 self.bump();
@@ -918,18 +919,32 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> PResult<Expr> {
-        let wrap: fn(Box<Expr>) -> ExprKind = match self.peek().kind {
-            TokenKind::Minus => |e| ExprKind::Unary(UnaryOp::Neg, e),
-            TokenKind::Tilde => |e| ExprKind::Unary(UnaryOp::BitNot, e),
-            TokenKind::Amp => ExprKind::AddrOf,
+        let op = match self.peek().kind {
+            TokenKind::Minus => Some(UnaryOp::Neg),
+            TokenKind::Tilde => Some(UnaryOp::BitNot),
+            TokenKind::Amp => None,
             _ => return self.postfix(),
         };
         let start = self.bump().span;
-        let operand = self.unary()?;
+        let kind = match op {
+            Some(op) => ExprKind::Unary(op, Box::new(self.unary()?)),
+            None => {
+                let mutability = self.pointer_mutability();
+                ExprKind::AddrOf(mutability, Box::new(self.unary()?))
+            }
+        };
         Ok(Expr {
-            kind: wrap(Box::new(operand)),
+            kind,
             span: self.span_from(start),
         })
+    }
+
+    /// The `var` of `&var`, if it's there, after the `&`.
+    fn pointer_mutability(&mut self) -> Mutability {
+        match self.eat(TokenKind::Var) {
+            true => Mutability::Var,
+            false => Mutability::Let,
+        }
     }
 
     /// A primary expression followed by any calls, indexing, field access, or
@@ -1368,7 +1383,8 @@ mod tests {
             ExprKind::Index(e, i) => format!("(index {} {})", sexpr(e), sexpr(i)),
             ExprKind::Field(e, field) => format!("(. {} {})", sexpr(e), field.name),
             ExprKind::Deref(e) => format!("(.* {})", sexpr(e)),
-            ExprKind::AddrOf(e) => format!("(& {})", sexpr(e)),
+            ExprKind::AddrOf(Mutability::Let, e) => format!("(& {})", sexpr(e)),
+            ExprKind::AddrOf(Mutability::Var, e) => format!("(&var {})", sexpr(e)),
             ExprKind::Cast(e, ty) => format!("(as {} {})", sexpr(e), render_ty(ty)),
             ExprKind::FnType(ty) => render_ty(ty),
             ExprKind::Pipe(value, body) => format!("(|> {} {})", sexpr(value), sexpr(body)),
@@ -1383,7 +1399,10 @@ mod tests {
                 let args: Vec<_> = args.iter().map(render_ty).collect();
                 format!("{name}({})", args.join(", "))
             }
-            TypeKind::Pointer(pointee) => format!("&{}", render_ty(pointee)),
+            TypeKind::Pointer(Mutability::Let, pointee) => format!("&{}", render_ty(pointee)),
+            TypeKind::Pointer(Mutability::Var, pointee) => {
+                format!("&var {}", render_ty(pointee))
+            }
             TypeKind::Qualified(module, ty) => format!("{}.{}", module.name, render_ty(ty)),
             TypeKind::Fn(params, ret) => {
                 let params: Vec<_> = params.iter().map(render_ty).collect();
@@ -1552,12 +1571,17 @@ mod tests {
         assert_eq!(expr("&p.x"), "(& (. p x))");
         assert_eq!(expr("-&p.* as u32"), "(as (Neg (& (.* p))) u32)");
         assert_eq!(expr("0 as &&u32"), "(as 0 &&u32)");
-        let src = "fn f(p: &P) -> &array(i32):\n    p.* = 1\n    p.*.x += 1\n    p.*= 2\n";
+        assert_eq!(expr("&var p.x"), "(&var (. p x))");
+        assert_eq!(expr("&var&p.*"), "(&var (& (.* p)))");
+        assert_eq!(expr("a & var_b"), "(BitAnd a var_b)");
+        assert_eq!(expr("0 as &var &u32"), "(as 0 &var &u32)");
+        assert_eq!(expr("(&var P).size"), "(. (&var P) size)");
+        let src = "fn f(p: &var P) -> &array(i32):\n    p.* = 1\n    p.*.x += 1\n    p.*= 2\n";
         let module = parse_src(src).unwrap();
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        assert_eq!(render_ty(&f.sig.params[0].ty), "&P");
+        assert_eq!(render_ty(&f.sig.params[0].ty), "&var P");
         assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "&array(i32)");
         assert_eq!(stmt_kinds(&f.body), vec!["assign", "assign", "assign"]);
         assert_eq!(

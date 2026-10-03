@@ -733,14 +733,15 @@ pub fn shown():
                 r#"  (export "a" (global $a))"#,
             ]
         );
-        assert!(wat.contains("(memory (;0;) 1)"), "{wat}");
+        // No literals, so nothing for memory to start with.
+        assert!(wat.contains("(memory (;0;) 0)"), "{wat}");
     }
 
     #[test]
     fn memory_limits() {
         let settings = Settings {
             memory: MemoryLimits {
-                min_pages: 2,
+                min_pages: Some(2),
                 max_pages: Some(16),
             },
             ..Settings::default()
@@ -874,7 +875,7 @@ struct P:
     a: u8
     b: i16
     c: f64
-fn f(p: &P) -> f64:
+fn f(p: &var P) -> f64:
     p.b = p.a as i16
     return p.c
 ";
@@ -887,7 +888,7 @@ fn f(p: &P) -> f64:
     #[test]
     fn module_functions_are_memory_instructions() {
         let src = "\
-pub fn f(p: &u8, q: &u8, n: u32) -> i32:
+pub fn f(p: &var u8, q: &u8, n: u32) -> i32:
     module.fill(p, 0, n)
     module.copy(p, q, n)
     let all = module.memory()

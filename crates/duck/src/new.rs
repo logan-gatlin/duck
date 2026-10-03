@@ -14,13 +14,14 @@ output = "build/out.wasm"
 # A function taking and returning nothing, run when the module is instantiated.
 start = "main"
 
-[memory]
 # Sizes are B, KiB, MiB, GiB, or pgs (64KiB wasm pages).
-min = "1pgs"
+# [memory]
+# What memory starts with. If not given, it is just enough to hold `static`.
+# min = "1pgs"
 # max = "16MiB"
-# The addresses literals are placed in, which `module.static` is. It must
-# end within `min`.
-static = { start = "0B", end = "64KiB" }
+# The addresses literals are placed in, which `module.static` is. If not
+# given, it starts at 0 and ends where the literals do.
+# static = { start = "0B", end = "64KiB" }
 
 # Packages to `import` by name, each with a [library].
 # [dependencies]
@@ -79,7 +80,7 @@ pub fn new(path: &Path, kind: Kind) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use duck_compiler::file::{MemoryLimits, StaticSection};
+    use duck_compiler::file::MemoryLimits;
 
     use super::*;
     use duck::files::Files;
@@ -99,13 +100,8 @@ mod tests {
             .map(|packages| packages.root().manifest.clone());
         let files = packages.as_ref().ok().map(|packages| {
             let module_manifest = packages.root().manifest.module.as_ref().unwrap();
-            let settings = duck_compiler::file::Settings {
-                memory: module_manifest.memory,
-                static_section: module_manifest.static_section,
-                start: module_manifest.start.clone(),
-            };
             let entry = module.join(&module_manifest.entry);
-            let mut files = Files::new(packages, entry, settings).unwrap();
+            let mut files = Files::new(packages, entry, module_manifest.settings()).unwrap();
             duck_compiler::compile(&mut files).map(|_| ())
         });
         let gitignore = fs::read_to_string(module.join(".gitignore")).unwrap();
@@ -120,13 +116,10 @@ mod tests {
                 output: "build/out.wasm".into(),
                 start: Some("main".to_string()),
                 memory: MemoryLimits {
-                    min_pages: 1,
+                    min_pages: None,
                     max_pages: None,
                 },
-                static_section: StaticSection {
-                    start: 0,
-                    end: 64 * 1024,
-                },
+                static_section: None,
             })
         );
         assert_eq!(manifest.library, None);

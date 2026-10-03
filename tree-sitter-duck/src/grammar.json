@@ -1018,6 +1018,22 @@
           "value": "&"
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "mutability",
+              "content": {
+                "type": "STRING",
+                "value": "var"
+              }
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "FIELD",
           "name": "pointee",
           "content": {
@@ -1859,6 +1875,22 @@
           {
             "type": "STRING",
             "value": "&"
+          },
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "FIELD",
+                "name": "mutability",
+                "content": {
+                  "type": "STRING",
+                  "value": "var"
+                }
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
           },
           {
             "type": "FIELD",

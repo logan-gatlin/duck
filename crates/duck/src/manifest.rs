@@ -38,7 +38,8 @@ pub struct Module {
     /// The function run when the module is instantiated.
     pub start: Option<String>,
     pub memory: MemoryLimits,
-    pub static_section: StaticSection,
+    /// `None` fits it to the literals, from address 0.
+    pub static_section: Option<StaticSection>,
 }
 
 /// What a package offers the packages that depend on it.
@@ -91,8 +92,6 @@ pub enum ManifestError {
     },
     /// Neither a `[module]` nor a `[library]`.
     Empty,
-    /// A `[module]` without a `[memory]`.
-    MissingMemory,
     /// A `[memory]` without a `[module]` to give it to.
     MemoryWithoutModule,
     /// A dependency named something that can't be imported.
@@ -136,13 +135,13 @@ struct RawModule {
     start: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMemory {
-    min: String,
+    min: Option<String>,
     max: Option<String>,
     #[serde(rename = "static")]
-    static_section: RawStaticSection,
+    static_section: Option<RawStaticSection>,
 }
 
 #[derive(Deserialize)]
@@ -173,8 +172,7 @@ impl Manifest {
     pub fn parse(src: &str) -> Result<Self, ManifestError> {
         let raw: Raw = toml::from_str(src).map_err(ManifestError::Toml)?;
         let module = match (raw.module, raw.memory) {
-            (Some(module), Some(memory)) => Some(Module::parse(module, memory)?),
-            (Some(_), None) => return Err(ManifestError::MissingMemory),
+            (Some(module), memory) => Some(Module::parse(module, memory.unwrap_or_default())?),
             (None, Some(_)) => return Err(ManifestError::MemoryWithoutModule),
             (None, None) => None,
         };
@@ -254,24 +252,31 @@ impl Module {
             max,
             static_section,
         } = memory;
-        let min_pages = pages("memory.min", &min)?;
+        let min_pages = min
+            .as_deref()
+            .map(|min| pages("memory.min", min))
+            .transpose()?;
         let max_pages = max
             .as_deref()
             .map(|max| pages("memory.max", max))
             .transpose()?;
-        if let Some(max) = max
-            && max_pages.is_some_and(|max_pages| min_pages > max_pages)
+        if let (Some(min), Some(max)) = (min, max)
+            && min_pages > max_pages
         {
             return Err(ManifestError::MinExceedsMax { min, max });
         }
-        let RawStaticSection { start, end } = static_section;
-        let static_section = StaticSection {
-            start: address("memory.static.start", &start)?,
-            end: address("memory.static.end", &end)?,
-        };
-        if static_section.start > static_section.end {
-            return Err(ManifestError::StaticStartExceedsEnd { start, end });
-        }
+        let static_section = static_section
+            .map(|RawStaticSection { start, end }| {
+                let section = StaticSection {
+                    start: address("memory.static.start", &start)?,
+                    end: address("memory.static.end", &end)?,
+                };
+                if section.start > section.end {
+                    return Err(ManifestError::StaticStartExceedsEnd { start, end });
+                }
+                Ok(section)
+            })
+            .transpose()?;
         Ok(Self {
             entry: module.entry,
             output: module.output,
@@ -291,13 +296,13 @@ impl Library {
     pub fn settings(&self) -> Settings {
         Settings {
             memory: MemoryLimits {
-                min_pages: MAX_PAGES,
+                min_pages: Some(MAX_PAGES),
                 max_pages: None,
             },
-            static_section: StaticSection {
+            static_section: Some(StaticSection {
                 start: 0,
                 end: u32::MAX,
-            },
+            }),
             start: None,
         }
     }
@@ -369,7 +374,6 @@ impl fmt::Display for ManifestError {
                 "memory.static.start \"{start}\" exceeds memory.static.end \"{end}\""
             ),
             Self::Empty => write!(f, "needs a [module] or [library] table"),
-            Self::MissingMemory => write!(f, "[module] needs a [memory] table"),
             Self::MemoryWithoutModule => write!(f, "[memory] needs a [module] table"),
             Self::DependencyName(name) => {
                 write!(f, "dependency name `{name}` is not an identifier")
@@ -495,13 +499,13 @@ mod tests {
                     output: "build/out.wasm".into(),
                     start: None,
                     memory: MemoryLimits {
-                        min_pages: 1,
+                        min_pages: Some(1),
                         max_pages: Some(256),
                     },
-                    static_section: StaticSection {
+                    static_section: Some(StaticSection {
                         start: 0,
                         end: 64 * 1024,
-                    },
+                    }),
                 }),
                 library: None,
                 dependencies: BTreeMap::new(),
@@ -514,16 +518,40 @@ mod tests {
                 .unwrap();
         assert_eq!(
             manifest.module.unwrap().static_section,
-            StaticSection {
+            Some(StaticSection {
                 start: 1024,
                 end: 1025
-            }
+            })
         );
         let manifest = Manifest::parse(&format!(
             "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\nstart = \"init\"\n\n[memory]\nmin = \"1pgs\"\n{STATIC}",
         ))
         .unwrap();
         assert_eq!(manifest.module.unwrap().start.as_deref(), Some("init"));
+    }
+
+    #[test]
+    fn memory_is_optional() {
+        let unset = MemoryLimits {
+            min_pages: None,
+            max_pages: None,
+        };
+        let module = |memory: &str| {
+            let src = format!("[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n{memory}");
+            Manifest::parse(&src).unwrap().module.unwrap()
+        };
+        for memory in ["", "[memory]\n"] {
+            let module = module(memory);
+            assert_eq!(module.memory, unset, "{memory:?}");
+            assert_eq!(module.static_section, None, "{memory:?}");
+        }
+        let module = module("[memory]\nmax = \"2pgs\"\n");
+        assert_eq!(module.memory.max_pages, Some(2));
+        assert_eq!(module.settings().memory.min_pages, None);
+        assert_eq!(module.settings().static_section, None);
+        let module = with_static(STATIC).unwrap().module.unwrap();
+        assert_eq!(module.memory, unset);
+        assert!(module.static_section.is_some());
     }
 
     #[test]
@@ -611,10 +639,6 @@ mod tests {
         let error = |src: &str| Manifest::parse(src).unwrap_err().to_string();
         assert_eq!(error(""), "needs a [module] or [library] table");
         assert_eq!(
-            error("[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n"),
-            "[module] needs a [memory] table"
-        );
-        assert_eq!(
             error(&format!(
                 "[library]\nentry = \"a.duck\"\n[memory]\nmin = \"1pgs\"\n{STATIC}"
             )),
@@ -637,7 +661,6 @@ mod tests {
             error("min = \"2MiB\"\nmax = \"1MiB\"\n"),
             "memory.min \"2MiB\" exceeds memory.max \"1MiB\""
         );
-        assert!(error("max = \"1MiB\"\n").contains("missing field `min`"));
         assert!(
             error("min = \"1pgs\"\nmax_pages = \"1pgs\"\n").contains("unknown field `max_pages`")
         );
@@ -655,7 +678,7 @@ mod tests {
             error("min = \"1pgs\"\nstatic = { start = \"0B\", end = \"1kb\" }\n"),
             "memory.static.end \"1kb\" is not a number followed by B, KiB, MiB, GiB, or pgs"
         );
-        assert!(error("min = \"1pgs\"\n").contains("missing field `static`"));
+        assert!(error("min = \"1pgs\"\nstatic = {}\n").contains("missing field `start`"));
         assert!(
             error("min = \"1pgs\"\nstatic = { start = \"0B\" }\n").contains("missing field `end`")
         );

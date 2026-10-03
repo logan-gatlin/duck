@@ -66,8 +66,10 @@ impl Checker {
     }
 
     /// The function comparing two arrays of type `ty`, created the first time
-    /// it's asked for and lowered by [`Self::lower_eq_func`].
+    /// it's asked for and lowered by [`Self::lower_eq_func`]. A `varray`
+    /// compares through the function of its `array`.
     fn eq_func(&mut self, ty: Ty) -> FuncId {
+        let ty = self.with_writes(ty, false);
         if let Some(id) = self.eq_funcs.get(&ty) {
             return *id;
         }

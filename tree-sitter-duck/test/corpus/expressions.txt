@@ -167,6 +167,8 @@ Pointers
 let _ = p.*.x.*
 let _ = &p.x
 let _ = -&p.* as u32
+let _ = &var p.x
+let _: &var &u8 = (&var P).size
 
 ---
 
@@ -192,7 +194,24 @@ let _ = -&p.* as u32
           (dereference_expression
             (identifier))))
       (named_type
-        (identifier)))))
+        (identifier))))
+  (binding
+    (discard)
+    (address_of_expression
+      (field_expression
+        (identifier)
+        (identifier))))
+  (binding
+    (discard)
+    (pointer_type
+      (pointer_type
+        (named_type
+          (identifier))))
+    (field_expression
+      (parenthesized_expression
+        (address_of_expression
+          (identifier)))
+      (identifier))))
 
 ====================
 Labelled arguments
