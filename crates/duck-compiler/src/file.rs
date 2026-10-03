@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FileId(usize);
 
 pub trait FileManager {
@@ -12,6 +12,10 @@ pub trait FileManager {
     /// imports it. Deduplicates with already opened files, so every path to
     /// the same file gives the same id. Returns `None` when no file is found
     fn open(&mut self, from: FileId, path: &str) -> Option<FileId>;
+    /// Attempt to open the library of the dependency `name` of the package
+    /// that the file `from` is in. Returns `None` when there is no such
+    /// dependency
+    fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId>;
     /// How to compile the module the files make up
     fn settings(&mut self) -> Settings;
 
@@ -77,6 +81,10 @@ impl FileManager for DummyManager {
     }
 
     fn open(&mut self, _from: FileId, _path: &str) -> Option<FileId> {
+        None
+    }
+
+    fn open_package(&mut self, _from: FileId, _name: &str) -> Option<FileId> {
         None
     }
 

@@ -7,12 +7,13 @@ use std::collections::HashMap;
 
 use crate::ir::{self, FuncId};
 use crate::lex::Span;
-use crate::parse::{self, Arg, ExprKind};
+use crate::load::Program;
+use crate::parse::{self, Arg};
 
 use super::generic::Arity;
 use super::{
     Body, Checker, FuncSig, GenericFnId, InstanceSite, Item, Synth, Ty, TypeErrorKind, Value,
-    generic_fn_decls, is_literal,
+    generic_fn_decls, is_literal, path_text,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -41,16 +42,8 @@ pub(super) struct FnInstance {
 }
 
 impl Checker {
-    /// Declares generic function `decl`, which `item` declares.
-    pub(super) fn declare_generic_fn(
-        &mut self,
-        item: &parse::Item,
-        decl: &parse::FnDecl,
-    ) -> GenericFnId {
-        if item.is_pub {
-            let kind = TypeErrorKind::PubGeneric(decl.sig.name.name.clone());
-            self.error(kind, decl.sig.name.span);
-        }
+    /// Declares generic function `decl`.
+    pub(super) fn declare_generic_fn(&mut self, decl: &parse::FnDecl) -> GenericFnId {
         let params = self.new_params(&decl.sig.type_params);
         self.generic_fns.push(GenericFn {
             params,
@@ -64,11 +57,15 @@ impl Checker {
     }
 
     /// Resolves the signature of every generic function.
-    pub(super) fn define_generic_fns(&mut self, module: &parse::Module) {
-        for (i, (_, decl)) in generic_fn_decls(module).enumerate() {
+    pub(super) fn define_generic_fns(&mut self, program: &Program) {
+        for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
+            self.module = item.span.file;
             let params = self.generic_fns[i].params.clone();
             self.declare_type_params(&decl.sig.type_params, &params);
             let (params, ret) = self.resolve_sig(&decl.sig);
+            if item.is_pub {
+                self.check_public_sig(&decl.sig, &params, ret);
+            }
             self.type_params.clear();
             let sig = &mut self.generic_fns[i].sig;
             sig.params = params;
@@ -135,13 +132,14 @@ impl Checker {
     /// Lowers function `id`, an instance of a generic function.
     pub(super) fn lower_instance(
         &mut self,
-        module: &parse::Module,
+        program: &Program,
         id: FuncId,
         instance: FnInstance,
     ) -> ir::Func {
-        let (item, decl) = generic_fn_decls(module)
+        let (item, decl) = generic_fn_decls(program)
             .nth(instance.generic.0 as usize)
             .unwrap();
+        self.module = item.span.file;
         let names = decl.sig.type_params.iter().map(|p| p.name.clone());
         self.type_params = names.zip(instance.args).collect();
         self.instance_chain = instance.chain;
@@ -266,13 +264,7 @@ impl Body<'_> {
 
     /// Whether `expr` names a function that no variable shadows.
     pub(super) fn names_fn(&self, expr: &parse::Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => matches!(
-                self.ck.items.get(name),
-                Some(Item::Func(_) | Item::GenericFn(_))
-            ),
-            _ => false,
-        }
+        matches!(self.named(expr), Some(Item::Func(_) | Item::GenericFn(_)))
     }
 
     /// `callee(args)`, where `callee` is the function `func` names given
@@ -285,12 +277,10 @@ impl Body<'_> {
         args: &[Arg],
         span: Span,
     ) -> (Ty, Value) {
-        let ExprKind::Name(name) = &func.kind else {
-            unreachable!("`names_fn` only accepts names")
-        };
+        let name = path_text(func);
         let type_args = self.ck.type_args(type_args);
-        let generic = match self.ck.items.get(name) {
-            Some(Item::GenericFn(generic)) => Some(*generic),
+        let generic = match self.named(func) {
+            Some(Item::GenericFn(generic)) => Some(generic),
             _ => {
                 self.error(TypeErrorKind::NotGeneric(name.clone()), callee.span);
                 None
@@ -298,7 +288,7 @@ impl Body<'_> {
         };
         if let (Some(generic), Some(type_args)) = (generic, type_args) {
             let arity = Arity::Exactly(self.ck.generic_fns[generic.0 as usize].params.len());
-            match arity.check(name, Some(type_args.len())) {
+            match arity.check(&name, Some(type_args.len())) {
                 Some(kind) => self.error(kind, callee.span),
                 None => return self.generic_fn_call(generic, Some(type_args), args, span),
             }

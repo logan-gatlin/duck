@@ -9,12 +9,13 @@ use std::fmt;
 use std::mem;
 use std::ops::Range;
 
-use crate::file::Settings;
+use crate::file::{FileId, Settings};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
     UnOp as IrUnOp, ValType,
 };
 use crate::lex::Span;
+use crate::load::Program;
 use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
     PatternKind, StmtKind, TypeKind, UnaryOp,
@@ -328,8 +329,23 @@ pub enum TypeErrorKind {
     ConstTrap,
     /// A `pub` item whose export name is taken by the module itself.
     ReservedExport(String),
-    /// A `pub` generic function, which has no one function to export.
-    PubGeneric(String),
+    /// An item of another module that isn't `pub`.
+    Private(String),
+    /// A name that no item of the module `module` has.
+    NoItem {
+        module: String,
+        item: String,
+    },
+    /// A field that isn't `pub`, used outside the module of its struct.
+    PrivateField {
+        ty: String,
+        field: String,
+    },
+    /// A type that isn't `pub` in the type of `item`, which is.
+    PrivateInPublic {
+        ty: String,
+        item: String,
+    },
     /// A start function named in the [`Settings`] that isn't a function.
     UnknownStart(String),
     /// A start function that takes arguments or returns something.
@@ -351,7 +367,13 @@ pub enum TypeErrorKind {
 
 #[derive(Default)]
 struct Checker {
-    items: HashMap<String, Item>,
+    /// The names declared in each module: its items and the modules it
+    /// imports.
+    scopes: HashMap<FileId, HashMap<String, Entry>>,
+    /// The module whose names are in scope.
+    module: FileId,
+    /// The module whose `pub` items are exported.
+    entry: FileId,
     /// Struct declarations in declaration order, then instances of generic
     /// ones as they are used.
     structs: Vec<StructDef>,
@@ -412,18 +434,37 @@ struct Checker {
     errors: Vec<TypeError>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Item {
     Func(FuncId),
     GenericFn(GenericFnId),
     Struct(StructId),
     Enum(EnumId),
     Global(usize),
+    /// A module, by the name it's imported as.
+    Module(FileId),
+}
+
+/// Why a module's item can't be reached from another.
+enum Member {
+    Private,
+    Missing,
+}
+
+/// A name declared in a module.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    item: Item,
+    /// Whether other modules can see it.
+    is_pub: bool,
 }
 
 struct StructDef {
     /// The declared name, or for an instance, its type as written.
     name: String,
+    /// The module that declares it, or for an instance, its declaration.
+    module: FileId,
+    is_pub: bool,
     /// The [`Ty::Param`] of each type parameter of a generic declaration.
     params: Vec<Ty>,
     /// Set for instances of generic declarations.
@@ -437,8 +478,7 @@ struct StructDef {
 struct FieldDef {
     name: String,
     ty: Ty,
-    /// Recorded for when modules can see each other's fields; not enforced.
-    #[allow(dead_code)]
+    /// Whether modules other than the struct's can use it.
     is_pub: bool,
     span: Span,
 }
@@ -757,10 +797,12 @@ impl fmt::Display for TypeErrorKind {
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
             Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
-            Self::PubGeneric(name) => write!(
-                f,
-                "generic function `{name}` cannot be `pub`: each instance is a separate function"
-            ),
+            Self::Private(name) => write!(f, "`{name}` is private"),
+            Self::NoItem { module, item } => write!(f, "`{module}` has no item `{item}`"),
+            Self::PrivateField { ty, field } => write!(f, "field `{field}` of `{ty}` is private"),
+            Self::PrivateInPublic { ty, item } => {
+                write!(f, "private type `{ty}` in the type of `pub` item `{item}`")
+            }
             Self::InvalidStart(name) => write!(
                 f,
                 "start function `{name}` must take no arguments and return nothing"
@@ -800,25 +842,28 @@ impl fmt::Display for TypeError {
 
 impl std::error::Error for TypeError {}
 
-/// Resolves names in, type checks, and lowers a parsed module, giving it the
-/// memory and start function `settings` describe.
+/// Resolves names in, type checks, and lowers a loaded program to one wasm
+/// module, giving it the memory and start function `settings` describe.
 ///
-/// Checking continues past errors, so every error in the module is reported
+/// Checking continues past errors, so every error in the program is reported
 /// at once.
-pub fn check(module: &parse::Module, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
-    let mut ck = Checker::default();
-    ck.declare(module);
-    ck.define_structs(module);
-    ck.define_funcs(module);
-    ck.define_globals(module);
+pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
+    let mut ck = Checker {
+        entry: program.entry,
+        ..Checker::default()
+    };
+    ck.declare(program);
+    ck.define_structs(program);
+    ck.define_funcs(program);
+    ck.define_globals(program);
     ck.end_data(settings);
     let start = settings
         .start
         .as_ref()
-        .and_then(|name| ck.resolve_start(module, name));
-    let imports = ck.lower_imports(module);
-    let mut funcs = ck.lower_funcs(module);
-    funcs.extend(ck.lower_synths(module));
+        .and_then(|name| ck.resolve_start(program, name));
+    let imports = ck.lower_imports(program);
+    let mut funcs = ck.lower_funcs(program);
+    funcs.extend(ck.lower_synths(program));
     if ck.errors.is_empty() {
         Ok(ir::Module {
             memory: ir::Memory {
@@ -847,40 +892,46 @@ impl Checker {
     }
 
     /// Registers every item's name, so bodies can refer to later items.
-    fn declare(&mut self, module: &parse::Module) {
-        self.import_count = extern_fns(module).count() as u32;
-        self.funcs = fn_sigs(module)
-            .map(|sig| FuncSig {
+    fn declare(&mut self, program: &Program) {
+        self.import_count = extern_fns(program).count() as u32;
+        self.funcs = fn_sigs(program)
+            .map(|(_, sig)| FuncSig {
                 name: sig.name.name.clone(),
                 params: Vec::new(),
                 ret: Ty::Unit,
             })
             .collect();
+        for import in &program.imports {
+            self.module = import.module;
+            self.declare_name(&import.name, Item::Module(import.target), import.is_pub);
+        }
         let (mut next_import, mut next_def) = (0, self.import_count);
-        for item in &module.items {
+        for item in &program.items {
+            self.module = item.span.file;
             let (name, entry) = match &item.kind {
                 ItemKind::Struct(s) => {
                     let id = StructId(self.structs.len() as u32);
                     let params = self.new_params(&s.params);
                     self.structs.push(StructDef {
                         name: s.name.name.clone(),
+                        module: self.module,
+                        is_pub: item.is_pub,
                         params,
                         instance: None,
                         fields: Vec::new(),
                     });
                     (&s.name, Item::Struct(id))
                 }
-                ItemKind::Fn(f) if !f.sig.type_params.is_empty() => (
-                    &f.sig.name,
-                    Item::GenericFn(self.declare_generic_fn(item, f)),
-                ),
+                ItemKind::Fn(f) if !f.sig.type_params.is_empty() => {
+                    (&f.sig.name, Item::GenericFn(self.declare_generic_fn(f)))
+                }
                 ItemKind::Fn(f) => {
                     next_def += 1;
                     (&f.sig.name, Item::Func(FuncId(next_def - 1)))
                 }
                 ItemKind::Extern(block) => {
                     for f in &block.fns {
-                        self.declare_name(&f.sig.name, Item::Func(FuncId(next_import)));
+                        self.declare_name(&f.sig.name, Item::Func(FuncId(next_import)), f.is_pub);
                         next_import += 1;
                     }
                     continue;
@@ -892,7 +943,7 @@ impl Checker {
                     }
                     continue;
                 }
-                ItemKind::Enum(e) => (&e.name, Item::Enum(self.declare_enum(e))),
+                ItemKind::Enum(e) => (&e.name, Item::Enum(self.declare_enum(e, item.is_pub))),
                 // Replaced by the imported items when loading.
                 ItemKind::Import(_) => continue,
             };
@@ -902,38 +953,84 @@ impl Checker {
 
     /// Declares a name defined by `item`, which may export it.
     fn declare_item(&mut self, item: &parse::Item, name: &Ident, entry: Item) {
-        self.declare_name(name, entry);
-        if item.is_pub && [MEMORY_EXPORT, DATA_END_EXPORT].contains(&name.name.as_str()) {
+        self.declare_name(name, entry, item.is_pub);
+        if self.exports(item) && [MEMORY_EXPORT, DATA_END_EXPORT].contains(&name.name.as_str()) {
             self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
         }
     }
 
-    fn declare_name(&mut self, name: &Ident, entry: Item) {
-        if self.items.contains_key(&name.name) || [ARRAY, TUPLE, TYPE].contains(&name.name.as_str())
-        {
+    /// Declares `name` in the current module.
+    fn declare_name(&mut self, name: &Ident, item: Item, is_pub: bool) {
+        let scope = self.scopes.entry(self.module).or_default();
+        if scope.contains_key(&name.name) || [ARRAY, TUPLE, TYPE].contains(&name.name.as_str()) {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
-            self.items.insert(name.name.clone(), entry);
+            scope.insert(name.name.clone(), Entry { item, is_pub });
+        }
+    }
+
+    /// Whether `item` is exported: it's `pub` and in the entry module.
+    fn exports(&self, item: &parse::Item) -> bool {
+        item.is_pub && item.span.file == self.entry
+    }
+
+    /// The item `name` names in the current module.
+    fn item(&self, name: &str) -> Option<Item> {
+        let entry = self.scopes.get(&self.module)?.get(name)?;
+        Some(entry.item)
+    }
+
+    /// The item `name` names in `module`, as other modules see it.
+    fn member_of(&self, module: FileId, name: &str) -> Result<Item, Member> {
+        let entry = self.scopes.get(&module).and_then(|scope| scope.get(name));
+        match entry {
+            Some(entry) if entry.is_pub || module == self.module => Ok(entry.item),
+            Some(_) => Err(Member::Private),
+            None => Err(Member::Missing),
+        }
+    }
+
+    /// [`Self::member_of`], reporting why `name` is unreachable through
+    /// `path`, the module as written.
+    fn reach(&mut self, module: FileId, path: &str, name: &Ident) -> Option<Item> {
+        match self.member_of(module, &name.name) {
+            Ok(item) => Some(item),
+            Err(Member::Private) => {
+                self.error(TypeErrorKind::Private(name.name.clone()), name.span);
+                None
+            }
+            Err(Member::Missing) => {
+                let kind = TypeErrorKind::NoItem {
+                    module: path.to_string(),
+                    item: name.name.clone(),
+                };
+                self.error(kind, name.span);
+                None
+            }
         }
     }
 
     /// Resolves the type of every enum's values and every struct's fields,
     /// reporting generic structs that recurse without end and types that
     /// contain themselves, then gives every instance used so far its fields.
-    fn define_structs(&mut self, module: &parse::Module) {
-        self.resolve_enums(module);
-        let decls = module.items.iter().filter_map(|item| match &item.kind {
+    fn define_structs(&mut self, program: &Program) {
+        self.resolve_enums(program);
+        let decls = program.items.iter().filter_map(|item| match &item.kind {
             ItemKind::Struct(s) => Some(s),
             _ => None,
         });
         let mut decl_count = 0;
         for (id, decl) in decls.enumerate() {
             decl_count += 1;
+            self.module = decl.name.span.file;
             let params = self.structs[id].params.clone();
             self.declare_type_params(&decl.params, &params);
             let mut fields: Vec<FieldDef> = Vec::new();
             for field in &decl.fields {
                 let ty = self.resolve_ty(&field.ty);
+                if self.structs[id].is_pub && field.is_pub {
+                    self.check_public(ty, field.ty.span, &field.name.name);
+                }
                 if fields.iter().any(|f| f.name == field.name.name) {
                     let kind = TypeErrorKind::DuplicateField(field.name.name.clone());
                     self.error(kind, field.name.span);
@@ -1061,13 +1158,60 @@ impl Checker {
     }
 
     /// Resolves the signature of every function, including generic ones.
-    fn define_funcs(&mut self, module: &parse::Module) {
-        for (id, decl) in fn_sigs(module).enumerate() {
+    fn define_funcs(&mut self, program: &Program) {
+        for (id, (is_pub, decl)) in fn_sigs(program).enumerate() {
+            self.module = decl.name.span.file;
             let (params, ret) = self.resolve_sig(decl);
+            if is_pub {
+                self.check_public_sig(decl, &params, ret);
+            }
             self.funcs[id].params = params;
             self.funcs[id].ret = ret;
         }
-        self.define_generic_fns(module);
+        self.define_generic_fns(program);
+    }
+
+    /// Reports types in `sig`, resolved as `params` and `ret`, that aren't
+    /// `pub`.
+    fn check_public_sig(&mut self, sig: &FnSig, params: &[(String, Ty)], ret: Ty) {
+        let name = &sig.name.name;
+        for (param, (_, ty)) in sig.params.iter().zip(params) {
+            self.check_public(*ty, param.ty.span, name);
+        }
+        if let Some(written) = &sig.ret {
+            self.check_public(ret, written.span, name);
+        }
+    }
+
+    /// Reports a type in `ty`, written at `span` in the type of `pub` item
+    /// `item`, that isn't `pub`.
+    fn check_public(&mut self, ty: Ty, span: Span, item: &str) {
+        if let Some(private) = self.private_part(ty) {
+            let kind = TypeErrorKind::PrivateInPublic {
+                ty: self.ty_name(private),
+                item: item.to_string(),
+            };
+            self.error(kind, span);
+        }
+    }
+
+    /// The first struct or enum in `ty` that isn't `pub`.
+    fn private_part(&self, ty: Ty) -> Option<Ty> {
+        match ty {
+            Ty::Struct(id) => {
+                let def = &self.structs[id.0 as usize];
+                if !def.is_pub {
+                    return Some(ty);
+                }
+                let args = def.instance.iter().flat_map(|instance| &instance.args);
+                args.into_iter().find_map(|arg| self.private_part(*arg))
+            }
+            Ty::Enum(id) => (!self.enums[id.0 as usize].is_pub).then_some(ty),
+            _ => self
+                .components(ty)
+                .into_iter()
+                .find_map(|component| self.private_part(component)),
+        }
     }
 
     /// The types of the parameters and result of `sig`.
@@ -1086,9 +1230,10 @@ impl Checker {
 
     /// Checks and folds global initializers and the values of enum members,
     /// in declaration order.
-    fn define_globals(&mut self, module: &parse::Module) {
+    fn define_globals(&mut self, program: &Program) {
         let (mut index, mut enum_index) = (0, 0);
-        for item in &module.items {
+        for item in &program.items {
+            self.module = item.span.file;
             let decl = match &item.kind {
                 ItemKind::Binding(decl) => decl,
                 ItemKind::Enum(decl) => {
@@ -1110,7 +1255,7 @@ impl Checker {
                 for ((name, vt), i) in leaves.into_iter().zip(bound.leaves) {
                     slots.push(GlobalId(self.ir_globals.len() as u32));
                     self.ir_globals.push(ir::Global {
-                        export: item.is_pub.then(|| name.clone()),
+                        export: self.exports(item).then(|| name.clone()),
                         name,
                         ty: vt,
                         mutable,
@@ -1118,6 +1263,9 @@ impl Checker {
                     });
                 }
                 let ty = bound.ty;
+                if item.is_pub {
+                    self.check_public(ty, bound.span, bound.name);
+                }
                 self.globals[index] = Some(GlobalDef { ty, mutable, slots });
                 index += 1;
             }
@@ -1149,14 +1297,15 @@ impl Checker {
 
     /// The function `name`, which must take and return nothing. `None` after
     /// reporting an error.
-    fn resolve_start(&mut self, module: &parse::Module, name: &str) -> Option<FuncId> {
-        if let Some(&Item::GenericFn(generic)) = self.items.get(name) {
-            let (_, decl) = generic_fn_decls(module).nth(generic.0 as usize).unwrap();
+    fn resolve_start(&mut self, program: &Program, name: &str) -> Option<FuncId> {
+        self.module = self.entry;
+        if let Some(Item::GenericFn(generic)) = self.item(name) {
+            let (_, decl) = generic_fn_decls(program).nth(generic.0 as usize).unwrap();
             let span = decl.sig.name.span;
             self.error(TypeErrorKind::InvalidStart(name.to_string()), span);
             return None;
         }
-        let Some(&Item::Func(id)) = self.items.get(name) else {
+        let Some(Item::Func(id)) = self.item(name) else {
             self.errors.push(TypeError {
                 kind: TypeErrorKind::UnknownStart(name.to_string()),
                 span: None,
@@ -1166,15 +1315,15 @@ impl Checker {
         };
         let sig = &self.funcs[id.0 as usize];
         if !sig.params.is_empty() || !matches!(sig.ret, Ty::Unit | Ty::Error) {
-            let span = fn_sigs(module).nth(id.0 as usize).unwrap().name.span;
+            let span = fn_sigs(program).nth(id.0 as usize).unwrap().1.name.span;
             self.error(TypeErrorKind::InvalidStart(name.to_string()), span);
             return None;
         }
         Some(id)
     }
 
-    fn lower_imports(&self, module: &parse::Module) -> Vec<ir::Import> {
-        let imports = extern_fns(module).zip(&self.funcs);
+    fn lower_imports(&self, program: &Program) -> Vec<ir::Import> {
+        let imports = extern_fns(program).zip(&self.funcs);
         imports
             .map(|((block, decl), sig)| ir::Import {
                 name: sig.name.clone(),
@@ -1193,11 +1342,12 @@ impl Checker {
             .collect()
     }
 
-    fn lower_funcs(&mut self, module: &parse::Module) -> Vec<ir::Func> {
+    fn lower_funcs(&mut self, program: &Program) -> Vec<ir::Func> {
         let mut funcs = Vec::new();
-        for (i, (item, decl)) in fn_decls(module).enumerate() {
+        for (i, (item, decl)) in fn_decls(program).enumerate() {
+            self.module = item.span.file;
             let sig = self.funcs[self.import_count as usize + i].clone();
-            let export = item.is_pub.then(|| sig.name.clone());
+            let export = self.exports(item).then(|| sig.name.clone());
             funcs.push(self.lower_body(sig, &decl.body, item.span, export));
         }
         funcs
@@ -1241,7 +1391,7 @@ impl Checker {
 
     /// Lowers every function in `synths`, including those that lowering the
     /// others creates.
-    fn lower_synths(&mut self, module: &parse::Module) -> Vec<ir::Func> {
+    fn lower_synths(&mut self, program: &Program) -> Vec<ir::Func> {
         let first = self.funcs.len() - self.synths.len();
         let mut funcs = Vec::new();
         while funcs.len() < self.synths.len() {
@@ -1250,7 +1400,7 @@ impl Checker {
                 Synth::Eq(ty) => self.lower_eq_func(id, *ty),
                 Synth::Instance(instance) => {
                     let instance = instance.clone();
-                    self.lower_instance(module, id, instance)
+                    self.lower_instance(program, id, instance)
                 }
             };
             funcs.push(func);
@@ -1260,61 +1410,14 @@ impl Checker {
 
     fn resolve_ty(&mut self, ty: &parse::Type) -> Ty {
         match &ty.kind {
-            TypeKind::Named(name, args) => {
-                let param = self.type_params.iter().find(|(p, _)| p == name);
-                let arity = match param {
-                    Some(_) => Some(Arity::Plain),
-                    None => self.type_arity(name),
-                };
-                let Some(arity) = arity else {
-                    self.error(TypeErrorKind::UnknownType(name.clone()), ty.span);
-                    return Ty::Error;
-                };
-                if let Some(kind) = arity.check(name, args.as_ref().map(Vec::len)) {
-                    self.error(kind, ty.span);
-                    return Ty::Error;
-                }
-                if let Some((_, param)) = param {
-                    return *param;
-                }
-                let args: Vec<_> = args
-                    .iter()
-                    .flatten()
-                    .map(|arg| self.resolve_ty(arg))
-                    .collect();
-                if args.contains(&Ty::Error) {
+            TypeKind::Named(name, args) => self.resolve_named(None, name, args, ty.span),
+            TypeKind::Qualified(module, inner) => match self.item(&module.name) {
+                Some(Item::Module(target)) => self.resolve_member_ty(target, &module.name, inner),
+                _ => {
+                    self.error(TypeErrorKind::UnknownName(module.name.clone()), module.span);
                     Ty::Error
-                } else if let Some(prim) = Prim::from_name(name) {
-                    Ty::Prim(prim)
-                } else if name == EXTERNREF {
-                    Ty::ExternRef
-                } else if name == TYPE {
-                    Ty::Type
-                } else if name == TUPLE && args.is_empty() {
-                    Ty::Unit
-                } else if name == TUPLE {
-                    self.tuple_of(args)
-                } else if name == ARRAY {
-                    match args[0] {
-                        // Struct fields are checked once every struct is defined.
-                        elem if self.structs_defined && !self.storable(elem) => {
-                            let kind = TypeErrorKind::NotStorable(self.ty_name(elem));
-                            self.error(kind, ty.span);
-                            Ty::Error
-                        }
-                        elem => self.array_of(elem),
-                    }
-                } else if let Some(Item::Struct(id)) = self.items.get(name).copied() {
-                    match args.is_empty() {
-                        true => Ty::Struct(id),
-                        false => self.instantiate(id, args, ty.span),
-                    }
-                } else if let Some(Item::Enum(id)) = self.items.get(name).copied() {
-                    Ty::Enum(id)
-                } else {
-                    unreachable!("`type_arity` knows every type")
                 }
-            }
+            },
             TypeKind::Pointer(pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
@@ -1325,6 +1428,108 @@ impl Checker {
                 }
                 pointee => self.ptr_to(pointee),
             },
+        }
+    }
+
+    /// Resolves `ty`, written after `path.` where `path` names `module`.
+    fn resolve_member_ty(&mut self, module: FileId, path: &str, ty: &parse::Type) -> Ty {
+        match &ty.kind {
+            TypeKind::Named(name, args) => {
+                let ident = Ident {
+                    name: name.clone(),
+                    span: ty.span,
+                };
+                match self.reach(module, path, &ident) {
+                    Some(item) => self.resolve_named(Some(item), name, args, ty.span),
+                    None => Ty::Error,
+                }
+            }
+            TypeKind::Qualified(next, inner) => match self.reach(module, path, next) {
+                Some(Item::Module(target)) => {
+                    self.resolve_member_ty(target, &format!("{path}.{}", next.name), inner)
+                }
+                Some(_) => {
+                    self.error(TypeErrorKind::UnknownName(next.name.clone()), next.span);
+                    Ty::Error
+                }
+                None => Ty::Error,
+            },
+            TypeKind::Pointer(_) => unreachable!("only names are qualified"),
+        }
+    }
+
+    /// Resolves the type `name`, given type arguments `args` if any, written
+    /// at `span`. `member` is the item `name` names in another module, which
+    /// it is qualified by; otherwise `name` is resolved in the current one.
+    fn resolve_named(
+        &mut self,
+        member: Option<Item>,
+        name: &str,
+        args: &Option<Vec<parse::Type>>,
+        span: Span,
+    ) -> Ty {
+        let param = match member {
+            Some(_) => None,
+            None => self.type_params.iter().find(|(p, _)| p == name),
+        };
+        let arity = match (param, member) {
+            (Some(_), _) => Some(Arity::Plain),
+            (None, Some(item)) => self.item_arity(item),
+            (None, None) => self.type_arity(name),
+        };
+        let Some(arity) = arity else {
+            self.error(TypeErrorKind::UnknownType(name.to_string()), span);
+            return Ty::Error;
+        };
+        if let Some(kind) = arity.check(name, args.as_ref().map(Vec::len)) {
+            self.error(kind, span);
+            return Ty::Error;
+        }
+        if let Some((_, param)) = param {
+            return *param;
+        }
+        let args: Vec<_> = args
+            .iter()
+            .flatten()
+            .map(|arg| self.resolve_ty(arg))
+            .collect();
+        // Built-in types win over items of the same name.
+        let item = match member {
+            Some(_) => member,
+            None if is_builtin_type(name) => None,
+            None => self.item(name),
+        };
+        if args.contains(&Ty::Error) {
+            Ty::Error
+        } else if let Some(Item::Struct(id)) = item {
+            match args.is_empty() {
+                true => Ty::Struct(id),
+                false => self.instantiate(id, args, span),
+            }
+        } else if let Some(Item::Enum(id)) = item {
+            Ty::Enum(id)
+        } else if let Some(prim) = Prim::from_name(name) {
+            Ty::Prim(prim)
+        } else if name == EXTERNREF {
+            Ty::ExternRef
+        } else if name == TYPE {
+            Ty::Type
+        } else if name == TUPLE && args.is_empty() {
+            Ty::Unit
+        } else if name == TUPLE {
+            self.tuple_of(args)
+        } else if name == ARRAY {
+            match args[0] {
+                // Struct fields are checked once every struct is defined.
+                elem if self.structs_defined && !self.storable(elem) => {
+                    let kind = TypeErrorKind::NotStorable(self.ty_name(elem));
+                    self.error(kind, span);
+                    Ty::Error
+                }
+                elem => self.array_of(elem),
+            }
+        } else {
+            unreachable!("`type_arity` knows every type")
         }
     }
 
@@ -1524,6 +1729,17 @@ impl Checker {
                 .position(|name| *name == field.name),
             _ => None,
         };
+        if let (Some(index), Ty::Struct(id)) = (index, ty) {
+            let def = &self.structs[id.0 as usize];
+            if !def.fields[index].is_pub && def.module != self.module {
+                let kind = TypeErrorKind::PrivateField {
+                    ty: def.name.clone(),
+                    field: field.name.clone(),
+                };
+                self.error(kind, field.span);
+                return None;
+            }
+        }
         if let Some(index) = index {
             let members = self.members(ty);
             let start = members[..index]
@@ -2036,21 +2252,8 @@ impl<'c> Body<'c> {
                         slots: Slots::Local(var.slots.clone()),
                     });
                 }
-                match self.ck.items.get(name).copied() {
-                    Some(Item::Global(index)) => {
-                        let global = self.ck.globals[index].as_ref()?;
-                        Some(Place {
-                            name: name.clone(),
-                            ty: global.ty,
-                            mutable: global.mutable,
-                            pre: Vec::new(),
-                            slots: Slots::Global(global.slots.clone()),
-                        })
-                    }
-                    Some(Item::Func(_) | Item::GenericFn(_) | Item::Struct(_) | Item::Enum(_)) => {
-                        self.error(TypeErrorKind::NotAssignable, target.span);
-                        None
-                    }
+                match self.ck.item(name) {
+                    Some(item) => self.item_place(item, name, target.span),
                     None if is_builtin_type(name) || self.ck.type_param(name).is_some() => {
                         self.error(TypeErrorKind::NotAssignable, target.span);
                         None
@@ -2060,6 +2263,10 @@ impl<'c> Body<'c> {
                         None
                     }
                 }
+            }
+            ExprKind::Field(inner, field) if self.names_module(inner).is_some() => {
+                let item = self.member(inner, field)?;
+                self.item_place(item, &field.name, target.span)
             }
             ExprKind::Field(inner, field) => {
                 let mut place = match &inner.kind {
@@ -2110,6 +2317,23 @@ impl<'c> Body<'c> {
                 None
             }
         }
+    }
+
+    /// The global `item`, named `name` at `span`, as a place. `None` after
+    /// reporting an error.
+    fn item_place(&mut self, item: Item, name: &str, span: Span) -> Option<Place> {
+        let Item::Global(index) = item else {
+            self.error(TypeErrorKind::NotAssignable, span);
+            return None;
+        };
+        let global = self.ck.globals[index].as_ref()?;
+        Some(Place {
+            name: name.to_string(),
+            ty: global.ty,
+            mutable: global.mutable,
+            pre: Vec::new(),
+            slots: Slots::Global(global.slots.clone()),
+        })
     }
 
     /// The element `array[index]`, as a place whose `pre` traps unless
@@ -2261,7 +2485,9 @@ impl<'c> Body<'c> {
                 }
                 None => (Ty::Error, Value::default()),
             },
-            ExprKind::Name(_) | ExprKind::AddrOf(_) if self.is_type_expr(expr) => {
+            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::AddrOf(_)
+                if self.is_type_expr(expr) =>
+            {
                 let ty = self.expr_type(expr);
                 self.type_value(ty, expr.span)
             }
@@ -2270,8 +2496,17 @@ impl<'c> Body<'c> {
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expected, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expected, expr.span),
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
+            ExprKind::Field(inner, field) if self.names_module(inner).is_some() => {
+                match self.member(inner, field) {
+                    Some(item) => self.item_value(item, &field.name, field.span),
+                    None => (Ty::Error, Value::default()),
+                }
+            }
             ExprKind::Field(inner, field) => {
-                if let Some(member) = self.enum_name(inner).and_then(|id| self.member(id, field)) {
+                if let Some(member) = self
+                    .enum_name(inner)
+                    .and_then(|id| self.enum_member(id, field))
+                {
                     return member;
                 }
                 let (mut ty, mut value) = self.expr(inner, None);
@@ -2410,8 +2645,19 @@ impl<'c> Body<'c> {
             let reads = var.slots.iter().map(|l| Expr::Local(*l)).collect();
             return (ty, self.scalars(ty, reads));
         }
-        match self.ck.items.get(name).copied() {
-            Some(Item::Global(index)) => match &self.ck.globals[index] {
+        match self.ck.item(name) {
+            Some(item) => self.item_value(item, name, span),
+            None => {
+                self.error(TypeErrorKind::UnknownName(name.to_string()), span);
+                (Ty::Error, Value::default())
+            }
+        }
+    }
+
+    /// The value of `item`, named `name` at `span`.
+    fn item_value(&mut self, item: Item, name: &str, span: Span) -> (Ty, Value) {
+        match item {
+            Item::Global(index) => match &self.ck.globals[index] {
                 Some(global) => {
                     let ty = global.ty;
                     let reads = global.slots.iter().map(|g| Expr::Global(*g)).collect();
@@ -2424,15 +2670,44 @@ impl<'c> Body<'c> {
                 }
             },
             // Struct and enum names are types, which `expr` makes values.
-            Some(Item::Func(_) | Item::GenericFn(_) | Item::Struct(_) | Item::Enum(_)) => {
+            Item::Func(_)
+            | Item::GenericFn(_)
+            | Item::Struct(_)
+            | Item::Enum(_)
+            | Item::Module(_) => {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
-            None => {
-                self.error(TypeErrorKind::UnknownName(name.to_string()), span);
-                (Ty::Error, Value::default())
-            }
         }
+    }
+
+    /// The item `expr` names, without reporting anything: a name that no
+    /// variable shadows, or `module.name`, an item another module lets this
+    /// one see.
+    fn named(&self, expr: &parse::Expr) -> Option<Item> {
+        match &expr.kind {
+            ExprKind::Name(name) if self.lookup(name).is_none() => self.ck.item(name),
+            ExprKind::Field(inner, field) => match self.named(inner)? {
+                Item::Module(module) => self.ck.member_of(module, &field.name).ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The module `expr` names, as [`Self::named`] finds it.
+    fn names_module(&self, expr: &parse::Expr) -> Option<FileId> {
+        match self.named(expr)? {
+            Item::Module(module) => Some(module),
+            _ => None,
+        }
+    }
+
+    /// The item `field` names in the module `module` names. `None` after
+    /// reporting why it can't be reached.
+    fn member(&mut self, module: &parse::Expr, field: &Ident) -> Option<Item> {
+        let id = self.names_module(module).unwrap();
+        self.ck.reach(id, &path_text(module), field)
     }
 
     /// Whether `expr` is a type written where a value belongs: the name of a
@@ -2440,10 +2715,13 @@ impl<'c> Body<'c> {
     /// or a pointer to one of those.
     fn is_type_expr(&self, expr: &parse::Expr) -> bool {
         match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.items.get(name) {
+            ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.item(name) {
                 Some(item) => matches!(item, Item::Struct(_) | Item::Enum(_)),
                 None => is_builtin_type(name) || self.ck.type_param(name).is_some(),
             },
+            ExprKind::Field(..) => {
+                matches!(self.named(expr), Some(Item::Struct(_) | Item::Enum(_)))
+            }
             ExprKind::Call(callee, args) => self.names_type(callee, args),
             ExprKind::AddrOf(pointee) => self.is_type_expr(pointee),
             _ => false,
@@ -2732,29 +3010,34 @@ impl<'c> Body<'c> {
     }
 
     fn call(&mut self, callee: &parse::Expr, args: &[Arg], span: Span) -> (Ty, Value) {
+        // `Err(None)` once the callee has been reported.
         let item = match &callee.kind {
             ExprKind::Name(name) if self.lookup(name).is_some() => {
-                Err(TypeErrorKind::NotCallable(name.clone()))
+                Err(Some(TypeErrorKind::NotCallable(name.clone())))
             }
             ExprKind::Name(name) if self.ck.takes_type_args(name) => {
-                return self.generic_call(name, callee, args, span);
+                return self.generic_call(callee, args, span);
             }
             ExprKind::Name(name) if name == TYPE => return self.construct(Ty::Type, args, span),
-            ExprKind::Name(name) => match self.ck.items.get(name).copied() {
-                Some(Item::Func(id)) => Ok(Item::Func(id)),
-                Some(Item::GenericFn(generic)) => {
-                    return self.generic_fn_call(generic, None, args, span);
+            ExprKind::Name(name) => match self.ck.item(name) {
+                Some(item) => Ok(item),
+                None if is_builtin_type(name) => {
+                    Err(Some(TypeErrorKind::NotCallable(name.clone())))
                 }
-                Some(Item::Struct(id)) => Ok(Item::Struct(id)),
-                Some(Item::Enum(_) | Item::Global(_)) => {
-                    Err(TypeErrorKind::NotCallable(name.clone()))
-                }
-                None if is_builtin_type(name) => Err(TypeErrorKind::NotCallable(name.clone())),
                 None => match self.ck.type_param(name) {
                     Some(ty) => return self.construct(ty, args, span),
-                    None => Err(TypeErrorKind::UnknownName(name.clone())),
+                    None => Err(Some(TypeErrorKind::UnknownName(name.clone()))),
                 },
             },
+            ExprKind::Field(inner, field) if self.names_module(inner).is_some() => {
+                match self.member(inner, field) {
+                    Some(item) if self.ck.item_arity(item).is_some_and(Arity::takes_args) => {
+                        return self.generic_call(callee, args, span);
+                    }
+                    Some(item) => Ok(item),
+                    None => Err(None),
+                }
+            }
             // A type given type arguments, such as `array(u8)`.
             ExprKind::Call(inner, targs) if self.names_type(inner, targs) => {
                 let ty = self.expr_type(callee);
@@ -2764,7 +3047,7 @@ impl<'c> Body<'c> {
             ExprKind::Call(inner, targs) if self.names_fn(inner) => {
                 return self.explicit_call(callee, inner, targs, args, span);
             }
-            _ => Err(TypeErrorKind::NotCallable("expression".to_string())),
+            _ => Err(Some(TypeErrorKind::NotCallable("expression".to_string()))),
         };
         match item {
             Ok(Item::Func(id)) => {
@@ -2772,9 +3055,14 @@ impl<'c> Body<'c> {
                 let value = self.args(&sig.params, args, false, span);
                 self.call_func(id, value)
             }
+            Ok(Item::GenericFn(generic)) => self.generic_fn_call(generic, None, args, span),
             Ok(Item::Struct(id)) => self.construct(Ty::Struct(id), args, span),
-            Ok(Item::GenericFn(_) | Item::Enum(_) | Item::Global(_)) | Err(_) => {
-                if let Err(kind) = item {
+            Ok(Item::Enum(_) | Item::Global(_) | Item::Module(_)) | Err(_) => {
+                let error = match item {
+                    Ok(_) => Some(TypeErrorKind::NotCallable(path_text(callee))),
+                    Err(error) => error,
+                };
+                if let Some(kind) = error {
                     self.error(kind, callee.span);
                 }
                 for arg in args {
@@ -2825,11 +3113,19 @@ impl<'c> Body<'c> {
     /// labelled fields.
     fn construct(&mut self, ty: Ty, args: &[Arg], span: Span) -> (Ty, Value) {
         let fields: Vec<_> = match ty {
-            Ty::Struct(id) => self.ck.structs[id.0 as usize]
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.ty))
-                .collect(),
+            Ty::Struct(id) => {
+                let def = &self.ck.structs[id.0 as usize];
+                let private = def.fields.iter().find(|f| !f.is_pub);
+                if let Some(field) = private.filter(|_| def.module != self.ck.module) {
+                    let kind = TypeErrorKind::PrivateField {
+                        ty: def.name.clone(),
+                        field: field.name.clone(),
+                    };
+                    self.error(kind, span);
+                }
+                let def = &self.ck.structs[id.0 as usize];
+                def.fields.iter().map(|f| (f.name.clone(), f.ty)).collect()
+            }
             Ty::Array(_) | Ty::Type => builtin_fields(ty)
                 .iter()
                 .map(|name| name.to_string())
@@ -3331,6 +3627,32 @@ fn is_stable(expr: &Expr) -> bool {
     }
 }
 
+/// `expr` as written, if it's a name or a path of names, like `a.b.c`.
+fn path_text(expr: &parse::Expr) -> String {
+    match &expr.kind {
+        ExprKind::Name(name) => name.clone(),
+        ExprKind::Field(inner, field) => format!("{}.{}", path_text(inner), field.name),
+        _ => "expression".to_string(),
+    }
+}
+
+/// The names in `expr`, a path of names like `a.b`, in order. `None` for
+/// any other expression.
+fn module_path(expr: &parse::Expr) -> Option<Vec<Ident>> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(vec![Ident {
+            name: name.clone(),
+            span: expr.span,
+        }]),
+        ExprKind::Field(inner, field) => {
+            let mut path = module_path(inner)?;
+            path.push(field.clone());
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
@@ -3369,8 +3691,8 @@ fn pattern_names(pattern: &Pattern) -> Vec<Ident> {
 }
 
 /// Every imported function, with the block that declares it.
-fn extern_fns(module: &parse::Module) -> impl Iterator<Item = (&ExternBlock, &ExternFn)> {
-    let blocks = module.items.iter().filter_map(|item| match &item.kind {
+fn extern_fns(program: &Program) -> impl Iterator<Item = (&ExternBlock, &ExternFn)> {
+    let blocks = program.items.iter().filter_map(|item| match &item.kind {
         ItemKind::Extern(block) => Some(block),
         _ => None,
     });
@@ -3379,8 +3701,8 @@ fn extern_fns(module: &parse::Module) -> impl Iterator<Item = (&ExternBlock, &Ex
 
 /// Every defined function that isn't generic, with the item that declares
 /// it.
-fn fn_decls(module: &parse::Module) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
-    module.items.iter().filter_map(|item| match &item.kind {
+fn fn_decls(program: &Program) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
+    program.items.iter().filter_map(|item| match &item.kind {
         ItemKind::Fn(f) if f.sig.type_params.is_empty() => Some((item, f)),
         _ => None,
     })
@@ -3388,19 +3710,18 @@ fn fn_decls(module: &parse::Module) -> impl Iterator<Item = (&parse::Item, &pars
 
 /// Every generic function, in [`Item::GenericFn`] order, with the item that
 /// declares it.
-fn generic_fn_decls(
-    module: &parse::Module,
-) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
-    module.items.iter().filter_map(|item| match &item.kind {
+fn generic_fn_decls(program: &Program) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
+    program.items.iter().filter_map(|item| match &item.kind {
         ItemKind::Fn(f) if !f.sig.type_params.is_empty() => Some((item, f)),
         _ => None,
     })
 }
 
-/// Every function signature in [`FuncId`] order: imports, then definitions.
-fn fn_sigs(module: &parse::Module) -> impl Iterator<Item = &FnSig> {
-    let imports = extern_fns(module).map(|(_, f)| &f.sig);
-    imports.chain(fn_decls(module).map(|(_, f)| &f.sig))
+/// Every function signature in [`FuncId`] order, imports then definitions,
+/// with whether it's `pub`.
+fn fn_sigs(program: &Program) -> impl Iterator<Item = (bool, &FnSig)> {
+    let imports = extern_fns(program).map(|(_, f)| (f.is_pub, &f.sig));
+    imports.chain(fn_decls(program).map(|(item, f)| (item.is_pub, &f.sig)))
 }
 
 /// Whether control can never reach the end of `block`.
@@ -3546,8 +3867,12 @@ mod tests {
     }
 
     fn check_with(src: &str, settings: &Settings) -> Result<Module, Vec<TypeError>> {
-        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
-        check(&parse::parse(&tokens).unwrap(), settings)
+        let entry = DummyManager::new().entry_point();
+        let tokens = tokenize(entry, src).unwrap();
+        check(
+            &Program::single(entry, parse::parse(&tokens).unwrap()),
+            settings,
+        )
     }
 
     fn lower(src: &str) -> Module {
@@ -4455,7 +4780,7 @@ fn f():
     #[test]
     fn pub_globals_are_exported() {
         let src = "\
-struct P:
+pub struct P:
     x: i32
     y: i32
 pub let a = 1
@@ -4483,7 +4808,7 @@ let hidden = 2
     #[test]
     fn pointers_are_i32_addresses() {
         let src = "\
-struct P:
+pub struct P:
     x: f64
 var null = 0 as &u32
 let top = 4294967295 as &&P
@@ -4817,7 +5142,7 @@ fn f(a: i16, b: i16, c: u8, d: i32):
     #[test]
     fn externrefs_pass_through_locals_and_structs() {
         let src = "\
-struct Handle:
+pub struct Handle:
     el: externref
     id: i32
 extern:
@@ -5203,11 +5528,16 @@ fn f(x: u8, y: i32):
     }
 
     #[test]
-    fn generic_fns_cannot_be_exported() {
-        assert_eq!(
-            errors("pub fn(T) id(val: T) -> T:\n    return val\n"),
-            vec![TypeErrorKind::PubGeneric("id".to_string())]
+    fn pub_generic_fns_are_not_exported() {
+        let module = lower(
+            "pub fn(T) id(val: T) -> T:\n    return val\npub fn f() -> i32:\n    return id(1)\n",
         );
+        let exports: Vec<_> = module
+            .funcs
+            .iter()
+            .filter_map(|f| f.export.as_deref())
+            .collect();
+        assert_eq!(exports, ["f"]);
     }
 
     #[test]
@@ -6353,7 +6683,7 @@ fn f(h: H, p: P) -> bool:
 enum(i8) R:
     ok = -1
     size
-enum(R) S:
+pub enum(R) S:
     good = R.ok
 enum(f32) F:
     half = 0.5

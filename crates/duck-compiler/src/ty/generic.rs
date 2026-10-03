@@ -8,7 +8,7 @@ use crate::parse::{self, Arg, ExprKind, Ident, TypeKind};
 
 use super::{
     ARRAY, Body, Checker, Item, ParamId, StructDef, StructId, TUPLE, Ty, TypeErrorKind, Value,
-    is_builtin_type,
+    is_builtin_type, module_path, path_text,
 };
 
 /// A use of a generic struct with type arguments.
@@ -129,7 +129,7 @@ impl Checker {
                     TypeErrorKind::DuplicateParam(param.name.clone()),
                     param.span,
                 );
-            } else if is_builtin_type(&param.name) || self.items.contains_key(&param.name) {
+            } else if is_builtin_type(&param.name) || self.item(&param.name).is_some() {
                 self.error(TypeErrorKind::DuplicateItem(param.name.clone()), param.span);
             } else {
                 self.type_params.push((param.name.clone(), tys[i]));
@@ -218,13 +218,11 @@ impl Checker {
     /// `Box(&i32)(value: p)`. `None` after reporting an error.
     fn type_syntax(&mut self, expr: &parse::Expr) -> Option<parse::Type> {
         let kind = match &expr.kind {
-            ExprKind::Name(name) => TypeKind::Named(name.clone(), None),
+            ExprKind::Name(_) | ExprKind::Field(..) => {
+                return self.path_type(expr, None, expr.span);
+            }
             ExprKind::Call(callee, args) => {
-                let ExprKind::Name(name) = &callee.kind else {
-                    self.error(TypeErrorKind::NotAType, callee.span);
-                    return None;
-                };
-                return self.applied_type_syntax(name, args, expr.span);
+                return self.applied_type_syntax(callee, args, expr.span);
             }
             ExprKind::AddrOf(pointee) => TypeKind::Pointer(Box::new(self.type_syntax(pointee)?)),
             _ => {
@@ -238,13 +236,62 @@ impl Checker {
         })
     }
 
-    /// Reads `name(args)`, written as an expression spanning `span`, as the
-    /// type `name` given type arguments. `None` after reporting an error.
-    fn applied_type_syntax(&mut self, name: &str, args: &[Arg], span: Span) -> Option<parse::Type> {
-        Some(parse::Type {
-            kind: TypeKind::Named(name.to_string(), Some(self.type_args_syntax(args)?)),
-            span,
-        })
+    /// Reads `callee(args)`, written as an expression spanning `span`, as
+    /// the type `callee` names given type arguments. `None` after reporting
+    /// an error.
+    pub(super) fn applied_type_syntax(
+        &mut self,
+        callee: &parse::Expr,
+        args: &[Arg],
+        span: Span,
+    ) -> Option<parse::Type> {
+        let args = self.type_args_syntax(args)?;
+        self.path_type(callee, Some(args), span)
+    }
+
+    /// Reads `path`, a name or `module.name`, as the type it names, given
+    /// type arguments `args` if any, written as an expression spanning
+    /// `span`. `None` after reporting an error.
+    fn path_type(
+        &mut self,
+        path: &parse::Expr,
+        args: Option<Vec<parse::Type>>,
+        span: Span,
+    ) -> Option<parse::Type> {
+        let (modules, name) = match &path.kind {
+            ExprKind::Name(name) => (
+                Vec::new(),
+                Ident {
+                    name: name.clone(),
+                    span: path.span,
+                },
+            ),
+            ExprKind::Field(inner, field) => match module_path(inner) {
+                Some(modules) => (modules, field.clone()),
+                None => {
+                    self.error(TypeErrorKind::NotAType, inner.span);
+                    return None;
+                }
+            },
+            _ => {
+                self.error(TypeErrorKind::NotAType, path.span);
+                return None;
+            }
+        };
+        let mut ty = parse::Type {
+            kind: TypeKind::Named(name.name, args),
+            span: Span {
+                start: name.span.start,
+                ..span
+            },
+        };
+        for module in modules.into_iter().rev() {
+            ty = parse::Type {
+                kind: TypeKind::Qualified(module, Box::new(ty)),
+                span,
+            };
+        }
+        Some(ty)
     }
 
     /// Reads `args`, written as expressions, as a list of type arguments.
@@ -270,15 +317,24 @@ impl Checker {
     /// Which lists of type arguments the type `name` takes. `None` for names
     /// that aren't types.
     pub(super) fn type_arity(&self, name: &str) -> Option<Arity> {
-        match self.items.get(name) {
+        match self.item(name) {
             _ if name == ARRAY => Some(Arity::Exactly(1)),
             _ if name == TUPLE => Some(Arity::NoneOrAtLeast(2)),
-            Some(Item::Struct(id)) => match self.structs[id.0 as usize].params.len() {
+            Some(item @ (Item::Struct(_) | Item::Enum(_))) => self.item_arity(item),
+            _ if is_builtin_type(name) => Some(Arity::Plain),
+            _ => None,
+        }
+    }
+
+    /// Which lists of type arguments `item` takes. `None` for items that
+    /// aren't types.
+    pub(super) fn item_arity(&self, item: Item) -> Option<Arity> {
+        match item {
+            Item::Struct(id) => match self.structs[id.0 as usize].params.len() {
                 0 => Some(Arity::Plain),
                 n => Some(Arity::Exactly(n)),
             },
-            Some(Item::Enum(_)) => Some(Arity::Plain),
-            _ if is_builtin_type(name) => Some(Arity::Plain),
+            Item::Enum(_) => Some(Arity::Plain),
             _ => None,
         }
     }
@@ -298,12 +354,11 @@ impl Checker {
         }
         let id = StructId(self.structs.len() as u32);
         let names: Vec<_> = args.iter().map(|arg| self.ty_name(*arg)).collect();
+        let decl = &self.structs[generic.0 as usize];
         self.structs.push(StructDef {
-            name: format!(
-                "{}({})",
-                self.structs[generic.0 as usize].name,
-                names.join(", ")
-            ),
+            name: format!("{}({})", decl.name, names.join(", ")),
+            module: decl.module,
+            is_pub: decl.is_pub,
             params: Vec::new(),
             instance: Some(Instance {
                 generic,
@@ -368,17 +423,17 @@ impl Checker {
 }
 
 impl Body<'_> {
-    /// A generic type `name` called directly: as `Box(i32)`, a type used as a
-    /// value, or as `Box(value: 1)`, a constructor missing type arguments.
+    /// A generic type `callee` called directly: as `Box(i32)`, a type used
+    /// as a value, or as `Box(value: 1)`, a constructor missing type
+    /// arguments.
     pub(super) fn generic_call(
         &mut self,
-        name: &str,
         callee: &parse::Expr,
         args: &[Arg],
         span: Span,
     ) -> (Ty, Value) {
         if args.iter().all(|arg| arg.label.is_none()) {
-            let ty = match self.ck.applied_type_syntax(name, args, span) {
+            let ty = match self.ck.applied_type_syntax(callee, args, span) {
                 Some(ty) => self.ck.resolve_ty(&ty),
                 None => Ty::Error,
             };
@@ -387,7 +442,7 @@ impl Body<'_> {
         // The arguments may be fields or mislabelled type arguments, so they
         // aren't checked.
         self.error(
-            TypeErrorKind::MissingTypeArgs(name.to_string()),
+            TypeErrorKind::MissingTypeArgs(path_text(callee)),
             callee.span,
         );
         (Ty::Error, Value::default())
@@ -406,14 +461,17 @@ impl Body<'_> {
     /// type arguments; any other struct is taken to when none are labelled,
     /// so that giving it some is reported.
     pub(super) fn names_type(&self, expr: &parse::Expr, args: &[Arg]) -> bool {
-        match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => {
-                self.ck.takes_type_args(name)
-                    || matches!(self.ck.items.get(name), Some(Item::Struct(_)))
-                        && args.iter().all(|arg| arg.label.is_none())
-            }
-            _ => false,
-        }
+        let takes_args = match &expr.kind {
+            ExprKind::Name(name) if self.lookup(name).is_none() => self.ck.takes_type_args(name),
+            ExprKind::Field(..) => self
+                .named(expr)
+                .and_then(|item| self.ck.item_arity(item))
+                .is_some_and(Arity::takes_args),
+            _ => return false,
+        };
+        takes_args
+            || matches!(self.named(expr), Some(Item::Struct(_)))
+                && args.iter().all(|arg| arg.label.is_none())
     }
 }
 

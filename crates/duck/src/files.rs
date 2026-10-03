@@ -72,6 +72,10 @@ impl FileManager for Files {
         self.read(dir.join(path)).ok()
     }
 
+    fn open_package(&mut self, _from: FileId, _name: &str) -> Option<FileId> {
+        None
+    }
+
     fn settings(&mut self) -> Settings {
         self.settings.clone()
     }

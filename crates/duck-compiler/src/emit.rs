@@ -2,9 +2,9 @@
 //!
 //! The IR is already shaped after wasm, so this is one direct walk: every
 //! statement and expression maps to a fixed instruction sequence. The module
-//! imports its `extern` functions and exports its memory, `pub fn`s, and `pub`
-//! globals, names its start function if it has one, and fills memory with its
-//! literals. Source names go in a `name` custom section so tools can show them.
+//! imports its `extern` functions and exports its memory and the `pub fn`s
+//! and `pub` globals of the entry module, names its start function if it has
+//! one, and fills memory with its literals. Source names go in a `name` custom section so tools can show them.
 
 use std::collections::HashMap;
 
@@ -481,6 +481,7 @@ mod tests {
     use super::*;
     use crate::file::{DummyManager, FileManager, MemoryLimits, Settings};
     use crate::lex::tokenize;
+    use crate::load::Program;
     use crate::{parse, ty};
 
     /// Compiles `src` and checks that the output is a valid module.
@@ -491,8 +492,10 @@ mod tests {
     /// Compiles `src` under `settings` and checks that the output is a valid
     /// module.
     fn emit_with(src: &str, settings: &Settings) -> Vec<u8> {
-        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
-        let module = match ty::check(&parse::parse(&tokens).unwrap(), settings) {
+        let entry = DummyManager::new().entry_point();
+        let tokens = tokenize(entry, src).unwrap();
+        let program = Program::single(entry, parse::parse(&tokens).unwrap());
+        let module = match ty::check(&program, settings) {
             Ok(module) => module,
             Err(errors) => panic!("unexpected type errors: {errors:#?}"),
         };
@@ -534,7 +537,7 @@ mod tests {
     #[test]
     fn array_equality_functions_follow_defined_functions() {
         let src = "\
-struct N:
+pub struct N:
     kids: array(N)
 extern:
     fn log(x: i32)
@@ -702,7 +705,7 @@ fn c(y: i32) -> i64:
     #[test]
     fn externrefs_are_reference_values() {
         let src = "\
-struct Handle:
+pub struct Handle:
     el: externref
     id: i32
 extern:
@@ -946,7 +949,7 @@ extern:
 enum(array(u8)) Greeting:
     hi = \"hello\"
     bye = \"goodbye\"
-enum(tuple(f64, f32)) Point:
+pub enum(tuple(f64, f32)) Point:
     origin = (0.0, 0.0)
     unit = (1.0, 1.0)
 pub fn f(p: Point) -> bool:

@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::lex::{Span, Token, TokenKind};
 
-/// A parsed source file, or a whole program once [`crate::load`] has spliced
-/// in the items of every imported file.
+/// A parsed source file, or the items of a whole program once
+/// [`crate::load`] has gathered every imported file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub items: Vec<Item>,
@@ -23,9 +23,24 @@ pub enum ItemKind {
     Struct(StructDecl),
     Enum(EnumDecl),
     Binding(Binding),
-    /// `import "path"`, which evaluates the items of another file in its
-    /// place. Resolved by [`crate::load`], so later stages never see one.
-    Import(String),
+    /// Resolved by [`crate::load`], so later stages never see one.
+    Import(Import),
+}
+
+/// `import "path"` or `import name`, binding the module it names to the
+/// stem of the path, or the name, unless `as alias` renames it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Import {
+    pub target: ImportTarget,
+    pub alias: Option<Ident>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportTarget {
+    /// A file, relative to the importing one.
+    File(String),
+    /// The library a dependency of the importing package names.
+    Package(Ident),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,9 +68,11 @@ pub struct ExternBlock {
 }
 
 /// A bodyless `fn` in an `extern` block, optionally followed by `= "name"` to
-/// import it under a different name.
+/// import it under a different name, and optionally marked `pub` so other
+/// modules can call it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternFn {
+    pub is_pub: bool,
     pub sig: FnSig,
     pub import_name: Option<String>,
     pub span: Span,
@@ -153,6 +170,9 @@ pub enum TypeKind {
     Named(String, Option<Vec<Type>>),
     /// `&T`
     Pointer(Box<Type>),
+    /// `module.T`, a type in another module, where `T` is a name or itself
+    /// qualified.
+    Qualified(Ident, Box<Type>),
 }
 
 pub type Block = Vec<Stmt>;
@@ -280,10 +300,10 @@ pub enum ParseErrorKind {
     MissingFnBody,
     /// A `fn` with a body inside an `extern` block.
     ExternFnBody,
-    /// `pub` on an `extern` block or on a function in one.
+    /// `pub` on an `extern` block.
     PubExtern,
-    /// `pub` on an `import`, which has no names of its own to export.
-    PubImport,
+    /// An `import` after an item that isn't one.
+    ImportAfterItem,
     /// `(x,)`, which would be a tuple of one element.
     OneElementTuple,
     /// A function in an `extern` block with type parameters.
@@ -325,8 +345,8 @@ impl fmt::Display for ParseErrorKind {
             Self::InvalidAssignTarget => write!(f, "invalid assignment target"),
             Self::MissingFnBody => write!(f, "functions outside `extern` blocks need a body"),
             Self::ExternFnBody => write!(f, "functions in `extern` blocks cannot have a body"),
-            Self::PubExtern => write!(f, "`extern` blocks and their functions cannot be `pub`"),
-            Self::PubImport => write!(f, "`import` cannot be `pub`"),
+            Self::PubExtern => write!(f, "`extern` blocks cannot be `pub`"),
+            Self::ImportAfterItem => write!(f, "`import` must come before other items"),
             Self::OneElementTuple => write!(f, "tuples must have at least two elements"),
             Self::GenericExtern => {
                 write!(
@@ -368,9 +388,17 @@ pub fn parse(tokens: &[Token]) -> Result<Module, Vec<ParseError>> {
 impl<'a> Parser<'a> {
     fn module(&mut self) -> Module {
         let mut items = Vec::new();
+        let mut past_imports = false;
         while !self.at(TokenKind::Eof) {
             match self.item() {
-                Ok(item) => items.push(item),
+                Ok(item) => {
+                    let is_import = matches!(item.kind, ItemKind::Import(_));
+                    if past_imports && is_import {
+                        self.error(ParseErrorKind::ImportAfterItem, item.span);
+                    }
+                    past_imports |= !is_import;
+                    items.push(item);
+                }
                 Err(e) => self.recover(e),
             }
         }
@@ -391,15 +419,7 @@ impl<'a> Parser<'a> {
             TokenKind::Struct => ItemKind::Struct(self.struct_decl()?),
             TokenKind::Enum => ItemKind::Enum(self.enum_decl()?),
             TokenKind::Let | TokenKind::Var => ItemKind::Binding(self.binding()?),
-            TokenKind::Import => {
-                if is_pub {
-                    self.error(ParseErrorKind::PubImport, start);
-                }
-                self.bump();
-                let path = self.string()?;
-                self.expect(TokenKind::Newline)?;
-                ItemKind::Import(path)
-            }
+            TokenKind::Import => ItemKind::Import(self.import()?),
             _ => return Err(self.unexpected("item")),
         };
         Ok(Item {
@@ -407,6 +427,21 @@ impl<'a> Parser<'a> {
             kind,
             span: self.span_from(start),
         })
+    }
+
+    fn import(&mut self) -> PResult<Import> {
+        self.expect(TokenKind::Import)?;
+        let target = match self.peek().kind {
+            TokenKind::Str(_) => ImportTarget::File(self.string()?),
+            TokenKind::Ident(_) => ImportTarget::Package(self.ident()?),
+            _ => return Err(self.unexpected("string or identifier")),
+        };
+        let alias = match self.eat(TokenKind::As) {
+            true => Some(self.ident()?),
+            false => None,
+        };
+        self.expect(TokenKind::Newline)?;
+        Ok(Import { target, alias })
     }
 
     fn fn_decl(&mut self) -> PResult<FnDecl> {
@@ -461,9 +496,7 @@ impl<'a> Parser<'a> {
 
     fn extern_fn(&mut self) -> PResult<ExternFn> {
         let start = self.peek().span;
-        if self.eat(TokenKind::Pub) {
-            self.error(ParseErrorKind::PubExtern, start);
-        }
+        let is_pub = self.eat(TokenKind::Pub);
         let sig = self.fn_sig()?;
         if let (Some(first), Some(last)) = (sig.type_params.first(), sig.type_params.last()) {
             let span = Span {
@@ -483,6 +516,7 @@ impl<'a> Parser<'a> {
         let span = self.span_from(start);
         self.expect(TokenKind::Newline)?;
         Ok(ExternFn {
+            is_pub,
             sig,
             import_name,
             span,
@@ -624,6 +658,14 @@ impl<'a> Parser<'a> {
     fn ty(&mut self) -> PResult<Type> {
         let token = self.peek();
         let kind = match &token.kind {
+            TokenKind::Ident(_) if self.peek_second().kind == TokenKind::Dot => {
+                let module = self.ident()?;
+                self.bump();
+                if !matches!(self.peek().kind, TokenKind::Ident(_)) {
+                    return Err(self.unexpected("type name"));
+                }
+                TypeKind::Qualified(module, Box::new(self.ty()?))
+            }
             TokenKind::Ident(name) => {
                 self.bump();
                 let args = match self.eat(TokenKind::LParen) {
@@ -1221,6 +1263,7 @@ mod tests {
                 format!("{name}({})", args.join(", "))
             }
             TypeKind::Pointer(pointee) => format!("&{}", render_ty(pointee)),
+            TypeKind::Qualified(module, ty) => format!("{}.{}", module.name, render_ty(ty)),
         }
     }
 
@@ -1802,7 +1845,6 @@ extern \"\":
 extern:
     fn a():
         pass
-    pub fn b()
     let c = 1
     fn d() = e
 pub extern:
@@ -1816,7 +1858,6 @@ fn h() -> i32:
             errors(src),
             vec![
                 ParseErrorKind::ExternFnBody,
-                ParseErrorKind::PubExtern,
                 expected("`fn`", TokenKind::Let),
                 expected("string", TokenKind::Ident("e".into())),
                 ParseErrorKind::PubExtern,
@@ -1829,10 +1870,7 @@ fn h() -> i32:
             .iter()
             .map(|e| &src[e.span.start..e.span.end])
             .collect();
-        assert_eq!(
-            spans,
-            ["fn a()", "pub", "let", "e", "pub", "fn g()", "fn g2()"]
-        );
+        assert_eq!(spans, ["fn a()", "let", "e", "pub", "fn g()", "fn g2()"]);
     }
 
     #[test]
@@ -1882,6 +1920,70 @@ let d = 1
             errors("fn f():\nlet x = 1\n"),
             vec![expected("indented block", TokenKind::Let)]
         );
+    }
+
+    #[test]
+    fn imports() {
+        let src = "import \"util/strings.duck\"\npub import \"a.duck\" as b\nimport json\nimport json as j\n";
+        let module = parse_src(src).unwrap();
+        let imports: Vec<_> = module
+            .items
+            .iter()
+            .map(|item| {
+                let ItemKind::Import(import) = &item.kind else {
+                    panic!("{item:?}")
+                };
+                let target = match &import.target {
+                    ImportTarget::File(path) => format!("{path:?}"),
+                    ImportTarget::Package(name) => name.name.clone(),
+                };
+                let alias = import.alias.as_ref().map(|alias| alias.name.as_str());
+                (item.is_pub, target, alias)
+            })
+            .collect();
+        assert_eq!(
+            imports,
+            [
+                (false, "\"util/strings.duck\"".to_string(), None),
+                (true, "\"a.duck\"".to_string(), Some("b")),
+                (false, "json".to_string(), None),
+                (false, "json".to_string(), Some("j")),
+            ]
+        );
+    }
+
+    #[test]
+    fn imports_come_before_other_items() {
+        let src = "import \"a\"\nlet x = 1\nimport \"b\"\nfn f():\n    pass\n";
+        assert_eq!(errors(src), [ParseErrorKind::ImportAfterItem]);
+        let span = parse_src(src).unwrap_err()[0].span;
+        assert_eq!(&src[span.start..span.end], "import \"b\"");
+    }
+
+    #[test]
+    fn qualified_types() {
+        let module =
+            parse_src("fn f(a: json.Value, b: &a.b.List(geo.Point)) -> m.T:\n\tpass").unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(render_ty(&f.sig.params[0].ty), "json.Value");
+        assert_eq!(render_ty(&f.sig.params[1].ty), "&a.b.List(geo.Point)");
+        assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "m.T");
+    }
+
+    #[test]
+    fn pub_extern_fns() {
+        let module = parse_src("extern:\n    pub fn a()\n    fn b()\n").unwrap();
+        let ItemKind::Extern(block) = &module.items[0].kind else {
+            panic!()
+        };
+        let fns: Vec<_> = block
+            .fns
+            .iter()
+            .map(|f| (f.is_pub, f.sig.name.name.as_str()))
+            .collect();
+        assert_eq!(fns, [(true, "a"), (false, "b")]);
     }
 
     #[test]

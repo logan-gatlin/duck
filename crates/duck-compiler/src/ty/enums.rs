@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use crate::ir::{Const, Expr, Stmt, ValType};
 use crate::lex::Span;
+use crate::load::Program;
 use crate::parse::{self, EnumDecl, ExprKind, Ident, ItemKind};
 
 use super::{
@@ -14,6 +15,7 @@ use super::{
 
 pub(super) struct EnumDef {
     pub(super) name: String,
+    pub(super) is_pub: bool,
     /// The type of every member's value. [`Ty::Error`] until resolved.
     pub(super) ty: Ty,
     /// Where the type of the values is written.
@@ -33,7 +35,7 @@ pub(super) struct MemberDef {
 impl Checker {
     /// Registers `decl`'s name and the names of its members, whose values
     /// are defined later.
-    pub(super) fn declare_enum(&mut self, decl: &EnumDecl) -> EnumId {
+    pub(super) fn declare_enum(&mut self, decl: &EnumDecl, is_pub: bool) -> EnumId {
         let members = decl
             .members
             .iter()
@@ -44,6 +46,7 @@ impl Checker {
             .collect();
         self.enums.push(EnumDef {
             name: decl.name.name.clone(),
+            is_pub,
             ty: Ty::Error,
             ty_span: decl.ty.span,
             members,
@@ -55,8 +58,9 @@ impl Checker {
     /// Resolves the type of every enum's values, then reports enums that
     /// contain themselves and cuts each cycle by giving the offending enum
     /// the error type. Cycles through a struct are left to the struct.
-    pub(super) fn resolve_enums(&mut self, module: &parse::Module) {
-        for (id, decl) in enum_decls(module).enumerate() {
+    pub(super) fn resolve_enums(&mut self, program: &Program) {
+        for (id, decl) in enum_decls(program).enumerate() {
+            self.module = decl.name.span.file;
             self.enums[id].ty = self.resolve_ty(&decl.ty);
         }
         let mut visits = vec![Visit::New; self.enums.len()];
@@ -209,23 +213,23 @@ impl Checker {
 
 impl Body<'_> {
     /// The enum `expr` names, if it's the name of one that no variable
-    /// shadows.
+    /// shadows, or of one in a module, as `module.Enum`.
     pub(super) fn enum_name(&self, expr: &parse::Expr) -> Option<EnumId> {
-        match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.items.get(name) {
-                Some(Item::Enum(id)) => Some(*id),
-                _ => match self.ck.type_param(name) {
+        match (self.named(expr), &expr.kind) {
+            (Some(Item::Enum(id)), _) => Some(id),
+            (None, ExprKind::Name(name)) if self.lookup(name).is_none() => {
+                match self.ck.type_param(name) {
                     Some(Ty::Enum(id)) => Some(id),
                     _ => None,
-                },
-            },
+                }
+            }
             _ => None,
         }
     }
 
     /// `E.field`, where `E` names enum `id`: the member `field`, or else
     /// `None` for a field of `type`, which `E` is as a value.
-    pub(super) fn member(&mut self, id: EnumId, field: &Ident) -> Option<(Ty, Value)> {
+    pub(super) fn enum_member(&mut self, id: EnumId, field: &Ident) -> Option<(Ty, Value)> {
         let def = &self.ck.enums[id.0 as usize];
         let Some(member) = def.members.iter().find(|m| m.name == field.name) else {
             if TYPE_FIELDS.contains(&field.name.as_str()) {
@@ -277,8 +281,8 @@ impl Body<'_> {
 }
 
 /// Every enum declaration, in [`EnumId`] order.
-fn enum_decls(module: &parse::Module) -> impl Iterator<Item = &EnumDecl> {
-    module.items.iter().filter_map(|item| match &item.kind {
+fn enum_decls(program: &Program) -> impl Iterator<Item = &EnumDecl> {
+    program.items.iter().filter_map(|item| match &item.kind {
         ItemKind::Enum(decl) => Some(decl),
         _ => None,
     })
