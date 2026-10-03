@@ -52,6 +52,23 @@ pub struct Library {
 pub enum Dependency {
     /// The directory holding its manifest, relative to this manifest.
     Path(PathBuf),
+    /// A commit of a git repository.
+    Git {
+        url: String,
+        reference: GitRef,
+        /// The directory in the repository holding its manifest, if not the
+        /// top.
+        path: Option<PathBuf>,
+    },
+}
+
+/// What names a commit of a git dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRef {
+    /// A tag, taken never to move.
+    Tag(String),
+    /// A commit hash, or a prefix of one.
+    Rev(String),
 }
 
 #[derive(Debug)]
@@ -75,6 +92,14 @@ pub enum ManifestError {
     MemoryWithoutModule,
     /// A dependency named something that can't be imported.
     DependencyName(String),
+    /// A dependency with neither a `path` nor a `git`.
+    NoSource(String),
+    /// A git dependency without exactly one of `tag` and `rev`.
+    GitRef(String),
+    /// A git dependency on a branch, which moves.
+    Branch(String),
+    /// A dependency that names a commit without a `git` to find it in.
+    RefWithoutGit(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +145,12 @@ struct RawLibrary {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDependency {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    git: Option<String>,
+    tag: Option<String>,
+    rev: Option<String>,
+    /// Only read to be refused.
+    branch: Option<String>,
 }
 
 impl Manifest {
@@ -143,7 +173,8 @@ impl Manifest {
             if !lex::is_identifier(&name) {
                 return Err(ManifestError::DependencyName(name));
             }
-            dependencies.insert(name, Dependency::Path(dependency.path));
+            let dependency = dependency.validate(&name)?;
+            dependencies.insert(name, dependency);
         }
         Ok(Self {
             module,
@@ -162,6 +193,32 @@ impl Manifest {
             .position(|dir| dir.join(MANIFEST).is_file())
             .map(|depth| (0..depth).map(|_| "..").collect());
         Ok(found)
+    }
+}
+
+impl RawDependency {
+    fn validate(self, name: &str) -> Result<Dependency, ManifestError> {
+        let error = |make: fn(String) -> ManifestError| Err(make(name.to_string()));
+        let Some(url) = self.git else {
+            if self.tag.is_some() || self.rev.is_some() || self.branch.is_some() {
+                return error(ManifestError::RefWithoutGit);
+            }
+            return match self.path {
+                Some(path) => Ok(Dependency::Path(path)),
+                None => error(ManifestError::NoSource),
+            };
+        };
+        let reference = match (self.tag, self.rev, self.branch) {
+            (_, _, Some(_)) => return error(ManifestError::Branch),
+            (Some(tag), None, None) => GitRef::Tag(tag),
+            (None, Some(rev), None) => GitRef::Rev(rev),
+            _ => return error(ManifestError::GitRef),
+        };
+        Ok(Dependency::Git {
+            url,
+            reference,
+            path: self.path,
+        })
     }
 }
 
@@ -239,6 +296,18 @@ impl fmt::Display for ManifestError {
             Self::DependencyName(name) => {
                 write!(f, "dependency name `{name}` is not an identifier")
             }
+            Self::NoSource(name) => write!(f, "dependency `{name}` needs a `path` or a `git`"),
+            Self::GitRef(name) => {
+                write!(f, "git dependency `{name}` needs one of `tag` and `rev`")
+            }
+            Self::Branch(name) => write!(
+                f,
+                "git dependency `{name}` can't follow a branch; pin a `tag` or a `rev`"
+            ),
+            Self::RefWithoutGit(name) => write!(
+                f,
+                "dependency `{name}` has a `tag`, `rev`, or `branch` but no `git`"
+            ),
         }
     }
 }
@@ -362,6 +431,60 @@ mod tests {
         )
         .unwrap();
         assert!(both.module.is_some() && both.library.is_some());
+    }
+
+    #[test]
+    fn git_dependencies() {
+        let manifest = Manifest::parse(
+            "[library]\nentry = \"a.duck\"\n[dependencies]\na = { git = \"https://x.org/a\", tag = \"v1\" }\nb = { git = \"../b\", rev = \"abc123\", path = \"libs/b\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.dependencies,
+            BTreeMap::from([
+                (
+                    "a".to_string(),
+                    Dependency::Git {
+                        url: "https://x.org/a".to_string(),
+                        reference: GitRef::Tag("v1".to_string()),
+                        path: None,
+                    }
+                ),
+                (
+                    "b".to_string(),
+                    Dependency::Git {
+                        url: "../b".to_string(),
+                        reference: GitRef::Rev("abc123".to_string()),
+                        path: Some("libs/b".into()),
+                    }
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_errors() {
+        let error = |dependency: &str| {
+            let src = format!("[library]\nentry = \"a.duck\"\n[dependencies]\nd = {dependency}\n");
+            Manifest::parse(&src).unwrap_err().to_string()
+        };
+        assert_eq!(error("{}"), "dependency `d` needs a `path` or a `git`");
+        assert_eq!(
+            error("{ git = \"u\" }"),
+            "git dependency `d` needs one of `tag` and `rev`"
+        );
+        assert_eq!(
+            error("{ git = \"u\", tag = \"v1\", rev = \"abc\" }"),
+            "git dependency `d` needs one of `tag` and `rev`"
+        );
+        assert_eq!(
+            error("{ git = \"u\", branch = \"main\" }"),
+            "git dependency `d` can't follow a branch; pin a `tag` or a `rev`"
+        );
+        assert_eq!(
+            error("{ path = \"p\", tag = \"v1\" }"),
+            "dependency `d` has a `tag`, `rev`, or `branch` but no `git`"
+        );
     }
 
     #[test]

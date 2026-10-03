@@ -20,6 +20,7 @@ min = "1pgs"
 # Packages to `import` by name, each with a [library].
 # [dependencies]
 # json = { path = "../json" }
+# xml = { git = "https://example.com/xml.git", tag = "v1.0" }
 "#;
 
 const DEFAULT_MAIN: &str = "pub fn main():\n\tpass\n";
@@ -56,7 +57,7 @@ mod tests {
         new(&module).unwrap();
         let again = new(&module).unwrap_err();
 
-        let packages = package::resolve(&module);
+        let packages = package::resolve(&module, &crate::git::Cache::new(dir.join("cache")));
         let manifest = packages
             .as_ref()
             .map(|packages| packages.root().manifest.clone());

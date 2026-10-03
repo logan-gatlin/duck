@@ -1,4 +1,5 @@
 mod files;
+mod git;
 mod manifest;
 mod new;
 mod package;
@@ -58,7 +59,7 @@ fn build() -> ExitCode {
         Err(e) => return fail(format_args!("cannot find {MANIFEST}: {e}")),
     };
     let manifest_path = root.join(MANIFEST);
-    let packages = match package::resolve(&root) {
+    let packages = match package::resolve(&root, &git::Cache::from_env()) {
         Ok(packages) => packages,
         Err(e) => return fail(e),
     };
