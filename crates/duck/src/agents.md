@@ -93,21 +93,26 @@ let primes: array(u16) = [2, 3, 5]
 let empty: array(i32) = []         # [] needs an annotation
 let SIZE: u32 = 1024
 let buf: varray(u8) = [0; SIZE]    # writable; zeros add nothing to the wasm
+let count = &var 0                 # &var i32: one writable value in memory
 
 fn f(i: u32) -> u8:
 	buf[i] = greeting[i]           # a u32 index, bounds checked
+	count.* += 1
 	return buf[0]
 ```
 
 - A literal is a read-only `array` unless its global is annotated `varray`.
+- In an initializer, `&value` and `&var value` place a constant in memory, as
+  a literal is, and give its address: `&var State()`, `&Mode.idle`. A name is
+  copied, so `&N` twice is two addresses.
 - An integer literal takes the type expected of it, which may be a float or a
   pointer (`let p: &u8 = 16`), and is otherwise `i32`. A float literal is
   `f64` by default and has a digit on each side of the `.`.
 - A global initializer is constant: literals, operators, casts, constructors,
   function names and earlier `let` globals. Calls and `var` globals are out.
 - A field default is constant too. It and other initializers use only the
-  defaults of structs declared earlier. A `varray` literal in one is empty,
-  as every value would share its elements.
+  defaults of structs declared earlier. A `varray` literal in one is empty
+  and it has no `&var value`, as every value would share the memory.
 - Only a constructor applies defaults. Memory that is cast to a struct holds
   whatever was there.
 
@@ -156,7 +161,8 @@ fn view(p: &i32, len: u32) -> array(i32):
 ```
 
 - `&` and `&var` take the address of `p.field`, `p.*` and `a[i]` only. Locals,
-  parameters and globals have no address.
+  parameters and globals have no address: only a global initializer or field
+  default gives a value one, by placing it.
 - A write needs a `var` local, a `&var` or a `varray`, and only the last
   pointer or array on the way to the place decides: with `next: &var Node`,
   `p.next.val = 1` works through a `p: &Node`. `let` and `var` govern the

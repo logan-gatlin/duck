@@ -374,7 +374,8 @@ module.exports = grammar({
       )),
     ),
 
-    // `&place`, or `&var place`, which can be written through.
+    // `&place`, or `&var place`, which can be written through. In a global
+    // initializer the operand may be any constant, which is placed in memory.
     address_of_expression: $ => prec(PREC.unary, seq(
       '&',
       optional(field('mutability', 'var')),

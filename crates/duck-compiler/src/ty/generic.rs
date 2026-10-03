@@ -461,8 +461,8 @@ impl Body<'_> {
 
     /// Whether `expr(args)` gives a type its type arguments, rather than
     /// building a struct that is then called. A generic type always takes
-    /// type arguments; any other struct is taken to when none are labelled,
-    /// so that giving it some is reported.
+    /// type arguments; any other struct is taken to when it's given some and
+    /// none are labelled, so that giving it some is reported.
     pub(super) fn names_type(&self, expr: &parse::Expr, args: &[Arg]) -> bool {
         let takes_args = match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => self.ck.takes_type_args(name),
@@ -474,6 +474,7 @@ impl Body<'_> {
         };
         takes_args
             || matches!(self.named(expr), Some(Item::Struct(_)))
+                && !args.is_empty()
                 && args.iter().all(|arg| arg.label.is_none())
     }
 }

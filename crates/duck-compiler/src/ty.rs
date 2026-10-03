@@ -446,6 +446,9 @@ pub enum TypeErrorKind {
     /// A `varray` literal with elements in a field default, which every
     /// value of the struct would share.
     SharedLiteral,
+    /// A `&var` that places its value in memory in a field default, which
+    /// every value of the struct would share.
+    SharedPointee,
     /// A field default that names this type parameter of its struct, or
     /// whose value one lays out.
     DefaultUsesParam(String),
@@ -1016,6 +1019,10 @@ impl fmt::Display for TypeErrorKind {
             Self::SharedLiteral => write!(
                 f,
                 "a writable literal in a field default is shared by every instance, so it must be empty"
+            ),
+            Self::SharedPointee => write!(
+                f,
+                "a `&var` in a field default places one value that every instance would share"
             ),
             Self::DefaultUsesParam(param) => write!(
                 f,
@@ -2403,6 +2410,25 @@ impl Checker {
         offset as u32
     }
 
+    /// Places `count` copies of a `ty` whose scalars are `consts` in memory.
+    /// Returns the address of the first.
+    fn repeat_data(&mut self, ty: Ty, consts: Vec<Const>, count: u32) -> u32 {
+        let (size, align) = self.layout(ty);
+        let mut bytes = vec![0; size as usize];
+        for (cell, c) in self.cells(ty).iter().zip(consts) {
+            write_const(&mut bytes[cell.offset as usize..], cell.store, c);
+        }
+        let offset = self.reserve_data(u64::from(size) * u64::from(count), align);
+        // Memory starts out zeroed, and data that doesn't fit is an error, so
+        // neither is written out.
+        let zeroed = count == 0 || bytes.iter().all(|&byte| byte == 0);
+        if !zeroed && self.data_fits() {
+            let bytes = bytes.repeat(count as usize);
+            self.data.push(ir::Data { offset, bytes });
+        }
+        offset
+    }
+
     /// Whether every literal placed so far is within the static data
     /// section, or within memory if the section is fitted to them.
     fn data_fits(&self) -> bool {
@@ -3197,7 +3223,9 @@ impl<'c> Body<'c> {
                 }
             }
             ExprKind::Cast(inner, ty) => self.cast(inner, ty, expr.span),
-            ExprKind::AddrOf(mutability, inner) => self.addr_of(*mutability, inner, expr.span),
+            ExprKind::AddrOf(mutability, inner) => {
+                self.addr_of(*mutability, inner, expected, expr.span)
+            }
             ExprKind::FnType(_) => unreachable!("function types are type expressions"),
             ExprKind::Pipe(value, body) => self.pipe(value, body, expected),
             ExprKind::Placeholder => match self.piped.last() {
@@ -3529,21 +3557,7 @@ impl<'c> Body<'c> {
         };
         let count = count as u32;
         self.check_shared(mutable, count as usize, span);
-        let (size, align) = self.ck.layout(elem);
-        let mut bytes = vec![0; size as usize];
-        for (cell, c) in self.ck.cells(elem).iter().zip(consts) {
-            write_const(&mut bytes[cell.offset as usize..], cell.store, c);
-        }
-        let offset = self
-            .ck
-            .reserve_data(u64::from(size) * u64::from(count), align);
-        // Memory starts out zeroed, and data that doesn't fit is an error, so
-        // neither is written out.
-        let zeroed = count == 0 || bytes.iter().all(|&byte| byte == 0);
-        if !zeroed && self.ck.data_fits() {
-            let bytes = bytes.repeat(count as usize);
-            self.ck.data.push(ir::Data { offset, bytes });
-        }
+        let offset = self.ck.repeat_data(elem, consts, count);
         (self.ck.array_of(elem, mutable), array_value(count, offset))
     }
 
@@ -3955,26 +3969,51 @@ impl<'c> Body<'c> {
     }
 
     /// `&place` or `&var place`, the address of memory reached through a
-    /// pointer or array, which must write its memory for `&var`.
-    fn addr_of(&mut self, mutability: Mutability, inner: &parse::Expr, span: Span) -> (Ty, Value) {
-        if !matches!(
-            inner.kind,
-            ExprKind::Field(..) | ExprKind::Deref(_) | ExprKind::Index(..)
-        ) {
-            self.error(TypeErrorKind::NotAddressable, span);
-            return (Ty::Error, Value::default());
+    /// pointer or array, which must write its memory for `&var`. In a global
+    /// initializer, what isn't in memory is a constant that is placed there.
+    fn addr_of(
+        &mut self,
+        mutability: Mutability,
+        inner: &parse::Expr,
+        expected: Option<Ty>,
+        span: Span,
+    ) -> (Ty, Value) {
+        let mutable = mutability == Mutability::Var;
+        let want = match expected {
+            Some(Ty::Ptr(id)) => Some(self.ck.pointee(id)),
+            _ => None,
+        };
+        // An enum member and a module's function are written like fields.
+        let is_value = match &inner.kind {
+            ExprKind::Field(of, _) => {
+                self.enum_name(of).is_some()
+                    || matches!(self.named(inner), Some(item) if !matches!(item, Item::Global(_)))
+            }
+            ExprKind::Deref(_) | ExprKind::Index(..) => false,
+            _ => true,
+        };
+        if is_value {
+            if !self.global {
+                self.error(TypeErrorKind::NotAddressable, span);
+                return (Ty::Error, Value::default());
+            }
+            let (ty, value) = self.expr(inner, want);
+            return self.cell(mutable, ty, value, want, span);
         }
         let Some(place) = self.place(inner) else {
             return (Ty::Error, Value::default());
         };
         let Slots::Memory { addr, offset } = place.slots else {
-            self.error(TypeErrorKind::NotAddressable, span);
-            return (Ty::Error, Value::default());
+            if !self.global {
+                self.error(TypeErrorKind::NotAddressable, span);
+                return (Ty::Error, Value::default());
+            }
+            let value = self.read_place(&place);
+            return self.cell(mutable, place.ty, value, want, span);
         };
         if place.ty == Ty::Error {
             return (Ty::Error, Value::default());
         }
-        let mutable = mutability == Mutability::Var;
         if let Some(ty) = place.behind.filter(|_| mutable && !place.mutable) {
             let (ty, needs, element) = self.read_only(ty);
             self.error(TypeErrorKind::ReadOnlyAddr { ty, needs, element }, span);
@@ -3993,6 +4032,32 @@ impl<'c> Body<'c> {
             scalars: vec![(ValType::I32, addr)],
         };
         (self.ck.ptr_to(place.ty, mutable), value)
+    }
+
+    /// `&value` or `&var value` in a global initializer, where `value` is a
+    /// `ty` that isn't in memory: it must be constant, and is placed there
+    /// after any literals within it. It's a `want` if it fits one, as a
+    /// literal is of the type expected of it.
+    fn cell(
+        &mut self,
+        mutable: bool,
+        ty: Ty,
+        value: Value,
+        want: Option<Ty>,
+        span: Span,
+    ) -> (Ty, Value) {
+        if self.default && mutable {
+            self.error(TypeErrorKind::SharedPointee, span);
+        }
+        let consts = self.ck.fold_value(&value, span);
+        // Nothing holding an `externref` is constant, so that's reported.
+        if ty == Ty::Error || !self.ck.storable(ty) {
+            return (Ty::Error, Value::default());
+        }
+        let ty = want.filter(|want| self.ck.fits(ty, *want)).unwrap_or(ty);
+        let offset = self.ck.repeat_data(ty, consts, 1);
+        let addr = Expr::Const(Const::I32(offset as i32));
+        (self.ck.ptr_to(ty, mutable), scalar(ValType::I32, addr))
     }
 
     fn call(&mut self, callee: &parse::Expr, args: &[Arg], span: Span) -> (Ty, Value) {
@@ -6317,6 +6382,107 @@ fn f(a: i32, p: P, pp: &&P):
             ..Settings::default()
         };
         check_with(src, &settings)
+    }
+
+    #[test]
+    fn address_of_a_constant_in_a_global_places_it() {
+        let src = "\
+pub enum(u8) Mode:
+    idle
+    busy = 7
+pub struct P:
+    a: u8 = 1
+    b: i32 = -2
+let N: i16 = 3
+pub let n = &N
+pub let m = &N
+pub let zero = &var 0
+pub let wide: &var u64 = &var 5
+pub let p = &var P()
+pub let b = &p.b
+pub let mode = &var Mode.busy
+pub let name = &\"hi\"
+fn take(n: &i16, zero: &var i32, wide: &var u64, p: &var P, b: &i32):
+    pass
+fn more(mode: &var Mode, name: &array(u8)):
+    pass
+fn f() -> i32:
+    take(n, zero, wide, p, b)
+    more(mode, name)
+    p.b += 1
+    zero.* = 4
+    return p.b
+";
+        let module = lower(src);
+        // A zeroed value adds no data, and one behind a pointer isn't copied.
+        assert_eq!(
+            data(&module),
+            [
+                (0, &[3, 0][..]),
+                (2, &[3, 0]),
+                (8, &[5, 0, 0, 0, 0, 0, 0, 0]),
+                (16, &[1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]),
+                (24, &[7]),
+                (25, b"hi"),
+                (28, &[2, 0, 0, 0, 25, 0, 0, 0]),
+            ]
+        );
+        let inits: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.init))
+            .collect();
+        assert_eq!(
+            inits,
+            [
+                ("n", Const::I32(0)),
+                ("m", Const::I32(2)),
+                ("zero", Const::I32(4)),
+                ("wide", Const::I32(8)),
+                ("p", Const::I32(16)),
+                ("b", Const::I32(20)),
+                ("mode", Const::I32(24)),
+                ("name", Const::I32(28)),
+            ]
+        );
+        assert_eq!(
+            body(&module, "f"),
+            "(call take [0 4 8 16 20] -> []) (call more [24 28] -> []) \
+             (I32.Store offset=4 16 (I32.Add (I32.Load offset=4 16) 1)) \
+             (I32.Store offset=0 4 4) (return (I32.Load offset=4 16))"
+        );
+    }
+
+    #[test]
+    fn address_of_a_constant_errors() {
+        let src = "\
+enum(u8) Mode:
+    idle
+struct S:
+    r: &i32 = &1
+    w: &var i32 = &var 1
+fn make() -> i32:
+    return 1
+var v = 1
+let a = &v
+let b = &make()
+let c: &var i32 = &1
+fn f(x: i32):
+    let d = &1
+    let e = &Mode.idle
+";
+        use TypeErrorKind::*;
+        assert_eq!(
+            errors(src),
+            vec![
+                SharedPointee,
+                NotConstant,
+                NotConstant,
+                mismatch("&var i32", "&i32"),
+                NotAddressable,
+                NotAddressable,
+            ]
+        );
     }
 
     #[test]
