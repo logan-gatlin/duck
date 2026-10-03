@@ -1,0 +1,19 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "duck",
+      "camelcase": "Duck",
+      "scope": "source.duck",
+      "path": ".",
+      "file-types": ["duck"],
+      "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "description": "Duck grammar for tree-sitter",
+    "authors": [{ "name": "Logan Gatlin" }]
+  }
+}

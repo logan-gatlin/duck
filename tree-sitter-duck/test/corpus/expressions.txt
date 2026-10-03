@@ -1,0 +1,356 @@
+====================
+Precedence
+====================
+
+let _ = a or b and not c == d | e ^ f & g << h + i * -j
+let _ = a * b + c << d & e ^ f | g == h and i or j
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (binary_expression
+      (identifier)
+      (binary_expression
+        (identifier)
+        (unary_expression
+          (binary_expression
+            (identifier)
+            (binary_expression
+              (identifier)
+              (binary_expression
+                (identifier)
+                (binary_expression
+                  (identifier)
+                  (binary_expression
+                    (identifier)
+                    (binary_expression
+                      (identifier)
+                      (binary_expression
+                        (identifier)
+                        (unary_expression
+                          (identifier)))))))))))))
+  (binding
+    (discard)
+    (binary_expression
+      (binary_expression
+        (binary_expression
+          (binary_expression
+            (binary_expression
+              (binary_expression
+                (binary_expression
+                  (binary_expression
+                    (binary_expression
+                      (identifier)
+                      (identifier))
+                    (identifier))
+                  (identifier))
+                (identifier))
+              (identifier))
+            (identifier))
+          (identifier))
+        (identifier))
+      (identifier))))
+
+====================
+Left associativity
+====================
+
+let _ = a - b - c
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (binary_expression
+      (binary_expression
+        (identifier)
+        (identifier))
+      (identifier))))
+
+====================
+Unary and postfix
+====================
+
+let _ = -f(x, 1).y[0]
+let _ = ~-a
+let _ = f()()
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (unary_expression
+      (index_expression
+        (field_expression
+          (call_expression
+            (identifier)
+            (arguments
+              (identifier)
+              (integer)))
+          (identifier))
+        (integer))))
+  (binding
+    (discard)
+    (unary_expression
+      (unary_expression
+        (identifier))))
+  (binding
+    (discard)
+    (call_expression
+      (call_expression
+        (identifier)
+        (arguments))
+      (arguments))))
+
+====================
+Casts
+====================
+
+let _ = -x as i64
+let _ = a + b as i64
+let _ = x as i64 as f32
+let _ = not x as bool
+let _ = x as Box(i32)
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (cast_expression
+      (unary_expression
+        (identifier))
+      (named_type
+        (identifier))))
+  (binding
+    (discard)
+    (binary_expression
+      (identifier)
+      (cast_expression
+        (identifier)
+        (named_type
+          (identifier)))))
+  (binding
+    (discard)
+    (cast_expression
+      (cast_expression
+        (identifier)
+        (named_type
+          (identifier)))
+      (named_type
+        (identifier))))
+  (binding
+    (discard)
+    (unary_expression
+      (cast_expression
+        (identifier)
+        (named_type
+          (identifier)))))
+  (binding
+    (discard)
+    (cast_expression
+      (identifier)
+      (named_type
+        (identifier)
+        (type_arguments
+          (named_type
+            (identifier)))))))
+
+====================
+Pointers
+====================
+
+let _ = p.*.x.*
+let _ = &p.x
+let _ = -&p.* as u32
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (dereference_expression
+      (field_expression
+        (dereference_expression
+          (identifier))
+        (identifier))))
+  (binding
+    (discard)
+    (address_of_expression
+      (field_expression
+        (identifier)
+        (identifier))))
+  (binding
+    (discard)
+    (cast_expression
+      (unary_expression
+        (address_of_expression
+          (dereference_expression
+            (identifier))))
+      (named_type
+        (identifier)))))
+
+====================
+Labelled arguments
+====================
+
+let _ = Point(x: 1, y: 2)
+let _ = Box(&i32)(value: 1)
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (call_expression
+      (identifier)
+      (arguments
+        (labeled_argument
+          (identifier)
+          (integer))
+        (labeled_argument
+          (identifier)
+          (integer)))))
+  (binding
+    (discard)
+    (call_expression
+      (call_expression
+        (identifier)
+        (arguments
+          (address_of_expression
+            (identifier))))
+      (arguments
+        (labeled_argument
+          (identifier)
+          (integer))))))
+
+====================
+Tuples and unit
+====================
+
+let _ = ()
+let _ = (a)
+let _ = (a, (b, c),)
+let _ = t.0.1
+let _ = f(x).10
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (unit))
+  (binding
+    (discard)
+    (parenthesized_expression
+      (identifier)))
+  (binding
+    (discard)
+    (tuple
+      (identifier)
+      (tuple
+        (identifier)
+        (identifier))))
+  (binding
+    (discard)
+    (field_expression
+      (field_expression
+        (identifier)
+        (tuple_index))
+      (tuple_index)))
+  (binding
+    (discard)
+    (field_expression
+      (call_expression
+        (identifier)
+        (arguments
+          (identifier)))
+      (tuple_index))))
+
+====================
+Lists
+====================
+
+let _ = []
+let _ = [1, 2,]
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (list))
+  (binding
+    (discard)
+    (list
+      (integer)
+      (integer))))
+
+====================
+Numbers
+====================
+
+let _ = [1_000, 0xff, 0b101, 0o17, 1.5, 2e3, 1.5e-2, 1.foo]
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (list
+      (integer)
+      (integer)
+      (integer)
+      (integer)
+      (float)
+      (float)
+      (float)
+      (field_expression
+        (integer)
+        (identifier)))))
+
+====================
+Strings
+====================
+
+let _ = "hi\n\"there\" \u{1F986}"
+let _ = " # not a comment"
+let _ = ""
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (string
+      (string_content)
+      (escape_sequence)
+      (escape_sequence)
+      (string_content)
+      (escape_sequence)
+      (string_content)
+      (escape_sequence)))
+  (binding
+    (discard)
+    (string
+      (string_content)))
+  (binding
+    (discard)
+    (string)))
+
+====================
+Discard as a name
+====================
+
+let _ = _
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (identifier)))

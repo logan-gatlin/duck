@@ -1,0 +1,340 @@
+====================
+Import
+====================
+
+import "lib/util.duck"
+pub import "value.duck" as v
+import json
+import json as j
+
+---
+
+(source_file
+  (import
+    path: (string
+      (string_content)))
+  (import
+    path: (string
+      (string_content))
+    alias: (identifier))
+  (import
+    package: (identifier))
+  (import
+    package: (identifier)
+    alias: (identifier)))
+
+====================
+Extern block
+====================
+
+extern "js":
+    fn now() -> f64
+    fn log(p: &u8, len: i32) = "console.log"
+extern:
+    pass
+
+---
+
+(source_file
+  (extern_block
+    (string
+      (string_content))
+    (extern_function
+      (identifier)
+      (parameters)
+      (named_type
+        (identifier)))
+    (extern_function
+      (identifier)
+      (parameters
+        (parameter
+          (identifier)
+          (pointer_type
+            (named_type
+              (identifier))))
+        (parameter
+          (identifier)
+          (named_type
+            (identifier))))
+      (string
+        (string_content))))
+  (extern_block
+    (pass_statement)))
+
+====================
+Struct
+====================
+
+pub struct Point:
+    pub x: f32
+    y: f32
+struct Unit:
+    pass
+
+---
+
+(source_file
+  (struct_declaration
+    (identifier)
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier)))
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier))))
+  (struct_declaration
+    (identifier)
+    (pass_statement)))
+
+====================
+Generic struct
+====================
+
+struct(A, B,) Pair:
+    a: A
+    b: B
+
+---
+
+(source_file
+  (struct_declaration
+    (type_parameters
+      (identifier)
+      (identifier))
+    (identifier)
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier)))
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier)))))
+
+====================
+Enum
+====================
+
+pub enum(i8) ReturnCode:
+    ok
+    error = 5 + 1
+
+---
+
+(source_file
+  (enum_declaration
+    (named_type
+      (identifier))
+    (identifier)
+    (enum_member
+      (identifier))
+    (enum_member
+      (identifier)
+      (binary_expression
+        (integer)
+        (integer)))))
+
+====================
+Function
+====================
+
+pub fn add(a: i32, b: i32,) -> i32:
+    return a + b
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier)))
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (named_type
+      (identifier))
+    (block
+      (return_statement
+        (binary_expression
+          (identifier)
+          (identifier))))))
+
+====================
+Generic function
+====================
+
+fn(T, U) pair(a: T, b: U) -> tuple(T, U):
+    return (a, b)
+
+---
+
+(source_file
+  (function_declaration
+    (type_parameters
+      (identifier)
+      (identifier))
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier)))
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (named_type
+      (identifier)
+      (type_arguments
+        (named_type
+          (identifier))
+        (named_type
+          (identifier))))
+    (block
+      (return_statement
+        (tuple
+          (identifier)
+          (identifier))))))
+
+====================
+Bindings
+====================
+
+pub let global = true
+pub var counter: i32 = 0
+
+---
+
+(source_file
+  (binding
+    (identifier)
+    (boolean))
+  (binding
+    (identifier)
+    (named_type
+      (identifier))
+    (integer)))
+
+====================
+Patterns
+====================
+
+let _ = 1
+var (a, _) = t
+let ((a, b), (c)) = t
+let () = t
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (integer))
+  (binding
+    (tuple_pattern
+      (identifier)
+      (discard))
+    (identifier))
+  (binding
+    (tuple_pattern
+      (tuple_pattern
+        (identifier)
+        (identifier))
+      (parenthesized_pattern
+        (identifier)))
+    (identifier))
+  (binding
+    (tuple_pattern)
+    (identifier)))
+
+====================
+Types
+====================
+
+let x: Map(&K, tuple(V, W), Box(T),) = 1
+let y: &&tuple() = 2
+
+---
+
+(source_file
+  (binding
+    (identifier)
+    (named_type
+      (identifier)
+      (type_arguments
+        (pointer_type
+          (named_type
+            (identifier)))
+        (named_type
+          (identifier)
+          (type_arguments
+            (named_type
+              (identifier))
+            (named_type
+              (identifier))))
+        (named_type
+          (identifier)
+          (type_arguments
+            (named_type
+              (identifier))))))
+    (integer))
+  (binding
+    (identifier)
+    (pointer_type
+      (pointer_type
+        (named_type
+          (identifier)
+          (type_arguments))))
+    (integer)))
+
+====================
+Qualified types and pub host functions
+====================
+
+extern:
+    pub fn log(n: i32)
+fn f(a: json.Value, b: &a.b.List(geo.Point)):
+    pass
+
+---
+
+(source_file
+  (extern_block
+    (extern_function
+      name: (identifier)
+      parameters: (parameters
+        (parameter
+          name: (identifier)
+          type: (named_type
+            name: (identifier))))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameters
+      (parameter
+        name: (identifier)
+        type: (qualified_type
+          module: (identifier)
+          type: (named_type
+            name: (identifier))))
+      (parameter
+        name: (identifier)
+        type: (pointer_type
+          pointee: (qualified_type
+            module: (identifier)
+            type: (qualified_type
+              module: (identifier)
+              type: (named_type
+                name: (identifier)
+                arguments: (type_arguments
+                  (qualified_type
+                    module: (identifier)
+                    type: (named_type
+                      name: (identifier))))))))))
+    body: (block
+      (pass_statement))))
