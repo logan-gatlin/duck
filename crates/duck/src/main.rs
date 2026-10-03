@@ -103,11 +103,11 @@ fn build() -> ExitCode {
                     files.display_name(span.file)
                 );
                 for site in error.instances() {
-                    let call = site.call;
-                    let (line, col) = line_col(&files.contents(call.file), call.start);
+                    let span = site.span;
+                    let (line, col) = line_col(&files.contents(span.file), span.start);
                     eprintln!(
-                        "{}:{line}:{col}: note: in `{}`, called here",
-                        files.display_name(call.file),
+                        "{}:{line}:{col}: note: required by `{}` here",
+                        files.display_name(span.file),
                         site.name
                     );
                 }

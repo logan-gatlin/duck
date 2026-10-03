@@ -70,6 +70,10 @@ impl Checker {
     /// compares through the function of its `array`.
     fn eq_func(&mut self, ty: Ty) -> FuncId {
         let ty = self.with_writes(ty, false);
+        // A generic function checked as declared compares arrays of no type.
+        if self.open {
+            return FuncId(0);
+        }
         if let Some(id) = self.eq_funcs.get(&ty) {
             return *id;
         }
@@ -117,7 +121,7 @@ impl Body<'_> {
         span: Span,
     ) -> (Ty, Value) {
         let bool = Ty::Prim(Prim::Bool);
-        if ty == Ty::Error || !self.ck.storable(ty) {
+        if ty == Ty::Error || !self.ck.stores(ty) {
             return self.invalid_operand(binop_symbol(op), ty, span);
         }
         // Checked up front, as folding skips calls in branches it doesn't

@@ -190,7 +190,7 @@ pointers.
 struct(T) Box:
 	value: T
 
-fn(T) larger(a: T, b: T) -> T:     # no bounds: the body is checked per instance
+fn(T) larger(a: T, b: T) -> T:     # no bounds: each call's types must suit the body
 	if a > b:
 		return a
 	return b
@@ -204,8 +204,12 @@ fn demo() -> u8:
 	return larger(z, b.value)
 ```
 
+- A generic body is checked as declared, where `T` is only itself. What no
+  type could make right is an error there, like a `T` returned as a `Box(T)`.
+  What some types make right, like `a > b`, is checked for each call's type
+  arguments, and an error is reported at the call.
 - In a generic body `T` is also a value (`T.size`), a constructor (`T(x: 1)`)
-  and an enum (`T.ok`).
+  and an enum (`T.ok`). `T.size` and `T.align` are always those of the type.
 - A field default never names `T`, and a field holding a `T` by value has
   none. `head: &var T = 0` and `items: varray(T) = []` are fine.
 - `p: &T` takes a `&var i32` with `T` as `i32`, and `array(T)` a `varray(i32)`.

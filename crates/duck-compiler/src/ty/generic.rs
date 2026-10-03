@@ -138,7 +138,7 @@ impl Checker {
     }
 
     /// Whether struct `id` is a generic declaration, or an instance whose type
-    /// arguments hold type parameters. Neither is ever laid out.
+    /// arguments hold type parameters. No value of either is ever run.
     pub(super) fn is_open(&self, id: StructId) -> bool {
         let def = &self.structs[id.0 as usize];
         match &def.instance {
@@ -148,7 +148,7 @@ impl Checker {
     }
 
     /// Whether `ty` holds a type parameter anywhere within it.
-    fn has_param(&self, ty: Ty) -> bool {
+    pub(super) fn has_param(&self, ty: Ty) -> bool {
         match ty {
             Ty::Param(_) => true,
             Ty::Struct(id) => self.is_open(id) && self.structs[id.0 as usize].instance.is_some(),
@@ -350,8 +350,11 @@ impl Checker {
     /// The instance of generic struct `generic` with type arguments `args`,
     /// first used at `site`. Instances are given their fields as soon as
     /// every generic struct is defined, and reported at `site` if a pointer
-    /// in them can't be stored once every struct is.
+    /// in them can't be stored once every struct is. One whose type
+    /// arguments hold type parameters is reported once they are given theirs,
+    /// which the body of a generic function checked as declared needs.
     pub(super) fn instantiate(&mut self, generic: StructId, args: Vec<Ty>, site: Span) -> Ty {
+        self.deferred |= self.open && args.iter().any(|arg| self.has_param(*arg));
         if let Some(id) = self.instances.get(&(generic, args.clone())) {
             return Ty::Struct(*id);
         }
@@ -371,9 +374,6 @@ impl Checker {
             fields: Vec::new(),
         });
         self.instances.insert((generic, args), id);
-        if self.is_open(id) {
-            return Ty::Struct(id);
-        }
         if !self.generics_defined {
             self.pending.push(id);
             return Ty::Struct(id);

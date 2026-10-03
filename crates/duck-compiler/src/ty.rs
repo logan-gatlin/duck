@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 use std::ops::Range;
+use std::rc::Rc;
 
 use crate::file::{FileId, MemoryLimits, Settings, StaticSection};
 use crate::ir::{
@@ -24,7 +25,7 @@ use crate::parse::{
 use defaults::FieldDefault;
 use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
-use generic_fn::{FnInstance, GenericFn};
+use generic_fn::{FnInstance, GenericFn, InstanceCall, Need, Needs};
 
 mod defaults;
 mod enums;
@@ -225,8 +226,9 @@ pub enum Ty {
     /// `malloc(Point)`. Laid out like a struct with the fields `size: u32`
     /// and `align: u32`, which describe the type in memory.
     Type,
-    /// A type parameter, which only the fields of its generic struct's
-    /// declaration have. Uses of the struct replace it with a type argument.
+    /// A type parameter, which the fields of its generic struct's declaration
+    /// have, and the body of its generic function's while that is checked as
+    /// declared. Uses of either replace it with a type argument.
     Param(ParamId),
     /// `externref`, an opaque reference that only the host can create. It
     /// can't be stored in linear memory, so nothing that holds one has a
@@ -245,16 +247,19 @@ pub struct TypeError {
     pub kind: TypeErrorKind,
     /// `None` for errors in the [`Settings`], which no source file holds.
     pub span: Option<Span>,
-    /// The instances of generic functions the error is in, innermost first.
+    /// For an error in the type arguments a call gives a generic function,
+    /// which `span` is, the instances that need what they lack, outermost
+    /// first. Each but the last needs it for the next.
     pub instances: Vec<InstanceSite>,
 }
 
-/// An instance of a generic function, and the call that first used it.
+/// An instance of a generic function, and where its body needs of its type
+/// arguments what an error says they lack.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceSite {
     /// The instance as written, such as `id(i32)`.
     pub name: String,
-    pub call: Span,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -450,6 +455,13 @@ pub enum TypeErrorKind {
     NotAType,
     /// A type argument given a label, as only fields and parameters are.
     LabelledTypeArg,
+    /// An error in the body of an instance of a generic function whose type
+    /// arguments have all that its declaration found it to need of them. A
+    /// bug in the compiler.
+    Unchecked {
+        instance: String,
+        error: Box<TypeErrorKind>,
+    },
 }
 
 #[derive(Default)]
@@ -469,8 +481,8 @@ struct Checker {
     instances: HashMap<(StructId, Vec<Ty>), StructId>,
     /// Every generic struct's type parameters, indexed by [`ParamId`].
     params: Vec<ParamDef>,
-    /// The type parameters in scope, while resolving a generic struct's
-    /// fields.
+    /// The type parameters in scope, and the types they stand for: themselves
+    /// in a generic declaration, and type arguments in an instance.
     type_params: Vec<(String, Ty)>,
     /// Enum declarations in declaration order.
     enums: Vec<EnumDef>,
@@ -517,9 +529,17 @@ struct Checker {
     /// Each instance of a generic function by its declaration and type
     /// arguments.
     fn_instances: HashMap<(GenericFnId, Vec<Ty>), FuncId>,
-    /// While lowering an instance of a generic function, it and the
-    /// instances whose calls led to it, innermost first. Given to errors.
-    instance_chain: Vec<InstanceSite>,
+    /// While checking or lowering an instance of a generic function, it and
+    /// the instances whose calls led to it, innermost first. Given to errors.
+    instance_chain: Vec<InstanceCall>,
+    /// Whether the body of a generic function is being checked as declared,
+    /// with its type parameters standing for themselves. Only an error that
+    /// no type argument avoids is reported; what some would avoid is
+    /// `deferred`.
+    open: bool,
+    /// Whether the statement being checked as declared needs something of
+    /// the type arguments, so it is checked again for each instance.
+    deferred: bool,
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
     ir_globals: Vec<ir::Global>,
@@ -580,8 +600,8 @@ struct StructDef {
     params: Vec<Ty>,
     /// Set for instances of generic declarations.
     instance: Option<Instance>,
-    /// Empty for instances whose type arguments hold type parameters, which
-    /// are never laid out.
+    /// An instance's are its declaration's, with its type arguments in place
+    /// of the type parameters.
     fields: Vec<FieldDef>,
 }
 
@@ -646,6 +666,12 @@ struct Body<'c> {
     default: bool,
     /// The value piped into each enclosing pipe body, innermost last.
     piped: Vec<(Ty, Vec<(ValType, Expr)>)>,
+    /// What the statements of a generic function's body need of its type
+    /// arguments, recorded as the body is checked as declared.
+    needs: Needs,
+    /// For an instance of a generic function, the needs its declaration
+    /// recorded, when only they are checked. Every statement is otherwise.
+    only: Option<Rc<Needs>>,
 }
 
 #[derive(Clone)]
@@ -998,6 +1024,11 @@ impl fmt::Display for TypeErrorKind {
             Self::UntypedEmptyArray => write!(f, "can't infer the element type of `[]`"),
             Self::NotAType => write!(f, "expected a type"),
             Self::LabelledTypeArg => write!(f, "type arguments can't be labelled"),
+            Self::Unchecked { instance, error } => write!(
+                f,
+                "internal error: the checks of `{instance}` missed an error in its body: \
+                 {error}; please report this"
+            ),
         }
     }
 }
@@ -1009,11 +1040,11 @@ impl fmt::Display for TypeError {
             None => self.kind.fmt(f)?,
         }
         for site in &self.instances {
-            let call = site.call;
+            let span = site.span;
             write!(
                 f,
-                ", in `{}` called at {}..{}",
-                site.name, call.start, call.end
+                ", required by `{}` at {}..{}",
+                site.name, span.start, span.end
             )?;
         }
         Ok(())
@@ -1055,9 +1086,16 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
         .start
         .as_ref()
         .and_then(|name| ck.resolve_start(program, name));
+    ck.check_generic_fns(program);
     let imports = ck.lower_imports(program);
     let mut funcs = ck.lower_funcs(program);
     funcs.extend(ck.lower_synths(program));
+    // An instance may only have an error its checks missed because of one
+    // that is reported.
+    let unchecked = |e: &TypeError| matches!(e.kind, TypeErrorKind::Unchecked { .. });
+    if !ck.errors.iter().all(unchecked) {
+        ck.errors.retain(|e| !unchecked(e));
+    }
     if ck.errors.is_empty() {
         Ok(ir::Module {
             memory: ir::Memory {
@@ -1081,11 +1119,22 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
 }
 
 impl Checker {
+    /// Reports an error at `span`. In an instance of a generic function it
+    /// is reported at the call that led to the instance, as what the
+    /// instance needs at `span`.
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
+        let mut span = span;
+        let mut instances = Vec::new();
+        for instance in &self.instance_chain {
+            let name = instance.name.clone();
+            instances.push(InstanceSite { name, span });
+            span = instance.call;
+        }
+        instances.reverse();
         self.errors.push(TypeError {
             kind,
             span: Some(span),
-            instances: self.instance_chain.clone(),
+            instances,
         });
     }
 
@@ -1279,6 +1328,10 @@ impl Checker {
     /// them the error type. Only checks the structs `ids`.
     fn check_field_pointers(&mut self, ids: Range<usize>) {
         for id in ids {
+            // Known once its type parameters are given their arguments.
+            if self.structs[id].instance.is_some() && self.is_open(StructId(id as u32)) {
+                continue;
+            }
             for i in 0..self.structs[id].fields.len() {
                 if let Some(ty) = self.unstorable_pointee(self.structs[id].fields[i].ty) {
                     let kind = TypeErrorKind::NotStorable(self.ty_name(ty));
@@ -1614,7 +1667,26 @@ impl Checker {
         span: Span,
         export: Option<String>,
     ) -> ir::Func {
+        self.walk_body(sig, block, span, export, None).0
+    }
+
+    /// Lowers a function as [`Self::lower_body`] does, and gives what its
+    /// statements need of type arguments, which is recorded for a generic
+    /// function checked as declared. With `only`, the needs recorded for an
+    /// instance's declaration, only they are checked.
+    fn walk_body(
+        &mut self,
+        sig: FuncSig,
+        block: &parse::Block,
+        span: Span,
+        export: Option<String>,
+        only: Option<Rc<Needs>>,
+    ) -> (ir::Func, Needs) {
+        // A type parameter may be given `tuple()`, which needs no `return`.
+        let unit = self.open && matches!(sig.ret, Ty::Param(_));
+        let returns = unit || diverges(block);
         let mut body = Body::new(self, sig.ret);
+        body.only = only;
         for (name, ty) in &sig.params {
             let slots = body.alloc(name, *ty);
             body.bind(name, *ty, false, slots);
@@ -1622,8 +1694,9 @@ impl Checker {
         let params = body.locals.iter().map(|local| local.ty).collect();
         let mut stmts = body.block(block);
         let locals = body.locals;
+        let needs = body.needs;
         let results = self.val_types(sig.ret);
-        if !matches!(sig.ret, Ty::Unit | Ty::Error) && !diverges(block) {
+        if !matches!(sig.ret, Ty::Unit | Ty::Error) && !returns {
             self.error(TypeErrorKind::MissingReturn(sig.name.clone()), span);
         }
         // Wasm validates the end of a function with results as reachable
@@ -1632,14 +1705,15 @@ impl Checker {
         if !results.is_empty() && !ends_unreachable {
             stmts.push(Stmt::Unreachable);
         }
-        ir::Func {
+        let func = ir::Func {
             export,
             name: sig.name,
             params,
             results,
             locals,
             body: stmts,
-        }
+        };
+        (func, needs)
     }
 
     /// Lowers every function in `synths`, including those that lowering the
@@ -1675,7 +1749,7 @@ impl Checker {
             TypeKind::Pointer(mutability, pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
-                pointee if self.structs_defined && !self.storable(pointee) => {
+                pointee if self.structs_defined && !self.stores(pointee) => {
                     let kind = TypeErrorKind::NotStorable(self.ty_name(pointee));
                     self.error(kind, ty.span);
                     Ty::Error
@@ -1783,7 +1857,7 @@ impl Checker {
         } else if name == ARRAY || name == VARRAY {
             match args[0] {
                 // Struct fields are checked once every struct is defined.
-                elem if self.structs_defined && !self.storable(elem) => {
+                elem if self.structs_defined && !self.stores(elem) => {
                     let kind = TypeErrorKind::NotStorable(self.ty_name(elem));
                     self.error(kind, span);
                     Ty::Error
@@ -1810,6 +1884,16 @@ impl Checker {
             Ty::Fn(_) => true,
             Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Type | Ty::Unit | Ty::Error => true,
         }
+    }
+
+    /// [`Self::storable`], for a type that a function's body needs to be. In
+    /// a generic function checked as declared, a type that holds a type
+    /// parameter may not be once it is given its argument.
+    fn stores(&mut self, ty: Ty) -> bool {
+        if self.open && self.held_param(ty, true).is_some() {
+            self.deferred = true;
+        }
+        self.storable(ty)
     }
 
     /// The types of a struct's fields, a tuple's elements, an array's `len`
@@ -1898,6 +1982,67 @@ impl Checker {
                 }
                 _ => false,
             }
+    }
+
+    /// Whether a `found` may stand where a `want` is expected, as
+    /// [`Self::fits`] has it, once every type parameter is given some type
+    /// argument.
+    fn may_fit(&self, found: Ty, want: Ty) -> bool {
+        let reads = self.writes(found) || !self.writes(want);
+        match (found, want) {
+            (Ty::Ptr(f), Ty::Ptr(w)) => reads && self.may_be(self.pointee(f), self.pointee(w)),
+            (Ty::Array(f), Ty::Array(w)) => reads && self.may_be(self.element(f), self.element(w)),
+            _ => self.may_be(found, want),
+        }
+    }
+
+    /// Whether `a` and `b` may be the same type once every type parameter is
+    /// given some type argument. A type parameter may be any type that
+    /// doesn't hold it.
+    fn may_be(&self, a: Ty, b: Ty) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a, b) {
+            (Ty::Error, _) | (_, Ty::Error) => true,
+            (Ty::Param(_), other) | (other, Ty::Param(_)) => {
+                let param = if let Ty::Param(_) = a { a } else { b };
+                !self.holds(other, param)
+            }
+            (Ty::Struct(a), Ty::Struct(b)) => {
+                let a = &self.structs[a.0 as usize].instance;
+                let b = &self.structs[b.0 as usize].instance;
+                match (a, b) {
+                    (Some(a), Some(b)) if a.generic == b.generic => {
+                        let mut args = a.args.iter().zip(&b.args);
+                        args.all(|(a, b)| self.may_be(*a, *b))
+                    }
+                    _ => false,
+                }
+            }
+            (Ty::Ptr(_), Ty::Ptr(_))
+            | (Ty::Array(_), Ty::Array(_))
+            | (Ty::Tuple(_), Ty::Tuple(_))
+            | (Ty::Fn(_), Ty::Fn(_)) => {
+                let (parts_a, parts_b) = (self.components(a), self.components(b));
+                let mut parts = parts_a.iter().zip(&parts_b);
+                self.writes(a) == self.writes(b)
+                    && parts_a.len() == parts_b.len()
+                    && parts.all(|(a, b)| self.may_be(*a, *b))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `from as to` may be allowed once every type parameter is given
+    /// some type argument.
+    fn may_cast(&self, from: Ty, to: Ty) -> bool {
+        match (from, to) {
+            (Ty::Param(_), _) | (_, Ty::Param(_)) => true,
+            (Ty::Array(from), Ty::Array(to)) => self.may_be(self.element(from), self.element(to)),
+            (Ty::Enum(id), to) => self.may_cast(self.enum_ty(id), to),
+            _ => self.may_be(from, to),
+        }
     }
 
     /// The types a pointer, tuple, array, or function type is made of: its
@@ -2072,7 +2217,9 @@ impl Checker {
             let offset = self.aggregate_layout(ty).0[index];
             return Some((members[index], start..start + len, offset));
         }
-        if ty != Ty::Error {
+        if let Ty::Param(_) = ty {
+            self.deferred = true;
+        } else if ty != Ty::Error {
             let kind = TypeErrorKind::NoField {
                 ty: self.ty_name(ty),
                 field: field.name.clone(),
@@ -2145,7 +2292,9 @@ impl Checker {
                     }
                     Ty::Unit if elems.is_empty() => Vec::new(),
                     _ => {
-                        if ty != Ty::Error {
+                        if let Ty::Param(_) = ty {
+                            self.deferred = true;
+                        } else if ty != Ty::Error {
                             let kind = TypeErrorKind::Mismatch {
                                 expected: format!("{TUPLE}({})", vec!["_"; elems.len()].join(", ")),
                                 found: self.ty_name(ty),
@@ -2323,6 +2472,8 @@ impl<'c> Body<'c> {
             global: false,
             default: false,
             piped: Vec::new(),
+            needs: Needs::default(),
+            only: None,
         }
     }
 
@@ -2331,14 +2482,61 @@ impl<'c> Body<'c> {
     }
 
     /// Reports a mismatch unless `found` fits where `want` is expected or
-    /// either is an error.
+    /// either is an error. In a generic function checked as declared, one
+    /// that some type arguments avoid is left to each instance.
     fn expect(&mut self, found: Ty, want: Ty, span: Span) {
-        if !self.ck.fits(found, want) && found != Ty::Error && want != Ty::Error {
-            let kind = TypeErrorKind::Mismatch {
-                expected: self.ck.ty_name(want),
-                found: self.ck.ty_name(found),
-            };
-            self.error(kind, span);
+        if self.ck.fits(found, want) || found == Ty::Error || want == Ty::Error {
+            return;
+        }
+        if self.ck.open && self.ck.may_fit(found, want) {
+            self.ck.deferred = true;
+            return;
+        }
+        let kind = TypeErrorKind::Mismatch {
+            expected: self.ck.ty_name(want),
+            found: self.ck.ty_name(found),
+        };
+        self.error(kind, span);
+    }
+
+    /// What is checked of `stmt`, or of its condition if it's an `if` or
+    /// `while`: all of it, unless only the needs of an instance are.
+    fn need(&self, stmt: &parse::Stmt) -> Need {
+        match &self.only {
+            Some(needs) => needs.of(stmt),
+            None => Need::Check,
+        }
+    }
+
+    /// Records what `stmt`, checked just now in a generic function as
+    /// declared, needs of the type arguments. `bound` is the type of what it
+    /// binds names in, if it's a `let`, `var` or `for`.
+    fn record(&mut self, stmt: &parse::Stmt, bound: Option<Ty>) {
+        if !self.ck.open {
+            return;
+        }
+        match (mem::take(&mut self.ck.deferred), bound) {
+            (true, _) => self.needs.set(stmt, Need::Check),
+            (false, Some(ty)) => self.needs.set(stmt, Need::Bind(ty)),
+            (false, None) => {}
+        }
+    }
+
+    /// A value of type `ty` that is never run: the result of what an
+    /// instance checks, or of what isn't checked for one.
+    fn blank(&self, ty: Ty) -> Value {
+        let zeros = self.ck.val_types(ty).into_iter().map(zero);
+        self.scalars(ty, zeros.map(Expr::Const).collect())
+    }
+
+    /// The type parameter `expr` names, if it's the name of one that no
+    /// variable or item shadows, and the type it stands for.
+    fn param_named(&self, expr: &parse::Expr) -> Option<Ty> {
+        match &expr.kind {
+            ExprKind::Name(name) if self.lookup(name).is_none() && self.ck.item(name).is_none() => {
+                self.ck.type_param(name)
+            }
+            _ => None,
         }
     }
 
@@ -2391,10 +2589,17 @@ impl<'c> Body<'c> {
     }
 
     fn stmt(&mut self, stmt: &parse::Stmt, out: &mut Vec<Stmt>) {
+        let need = self.need(stmt);
+        let checked = matches!(need, Need::Check);
         match &stmt.kind {
             StmtKind::Binding(binding) => {
-                let (ty, value) = self.binding_value(binding);
+                let (ty, value) = match need {
+                    Need::Check => self.binding_value(binding),
+                    Need::Bind(ty) => self.unchecked(ty, stmt.span),
+                    Need::Skip => (Ty::Error, Value::default()),
+                };
                 let bounds = self.ck.destructure(&binding.pattern, ty);
+                self.record(stmt, Some(ty));
                 // The local each leaf of the value goes to, if it's kept.
                 let mut dests = vec![None; self.ck.val_types(ty).len()];
                 let mut vars = Vec::new();
@@ -2423,34 +2628,14 @@ impl<'c> Body<'c> {
                     self.bind(name, ty, mutable, slots);
                 }
             }
+            StmtKind::Assign { .. } | StmtKind::Expr(_) | StmtKind::Return(_) if !checked => {}
             StmtKind::Assign { target, op, value } => {
-                let Some(mut place) = self.place(target) else {
-                    self.expr(value, None);
-                    return;
-                };
-                out.append(&mut place.pre);
-                if !place.mutable {
-                    let kind = match place.behind {
-                        Some(ty) => {
-                            let (ty, needs, element) = self.read_only(ty);
-                            TypeErrorKind::ReadOnlyWrite { ty, needs, element }
-                        }
-                        None => TypeErrorKind::ImmutableAssign(place.name.clone()),
-                    };
-                    self.error(kind, target.span);
-                }
-                let value = match op {
-                    None => self.check(value, place.ty),
-                    Some(op) => {
-                        let current = self.read_place(&place);
-                        let rhs = self.check(value, place.ty);
-                        self.binary_values(*op, place.ty, current, rhs, stmt.span).1
-                    }
-                };
-                self.assign(&place, value, out);
+                self.assign_stmt(target, *op, value, stmt.span, out);
+                self.record(stmt, None);
             }
             StmtKind::Expr(expr) => {
                 let value = self.expr(expr, None).1;
+                self.record(stmt, None);
                 out.extend(value.pre);
                 for (_, scalar) in value.scalars {
                     if !is_pure(&scalar) {
@@ -2466,6 +2651,7 @@ impl<'c> Body<'c> {
                         Value::default()
                     }
                 };
+                self.record(stmt, None);
                 out.extend(value.pre);
                 out.push(Stmt::Return(exprs(value.scalars)));
             }
@@ -2474,7 +2660,8 @@ impl<'c> Body<'c> {
                 then_body,
                 else_body,
             } => {
-                let (pre, cond) = split1(self.check(cond, Ty::Prim(Prim::Bool)));
+                let (pre, cond) = split1(self.condition(cond, checked));
+                self.record(stmt, None);
                 out.extend(pre);
                 let then_body = self.labelled(Label::Other, then_body);
                 let else_body = match else_body {
@@ -2489,14 +2676,15 @@ impl<'c> Body<'c> {
             }
             StmtKind::While { cond, body } => {
                 let infinite = matches!(cond.kind, ExprKind::Bool(true));
-                let (mut inner, cond) = split1(self.check(cond, Ty::Prim(Prim::Bool)));
+                let (mut inner, cond) = split1(self.condition(cond, checked));
+                self.record(stmt, None);
                 if !infinite {
                     let exit = Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(cond));
                     inner.push(Stmt::BrIf(1, exit));
                 }
                 out.push(self.loop_stmt(inner, body));
             }
-            StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
+            StmtKind::For { var, iter, body } => self.for_loop(stmt, var, iter, body, out),
             StmtKind::Break => match self.depth(Label::Break) {
                 Some(depth) => out.push(Stmt::Br(depth)),
                 None => self.error(TypeErrorKind::BreakOutsideLoop, stmt.span),
@@ -2509,17 +2697,96 @@ impl<'c> Body<'c> {
         }
     }
 
+    /// The condition `cond` of an `if` or `while`, which is only `checked`
+    /// if an instance needs it to be.
+    fn condition(&mut self, cond: &parse::Expr, checked: bool) -> Value {
+        let bool = Ty::Prim(Prim::Bool);
+        match checked {
+            true => self.check(cond, bool),
+            false => self.blank(bool),
+        }
+    }
+
+    /// The type and value of what a `let`, `var` or `for` that isn't checked
+    /// for an instance binds names in: `ty`, as its declaration found it,
+    /// with the instance's type arguments.
+    fn unchecked(&mut self, ty: Ty, span: Span) -> (Ty, Value) {
+        let args: Vec<_> = self.ck.type_params.iter().map(|(_, arg)| *arg).collect();
+        let ty = self.ck.substitute(ty, &args, span);
+        (ty, self.blank(ty))
+    }
+
+    /// `target = value`, or `target op= value` if `op` is given.
+    fn assign_stmt(
+        &mut self,
+        target: &parse::Expr,
+        op: Option<BinOp>,
+        value: &parse::Expr,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) {
+        let Some(mut place) = self.place(target) else {
+            self.expr(value, None);
+            return;
+        };
+        out.append(&mut place.pre);
+        if !place.mutable {
+            let kind = match place.behind {
+                Some(ty) => {
+                    let (ty, needs, element) = self.read_only(ty);
+                    TypeErrorKind::ReadOnlyWrite { ty, needs, element }
+                }
+                None => TypeErrorKind::ImmutableAssign(place.name.clone()),
+            };
+            self.error(kind, target.span);
+        }
+        let value = match op {
+            None => self.check(value, place.ty),
+            Some(op) => {
+                let current = self.read_place(&place);
+                let rhs = self.check(value, place.ty);
+                self.binary_values(op, place.ty, current, rhs, span).1
+            }
+        };
+        self.assign(&place, value, out);
+    }
+
     /// `for var in iter`, which copies each element of the array `iter`, or
     /// each member of the enum `iter` names, to `var` in turn. The array's
     /// `len` and `ptr` are read once, before the first iteration.
     fn for_loop(
         &mut self,
+        stmt: &parse::Stmt,
         var: &Ident,
         iter: &parse::Expr,
         body: &parse::Block,
         out: &mut Vec<Stmt>,
     ) {
+        // What an instance doesn't check, and a type parameter that may be
+        // an enum, only bind `var` for `body`.
+        let param = self
+            .param_named(iter)
+            .filter(|ty| matches!(ty, Ty::Param(_)));
+        let unchecked = match (self.need(stmt), param) {
+            (Need::Bind(ty), _) => Some(self.unchecked(ty, stmt.span).0),
+            (Need::Skip, _) => Some(Ty::Error),
+            (Need::Check, Some(param)) => {
+                self.ck.deferred = true;
+                Some(param)
+            }
+            (Need::Check, None) => None,
+        };
+        if let Some(elem) = unchecked {
+            self.record(stmt, Some(elem));
+            let slots = self.alloc(&var.name, elem);
+            self.scopes.push(HashMap::new());
+            self.bind(&var.name, elem, false, slots);
+            out.push(self.loop_stmt(Vec::new(), body));
+            self.scopes.pop();
+            return;
+        }
         if let Some(id) = self.enum_name(iter) {
+            self.record(stmt, Some(Ty::Enum(id)));
             out.push(self.unrolled_loop(id, var, body));
             return;
         }
@@ -2528,6 +2795,7 @@ impl<'c> Body<'c> {
             Ty::Array(id) => self.ck.element(id),
             _ => self.invalid_operand("for", ty, iter.span).0,
         };
+        self.record(stmt, Some(elem));
         let (len, ptr, index) = (
             self.temp(ValType::I32),
             self.temp(ValType::I32),
@@ -2601,14 +2869,16 @@ impl<'c> Body<'c> {
         match &target.kind {
             ExprKind::Name(name) => {
                 if let Some(var) = self.lookup(name) {
-                    return Some(Place {
+                    let place = Place {
                         name: name.clone(),
                         ty: var.ty,
                         mutable: var.mutable,
                         behind: None,
                         pre: Vec::new(),
                         slots: Slots::Local(var.slots.clone()),
-                    });
+                    };
+                    self.ck.deferred |= self.ck.open && place.ty == Ty::Error;
+                    return Some(place);
                 }
                 match self.ck.item(name) {
                     Some(item) => self.item_place(item, name, target.span),
@@ -2635,6 +2905,11 @@ impl<'c> Body<'c> {
                     _ => match self.expr(inner, None) {
                         (ty @ Ty::Ptr(_), ptr) => self.deref_place(ptr, ty),
                         (Ty::Error, _) => return None,
+                        // A pointer, for some type arguments.
+                        (Ty::Param(_), _) => {
+                            self.ck.deferred = true;
+                            return None;
+                        }
                         _ => {
                             self.error(TypeErrorKind::NotAssignable, target.span);
                             return None;
@@ -2876,11 +3151,22 @@ impl<'c> Body<'c> {
                 }
             }
             ExprKind::Field(inner, field) => {
-                if let Some(member) = self
-                    .enum_name(inner)
-                    .and_then(|id| self.enum_member(id, field))
-                {
-                    return member;
+                let type_field = TYPE_FIELDS.contains(&field.name.as_str());
+                match self.param_named(inner) {
+                    // The `size` and `align` of a type parameter are those of
+                    // the type, even if it's an enum with such a member.
+                    Some(_) if type_field => {}
+                    // A member, if the type argument is an enum that has it.
+                    Some(param @ Ty::Param(_)) => {
+                        self.ck.deferred = true;
+                        return (param, Value::default());
+                    }
+                    _ => {
+                        let id = self.enum_name(inner);
+                        if let Some(member) = id.and_then(|id| self.enum_member(id, field)) {
+                            return member;
+                        }
+                    }
                 }
                 let (mut ty, mut value) = self.expr(inner, None);
                 // Fields are reached through any number of pointers.
@@ -3295,6 +3581,9 @@ impl<'c> Body<'c> {
         if let Some(var) = self.lookup(name) {
             let ty = var.ty;
             let reads = var.slots.iter().map(|l| Expr::Local(*l)).collect();
+            // Its type is known once the statement that bound it is checked
+            // for an instance.
+            self.ck.deferred |= self.ck.open && ty == Ty::Error;
             return (ty, self.scalars(ty, reads));
         }
         match self.ck.item(name) {
@@ -3388,7 +3677,7 @@ impl<'c> Body<'c> {
         if ty == Ty::Error {
             return (Ty::Error, Value::default());
         }
-        if !self.ck.storable(ty) {
+        if !self.ck.stores(ty) {
             self.error(TypeErrorKind::NotStorable(self.ck.ty_name(ty)), span);
             return (Ty::Error, Value::default());
         }
@@ -3438,9 +3727,17 @@ impl<'c> Body<'c> {
             ),
             UnaryOp::Neg | UnaryOp::BitNot => self.expr(operand, expected),
         };
-        let Ty::Prim(prim) = ty else {
-            let symbol = if op == UnaryOp::Neg { "-" } else { "~" };
-            return self.invalid_operand(symbol, ty, span);
+        let prim = match ty {
+            Ty::Prim(prim) => prim,
+            // A number, for some type arguments.
+            Ty::Param(_) => {
+                self.ck.deferred = true;
+                return (ty, Value::default());
+            }
+            _ => {
+                let symbol = if op == UnaryOp::Neg { "-" } else { "~" };
+                return self.invalid_operand(symbol, ty, span);
+            }
         };
         let vt = prim.val_type();
         let lowered = match op {
@@ -3465,8 +3762,12 @@ impl<'c> Body<'c> {
         (ty, map1(value, vt, lowered))
     }
 
+    /// Reports that `op` can't be applied to a `ty`, unless `ty` is an error
+    /// or a type parameter, whose type argument it may be applied to.
     fn invalid_operand(&mut self, op: &'static str, ty: Ty, span: Span) -> (Ty, Value) {
-        if ty != Ty::Error {
+        if let Ty::Param(_) = ty {
+            self.ck.deferred = true;
+        } else if ty != Ty::Error {
             let kind = TypeErrorKind::InvalidOperand {
                 op,
                 ty: self.ck.ty_name(ty),
@@ -3526,6 +3827,14 @@ impl<'c> Body<'c> {
         let bool = Ty::Prim(Prim::Bool);
         let prim = match ty {
             Ty::Prim(prim) => prim,
+            // Whatever `op` takes, for some type arguments.
+            Ty::Param(_) => {
+                self.ck.deferred = true;
+                return match is_comparison(op) {
+                    true => (bool, self.blank(bool)),
+                    false => (ty, Value::default()),
+                };
+            }
             // Pointers compare as unsigned addresses.
             Ty::Ptr(_) if is_comparison(op) => Prim::U32,
             _ if matches!(op, BinOp::Eq | BinOp::NotEq) => {
@@ -3630,6 +3939,10 @@ impl<'c> Body<'c> {
         }
         match self.ck.cast_value(from, to, value) {
             Some(cast) => cast,
+            None if self.ck.open && self.ck.may_cast(from, to) => {
+                self.ck.deferred = true;
+                (to, self.blank(to))
+            }
             None => {
                 let kind = TypeErrorKind::InvalidCast {
                     from: self.ck.ty_name(from),
@@ -3795,11 +4108,17 @@ impl<'c> Body<'c> {
                 .zip(self.ck.members(ty))
                 .collect(),
             _ => {
-                if ty != Ty::Error {
+                let param = matches!(ty, Ty::Param(_));
+                if !param && ty != Ty::Error {
                     self.error(TypeErrorKind::NotCallable(self.ck.ty_name(ty)), span);
                 }
                 for arg in args {
                     self.expr(&arg.value, None);
+                }
+                // A struct with these fields, for some type arguments.
+                if param {
+                    self.ck.deferred = true;
+                    return (ty, Value::default());
                 }
                 return (Ty::Error, Value::default());
             }
@@ -6520,31 +6839,169 @@ fn f():
     }
 
     #[test]
-    fn errors_in_instances_name_the_instances_they_are_in() {
+    fn needs_of_type_arguments_are_reported_at_the_call() {
         let src = "\
 fn(T) add(a: T, b: T) -> T:
     return a + b
 fn(T) twice(x: T) -> T:
     return add(x, x)
-fn(T) unused(x: T):
-    nope()
 fn f():
+    twice(1)
     twice(true)
     twice(false)
 ";
         let errors = check_src(src).unwrap_err();
         assert_eq!(errors.len(), 1, "{errors:#?}");
+        let operand = TypeErrorKind::InvalidOperand {
+            op: "+",
+            ty: "bool".to_string(),
+        };
+        assert_eq!(errors[0].kind, operand);
         let span = errors[0].span.unwrap();
-        assert_eq!(&src[span.start..span.end], "a + b");
+        assert_eq!(&src[span.start..span.end], "twice(true)");
         let instances: Vec<_> = errors[0]
             .instances
             .iter()
-            .map(|site| (site.name.as_str(), &src[site.call.start..site.call.end]))
+            .map(|site| (site.name.as_str(), &src[site.span.start..site.span.end]))
             .collect();
         assert_eq!(
             instances,
-            vec![("add(bool)", "add(x, x)"), ("twice(bool)", "twice(true)")]
+            vec![("twice(bool)", "add(x, x)"), ("add(bool)", "a + b")]
         );
+    }
+
+    #[test]
+    fn generic_fn_bodies_are_checked_as_declared() {
+        use TypeErrorKind::*;
+        let src = "\
+struct(T) Box:
+    v: T
+fn(T) a(x: T) -> Box(T):
+    return x
+fn(T) b(x: &T) -> T:
+    return -x
+fn(T) c(x: Box(T)) -> T:
+    return x.w
+fn(T) d(x: T):
+    x = x
+fn(T) e(xs: array(T)):
+    xs[0] = xs[1]
+fn(T) g(x: T) -> u8:
+    if x == x:
+        return 1
+fn(T) h(x: T) -> bool:
+    return nope(x) and Box(T)(v: x) == Box(u8)(v: true)
+";
+        let name = |ty: &str| ty.to_string();
+        assert_eq!(
+            errors(src),
+            vec![
+                Mismatch {
+                    expected: name("Box(T)"),
+                    found: name("T")
+                },
+                InvalidOperand {
+                    op: "-",
+                    ty: name("&T")
+                },
+                NoField {
+                    ty: name("Box(T)"),
+                    field: name("w")
+                },
+                ImmutableAssign(name("x")),
+                ReadOnlyWrite {
+                    ty: name("array(T)"),
+                    needs: name("varray(T)"),
+                    element: true
+                },
+                MissingReturn(name("g")),
+                UnknownName(name("nope")),
+                Mismatch {
+                    expected: name("u8"),
+                    found: name("bool")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn errors_some_type_arguments_avoid_are_left_to_instances() {
+        // None of these is called with the type arguments it is wrong for.
+        let src = "\
+struct(T) Box:
+    v: T
+struct Point:
+    x: i32
+enum(u8) Color:
+    red
+fn one(x: i32) -> i32:
+    return x
+fn(T) only_i32(x: T) -> i32:
+    return one(x)
+fn(T) only_unit(x: T) -> T:
+    pass
+fn(T) boxed(x: T) -> bool:
+    return Box(T)(v: x) == Box(u8)(v: 1)
+fn(T) duck(p: T, q: T) -> T:
+    let (a, b) = p.x |> (_, q.*)
+    let n: T = 300
+    for c in T:
+        p.x = T.red(a)[b] as T
+    return T(x: -1)
+fn f() -> i32:
+    only_unit(())
+    return only_i32(1)
+";
+        let module = lower(src);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["one", "f", "only_unit(tuple())", "only_i32(i32)"]);
+        let wrong = format!("{src}    only_i32(true)\n    only_unit(1)\n    boxed(true)\n");
+        assert_eq!(
+            errors(&wrong),
+            vec![
+                TypeErrorKind::Mismatch {
+                    expected: "i32".to_string(),
+                    found: "bool".to_string()
+                },
+                TypeErrorKind::MissingReturn("only_unit(i32)".to_string()),
+                TypeErrorKind::Mismatch {
+                    expected: "Box(bool)".to_string(),
+                    found: "Box(u8)".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn errors_in_a_generic_fns_declaration_are_reported_once() {
+        let src = "\
+fn(T) add(a: T, b: T) -> T:
+    nope()
+    return a + b
+fn f():
+    add(1, 2)
+    add(true, false)
+";
+        let errors = check_src(src).unwrap_err();
+        let kinds: Vec<_> = errors.iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(kinds, vec![TypeErrorKind::UnknownName("nope".to_string())]);
+        assert!(errors[0].instances.is_empty());
+    }
+
+    #[test]
+    fn type_parameters_give_the_size_of_any_type() {
+        let src = "\
+enum(u16) Unit:
+    size
+    align = 7
+fn(T) bytes() -> u32:
+    return T.size + T.align
+fn f() -> u32:
+    let member = Unit.size
+    return bytes(Unit)()
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "bytes(Unit)"), "(return (I32.Add 2 2))");
     }
 
     #[test]
@@ -6575,7 +7032,14 @@ fn f():
         );
         for error in &errors {
             let span = error.span.unwrap();
-            assert!(["deep((x, 1))", "wide((x, x))"].contains(&&src[span.start..span.end]));
+            assert!(["deep(1)", "wide(1)"].contains(&&src[span.start..span.end]));
+            let needs = error.instances.iter().map(|site| site.span);
+            let needs: Vec<_> = needs.map(|span| &src[span.start..span.end]).collect();
+            assert!(
+                needs
+                    .iter()
+                    .all(|need| ["deep((x, 1))", "wide((x, x))"].contains(need))
+            );
         }
         let deep = errors
             .iter()
@@ -6585,7 +7049,7 @@ fn f():
     }
 
     #[test]
-    fn generic_fn_signatures_are_checked_without_calls() {
+    fn generic_fn_declarations_are_checked_without_calls() {
         use TypeErrorKind::*;
         let src = "\
 struct S:
@@ -6611,6 +7075,7 @@ fn(T) e(x: Nope) -> T:
                 DuplicateItem("g".to_string()),
                 DuplicateItem("i32".to_string()),
                 UnknownType("Nope".to_string()),
+                UnknownName("nope".to_string()),
             ]
         );
     }

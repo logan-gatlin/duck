@@ -126,8 +126,8 @@ impl Overlay<'_> {
                 return Problem::in_manifest(manifest_path.to_path_buf(), message);
             };
             let notes = error.instances().iter().map(|site| Note {
-                place: self.place(site.call),
-                message: format!("in `{}`, called here", site.name),
+                place: self.place(site.span),
+                message: format!("required by `{}` here", site.name),
             });
             Problem {
                 notes: notes.collect(),
@@ -388,7 +388,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn errors_in_generic_instances_note_their_calls() {
+    fn errors_in_type_arguments_note_the_instances_that_need_them() {
         let dir = TempDir::new("instances");
         dir.write(&[
             ("app/Duck.toml", MODULE),
@@ -400,12 +400,12 @@ pub(crate) mod tests {
         let problems = check(&dir, &[]);
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(
-            problems[0].starts_with("app/main.duck:1:11-1:13: "),
+            problems[0].starts_with("app/main.duck:3:11-3:20: "),
             "{problems:?}"
         );
         assert_eq!(
             problems[1],
-            "app/main.duck:3:11-3:20: in `neg(bool)`, called here"
+            "app/main.duck:1:11-1:13: required by `neg(bool)` here"
         );
     }
 

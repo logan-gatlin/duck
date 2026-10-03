@@ -35,8 +35,9 @@ impl Error {
         }
     }
 
-    /// The instances of generic functions the error is in, innermost first,
-    /// each with the call that first used it.
+    /// For an error in the type arguments a call gives a generic function,
+    /// the instances that need what they lack, outermost first, each with
+    /// where in its body it needs it.
     pub fn instances(&self) -> &[InstanceSite] {
         match self {
             Self::Type(e) => &e.instances,

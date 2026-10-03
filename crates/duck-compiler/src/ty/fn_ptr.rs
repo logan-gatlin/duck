@@ -26,6 +26,10 @@ impl Checker {
     /// The table index of function `id`, which is the next one free the
     /// first time it's asked for.
     fn table_index(&mut self, id: FuncId) -> u32 {
+        // A generic function checked as declared takes no pointers.
+        if self.open {
+            return 0;
+        }
         let target = self.pointer_target(id);
         // Nothing is at index 0, so that calling zeroed memory traps.
         let next = self.table.len() as u32 + 1;
@@ -117,7 +121,10 @@ impl Body<'_> {
     ) -> (Ty, Value) {
         let (ty, callee_value) = self.expr(callee, None);
         let Ty::Fn(id) = ty else {
-            if ty != Ty::Error {
+            // A function pointer, for some type arguments.
+            if let Ty::Param(_) = ty {
+                self.ck.deferred = true;
+            } else if ty != Ty::Error {
                 self.error(TypeErrorKind::NotCallable(path_text(callee)), callee.span);
             }
             for arg in args {
