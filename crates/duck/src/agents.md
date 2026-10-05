@@ -6,8 +6,8 @@ memory, and the host supplies all I/O through `extern`. `duck build` compiles
 the package of the nearest `Duck.toml`.
 
 Absent: allocator, GC, standard library, closures, anonymous functions,
-methods, traits, overloading, default arguments, varargs, `match`, ternary,
-ranges, exceptions, char type, string operations.
+methods, traits, overloading, varargs, `match`, ternary, ranges, exceptions,
+char type, string operations.
 
 ## Syntax
 
@@ -27,7 +27,7 @@ enum(u8) Color:
 	green = 5
 	blue                         # 6
 
-fn area(w: f64, h: f64) -> f64:
+fn area(w: f64, h: f64 = 1.0) -> f64:   # a default: a call may leave `h` out
 	return w * h
 
 pub fn main():                   # no `->`: returns `tuple()`, the unit type
@@ -52,8 +52,10 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - A statement ends with its line. Lines break freely inside `()` and `[]`.
 - Items are declared in any order. `let` bindings and parameters are
   immutable, and shadowing is allowed. Conditions are `bool`.
+- A parameter anywhere in the list may have a default. Label a later argument
+  to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
-  struct enum extern import module and or not true false as`. No item is
+  struct enum extern use module and or not true false as`. No item is
   named `array`, `varray`, `tuple` or `type`.
 
 ## Types
@@ -84,8 +86,8 @@ type as a whole only: a `tuple(&var T, i32)` is not a `tuple(&T, i32)`, and a
 
 ## Literals and globals
 
-**String and array literals belong in global initializers and field defaults
-only.** In a function, name a global.
+**String and array literals belong in global initializers and defaults only.**
+In a function, name a global.
 
 ```duck
 let greeting = "hello"             # array(u8)
@@ -113,8 +115,11 @@ fn f(i: u32) -> u8:
 - A field default is constant too. It and other initializers use only the
   defaults of structs declared earlier. A `varray` literal in one is empty
   and it has no `&var value`, as every value would share the memory.
-- Only a constructor applies defaults. Memory that is cast to a struct holds
-  whatever was there.
+- Only a constructor applies field defaults. Memory that is cast to a struct
+  holds whatever was there.
+- A parameter default is constant, with the same `varray` and `&var` rule. It
+  uses any global or struct, declared before or after, and never another
+  parameter: `end: u32 = a.len` is an error.
 
 ## Operators
 
@@ -161,7 +166,7 @@ fn view(p: &i32, len: u32) -> array(i32):
 ```
 
 - `&` and `&var` take the address of `p.field`, `p.*` and `a[i]` only. Locals,
-  parameters and globals have no address: only a global initializer or field
+  parameters and globals have no address: only a global initializer or
   default gives a value one, by placing it.
 - A write needs a `var` local, a `&var` or a `varray`, and only the last
   pointer or array on the way to the place decides: with `next: &var Node`,
@@ -216,8 +221,9 @@ fn demo() -> u8:
   arguments, and an error is reported at the call.
 - In a generic body `T` is also a value (`T.size`), a constructor (`T(x: 1)`)
   and an enum (`T.ok`). `T.size` and `T.align` are always those of the type.
-- A field default never names `T`, and a field holding a `T` by value has
-  none. `head: &var T = 0` and `items: varray(T) = []` are fine.
+- A default never names `T`, and a field or parameter holding a `T` by value
+  has none. `head: &var T = 0` and `items: varray(T) = []` are fine. An
+  argument left to its default infers nothing: `f(u8)()` if no other does.
 - `p: &T` takes a `&var i32` with `T` as `i32`, and `array(T)` a `varray(i32)`.
   Nothing is generic over writability: write both, or cast.
 
@@ -238,7 +244,9 @@ fn demo(f: fn(i32) -> i32) -> i32:
 	return f(g(1)) + steps[0](2) + h(3) as i32
 ```
 
-- A call through a pointer takes positional arguments only.
+- A call through a pointer takes every argument, positionally. Defaults
+  belong to the function's name: `double` with one would still be only a
+  `fn(i32) -> i32`.
 - `extern` functions have pointers too. Calling a zeroed pointer traps.
 - With a generic `f`, `f(x)(y)` reads `x` as type arguments, so bind `f(x)`
   to a name before calling what it returns.
@@ -262,16 +270,31 @@ fn demo(n: i32) -> i32:
 
 ## Modules
 
-- `import "dir/file.duck"` resolves from the importing file and binds `file`.
-  `as name` renames it, and is required when the stem isn't an identifier.
-- `import json` binds the library of the `Duck.toml` dependency `json`. Files
-  of one package import each other by path only.
-- `pub` items are reached as `mod.item`: `geo.Point(x: 1, y: 2)`,
-  `geo.Color.red`. A `pub` item's signature uses only `pub` types.
+Every file is a module, named by its path from the directory of the package's
+entry: beside `src/main.duck`, `src/util/strings.duck` is `util.strings`. A
+directory is not itself a module.
+
+```
+use util.strings                 # the module: strings.split(...)
+use geo.{Point, len as length}   # its items: Point(x: 1), length(p)
+use json.Value                   # from the Duck.toml dependency `json`
+pub use geo.Color                # also reachable as `this.Color`
+```
+
+- A path starts at the package's root, or with a dependency, wherever the
+  file is. A name that is both a module and a dependency is an error.
+- The module is the file furthest along the path. What follows names its
+  `pub` items, or goes on through a module it makes `pub`.
+- `use` binds the last name of the path, or the one `as` gives. `{}` groups
+  nest, and `use` lines come before every other item.
+- A dependency's library is its only module in reach: `json.Value`, or
+  `json.value.Value` once it has `pub use value`.
+- A used module's `pub` items are reached as `mod.item`:
+  `geo.Point(x: 1, y: 2)`, `geo.Color.red`. A `pub` item's signature uses
+  only `pub` types.
 - Another file constructs a struct only if every private field has a default,
   and never gives a private field a value.
-- `pub import "x.duck"` exposes `x` to importers, as `this.x.item`.
-- Imports form no cycles.
+- Uses form no cycles.
 
 ## Host
 
@@ -284,10 +307,13 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
 	return dt
 ```
 
-- The entry file's `pub` functions and globals are the exports, generic
-  functions excepted. Also exported are `memory` and, once any function
+- The `pub` functions and globals the entry file defines are the exports,
+  generic functions excepted. Also exported are `memory` and, once any function
   pointer is taken, `table`: the host calls pointer `i` as
   `table.get(i)(...)`. No `pub` item is named either.
+- The host gives every argument. A default is passed by the Duck call that
+  leaves it out, so an `extern` function may have them, an exported one has
+  them for Duck callers only, and `start` names a function with no parameters.
 - Integers of 32 bits or fewer, `bool`, pointers and function pointers are
   wasm `i32`. `i64`, `f32`, `f64` and `externref` are themselves, and an enum
   is its value type. Structs, tuples, arrays and `type` are one wasm value
@@ -312,7 +338,7 @@ min = "1pgs"             # sizes: B, KiB, MiB, GiB, pgs (64 KiB)
 max = "16MiB"
 static = { start = "0B", end = "64KiB" }  # where literals go
 
-[library]                # what other packages `import` by name
+[library]                # what other packages `use` by name
 entry = "src/lib.duck"
 
 [dependencies]           # each must have a [library]

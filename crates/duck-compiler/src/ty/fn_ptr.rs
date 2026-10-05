@@ -59,6 +59,7 @@ impl Checker {
         let name = format!("extern {}", sig.name);
         let sig = FuncSig {
             name,
+            defaults: Vec::new(),
             ..sig.clone()
         };
         self.funcs.push(sig);

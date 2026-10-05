@@ -4,7 +4,7 @@
 //! collected first so items can be used before they are declared. Functions
 //! imported from `extern` blocks come first in the function index space.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::mem;
 use std::ops::Range;
@@ -16,13 +16,13 @@ use crate::ir::{
     UnOp as IrUnOp, ValType,
 };
 use crate::lex::Span;
-use crate::load::Program;
+use crate::load::{Program, Use};
 use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
     PatternKind, StmtKind, TypeKind, UnaryOp,
 };
 
-use defaults::FieldDefault;
+use defaults::DefaultValue;
 use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
 use generic_fn::{FnInstance, GenericFn, InstanceCall, Need, Needs};
@@ -391,8 +391,8 @@ pub enum TypeErrorKind {
     MissingReturn(String),
     BreakOutsideLoop,
     ContinueOutsideLoop,
-    /// A global initializer, enum member's value or field default that
-    /// can't be evaluated at compile time.
+    /// A global initializer, enum member's value or default that can't be
+    /// evaluated at compile time.
     NotConstant,
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
@@ -405,6 +405,8 @@ pub enum TypeErrorKind {
         module: String,
         item: String,
     },
+    /// An item that a `use` path goes on past, as only a module's can.
+    NotAModule(String),
     /// A field that isn't `pub`, used outside the module of its struct.
     PrivateField {
         ty: String,
@@ -440,18 +442,19 @@ pub enum TypeErrorKind {
     SelfSizedStatic,
     /// `module.name` naming nothing.
     UnknownModuleProperty(String),
-    /// A string or array literal outside a global initializer or field
-    /// default.
+    /// A string or array literal outside a global initializer or default.
     LiteralOutsideGlobal,
-    /// A `varray` literal with elements in a field default, which every
-    /// value of the struct would share.
+    /// A `varray` literal with elements in a default, which every value of
+    /// the struct or call of the function would share.
     SharedLiteral,
-    /// A `&var` that places its value in memory in a field default, which
-    /// every value of the struct would share.
+    /// A `&var` that places its value in memory in a default, which every
+    /// value of the struct or call of the function would share.
     SharedPointee,
-    /// A field default that names this type parameter of its struct, or
-    /// whose value one lays out.
+    /// A default that names this type parameter of its struct or function,
+    /// or whose value one lays out.
     DefaultUsesParam(String),
+    /// A parameter's default that names this parameter of its function.
+    DefaultReadsParam(String),
     /// `[]` with no type to give its elements.
     UntypedEmptyArray,
     /// An expression where a type argument should be.
@@ -469,9 +472,11 @@ pub enum TypeErrorKind {
 
 #[derive(Default)]
 struct Checker {
-    /// The names declared in each module: its items and the modules it
-    /// imports.
+    /// The names declared in each module: its items and what it uses.
     scopes: HashMap<FileId, HashMap<String, Entry>>,
+    /// The names each module uses that weren't found, which are reported
+    /// where they are used and not again where they are named.
+    unresolved: HashSet<(FileId, String)>,
     /// The module whose names are in scope.
     module: FileId,
     /// The module whose `pub` items are exported.
@@ -575,7 +580,7 @@ enum Item {
     Struct(StructId),
     Enum(EnumId),
     Global(usize),
-    /// A module, by the name it's imported as.
+    /// A module, by the name it's used as.
     Module(FileId),
 }
 
@@ -616,7 +621,7 @@ struct FieldDef {
     is_pub: bool,
     /// What it is where a constructor gives it no value, if anything. An
     /// instance's is its declaration's, as it was when the instance was made.
-    default: Option<FieldDefault>,
+    default: Option<DefaultValue>,
     span: Span,
 }
 
@@ -624,6 +629,10 @@ struct FieldDef {
 struct FuncSig {
     name: String,
     params: Vec<(String, Ty)>,
+    /// What each parameter is where a call gives it no argument, if
+    /// anything. Empty for a function the checker creates, which no call
+    /// names: an instance of a generic function has its declaration's.
+    defaults: Vec<Option<DefaultValue>>,
     ret: Ty,
 }
 
@@ -664,8 +673,8 @@ struct Body<'c> {
     /// Whether this is a global initializer, the only place literals that
     /// need memory can be.
     global: bool,
-    /// Whether this is a field default, a kind of global initializer whose
-    /// value every instance of the struct has.
+    /// Whether this is a field's or parameter's default, a kind of global
+    /// initializer whose value is shared wherever the default is used.
     default: bool,
     /// The value piped into each enclosing pipe body, innermost last.
     piped: Vec<(Ty, Vec<(ValType, Expr)>)>,
@@ -980,13 +989,14 @@ impl fmt::Display for TypeErrorKind {
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
             Self::NotConstant => write!(
                 f,
-                "global initializers, enum members and field defaults must be constant"
+                "global initializers, enum members and defaults must be constant"
             ),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
             Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
             Self::Private(name) => write!(f, "`{name}` is private"),
             Self::NoItem { module, item } => write!(f, "`{module}` has no item `{item}`"),
+            Self::NotAModule(name) => write!(f, "`{name}` is not a module"),
             Self::PrivateField { ty, field } => write!(f, "field `{field}` of `{ty}` is private"),
             Self::PrivateInPublic { ty, item } => {
                 write!(f, "private type `{ty}` in the type of `pub` item `{item}`")
@@ -1014,19 +1024,22 @@ impl fmt::Display for TypeErrorKind {
             Self::UnknownModuleProperty(name) => write!(f, "`module` has no property `{name}`"),
             Self::LiteralOutsideGlobal => write!(
                 f,
-                "string and array literals are only allowed in global initializers and field defaults"
+                "string and array literals are only allowed in global initializers and defaults"
             ),
             Self::SharedLiteral => write!(
                 f,
-                "a writable literal in a field default is shared by every instance, so it must be empty"
+                "a writable literal in a default is shared wherever the default is used, so it must be empty"
             ),
             Self::SharedPointee => write!(
                 f,
-                "a `&var` in a field default places one value that every instance would share"
+                "a `&var` in a default places one value, shared wherever the default is used"
             ),
-            Self::DefaultUsesParam(param) => write!(
+            Self::DefaultUsesParam(param) => {
+                write!(f, "a default can't depend on the type parameter `{param}`")
+            }
+            Self::DefaultReadsParam(param) => write!(
                 f,
-                "a field default can't depend on the type parameter `{param}`"
+                "a default is constant, so it can't use the parameter `{param}`"
             ),
             Self::UntypedEmptyArray => write!(f, "can't infer the element type of `[]`"),
             Self::NotAType => write!(f, "expected a type"),
@@ -1130,6 +1143,11 @@ impl Checker {
     /// is reported at the call that led to the instance, as what the
     /// instance needs at `span`.
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
+        if let TypeErrorKind::UnknownName(name) | TypeErrorKind::UnknownType(name) = &kind
+            && self.unresolved.contains(&(self.module, name.clone()))
+        {
+            return;
+        }
         let mut span = span;
         let mut instances = Vec::new();
         for instance in &self.instance_chain {
@@ -1152,13 +1170,10 @@ impl Checker {
             .map(|(_, sig)| FuncSig {
                 name: sig.name.name.clone(),
                 params: Vec::new(),
+                defaults: Vec::new(),
                 ret: Ty::Unit,
             })
             .collect();
-        for import in &program.imports {
-            self.module = import.module;
-            self.declare_name(&import.name, Item::Module(import.target), import.is_pub);
-        }
         let (mut next_import, mut next_def) = (0, self.import_count);
         for item in &program.items {
             self.module = item.span.file;
@@ -1198,10 +1213,40 @@ impl Checker {
                     continue;
                 }
                 ItemKind::Enum(e) => (&e.name, Item::Enum(self.declare_enum(e, item.is_pub))),
-                // Replaced by the imported items when loading.
-                ItemKind::Import(_) => continue,
+                // Replaced by the items of the modules used when loading.
+                ItemKind::Use(_) => continue,
             };
             self.declare_item(item, name, entry);
+        }
+        // Each leads into a module whose own are declared by now.
+        for used in &program.uses {
+            self.declare_use(used);
+        }
+    }
+
+    /// Declares the name `used` gives the module its path leads into, or
+    /// what the rest of the path reaches from there.
+    fn declare_use(&mut self, used: &Use) {
+        self.module = used.module;
+        let mut item = Some(Item::Module(used.target));
+        let mut path = used.target_path.clone();
+        for member in &used.members {
+            item = match item {
+                Some(Item::Module(module)) => self.reach(module, &path, member),
+                Some(_) => {
+                    self.error(TypeErrorKind::NotAModule(path.clone()), member.span);
+                    None
+                }
+                None => break,
+            };
+            path = format!("{path}.{}", member.name);
+        }
+        match item {
+            Some(item) => self.declare_name(&used.name, item, used.is_pub),
+            None => {
+                let name = used.name.name.clone();
+                self.unresolved.insert((used.module, name));
+            }
         }
     }
 
@@ -1296,7 +1341,7 @@ impl Checker {
                     name: field.name.name.clone(),
                     ty,
                     is_pub: field.is_pub,
-                    default: field.default.as_ref().map(|_| FieldDefault::Pending),
+                    default: field.default.as_ref().map(|_| DefaultValue::Pending),
                     span: field.span,
                 });
             }
@@ -1427,6 +1472,7 @@ impl Checker {
                 self.check_public_sig(decl, &params, ret);
             }
             self.funcs[id].params = params;
+            self.funcs[id].defaults = pending_defaults(decl);
             self.funcs[id].ret = ret;
         }
         self.define_generic_fns(program);
@@ -1570,6 +1616,7 @@ impl Checker {
         ck.define_structs(program);
         ck.define_funcs(program);
         ck.define_globals(program);
+        ck.define_param_defaults(program);
         ck
     }
 
@@ -3294,8 +3341,8 @@ impl<'c> Body<'c> {
     }
 
     /// Reports a literal of `len` elements at `span` that is `mutable` in a
-    /// field default, unless it's empty: its elements would be those of
-    /// every value of the struct.
+    /// default, unless it's empty: its elements would be shared wherever the
+    /// default is used.
     fn check_shared(&mut self, mutable: bool, len: usize, span: Span) {
         if self.default && mutable && len > 0 {
             self.error(TypeErrorKind::SharedLiteral, span);
@@ -3381,7 +3428,7 @@ impl<'c> Body<'c> {
             }
         };
         let params: Vec<_> = params.iter().map(|(n, ty)| (n.to_string(), *ty)).collect();
-        let Value { mut pre, scalars } = self.args(&params, args, false, span);
+        let Value { mut pre, scalars } = self.args(&params, &[], args, false, span);
         // Missing or mistyped arguments, already reported.
         if scalars.len() != params.len() {
             return (Ty::Error, Value::default());
@@ -3434,7 +3481,7 @@ impl<'c> Body<'c> {
         // The operand may be of any integer type, so it's inferred rather
         // than checked against a parameter's.
         let params = [("value".to_string(), Ty::Error)];
-        let binding = self.bind_args(&params, args, false, span);
+        let binding = self.bind_args(&params, &[], args, false, span);
         let mut ty = Ty::Error;
         let mut checked = Vec::new();
         for (arg, param) in args.iter().zip(&binding) {
@@ -3444,7 +3491,7 @@ impl<'c> Body<'c> {
                 operand
             }));
         }
-        let value = self.bound_args(&params, args, binding, checked);
+        let value = self.bound_args(&params, &[], args, binding, checked);
         let prim = match ty {
             Ty::Prim(prim) if prim.is_int() => prim,
             _ => {
@@ -4104,7 +4151,7 @@ impl<'c> Body<'c> {
         match item {
             Ok(Item::Func(id)) => {
                 let sig = self.ck.funcs[id.0 as usize].clone();
-                let value = self.args(&sig.params, args, false, span);
+                let value = self.args(&sig.params, &sig.defaults, args, false, span);
                 self.call_func(id, value)
             }
             Ok(Item::GenericFn(generic)) => self.generic_fn_call(generic, None, args, span),
@@ -4188,21 +4235,24 @@ impl<'c> Body<'c> {
                 return (Ty::Error, Value::default());
             }
         };
-        (ty, self.args(&fields, args, true, span))
+        (ty, self.args(&fields, &[], args, true, span))
     }
 
     /// Checks call arguments against `params`. They are evaluated in source
-    /// order, and their scalars are returned in parameter order.
+    /// order, and their scalars are returned in parameter order. A parameter
+    /// given no argument has its default, of `defaults`, which holds one for
+    /// each parameter or is empty.
     fn args(
         &mut self,
         params: &[(String, Ty)],
+        defaults: &[Option<DefaultValue>],
         args: &[Arg],
         require_labels: bool,
         span: Span,
     ) -> Value {
-        let binding = self.bind_args(params, args, require_labels, span);
+        let binding = self.bind_args(params, defaults, args, require_labels, span);
         let checked = args.iter().map(|_| None).collect();
-        self.bound_args(params, args, binding, checked)
+        self.bound_args(params, defaults, args, binding, checked)
     }
 
     /// Checks call arguments against the parameters `binding` matches them
@@ -4211,25 +4261,32 @@ impl<'c> Body<'c> {
     fn bound_args(
         &mut self,
         params: &[(String, Ty)],
+        defaults: &[Option<DefaultValue>],
         args: &[Arg],
         binding: Vec<Option<usize>>,
         checked: Vec<Option<(Ty, Value)>>,
     ) -> Value {
-        let defaults = vec![Vec::new(); params.len()];
-        self.filled_args(params, args, binding, checked, defaults)
-    }
-
-    /// Checks call arguments as [`Self::bound_args`] does. A parameter that
-    /// no argument is bound to has its scalars of `defaults`, which are
-    /// constant.
-    fn filled_args(
-        &mut self,
-        params: &[(String, Ty)],
-        args: &[Arg],
-        binding: Vec<Option<usize>>,
-        checked: Vec<Option<(Ty, Value)>>,
-        defaults: Vec<Vec<(ValType, Expr)>>,
-    ) -> Value {
+        // A parameter that no argument is bound to has the scalars of its
+        // default, which are constant.
+        let mut by_param = vec![Vec::new(); params.len()];
+        for (i, default) in defaults.iter().enumerate() {
+            let Some(default) = default else {
+                continue;
+            };
+            if binding.contains(&Some(i)) {
+                continue;
+            }
+            let types = self.ck.val_types(params[i].1);
+            let consts = match default {
+                DefaultValue::Folded(consts) => consts.clone(),
+                // Reported, here or where it failed to fold.
+                DefaultValue::Pending | DefaultValue::Failed => {
+                    types.iter().map(|ty| zero(*ty)).collect()
+                }
+            };
+            let consts = consts.into_iter().map(Expr::Const);
+            by_param[i] = types.into_iter().zip(consts).collect();
+        }
         let mut values = Vec::new();
         // Parameter index and scalar count of each value.
         let mut groups = Vec::new();
@@ -4258,7 +4315,6 @@ impl<'c> Body<'c> {
         if reordered && !value.scalars.iter().all(|(_, e)| is_pure(e)) {
             self.spill(&mut value, is_stable);
         }
-        let mut by_param = defaults;
         let mut scalars = value.scalars.into_iter();
         for (i, count) in groups {
             by_param[i] = scalars.by_ref().take(count).collect();
@@ -4268,17 +4324,20 @@ impl<'c> Body<'c> {
     }
 
     /// Matches each argument to a parameter as [`Self::match_args`] does,
-    /// reporting each parameter left without one at `span`.
+    /// reporting at `span` each parameter left without one that has no
+    /// default in `defaults`.
     fn bind_args(
         &mut self,
         params: &[(String, Ty)],
+        defaults: &[Option<DefaultValue>],
         args: &[Arg],
         require_labels: bool,
         span: Span,
     ) -> Vec<Option<usize>> {
         let binding = self.match_args(params, args, require_labels);
         for (i, (name, _)) in params.iter().enumerate() {
-            if !binding.contains(&Some(i)) {
+            let defaulted = matches!(defaults.get(i), Some(Some(_)));
+            if !defaulted && !binding.contains(&Some(i)) {
                 self.error(TypeErrorKind::MissingArg(name.clone()), span);
             }
         }
@@ -4804,6 +4863,14 @@ fn generic_fn_decls(program: &Program) -> impl Iterator<Item = (&parse::Item, &p
         ItemKind::Fn(f) if !f.sig.type_params.is_empty() => Some((item, f)),
         _ => None,
     })
+}
+
+/// A default not yet folded for each parameter of `sig` that has one.
+fn pending_defaults(sig: &FnSig) -> Vec<Option<DefaultValue>> {
+    let defaults = sig.params.iter().map(|param| &param.default);
+    defaults
+        .map(|default| default.as_ref().map(|_| DefaultValue::Pending))
+        .collect()
 }
 
 /// Every function signature in [`FuncId`] order, imports then definitions,
@@ -9642,5 +9709,235 @@ struct S:
     f: tuple(varray(u8), i32) = (\"a\", 1)
 ";
         assert_eq!(errors(src), vec![TypeErrorKind::SharedLiteral; 6]);
+    }
+
+    #[test]
+    fn omitted_arguments_have_their_defaults() {
+        let src = "\
+extern:
+    fn log(n: i32, base: i32 = 10)
+let STEP = 2
+struct P:
+    x: i32
+    y: i32 = 3
+fn inc(x: i32) -> i32:
+    return x + 1
+fn add(a: i32, b: i32 = STEP * 2, c: i64 = 1) -> i64:
+    return (a + b) as i64 + c
+fn mid(a: i32 = 7, b: i32) -> i32:
+    return a - b
+fn wide(p: P = P(x: 1), s: array(u8) = \"duck\", cb: fn(i32) -> i32 = inc) -> i32:
+    return cb(p.x)
+pub fn tick(dt: f64 = 0.5) -> f64:
+    return dt
+fn f(x: i32):
+    log(x)
+    log(x, 2)
+    add(x)
+    add(x, 5)
+    add(x, c: 9)
+    add(c: 9, a: x)
+    x |> add(_, _)
+fn g():
+    mid(b: 1)
+    mid(2, 3)
+    wide()
+    wide(cb: inc, p: P(x: 4, y: 5))
+    tick()
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(call log [x 10] -> []) (call log [x 2] -> []) \
+             (drop (call add x 4 1i64)) (drop (call add x 5 1i64)) \
+             (drop (call add x 4 9i64)) (drop (call add x 4 9i64)) \
+             (drop (call add x x 1i64))"
+        );
+        assert_eq!(
+            body(&module, "g"),
+            "(drop (call mid 7 1)) (drop (call mid 2 3)) \
+             (drop (call wide 1 3 4 0 1)) (drop (call wide 4 5 4 0 1)) \
+             (drop (call tick 0.5f64))"
+        );
+        assert_eq!(data(&module), [(0, &b"duck"[..])]);
+        // Neither the host nor the function itself knows of a default.
+        assert_eq!(module.imports[0].params, vec![ValType::I32; 2]);
+        let tick = module.funcs.iter().find(|f| f.name == "tick").unwrap();
+        assert_eq!(tick.params, vec![ValType::F64]);
+    }
+
+    /// Each error of `src`, with the text it points at.
+    fn errors_at(src: &str) -> Vec<(TypeErrorKind, &str)> {
+        let errors = check_src(src).unwrap_err();
+        let at = |e: TypeError| {
+            let span = e.span.unwrap();
+            (e.kind, &src[span.start..span.end])
+        };
+        errors.into_iter().map(at).collect()
+    }
+
+    #[test]
+    fn parameter_defaults_follow_every_global() {
+        let src = "\
+fn f(a: i32 = LATER, p: Late = Late()) -> i32:
+    return a + p.x
+let LATER = 2
+struct Late:
+    x: i32 = LATER * 2
+fn g() -> i32:
+    return f()
+";
+        assert_eq!(body(&lower(src), "g"), "(return (call f 2 4))");
+    }
+
+    #[test]
+    fn parameter_defaults_are_constant() {
+        use TypeErrorKind::*;
+        let src = "\
+let a = 5
+var count = 0
+fn call(n: i32 = 1) -> i32:
+    return n
+let early = call()
+fn f(a: i32, b: i32 = a, c: i32 = b + 1, d: i32 = d, e: i32 = 2):
+    pass
+fn g(x: i32 = call(), y: i32 = count, z: u8 = 300, w: bool = 1, v: i32 = 1 / 0):
+    pass
+fn h(a: varray(u8) = \"abc\", b: &var i32 = &var 0, c: varray(i32) = [], d: &i32 = &1):
+    pass
+fn m():
+    f(1)
+    g()
+    h()
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (NotConstant, "call()"),
+                (DefaultReadsParam("a".into()), "a"),
+                (DefaultReadsParam("b".into()), "b"),
+                (DefaultReadsParam("d".into()), "d"),
+                (NotConstant, "call()"),
+                (NotConstant, "count"),
+                (IntOutOfRange("u8".into()), "300"),
+                (mismatch("bool", "i32"), "1"),
+                (ConstTrap, "1 / 0"),
+                (SharedLiteral, "\"abc\""),
+                (SharedPointee, "&var 0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_without_defaults_are_still_counted() {
+        use TypeErrorKind::*;
+        let src = "\
+fn k(a: i32, b: i32 = 1, c: i32 = 2) -> i32:
+    return a
+fn start(verbose: bool = false):
+    pass
+let p = k
+fn m() -> i32:
+    k()
+    k(1, 2, 3, 4)
+    k(1, b: 2, b: 3)
+    k(1, d: 2)
+    k(b: 2)
+    let short: fn(i32) -> i32 = k
+    return p(1) + k(1)
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (MissingArg("a".into()), "k()"),
+                (
+                    TooManyArgs {
+                        expected: 3,
+                        found: 4
+                    },
+                    "4"
+                ),
+                (DuplicateArg("b".into()), "3"),
+                (UnknownLabel("d".into()), "2"),
+                (MissingArg("a".into()), "k(b: 2)"),
+                (mismatch("fn(i32) -> i32", "fn(i32, i32, i32) -> i32"), "k"),
+                (
+                    TooFewArgs {
+                        expected: 3,
+                        found: 1
+                    },
+                    "p(1)"
+                ),
+            ]
+        );
+        // The host calls the start function, and gives no argument.
+        let errors = check_start(src, "start").unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.kind == InvalidStart("start".into()))
+        );
+    }
+
+    #[test]
+    fn instances_share_the_defaults_of_a_generic_fn() {
+        let src = "\
+let buf: varray(i64) = [0; 4]
+fn(T) fill(a: varray(T), n: u32 = 3, p: &T = 0) -> u32:
+    return n
+fn(T) only(p: &T = 0, n: i32 = 1) -> i32:
+    return n
+fn(T) outer(a: varray(T)) -> u32:
+    return fill(a) + fill(a, p: 8)
+fn f() -> u32:
+    return fill(buf) + fill(buf, 2) + outer(buf)
+fn g() -> i32:
+    return only(u8)() + only(u8)(n: 2)
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(return (I32.Add (I32.Add (call fill(i64) 4 0 3 0) (call fill(i64) 4 0 2 0)) \
+             (call outer(i64) 4 0)))"
+        );
+        assert_eq!(
+            body(&module, "g"),
+            "(return (I32.Add (call only(u8) 0 1) (call only(u8) 0 2)))"
+        );
+        assert_eq!(
+            body(&module, "outer(i64)"),
+            "(return (I32.Add (call fill(i64) a.len a.ptr 3 0) (call fill(i64) a.len a.ptr 3 8)))"
+        );
+    }
+
+    #[test]
+    fn parameter_defaults_cannot_depend_on_type_parameters() {
+        use TypeErrorKind::*;
+        let src = "\
+fn(T) id(x: T) -> T:
+    return x
+fn(T, U) bad(a: T, size: u32 = T.size, v: U = 0, pair: tuple(T, i32) = (0, 1), cast: &T = 0 as &U, cb: fn(T) -> T = id, ok: &U = 0) -> T:
+    return a
+fn(T) only(p: &T = 0) -> i32:
+    return 1
+fn f() -> i32:
+    return bad(1) + only()
+";
+        let uses = |param: &str, text: &'static str| (DefaultUsesParam(param.into()), text);
+        let cannot_infer = CannotInfer {
+            func: "only".into(),
+            param: "T".into(),
+        };
+        assert_eq!(
+            errors_at(src),
+            vec![
+                uses("T", "T"),
+                uses("U", "0"),
+                uses("T", "(0, 1)"),
+                uses("U", "U"),
+                uses("T", "id"),
+                (cannot_infer, "only()"),
+            ]
+        );
     }
 }

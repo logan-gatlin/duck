@@ -3,7 +3,7 @@ use std::fmt;
 use crate::lex::{Span, Token, TokenKind};
 
 /// A parsed source file, or the items of a whole program once
-/// [`crate::load`] has gathered every imported file.
+/// [`crate::load`] has gathered every file it uses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub items: Vec<Item>,
@@ -24,23 +24,25 @@ pub enum ItemKind {
     Enum(EnumDecl),
     Binding(Binding),
     /// Resolved by [`crate::load`], so later stages never see one.
-    Import(Import),
+    Use(Use),
 }
 
-/// `import "path"` or `import name`, binding the module it names to the
-/// stem of the path, or the name, unless `as alias` renames it.
+/// `use a.b` or `use a.{b, c}`, binding what each path names.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Import {
-    pub target: ImportTarget,
+pub struct Use {
+    /// One for `use a.b`, and one for each name a group ends in.
+    pub paths: Vec<UsePath>,
+}
+
+/// `a.b.c`, binding the module or item it names to its last name, unless
+/// `as alias` renames it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsePath {
+    /// The names from the root of the package, the first of which may be a
+    /// dependency instead. Those before a group are repeated in each of its
+    /// paths.
+    pub segments: Vec<Ident>,
     pub alias: Option<Ident>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ImportTarget {
-    /// A file, relative to the importing one.
-    File(String),
-    /// The library a dependency of the importing package names.
-    Package(Ident),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,11 +80,13 @@ pub struct ExternFn {
     pub span: Span,
 }
 
-/// A `name: Type` function parameter.
+/// A `name: Type` or `name: Type = default` function parameter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: Ident,
     pub ty: Type,
+    /// The value the parameter has where a call gives it none.
+    pub default: Option<Expr>,
     pub span: Span,
 }
 
@@ -318,8 +322,8 @@ pub enum ParseErrorKind {
     ExternFnBody,
     /// `pub` on an `extern` block.
     PubExtern,
-    /// An `import` after an item that isn't one.
-    ImportAfterItem,
+    /// A `use` after an item that isn't one.
+    UseAfterItem,
     /// `(x,)`, which would be a tuple of one element.
     OneElementTuple,
     /// A function in an `extern` block with type parameters.
@@ -372,7 +376,7 @@ impl fmt::Display for ParseErrorKind {
             Self::MissingFnBody => write!(f, "functions outside `extern` blocks need a body"),
             Self::ExternFnBody => write!(f, "functions in `extern` blocks cannot have a body"),
             Self::PubExtern => write!(f, "`extern` blocks cannot be `pub`"),
-            Self::ImportAfterItem => write!(f, "`import` must come before other items"),
+            Self::UseAfterItem => write!(f, "`use` must come before other items"),
             Self::OneElementTuple => write!(f, "tuples must have at least two elements"),
             Self::GenericExtern => {
                 write!(
@@ -425,15 +429,15 @@ pub fn parse(tokens: &[Token]) -> Result<Module, Vec<ParseError>> {
 impl<'a> Parser<'a> {
     fn module(&mut self) -> Module {
         let mut items = Vec::new();
-        let mut past_imports = false;
+        let mut past_uses = false;
         while !self.at(TokenKind::Eof) {
             match self.item() {
                 Ok(item) => {
-                    let is_import = matches!(item.kind, ItemKind::Import(_));
-                    if past_imports && is_import {
-                        self.error(ParseErrorKind::ImportAfterItem, item.span);
+                    let is_use = matches!(item.kind, ItemKind::Use(_));
+                    if past_uses && is_use {
+                        self.error(ParseErrorKind::UseAfterItem, item.span);
                     }
-                    past_imports |= !is_import;
+                    past_uses |= !is_use;
                     items.push(item);
                 }
                 Err(e) => self.recover(e),
@@ -456,7 +460,7 @@ impl<'a> Parser<'a> {
             TokenKind::Struct => ItemKind::Struct(self.struct_decl()?),
             TokenKind::Enum => ItemKind::Enum(self.enum_decl()?),
             TokenKind::Let | TokenKind::Var => ItemKind::Binding(self.binding()?),
-            TokenKind::Import => ItemKind::Import(self.import()?),
+            TokenKind::Use => ItemKind::Use(self.use_decl()?),
             _ => return Err(self.unexpected("item")),
         };
         Ok(Item {
@@ -466,19 +470,33 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn import(&mut self) -> PResult<Import> {
-        self.expect(TokenKind::Import)?;
-        let target = match self.peek().kind {
-            TokenKind::Str(_) => ImportTarget::File(self.string()?),
-            TokenKind::Ident(_) => ImportTarget::Package(self.ident()?),
-            _ => return Err(self.unexpected("string or identifier")),
-        };
+    fn use_decl(&mut self) -> PResult<Use> {
+        self.expect(TokenKind::Use)?;
+        let mut paths = Vec::new();
+        self.use_tree(Vec::new(), &mut paths)?;
+        self.expect(TokenKind::Newline)?;
+        Ok(Use { paths })
+    }
+
+    /// The paths of `a.b`, `a.b as c` or `a.{b, c.d}`, each after `prefix`.
+    fn use_tree(&mut self, prefix: Vec<Ident>, paths: &mut Vec<UsePath>) -> PResult<()> {
+        let mut segments = prefix;
+        segments.push(self.ident()?);
+        while self.eat(TokenKind::Dot) {
+            if self.eat(TokenKind::LBrace) {
+                self.comma_list(TokenKind::RBrace, |parser| {
+                    parser.use_tree(segments.clone(), paths)
+                })?;
+                return Ok(());
+            }
+            segments.push(self.ident()?);
+        }
         let alias = match self.eat(TokenKind::As) {
             true => Some(self.ident()?),
             false => None,
         };
-        self.expect(TokenKind::Newline)?;
-        Ok(Import { target, alias })
+        paths.push(UsePath { segments, alias });
+        Ok(())
     }
 
     fn fn_decl(&mut self) -> PResult<FnDecl> {
@@ -615,9 +633,11 @@ impl<'a> Parser<'a> {
     fn param(&mut self) -> PResult<Param> {
         let start = self.peek().span;
         let (name, ty) = self.typed_name()?;
+        let default = self.default()?;
         Ok(Param {
             name,
             ty,
+            default,
             span: self.span_from(start),
         })
     }
@@ -626,10 +646,7 @@ impl<'a> Parser<'a> {
         let start = self.peek().span;
         let is_pub = self.eat(TokenKind::Pub);
         let (name, ty) = self.typed_name()?;
-        let default = match self.eat(TokenKind::Eq) {
-            true => Some(self.expr()?),
-            false => None,
-        };
+        let default = self.default()?;
         Ok(Field {
             is_pub,
             name,
@@ -637,6 +654,14 @@ impl<'a> Parser<'a> {
             default,
             span: self.span_from(start),
         })
+    }
+
+    /// The `= default` after a parameter or field, if there is one.
+    fn default(&mut self) -> PResult<Option<Expr>> {
+        match self.eat(TokenKind::Eq) {
+            true => self.expr().map(Some),
+            false => Ok(None),
+        }
     }
 
     /// `name: Type`
@@ -2023,6 +2048,43 @@ fn f():
     }
 
     #[test]
+    fn param_defaults() {
+        let src = "fn f(a: i32, b: f32 = 1.5 * 2.0, c: &P = 0) -> i32:\n    return a\n";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        let params = &f.sig.params;
+        let defaults: Vec<_> = params
+            .iter()
+            .map(|p| p.default.as_ref().map(sexpr))
+            .collect();
+        let want = [None, Some("(Mul 1.5 2)"), Some("0")].map(|d| d.map(str::to_string));
+        assert_eq!(defaults, want);
+        let span = params[1].span;
+        assert_eq!(&src[span.start..span.end], "b: f32 = 1.5 * 2.0");
+
+        // A default is before the host's name for an `extern` function.
+        let src = "extern:\n    fn log(n: i32, base: i32 = 10) = \"log_int\"\n";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Extern(host) = &module.items[0].kind else {
+            panic!()
+        };
+        let log = &host.fns[0];
+        assert_eq!(log.sig.params[1].default.as_ref().map(sexpr).unwrap(), "10");
+        assert_eq!(log.import_name.as_deref(), Some("log_int"));
+
+        assert_eq!(
+            errors("fn f(a: i32 =):\n    pass\n"),
+            vec![expected("expression", TokenKind::RParen)]
+        );
+        assert_eq!(
+            errors("fn f(a = 1):\n    pass\n"),
+            vec![expected("`:`", TokenKind::Eq)]
+        );
+    }
+
+    #[test]
     fn empty_struct() {
         let module = parse_src("struct Unit:\n    pass\n").unwrap();
         let ItemKind::Struct(unit) = &module.items[0].kind else {
@@ -2262,42 +2324,72 @@ let d = 1
         );
     }
 
-    #[test]
-    fn imports() {
-        let src = "import \"util/strings.duck\"\npub import \"a.duck\" as b\nimport json\nimport json as j\n";
+    /// Each path of every `use` in `src`, with `pub` and `as` as written.
+    fn uses(src: &str) -> Vec<String> {
         let module = parse_src(src).unwrap();
-        let imports: Vec<_> = module
-            .items
-            .iter()
-            .map(|item| {
-                let ItemKind::Import(import) = &item.kind else {
-                    panic!("{item:?}")
-                };
-                let target = match &import.target {
-                    ImportTarget::File(path) => format!("{path:?}"),
-                    ImportTarget::Package(name) => name.name.clone(),
-                };
-                let alias = import.alias.as_ref().map(|alias| alias.name.as_str());
-                (item.is_pub, target, alias)
-            })
-            .collect();
+        let mut uses = Vec::new();
+        for item in &module.items {
+            let ItemKind::Use(decl) = &item.kind else {
+                panic!("{item:?}")
+            };
+            for path in &decl.paths {
+                let names: Vec<_> = path.segments.iter().map(|s| s.name.as_str()).collect();
+                let mut text = names.join(".");
+                if item.is_pub {
+                    text.insert_str(0, "pub ");
+                }
+                if let Some(alias) = &path.alias {
+                    text.push_str(&format!(" as {}", alias.name));
+                }
+                uses.push(text);
+            }
+        }
+        uses
+    }
+
+    #[test]
+    fn use_paths() {
+        let src = "use util.strings\npub use a.b.c as d\nuse json\nuse json as j\n";
         assert_eq!(
-            imports,
+            uses(src),
+            ["util.strings", "pub a.b.c as d", "json", "json as j"]
+        );
+    }
+
+    #[test]
+    fn use_groups_are_a_path_for_each_name() {
+        let src = "use geo.{Point, len as length}\npub use a.{\n    b.{c, d},\n    e,\n}\n";
+        assert_eq!(
+            uses(src),
             [
-                (false, "\"util/strings.duck\"".to_string(), None),
-                (true, "\"a.duck\"".to_string(), Some("b")),
-                (false, "json".to_string(), None),
-                (false, "json".to_string(), Some("j")),
+                "geo.Point",
+                "geo.len as length",
+                "pub a.b.c",
+                "pub a.b.d",
+                "pub a.e"
             ]
         );
     }
 
     #[test]
-    fn imports_come_before_other_items() {
-        let src = "import \"a\"\nlet x = 1\nimport \"b\"\nfn f():\n    pass\n";
-        assert_eq!(errors(src), [ParseErrorKind::ImportAfterItem]);
+    fn use_errors() {
+        assert_eq!(
+            errors("use \"a.duck\"\nuse a.\nuse a.{b} as c\nuse {a, b}\n"),
+            [
+                expected("identifier", TokenKind::Str("a.duck".into())),
+                expected("identifier", TokenKind::Newline),
+                expected("newline", TokenKind::As),
+                expected("identifier", TokenKind::LBrace),
+            ]
+        );
+    }
+
+    #[test]
+    fn uses_come_before_other_items() {
+        let src = "use a\nlet x = 1\nuse b\nfn f():\n    pass\n";
+        assert_eq!(errors(src), [ParseErrorKind::UseAfterItem]);
         let span = parse_src(src).unwrap_err()[0].span;
-        assert_eq!(&src[span.start..span.end], "import \"b\"");
+        assert_eq!(&src[span.start..span.end], "use b");
     }
 
     #[test]

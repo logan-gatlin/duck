@@ -5,11 +5,11 @@ pub const OVERVIEW: &str = include_str!("agents.md");
 
 #[cfg(test)]
 mod tests {
-    use duck_compiler::file::{FileId, FileManager, OpenError, Settings};
+    use duck_compiler::file::{FileId, FileManager, Settings};
 
     use super::*;
 
-    /// One file, which imports nothing.
+    /// One file, which uses nothing.
     struct Single(&'static str);
 
     impl FileManager for Single {
@@ -25,8 +25,8 @@ mod tests {
             self.0.to_string()
         }
 
-        fn open(&mut self, _from: FileId, _path: &str) -> Result<FileId, OpenError> {
-            Err(OpenError::NotFound)
+        fn open(&mut self, _from: FileId, _path: &[&str]) -> Option<FileId> {
+            None
         }
 
         fn open_package(&mut self, _from: FileId, _name: &str) -> Option<FileId> {

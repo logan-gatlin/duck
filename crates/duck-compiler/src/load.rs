@@ -1,64 +1,69 @@
-//! Gathers a program from its entry point and every module it imports.
+//! Gathers a program from its entry point and every module it uses.
 //!
-//! Every file is a module. Its items are kept apart from those of other
-//! modules, which it reaches through the names it imports them by.
+//! Every file is a module, named by its path from the root of its package:
+//! `util/strings.duck` is `util.strings`. Its items are kept apart from those
+//! of other modules, which it reaches through the names `use` gives them.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
 
 use crate::Error;
-use crate::file::{FileId, FileManager, OpenError};
+use crate::file::{FileId, FileManager};
 use crate::lex::{self, Span};
-use crate::parse::{self, Ident, ImportTarget, Item, ItemKind};
+use crate::parse::{self, Ident, Item, ItemKind, UsePath};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ImportError {
-    pub kind: ImportErrorKind,
+pub struct UseError {
+    pub kind: UseErrorKind,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ImportErrorKind {
-    /// No file was found at the path.
+pub enum UseErrorKind {
+    /// A path that no module of the package is along, and that doesn't
+    /// start with a dependency.
     NotFound(String),
-    /// A path to a file of another package.
-    OutsidePackage(String),
-    /// The importing package has no dependency by this name.
-    NoDependency(String),
-    /// A module that imports itself, through the modules named in order,
+    /// A path starting with the name of both a module of the package and a
+    /// dependency.
+    Ambiguous(String),
+    /// A module that uses itself, through the modules named in order,
     /// starting and ending with itself.
     Cycle(Vec<String>),
-    /// A file whose stem isn't a name, imported without `as`.
-    Unnamed(String),
 }
 
-/// The items of every module of a program, and the names modules give the
-/// modules they import.
+/// The items of every module of a program, and the names modules give what
+/// they use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     /// Every module's items, each module's after those of every module it
-    /// imports, which is the order globals are initialized in.
+    /// uses, which is the order globals are initialized in.
     pub items: Vec<Item>,
-    pub imports: Vec<Import>,
+    /// Each after every `use` of the module it leads into.
+    pub uses: Vec<Use>,
     /// The module whose `pub` items the program exports.
     pub entry: FileId,
 }
 
-/// A module that `module` imports, by the name it gives it.
+/// A name `module` gives a module, or something reached through one.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Import {
+pub struct Use {
     pub module: FileId,
     pub name: Ident,
+    /// The module furthest along the path.
     pub target: FileId,
-    /// Whether modules importing `module` can reach `target` through it.
+    /// `target`, as the path names it.
+    pub target_path: String,
+    /// The rest of the path, each a member of what the one before names.
+    /// Empty when the path names `target` itself.
+    pub members: Vec<Ident>,
+    /// Whether modules using `module` can reach `name` through it.
     pub is_pub: bool,
 }
 
 /// How far a module has been loaded.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// Loading it or a module it imports.
+    /// Loading it or a module it uses.
     Loading,
     Loaded,
 }
@@ -66,55 +71,53 @@ enum State {
 struct Loader<'f, F> {
     files: &'f mut F,
     states: HashMap<FileId, State>,
-    /// The modules being loaded, each imported by the one before.
+    /// The modules being loaded, each used by the one before.
     stack: Vec<FileId>,
     items: Vec<Item>,
-    imports: Vec<Import>,
+    uses: Vec<Use>,
     errors: Vec<Error>,
 }
 
-impl fmt::Display for ImportErrorKind {
+impl fmt::Display for UseErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotFound(path) => write!(f, "cannot find `{path}`"),
-            Self::OutsidePackage(path) => write!(
+            Self::NotFound(path) => write!(
                 f,
-                "`{path}` is outside this package; import its package by name"
+                "cannot find `{path}` in this package or its dependencies"
             ),
-            Self::NoDependency(name) => write!(f, "no dependency is named `{name}`"),
-            Self::Cycle(modules) => write!(f, "import cycle: {}", modules.join(" -> ")),
-            Self::Unnamed(path) => write!(
+            Self::Ambiguous(name) => write!(
                 f,
-                "the name of `{path}` is not an identifier; import it `as` one"
+                "`{name}` is both a module of this package and a dependency"
             ),
+            Self::Cycle(modules) => write!(f, "use cycle: {}", modules.join(" -> ")),
         }
     }
 }
 
-impl fmt::Display for ImportError {
+impl fmt::Display for UseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} at {}..{}", self.kind, self.span.start, self.span.end)
     }
 }
 
-impl std::error::Error for ImportError {}
+impl std::error::Error for UseError {}
 
 impl Program {
-    /// A program of one module, which imports nothing.
+    /// A program of one module, which uses nothing.
     pub fn single(entry: FileId, module: parse::Module) -> Self {
         Self {
             items: module.items,
-            imports: Vec::new(),
+            uses: Vec::new(),
             entry,
         }
     }
 }
 
-/// Lexes and parses the entry point of `files` and every module it imports,
+/// Lexes and parses the entry point of `files` and every module it uses,
 /// recursively.
 ///
-/// Each module is loaded once, however many modules import it. Errors in one
-/// file don't stop the others from loading, but the imports of a file that
+/// Each module is loaded once, however many modules use it. Errors in one
+/// file don't stop the others from loading, but the uses of a file that
 /// fails to lex or parse are not followed.
 pub fn load(files: &mut impl FileManager) -> Result<Program, Vec<Error>> {
     let entry = files.entry_point();
@@ -123,14 +126,14 @@ pub fn load(files: &mut impl FileManager) -> Result<Program, Vec<Error>> {
         states: HashMap::new(),
         stack: Vec::new(),
         items: Vec::new(),
-        imports: Vec::new(),
+        uses: Vec::new(),
         errors: Vec::new(),
     };
     loader.file(entry);
     if loader.errors.is_empty() {
         Ok(Program {
             items: loader.items,
-            imports: loader.imports,
+            uses: loader.uses,
             entry,
         })
     } else {
@@ -157,13 +160,15 @@ impl<F: FileManager> Loader<'_, F> {
             Ok(module) => module,
             Err(errors) => return self.errors.extend(errors.into_iter().map(Error::Parse)),
         };
-        // Imports come first, so the modules they load precede these items.
+        // Uses come first, so the modules they load precede these items.
         for item in module.items {
             match &item.kind {
-                ItemKind::Import(import) => {
-                    if let Err(kind) = self.import(id, &item, import) {
-                        let span = item.span;
-                        self.errors.push(Error::Import(ImportError { kind, span }));
+                ItemKind::Use(decl) => {
+                    for path in &decl.paths {
+                        if let Err(kind) = self.use_path(id, item.is_pub, path) {
+                            let span = path_span(path);
+                            self.errors.push(Error::Use(UseError { kind, span }));
+                        }
                     }
                 }
                 _ => self.items.push(item),
@@ -171,40 +176,22 @@ impl<F: FileManager> Loader<'_, F> {
         }
     }
 
-    fn import(
-        &mut self,
-        from: FileId,
-        item: &Item,
-        import: &parse::Import,
-    ) -> Result<(), ImportErrorKind> {
-        let (target, name) = match &import.target {
-            ImportTarget::File(path) => {
-                let target = self.files.open(from, path).map_err(|e| match e {
-                    OpenError::NotFound => ImportErrorKind::NotFound(path.clone()),
-                    OpenError::OutsidePackage => ImportErrorKind::OutsidePackage(path.clone()),
-                })?;
-                let stem = Path::new(path).file_stem().and_then(|stem| stem.to_str());
-                let name = stem
-                    .filter(|stem| lex::is_identifier(stem))
-                    .map(|stem| Ident {
-                        name: stem.to_string(),
-                        span: item.span,
-                    });
-                (
-                    target,
-                    name.ok_or_else(|| ImportErrorKind::Unnamed(path.clone())),
-                )
-            }
-            ImportTarget::Package(name) => {
-                let target = self.files.open_package(from, &name.name);
-                let target =
-                    target.ok_or_else(|| ImportErrorKind::NoDependency(name.name.clone()))?;
-                (target, Ok(name.clone()))
-            }
-        };
-        let name = match &import.alias {
-            Some(alias) => alias.clone(),
-            None => name?,
+    /// Loads the module `path` leads into, and gives what it names its name
+    /// in the module `from`.
+    fn use_path(&mut self, from: FileId, is_pub: bool, path: &UsePath) -> Result<(), UseErrorKind> {
+        let names: Vec<_> = path.segments.iter().map(|s| s.name.as_str()).collect();
+        // The module is the file furthest along the path, and the names
+        // after it are found by the type checker.
+        let local = (1..=names.len())
+            .rev()
+            .find_map(|len| Some((self.files.open(from, &names[..len])?, len)));
+        let dependency = self.files.open_package(from, names[0]);
+        let (target, len) = match (local, dependency) {
+            (Some(_), Some(_)) => return Err(UseErrorKind::Ambiguous(names[0].to_string())),
+            (Some(local), None) => local,
+            // Only what its library makes `pub` is reached in a dependency.
+            (None, Some(library)) => (library, 1),
+            (None, None) => return Err(UseErrorKind::NotFound(names.join("."))),
         };
         match self.states.get(&target) {
             None => self.file(target),
@@ -213,16 +200,28 @@ impl<F: FileManager> Loader<'_, F> {
                 let start = self.stack.iter().position(|id| *id == target).unwrap();
                 let cycle = self.stack[start..].iter().chain([&target]);
                 let names = cycle.map(|id| self.files.display_name(*id)).collect();
-                return Err(ImportErrorKind::Cycle(names));
+                return Err(UseErrorKind::Cycle(names));
             }
         }
-        self.imports.push(Import {
+        let name = path.alias.as_ref().or(path.segments.last()).unwrap();
+        self.uses.push(Use {
             module: from,
-            name,
+            name: name.clone(),
             target,
-            is_pub: item.is_pub,
+            target_path: names[..len].join("."),
+            members: path.segments[len..].to_vec(),
+            is_pub,
         });
         Ok(())
+    }
+}
+
+/// From the first name of `path` to its last.
+fn path_span(path: &UsePath) -> Span {
+    let (first, last) = (&path.segments[0], path.segments.last().unwrap());
+    Span {
+        end: last.span.end,
+        ..first.span
     }
 }
 
@@ -235,7 +234,7 @@ mod tests {
     use crate::parse::{ParseErrorKind, PatternKind};
     use crate::ty::{self, TypeErrorKind};
 
-    /// Files named by the paths that import them; the first is the entry
+    /// Files named by the paths that use them; the first is the entry
     /// point. A file named `@name` is the library of dependency `name`.
     struct Memory(Vec<(&'static str, &'static str)>);
 
@@ -254,6 +253,11 @@ mod tests {
         fn text(&self, span: Span) -> &'static str {
             &self.0[self.index(span.file)].1[span.start..span.end]
         }
+
+        fn named(&self, name: &str) -> Option<FileId> {
+            let index = self.0.iter().position(|f| f.0 == name);
+            Some(Self::mint_file_id(index?))
+        }
     }
 
     impl FileManager for Memory {
@@ -269,13 +273,12 @@ mod tests {
             self.0[self.index(id)].1.to_string()
         }
 
-        fn open(&mut self, _from: FileId, path: &str) -> Result<FileId, OpenError> {
-            let index = self.0.iter().position(|f| f.0 == path);
-            Ok(Self::mint_file_id(index.ok_or(OpenError::NotFound)?))
+        fn open(&mut self, _from: FileId, path: &[&str]) -> Option<FileId> {
+            self.named(&path.join("."))
         }
 
-        fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId> {
-            self.open(from, &format!("@{name}")).ok()
+        fn open_package(&mut self, _from: FileId, name: &str) -> Option<FileId> {
+            self.named(&format!("@{name}"))
         }
 
         fn settings(&mut self) -> Settings {
@@ -345,10 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn modules_follow_the_modules_they_import() {
+    fn modules_follow_the_modules_they_use() {
         let mut files = Memory(vec![
-            ("main", "import \"b\"\nimport \"e\"\nlet a = 1\nlet d = 4\n"),
-            ("b", "import \"c\"\nlet b = 2\n"),
+            ("main", "use b\nuse e\nlet a = 1\nlet d = 4\n"),
+            ("b", "use c\nlet b = 2\n"),
             ("c", "let c = 3\n"),
             ("e", "fn e():\n    pass\n"),
         ]);
@@ -359,20 +362,20 @@ mod tests {
     }
 
     #[test]
-    fn a_module_imported_twice_is_loaded_once() {
+    fn a_module_used_twice_is_loaded_once() {
         let mut files = Memory(vec![
-            ("main", "import \"a\"\nimport \"b\"\nlet m = 0\n"),
-            ("a", "let a = 1\n"),
-            ("b", "import \"a\"\nlet b = 2\n"),
+            ("main", "use a\nuse b\nuse a.a as one\nlet m = 0\n"),
+            ("a", "pub let a = 1\n"),
+            ("b", "use a\nlet b = 2\n"),
         ]);
         assert_eq!(items(&mut files), ["a a", "b b", "m main"]);
     }
 
     #[test]
-    fn globals_are_initialized_after_those_they_import() {
+    fn globals_are_initialized_after_those_they_use() {
         let mut files = Memory(vec![
-            ("main", "import \"b\"\npub let c = b.b + 1\n"),
-            ("b", "import \"a\"\npub let b = a.a + 1\n"),
+            ("main", "use b\npub let c = b.b + 1\n"),
+            ("b", "use a.a\npub let b = a + 1\n"),
             ("a", "pub let a = 1\n"),
         ]);
         let module = lower(&mut files);
@@ -382,58 +385,109 @@ mod tests {
     }
 
     #[test]
-    fn import_cycles_are_errors_at_the_import_that_closes_them() {
+    fn use_cycles_are_errors_at_the_use_that_closes_them() {
         let mut files = Memory(vec![
-            ("main", "import \"a\"\n"),
-            ("a", "import \"b\"\n"),
-            ("b", "import \"main\"\nimport \"b\"\n"),
+            ("main", "use a\n"),
+            ("a", "use b\n"),
+            ("b", "use main.x\nuse b\n"),
         ]);
         assert_eq!(
             errors(&mut files),
             [
-                "b \"import \\\"main\\\"\": import cycle: main -> a -> b -> main",
-                "b \"import \\\"b\\\"\": import cycle: b -> b",
+                "b \"main.x\": use cycle: main -> a -> b -> main",
+                "b \"b\": use cycle: b -> b",
             ]
         );
     }
 
     #[test]
-    fn missing_files() {
-        let mut files = Memory(vec![("main", "import \"nope\"\nlet a = 1\n")]);
-        assert_eq!(
-            errors(&mut files),
-            ["main \"import \\\"nope\\\"\": cannot find `nope`"]
-        );
-        let mut files = Memory(vec![("main", "import nope\n")]);
-        assert_eq!(
-            errors(&mut files),
-            ["main \"import nope\": no dependency is named `nope`"]
-        );
-    }
-
-    #[test]
-    fn modules_are_named_by_their_stem_unless_renamed() {
+    fn missing_modules() {
         let mut files = Memory(vec![
-            (
-                "main",
-                "import \"util/strings.duck\"\nimport \"my-file.duck\" as other\nimport json as j\nlet x = strings.a + other.b + j.c\n",
-            ),
-            ("util/strings.duck", "pub let a = 1\n"),
-            ("my-file.duck", "pub let b = 2\n"),
-            ("@json", "pub let c = 3\n"),
-        ]);
-        lower(&mut files);
-
-        let mut files = Memory(vec![
-            ("main", "import \"my-file.duck\"\nimport \"fn.duck\"\n"),
-            ("my-file.duck", ""),
-            ("fn.duck", ""),
+            ("main", "use nope\nuse util\nuse util.nope.x\nlet a = 1\n"),
+            // A directory holds modules without being one.
+            ("util.strings", ""),
         ]);
         assert_eq!(
             errors(&mut files),
             [
-                "main \"import \\\"my-file.duck\\\"\": the name of `my-file.duck` is not an identifier; import it `as` one",
-                "main \"import \\\"fn.duck\\\"\": the name of `fn.duck` is not an identifier; import it `as` one",
+                "main \"nope\": cannot find `nope` in this package or its dependencies",
+                "main \"util\": cannot find `util` in this package or its dependencies",
+                "main \"util.nope.x\": cannot find `util.nope.x` in this package or its dependencies",
+            ]
+        );
+
+        // Past the module, the path names its items.
+        let mut files = Memory(vec![("main", "use a.{b, nope.c}\n"), ("a", "")]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"b\": `a` has no item `b`",
+                "main \"nope\": `a` has no item `nope`",
+            ]
+        );
+    }
+
+    #[test]
+    fn modules_are_named_by_their_last_name_unless_renamed() {
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use util.strings\nuse util.strings as text\nuse json as j\nuse json.c\nlet x = strings.a + text.a + j.c + c\n",
+            ),
+            ("util.strings", "pub let a = 1\n"),
+            ("@json", "pub let c = 3\n"),
+        ]);
+        lower(&mut files);
+    }
+
+    #[test]
+    fn the_module_is_the_file_furthest_along_the_path() {
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use a.b\nuse a.b.c\nuse a.d\nuse a.{b as inner, b.c as two}\nlet x = b.c + c + d + inner.c + two\n",
+            ),
+            // The item `b` is hidden by the file of that name.
+            ("a", "pub let b = 1\npub let d = 4\n"),
+            ("a.b", "pub let c = 2\n"),
+        ]);
+        lower(&mut files);
+        let program = load(&mut files).unwrap();
+        let uses: Vec<_> = (program.uses.iter())
+            .map(|u| {
+                (
+                    u.name.name.as_str(),
+                    u.target_path.as_str(),
+                    u.members.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            uses,
+            [
+                ("b", "a.b", 0),
+                ("c", "a.b", 1),
+                ("d", "a", 1),
+                ("inner", "a.b", 0),
+                ("two", "a.b", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_is_a_module_or_a_dependency_not_both() {
+        let mut files = Memory(vec![
+            ("main", "use json\nuse text.Value\nuse text.inner.x\n"),
+            ("json", ""),
+            ("@json", ""),
+            ("text.inner", ""),
+            ("@text", "pub let Value = 1\n"),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"json\": `json` is both a module of this package and a dependency",
+                "main \"text.inner.x\": `text` is both a module of this package and a dependency",
             ]
         );
     }
@@ -441,7 +495,7 @@ mod tests {
     #[test]
     fn errors_point_into_the_file_they_are_in() {
         let mut files = Memory(vec![
-            ("main", "import \"a\"\nimport \"b\"\nlet x = 1\n"),
+            ("main", "use a\nuse b\nlet x = 1\n"),
             ("a", "let x = 1\nlet y = @\n"),
             ("b", "fn f(: i32):\n    pass\n"),
         ]);
@@ -454,7 +508,7 @@ mod tests {
         );
 
         let mut files = Memory(vec![
-            ("main", "import \"a\"\nlet x = 1\nlet x = 2\n"),
+            ("main", "use a\nlet x = 1\nlet x = 2\n"),
             ("a", "\nlet x = 2\nlet y: Nope = 3\n"),
         ]);
         assert_eq!(
@@ -467,11 +521,8 @@ mod tests {
     }
 
     #[test]
-    fn import_syntax() {
-        let mut files = Memory(vec![
-            ("main", "import \"a\" as\nfn f():\n    import \"a\"\n"),
-            ("a", ""),
-        ]);
+    fn use_syntax() {
+        let mut files = Memory(vec![("main", "use a as\nfn f():\n    use a\n"), ("a", "")]);
         let kinds: Vec<_> = load(&mut files)
             .unwrap_err()
             .into_iter()
@@ -489,7 +540,7 @@ mod tests {
                 },
                 ParseErrorKind::Expected {
                     expected: "expression".into(),
-                    found: TokenKind::Import,
+                    found: TokenKind::Use,
                 },
             ]
         );
@@ -500,7 +551,7 @@ mod tests {
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"geo\"\nfn f() -> f32:\n    let p = geo.Point(x: 1.0, y: geo.origin.y)\n    return geo.len(p) + geo.unit.x\n",
+                "use geo\nfn f() -> f32:\n    let p = geo.Point(x: 1.0, y: geo.origin.y)\n    return geo.len(p) + geo.unit.x\n",
             ),
             (
                 "geo",
@@ -511,9 +562,34 @@ mod tests {
     }
 
     #[test]
+    fn used_items_are_named_alone() {
+        let geo = "pub struct Point:\n    pub x: f32\n    pub y: f32\npub let origin = Point(x: 0.0, y: 0.0)\npub var unit = Point(x: 1.0, y: 1.0)\npub fn len(p: Point) -> f32:\n    return p.x + p.y\n";
+        let main = "\
+use geo.{Point, origin, unit, len as length}
+fn f(q: &Point) -> f32:
+    let p: Point = Point(x: 1.0, y: origin.y)
+    unit.x = q.x
+    return length(p) + unit.x
+";
+        let mut files = Memory(vec![("main", main), ("geo", geo)]);
+        lower(&mut files);
+
+        // Only the name it is used by is declared.
+        let main = "use geo.len as length\nfn f(p: geo.Point) -> f32:\n    return len(p)\n";
+        let mut files = Memory(vec![("main", main), ("geo", geo)]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"geo\": unknown name `geo`",
+                "main \"len\": unknown name `len`",
+            ]
+        );
+    }
+
+    #[test]
     fn names_are_local_to_their_module() {
         let mut files = Memory(vec![
-            ("main", "import \"a\"\nlet x = 1\nfn f():\n    g()\n"),
+            ("main", "use a\nlet x = 1\nfn f():\n    g()\n"),
             ("a", "let x = 2\nfn g():\n    pass\n"),
         ]);
         assert_eq!(
@@ -524,15 +600,31 @@ mod tests {
 
     #[test]
     fn private_items_are_unreachable_from_other_modules() {
+        let a = "let x = 2\nfn g():\n    pass\nstruct P:\n    pub y: i32\npub let p = 0\n";
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"a\"\nfn f():\n    a.g()\n    let x = a.x\n    let p: a.P = a.p\n    a.nope()\n",
+                "use a\nfn f():\n    a.g()\n    let x = a.x\n    let p: a.P = a.p\n    a.nope()\n",
             ),
+            ("a", a),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"g\": `g` is private",
+                "main \"x\": `x` is private",
+                "main \"P\": `P` is private",
+                "main \"nope\": `a` has no item `nope`",
+            ]
+        );
+
+        // A name that can't be used is an error once, where it is used.
+        let mut files = Memory(vec![
             (
-                "a",
-                "let x = 2\nfn g():\n    pass\nstruct P:\n    pub y: i32\npub let p = 0\n",
+                "main",
+                "use a.{g, x, P, p, nope}\nfn f():\n    g()\n    let y = x\n    let q: P = p\n    nope()\n",
             ),
+            ("a", a),
         ]);
         assert_eq!(
             errors(&mut files),
@@ -546,32 +638,78 @@ mod tests {
     }
 
     #[test]
-    fn pub_imports_are_reachable_through_the_importing_module() {
+    fn pub_uses_are_reachable_through_the_using_module() {
+        let value = "pub struct Value:\n    pub n: i32\npub let one = 1\n";
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"lib\"\nlet x: lib.value.Value = lib.value.Value(n: lib.value.one)\nlet y = lib.inner.one\n",
+                "use lib\nlet x: lib.value.Value = lib.value.Value(n: lib.value.one)\nlet y = lib.inner.one\n",
             ),
-            ("lib", "pub import \"value\"\nimport \"value\" as inner\n"),
-            (
-                "value",
-                "pub struct Value:\n    pub n: i32\npub let one = 1\n",
-            ),
+            ("lib", "pub use value\nuse value as inner\n"),
+            ("value", value),
         ]);
         assert_eq!(errors(&mut files), ["main \"inner\": `inner` is private"]);
+
+        // A path goes on through them, and they name items as well.
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use lib.{value.one, Value, uno, inner.one as hidden, two}\nlet x: Value = Value(n: one + uno)\n",
+            ),
+            (
+                "lib",
+                "pub use value\npub use value.{Value, one as uno}\nuse value as inner\nuse value.one as two\n",
+            ),
+            ("value", value),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"inner\": `inner` is private",
+                "main \"two\": `two` is private",
+            ]
+        );
+    }
+
+    #[test]
+    fn use_paths_go_on_through_modules_only() {
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use lib.Color.Red\nuse lib.one.two\nuse lib.Color\nlet c = Color.Red\n",
+            ),
+            (
+                "lib",
+                "pub enum(u8) Color:\n    Red\n    Green\npub let one = 1\n",
+            ),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"Red\": `lib.Color` is not a module",
+                "main \"two\": `lib.one` is not a module",
+            ]
+        );
     }
 
     #[test]
     fn qualified_generics_and_enums() {
+        let lib = "pub struct(T) Box:\n    pub v: T\npub enum(u8) Color:\n    Red\n    Green\npub fn(T) id(x: T) -> T:\n    return x\n";
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"lib\"\nfn f() -> i32:\n    let b: lib.Box(lib.Color) = lib.Box(lib.Color)(v: lib.Color.Red)\n    let size = lib.Box(i64).size\n    var n = lib.id(b.v) as i32\n    for c in lib.Color:\n        n += c as i32\n    return n + lib.id(i32)(size as i32)\n",
+                "use lib\nfn f() -> i32:\n    let b: lib.Box(lib.Color) = lib.Box(lib.Color)(v: lib.Color.Red)\n    let size = lib.Box(i64).size\n    var n = lib.id(b.v) as i32\n    for c in lib.Color:\n        n += c as i32\n    return n + lib.id(i32)(size as i32)\n",
             ),
+            ("lib", lib),
+        ]);
+        lower(&mut files);
+
+        let mut files = Memory(vec![
             (
-                "lib",
-                "pub struct(T) Box:\n    pub v: T\npub enum(u8) Color:\n    Red\n    Green\npub fn(T) id(x: T) -> T:\n    return x\n",
+                "main",
+                "use lib.{Box, Color, id}\nfn f() -> i32:\n    let b: Box(Color) = Box(Color)(v: Color.Red)\n    let size = Box(i64).size\n    var n = id(b.v) as i32\n    for c in Color:\n        n += c as i32\n    return n + id(i32)(size as i32)\n",
             ),
+            ("lib", lib),
         ]);
         lower(&mut files);
     }
@@ -589,10 +727,11 @@ fn secret(x: i32) -> i32:
     return x
 ";
         let main = "\
-import \"lib\"
+use lib
+use lib.id
 fn f() -> i32:
     let a = lib.inc
-    let b: fn(u8) -> u8 = lib.id
+    let b: fn(u8) -> u8 = id
     return lib.hidden()(1) + lib.inc(2) + a(3)
 ";
         let mut files = Memory(vec![("main", main), ("lib", lib)]);
@@ -602,16 +741,16 @@ fn f() -> i32:
             .iter()
             .map(|id| module.funcs[id.0 as usize].name.as_str())
             .collect();
-        // Imported modules are lowered first.
+        // Used modules are lowered first.
         assert_eq!(names, ["secret", "inc", "id(u8)"]);
 
         // Function types belong to no module.
-        let main = "import \"lib\"\nlet a: lib.fn(i32) = lib.inc\n";
+        let main = "use lib\nlet a: lib.fn(i32) = lib.inc\n";
         let mut files = Memory(vec![("main", main), ("lib", lib)]);
         let message = "main \"fn\": expected type name, found `fn`";
         assert_eq!(errors(&mut files), [message]);
 
-        let main = "import \"lib\"\nfn f():\n    let a = lib.secret\n";
+        let main = "use lib\nfn f():\n    let a = lib.secret\n";
         let mut files = Memory(vec![("main", main), ("lib", lib)]);
         assert_eq!(errors(&mut files), ["main \"secret\": `secret` is private"]);
     }
@@ -621,7 +760,7 @@ fn f() -> i32:
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"a\"\nfn f():\n    let x = a\n    a()\n    a = 1\n",
+                "use a\nfn f():\n    let x = a\n    a()\n    a = 1\n",
             ),
             ("a", ""),
         ]);
@@ -636,15 +775,21 @@ fn f() -> i32:
     }
 
     #[test]
-    fn import_names_collide_with_items_but_locals_shadow_them() {
+    fn used_names_collide_with_items_but_locals_shadow_them() {
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"a\"\nfn a():\n    pass\nfn f(a: i32) -> i32:\n    return a\n",
+                "use a as b\nuse a.g\nfn b():\n    pass\nlet g = 1\nfn f(b: i32, g: i32) -> i32:\n    return b + g\n",
             ),
-            ("a", ""),
+            ("a", "pub fn g():\n    pass\n"),
         ]);
-        assert_eq!(errors(&mut files), ["main \"a\": `a` is already defined"]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"b\": `b` is already defined",
+                "main \"g\": `g` is already defined",
+            ]
+        );
     }
 
     #[test]
@@ -652,11 +797,11 @@ fn f() -> i32:
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"a\"\npub fn f():\n    a.g()\npub let x = a.y\nfn hidden():\n    pass\npub fn(T) id(x: T) -> T:\n    return x\n",
+                "use a\npub use a.h\npub fn f():\n    a.g()\npub let x = a.y\nfn hidden():\n    pass\npub fn(T) id(x: T) -> T:\n    return x\n",
             ),
             (
                 "a",
-                "pub fn g():\n    pass\npub let y = 1\npub let memory = 2\n",
+                "pub fn g():\n    pass\npub fn h():\n    pass\npub let y = 1\npub let memory = 2\n",
             ),
         ]);
         let module = lower(&mut files);
@@ -668,7 +813,7 @@ fn f() -> i32:
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"a\"\nfn f(p: a.P, q: &a.P):\n    let x = p.x + p.y\n    q.x = 1\n    let r = a.P(x: 1, y: 2)\n",
+                "use a\nuse a.P\nfn f(p: a.P, q: &P):\n    let x = p.x + p.y\n    q.x = 1\n    let r = P(x: 1, y: 2)\n",
             ),
             (
                 "a",
@@ -680,7 +825,7 @@ fn f() -> i32:
             [
                 "main \"x\": field `x` of `P` is private",
                 "main \"x\": field `x` of `P` is private",
-                "main \"a.P(x: 1, y: 2)\": field `x` of `P` is private",
+                "main \"P(x: 1, y: 2)\": field `x` of `P` is private",
             ]
         );
     }
@@ -688,7 +833,7 @@ fn f() -> i32:
     #[test]
     fn private_fields_with_defaults_are_constructed_from_other_modules() {
         let lib = "pub struct Counter:\n    pub step: i32 = 1\n    count: i32 = 5\npub struct Sealed:\n    pub open: i32\n    key: i32\n    pad: i32 = 0\npub fn new() -> Counter:\n    return Counter(count: 3)\n";
-        let main = "import \"a\"\npub fn f() -> a.Counter:\n    return a.Counter(step: 2)\n";
+        let main = "use a\npub fn f() -> a.Counter:\n    return a.Counter(step: 2)\n";
         let mut files = Memory(vec![("main", main), ("a", lib)]);
         let module = lower(&mut files);
         let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
@@ -700,7 +845,7 @@ fn f() -> i32:
 
         // A default can't be replaced where its field can't be named, and a
         // private field without one still seals its struct.
-        let main = "import \"a\"\nfn f():\n    let c = a.Counter(count: 1)\n    let s = a.Sealed(open: 1, key: 2, pad: 3)\n";
+        let main = "use a\nfn f():\n    let c = a.Counter(count: 1)\n    let s = a.Sealed(open: 1, key: 2, pad: 3)\n";
         let mut files = Memory(vec![("main", main), ("a", lib)]);
         assert_eq!(
             errors(&mut files),
@@ -709,6 +854,29 @@ fn f() -> i32:
                 "main \"a.Sealed(open: 1, key: 2, pad: 3)\": field `key` of `Sealed` is private",
             ]
         );
+    }
+
+    #[test]
+    fn parameter_defaults_are_folded_where_they_are_declared() {
+        let lib = "let STEP = 4\nfn twice(x: i32) -> i32:\n    return x * 2\npub fn step(n: i32, by: i32 = STEP, with: fn(i32) -> i32 = twice) -> i32:\n    return with(n) + by\n";
+        let main = "use a\nuse a.{step as advance}\nlet STEP = 9\npub fn f() -> i32:\n    return advance(1) + a.step(2, by: STEP)\n";
+        let mut files = Memory(vec![("main", main), ("a", lib)]);
+        let module = lower(&mut files);
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        let ir::Stmt::Return(values) = &f.body[0] else {
+            panic!("{:?}", f.body)
+        };
+        let ir::Expr::Binary(_, _, first, second) = &values[0] else {
+            panic!("{values:?}")
+        };
+        let args = |call: &ir::Expr| match call {
+            ir::Expr::Call(_, args) => args.clone(),
+            other => panic!("{other:?}"),
+        };
+        let consts = |xs: [i32; 3]| xs.map(|x| ir::Expr::Const(Const::I32(x))).to_vec();
+        // The private `STEP` and `twice` of the module that declares `step`.
+        assert_eq!(args(first), consts([1, 4, 1]));
+        assert_eq!(args(second), consts([2, 9, 1]));
     }
 
     #[test]
@@ -734,7 +902,7 @@ fn f() -> i32:
         let mut files = Memory(vec![
             (
                 "main",
-                "import \"host\"\nfn f():\n    host.log(1)\n    host.secret()\n",
+                "use host\nuse host.log\nfn f():\n    host.log(1)\n    log(2)\n    host.secret()\n",
             ),
             ("host", "extern:\n    pub fn log(n: i32)\n    fn secret()\n"),
         ]);
@@ -743,32 +911,30 @@ fn f() -> i32:
 
     #[test]
     fn generic_instances_resolve_names_where_they_are_declared() {
-        let mut files = Memory(vec![
-            (
-                "main",
-                "import \"a\"\nfn helper() -> i32:\n    return 0\nfn f() -> i32:\n    return a.twice(1) + helper()\n",
-            ),
-            (
-                "a",
-                "fn helper() -> i32:\n    return 2\npub fn(T) twice(x: T) -> i32:\n    return helper()\n",
-            ),
-        ]);
-        let module = lower(&mut files);
-        let instance = module
-            .funcs
-            .iter()
-            .find(|f| f.name == "twice(i32)")
-            .unwrap();
-        let ir::Stmt::Return(values) = &instance.body[0] else {
-            panic!("{:?}", instance.body)
-        };
-        let [ir::Expr::Call(id, _)] = &values[..] else {
-            panic!("{values:?}")
-        };
-        let callee = &module.funcs[id.0 as usize - module.imports.len()];
-        let ir::Stmt::Return(values) = &callee.body[0] else {
-            panic!()
-        };
-        assert_eq!(values, &[ir::Expr::Const(Const::I32(2))]);
+        let a = "fn helper() -> i32:\n    return 2\npub fn(T) twice(x: T) -> i32:\n    return helper()\n";
+        let mains = [
+            "use a\nfn helper() -> i32:\n    return 0\nfn f() -> i32:\n    return a.twice(1) + helper()\n",
+            "use a.twice\nfn helper() -> i32:\n    return 0\nfn f() -> i32:\n    return twice(1) + helper()\n",
+        ];
+        for main in mains {
+            let mut files = Memory(vec![("main", main), ("a", a)]);
+            let module = lower(&mut files);
+            let instance = module
+                .funcs
+                .iter()
+                .find(|f| f.name == "twice(i32)")
+                .unwrap();
+            let ir::Stmt::Return(values) = &instance.body[0] else {
+                panic!("{:?}", instance.body)
+            };
+            let [ir::Expr::Call(id, _)] = &values[..] else {
+                panic!("{values:?}")
+            };
+            let callee = &module.funcs[id.0 as usize - module.imports.len()];
+            let ir::Stmt::Return(values) = &callee.body[0] else {
+                panic!()
+            };
+            assert_eq!(values, &[ir::Expr::Const(Const::I32(2))]);
+        }
     }
 }

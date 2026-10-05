@@ -24,7 +24,7 @@ pub const MAX_PAGES: u32 = 1 << 16;
 pub struct Manifest {
     pub module: Option<Module>,
     pub library: Option<Library>,
-    /// Each package this one can import, by the name it imports it as.
+    /// Each package this one can use, by the name it uses it as.
     pub dependencies: BTreeMap<String, Dependency>,
 }
 
@@ -45,7 +45,7 @@ pub struct Module {
 /// What a package offers the packages that depend on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Library {
-    /// The file other packages import, relative to the manifest.
+    /// The file other packages use, relative to the manifest.
     pub entry: PathBuf,
 }
 
@@ -94,7 +94,7 @@ pub enum ManifestError {
     Empty,
     /// A `[memory]` without a `[module]` to give it to.
     MemoryWithoutModule,
-    /// A dependency named something that can't be imported.
+    /// A dependency named something that can't be used.
     DependencyName(String),
     /// A dependency with neither a `path` nor a `git`.
     NoSource(String),

@@ -8,10 +8,11 @@ pub trait FileManager {
     fn display_name(&mut self, id: FileId) -> String;
     /// Get the contents of a file
     fn contents(&mut self, id: FileId) -> String;
-    /// Attempt to open a file by pathname, relative to the file `from` that
-    /// imports it. Deduplicates with already opened files, so every path to
-    /// the same file gives the same id
-    fn open(&mut self, from: FileId, path: &str) -> Result<FileId, OpenError>;
+    /// Attempt to open the module `path` names from the root of the package
+    /// that the file `from` is in: `a/b.duck` for `["a", "b"]`. Deduplicates
+    /// with already opened files, so every path to the same file gives the
+    /// same id
+    fn open(&mut self, from: FileId, path: &[&str]) -> Option<FileId>;
     /// Attempt to open the library of the dependency `name` of the package
     /// that the file `from` is in. Returns `None` when there is no such
     /// dependency
@@ -22,14 +23,6 @@ pub trait FileManager {
     fn mint_file_id(id: usize) -> FileId {
         FileId(id)
     }
-}
-
-/// Why a file can't be opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenError {
-    NotFound,
-    /// A file in another package, which is only reached through its library.
-    OutsidePackage,
 }
 
 /// Module-wide choices that aren't written in any source file.
@@ -91,8 +84,8 @@ impl FileManager for DummyManager {
         guard(id, include_str!("../example.duck").to_string())
     }
 
-    fn open(&mut self, _from: FileId, _path: &str) -> Result<FileId, OpenError> {
-        Err(OpenError::NotFound)
+    fn open(&mut self, _from: FileId, _path: &[&str]) -> Option<FileId> {
+        None
     }
 
     fn open_package(&mut self, _from: FileId, _name: &str) -> Option<FileId> {

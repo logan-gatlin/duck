@@ -31,8 +31,11 @@
 ; Modules
 
 (qualified_type module: (identifier) @module)
-(import package: (identifier) @module)
-(import alias: (identifier) @module)
+(use (identifier) @module)
+(use_path path: (identifier) @module)
+(use_path path: (use_path name: (identifier) @module))
+(use_group path: (identifier) @module)
+(use_group path: (use_path name: (identifier) @module))
 
 ((named_type name: (identifier) @type.builtin)
   (#any-of? @type.builtin
@@ -46,7 +49,6 @@
 (boolean) @boolean
 (string) @string
 (escape_sequence) @string.escape
-(import path: (string) @string.special.path)
 (discard) @variable.builtin
 (placeholder) @variable.builtin
 "module" @variable.builtin
@@ -66,7 +68,7 @@
 ] @keyword
 
 "fn" @keyword.function
-"import" @keyword.import
+"use" @keyword.import
 "return" @keyword.return
 
 [

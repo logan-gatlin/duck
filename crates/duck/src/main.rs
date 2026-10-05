@@ -29,7 +29,7 @@ enum Command {
     New {
         /// The directory to create
         path: PathBuf,
-        /// Create a library for other packages to import, not a module
+        /// Create a library for other packages to use, not a module
         #[arg(long)]
         lib: bool,
     },

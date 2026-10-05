@@ -23,7 +23,7 @@ start = "main"
 # given, it starts at 0 and ends where the literals do.
 # static = { start = "0B", end = "64KiB" }
 
-# Packages to `import` by name, each with a [library].
+# Packages to `use` by name, each with a [library].
 # [dependencies]
 # json = { path = "../json" }
 # xml = { git = "https://example.com/xml.git", tag = "v1.0" }
@@ -34,10 +34,10 @@ const DEFAULT_MAIN: &str = "pub fn main():\n\tpass\n";
 const LIBRARY_MANIFEST: &str = r#"# Build using the `duck` cli
 
 [library]
-# The file other packages reach when they `import` this one.
+# The file other packages reach when they `use` this one.
 entry = "src/lib.duck"
 
-# Packages to `import` by name, each with a [library].
+# Packages to `use` by name, each with a [library].
 # [dependencies]
 # json = { path = "../json" }
 # xml = { git = "https://example.com/xml.git", tag = "v1.0" }
@@ -52,7 +52,7 @@ const DEFAULT_GITIGNORE: &str = "/build\n";
 pub enum Kind {
     /// A package that builds a wasm module.
     Module,
-    /// A package that other packages import, which builds nothing.
+    /// A package that other packages use, which builds nothing.
     Library,
 }
 

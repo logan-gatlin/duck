@@ -20,8 +20,8 @@ use crate::parse::{self, Arg};
 
 use super::generic::Arity;
 use super::{
-    Body, Checker, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value, generic_fn_decls,
-    is_literal, path_text,
+    Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
+    generic_fn_decls, is_literal, path_text, pending_defaults,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -103,6 +103,7 @@ impl Checker {
             sig: FuncSig {
                 name: decl.sig.name.name.clone(),
                 params: Vec::new(),
+                defaults: Vec::new(),
                 ret: Ty::Unit,
             },
             needs: Rc::default(),
@@ -125,8 +126,19 @@ impl Checker {
             self.type_params.clear();
             let def = &mut self.generic_fns[i];
             def.sig.params = params;
+            def.sig.defaults = pending_defaults(&decl.sig);
             def.sig.ret = ret;
             def.failed = self.errors.len() > errors;
+        }
+    }
+
+    /// Checks and folds the defaults of every generic function's parameters,
+    /// which each instance shares.
+    pub(super) fn define_generic_fn_defaults(&mut self, program: &Program) {
+        for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
+            self.module = item.span.file;
+            let params = self.generic_fns[i].sig.params.clone();
+            self.generic_fns[i].sig.defaults = self.fold_param_defaults(&decl.sig, &params);
         }
     }
 
@@ -215,7 +227,13 @@ impl Checker {
             self.error(TypeErrorKind::NotStorable(self.ty_name(pointee)), call);
             return None;
         }
-        Some(FuncSig { name, params, ret })
+        // A call takes the defaults of the declaration it names.
+        Some(FuncSig {
+            name,
+            params,
+            defaults: Vec::new(),
+            ret,
+        })
     }
 
     /// The signature of generic function `generic` with type arguments
@@ -388,7 +406,7 @@ impl Body<'_> {
         span: Span,
     ) -> (Ty, Value) {
         let sig = self.ck.generic_fns[generic.0 as usize].sig.clone();
-        let binding = self.bind_args(&sig.params, args, false, span);
+        let binding = self.bind_args(&sig.params, &sig.defaults, args, false, span);
         let mut checked: Vec<_> = args.iter().map(|_| None).collect();
         let type_args = match explicit {
             Some(type_args) => type_args,
@@ -410,10 +428,10 @@ impl Body<'_> {
                 .iter()
                 .map(|(p, _)| (p.clone(), Ty::Error))
                 .collect();
-            self.bound_args(&params, args, binding, checked);
+            self.bound_args(&params, &sig.defaults, args, binding, checked);
             return (Ty::Error, Value::default());
         };
-        let value = self.bound_args(&instance.params, args, binding, checked);
+        let value = self.bound_args(&instance.params, &sig.defaults, args, binding, checked);
         match id {
             Some(id) => self.call_func(id, value),
             None => (instance.ret, self.blank(instance.ret)),
@@ -558,14 +576,20 @@ impl Body<'_> {
                 checked[k] = Some((ty, value));
             }
         }
-        // Missing arguments, and signatures that failed to resolve, are
-        // already reported.
+        // Missing arguments, and signatures and defaults that failed to
+        // resolve, are already reported. A default that didn't fail settles
+        // nothing.
         let sig = &self.ck.generic_fns[generic.0 as usize].sig;
         if sig.params.iter().any(|(_, ty)| *ty == Ty::Error) || sig.ret == Ty::Error {
             bound.fill(Some(Ty::Error));
         }
+        let defaults = sig.defaults.clone();
         for (i, pattern) in patterns.into_iter().enumerate() {
-            if !binding.contains(&Some(i)) {
+            let defaulted = matches!(
+                defaults.get(i),
+                Some(Some(DefaultValue::Pending | DefaultValue::Folded(_)))
+            );
+            if !defaulted && !binding.contains(&Some(i)) {
                 self.ck.unify(pattern, Ty::Error, &mut bound);
             }
         }

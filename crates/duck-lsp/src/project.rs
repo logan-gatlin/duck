@@ -9,7 +9,7 @@ use duck::files::Files;
 use duck::git::Cache;
 use duck::manifest::{MANIFEST, ManifestError};
 use duck::package::{self, Packages, ResolveError};
-use duck_compiler::file::{FileId, FileManager, OpenError, Settings};
+use duck_compiler::file::{FileId, FileManager, Settings};
 use duck_compiler::lex::Span;
 use duck_compiler::{Error, load, ty};
 use lsp_types::{Position, Range};
@@ -63,7 +63,7 @@ impl Project {
     }
 
     /// Every error in the package's module and in its library. Files they
-    /// don't import aren't checked.
+    /// don't use aren't checked.
     pub fn check(&self, buffers: Buffers<'_>) -> Vec<Problem> {
         let manifest_path = canonical(&self.root.join(MANIFEST));
         let packages = match &self.packages {
@@ -84,7 +84,7 @@ impl Project {
                     vec![Problem::in_manifest(manifest_path.clone(), message)]
                 }
             };
-            // A file both import has its errors found twice.
+            // A file both use has its errors found twice.
             for problem in found {
                 if !problems.contains(&problem) {
                     problems.push(problem);
@@ -176,7 +176,7 @@ impl FileManager for Overlay<'_> {
         }
     }
 
-    fn open(&mut self, from: FileId, path: &str) -> Result<FileId, OpenError> {
+    fn open(&mut self, from: FileId, path: &[&str]) -> Option<FileId> {
         self.files.open(from, path)
     }
 
@@ -322,10 +322,7 @@ pub(crate) mod tests {
                 "app/Duck.toml",
                 &format!("{MODULE}[dependencies]\nutil = {{ path = \"../util\" }}\n"),
             ),
-            (
-                "app/main.duck",
-                "import \"src/a.duck\"\nimport util\nlet x: Nope = 1\n",
-            ),
+            ("app/main.duck", "use src.a\nuse util\nlet x: Nope = 1\n"),
             ("app/src/a.duck", "let ok = 1\nlet y = @\n"),
             ("app/src/unused.duck", "let z = @\n"),
             ("util/Duck.toml", LIBRARY),
@@ -354,7 +351,7 @@ pub(crate) mod tests {
         let dir = TempDir::new("buffers");
         dir.write(&[
             ("app/Duck.toml", MODULE),
-            ("app/main.duck", "import \"a.duck\"\nlet x = a.y\n"),
+            ("app/main.duck", "use a\nlet x = a.y\n"),
             ("app/a.duck", "pub let y = 1\n"),
         ]);
         assert_eq!(check(&dir, &[]), [] as [&str; 0]);
@@ -373,8 +370,8 @@ pub(crate) mod tests {
         let dir = TempDir::new("both");
         dir.write(&[
             ("app/Duck.toml", &format!("{MODULE}{LIBRARY}")),
-            ("app/main.duck", "import \"shared.duck\"\nlet a: A = 1\n"),
-            ("app/lib.duck", "import \"shared.duck\"\nlet b: B = 1\n"),
+            ("app/main.duck", "use shared\nlet a: A = 1\n"),
+            ("app/lib.duck", "use shared\nlet b: B = 1\n"),
             ("app/shared.duck", "let s: S = 1\n"),
         ]);
         assert_eq!(

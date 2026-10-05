@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::file::FileManager;
 use crate::lex::{LexError, Span};
-use crate::load::ImportError;
+use crate::load::UseError;
 use crate::parse::ParseError;
 use crate::ty::{InstanceSite, TypeError};
 
@@ -19,7 +19,7 @@ pub mod ty;
 pub enum Error {
     Lex(LexError),
     Parse(ParseError),
-    Import(ImportError),
+    Use(UseError),
     Type(TypeError),
 }
 
@@ -30,7 +30,7 @@ impl Error {
         match self {
             Self::Lex(e) => Some(e.span),
             Self::Parse(e) => Some(e.span),
-            Self::Import(e) => Some(e.span),
+            Self::Use(e) => Some(e.span),
             Self::Type(e) => e.span,
         }
     }
@@ -52,7 +52,7 @@ impl fmt::Display for Error {
         match self {
             Self::Lex(e) => e.kind.fmt(f),
             Self::Parse(e) => e.kind.fmt(f),
-            Self::Import(e) => e.kind.fmt(f),
+            Self::Use(e) => e.kind.fmt(f),
             Self::Type(e) => e.kind.fmt(f),
         }
     }
@@ -60,7 +60,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Compiles the entry point of `files`, and every file it imports, to a
+/// Compiles the entry point of `files`, and every file it uses, to a
 /// WebAssembly binary module.
 ///
 /// Stops at the first stage that fails, returning all of its errors. Loading

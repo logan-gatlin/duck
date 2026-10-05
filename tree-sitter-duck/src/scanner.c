@@ -16,6 +16,7 @@ enum TokenType {
     DEDENT,
     CLOSE_PAREN,
     CLOSE_BRACKET,
+    CLOSE_BRACE,
     ERROR_SENTINEL,
 };
 
@@ -68,7 +69,8 @@ bool tree_sitter_duck_external_scanner_scan(void *payload, TSLexer *lexer, const
     Scanner *scanner = payload;
 
     bool error_recovery = valid_symbols[ERROR_SENTINEL];
-    bool within_brackets = !error_recovery && (valid_symbols[CLOSE_PAREN] || valid_symbols[CLOSE_BRACKET]);
+    bool within_brackets = !error_recovery &&
+        (valid_symbols[CLOSE_PAREN] || valid_symbols[CLOSE_BRACKET] || valid_symbols[CLOSE_BRACE]);
     bool layout_valid = valid_symbols[NEWLINE] || valid_symbols[INDENT] || valid_symbols[DEDENT];
 
     // Layout tokens are zero-width, sitting before the line break they stand

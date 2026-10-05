@@ -81,6 +81,7 @@ impl Checker {
         self.funcs.push(FuncSig {
             name: format!("==({})", self.ty_name(ty)),
             params: vec![("a".to_string(), ty), ("b".to_string(), ty)],
+            defaults: Vec::new(),
             ret: Ty::Prim(Prim::Bool),
         });
         self.synths.push(Synth::Eq(ty));

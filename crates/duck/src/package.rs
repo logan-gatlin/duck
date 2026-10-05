@@ -35,7 +35,7 @@ pub enum ResolveError {
         path: PathBuf,
         error: ManifestError,
     },
-    /// A dependency without a library to import.
+    /// A dependency without a library to use.
     NotALibrary {
         name: String,
         dir: PathBuf,
@@ -413,8 +413,8 @@ mod tests {
     }
 
     #[test]
-    fn packages_import_their_dependencies_by_name() {
-        let dir = TempDir::new("import");
+    fn packages_use_their_dependencies_by_name() {
+        let dir = TempDir::new("use");
         let root = dir.0.join("app");
         dir.write(&[
             (
@@ -423,21 +423,52 @@ mod tests {
             ),
             (
                 "app/lib.duck",
-                "import m\nimport u as util\npub fn f() -> i32:\n    return m.double(util.one)\n",
+                "use m\nuse u as util\nuse u.{one as uno, consts.value}\npub fn f() -> i32:\n    return m.double(util.one) + uno + value\n",
             ),
             ("math/Duck.toml", &library("util = { path = \"../util\" }\n")),
             (
                 "math/lib.duck",
-                "import util\npub fn double(x: i32) -> i32:\n    return x * util.two()\n",
+                "use util\npub fn double(x: i32) -> i32:\n    return x * util.two()\n",
             ),
             ("util/Duck.toml", LIBRARY),
             (
                 "util/lib.duck",
-                "import \"src/two.duck\" as consts\npub let one = 1\npub fn two() -> i32:\n    return consts.value\n",
+                "pub use src.two as consts\npub let one = 1\npub fn two() -> i32:\n    return consts.value\n",
             ),
             ("util/src/two.duck", "pub let value = 2\n"),
         ]);
         assert_eq!(check(&root), Ok(()));
+    }
+
+    #[test]
+    fn modules_are_named_from_the_directory_of_the_entry() {
+        let dir = TempDir::new("root");
+        let root = dir.0.join("app");
+        dir.write(&[
+            ("app/Duck.toml", "[library]\nentry = \"src/lib.duck\"\n"),
+            (
+                "app/src/lib.duck",
+                "use geo\nuse util.strings.{len, deep.empty}\nlet x: i32 = geo.zero + len + empty\n",
+            ),
+            // From the root, wherever the file using them is.
+            ("app/src/geo.duck", "use util.strings\npub let zero = strings.len\n"),
+            ("app/src/util/strings.duck", "use util.strings.deep\npub let len = 0\n"),
+            ("app/src/util/strings/deep.duck", "pub let empty = 0\n"),
+            ("app/geo.duck", "let x = @\n"),
+        ]);
+        assert_eq!(check(&root), Ok(()));
+
+        dir.write(&[("app/src/lib.duck", "use src.geo\nuse util\nuse lib.x\n")]);
+        let lib = root.join("src/lib.duck").display().to_string();
+        assert_eq!(
+            check(&root),
+            Err(vec![
+                "src/lib.duck: cannot find `src.geo` in this package or its dependencies"
+                    .to_string(),
+                "src/lib.duck: cannot find `util` in this package or its dependencies".to_string(),
+                format!("src/lib.duck: use cycle: {lib} -> {lib}"),
+            ])
+        );
     }
 
     #[test]
@@ -446,37 +477,63 @@ mod tests {
         let root = dir.0.join("app");
         dir.write(&[
             ("app/Duck.toml", &library("math = { path = \"../math\" }\n")),
-            ("app/lib.duck", "import math\nimport util\n"),
+            ("app/lib.duck", "use math\nuse util\n"),
             (
                 "math/Duck.toml",
                 &library("util = { path = \"../util\" }\n"),
             ),
-            ("math/lib.duck", "import util\n"),
+            ("math/lib.duck", "use util\n"),
             ("util/Duck.toml", LIBRARY),
             ("util/lib.duck", ""),
-        ]);
-        assert_eq!(
-            check(&root),
-            Err(vec!["lib.duck: no dependency is named `util`".to_string()])
-        );
-    }
-
-    #[test]
-    fn files_of_other_packages_are_not_imported_by_path() {
-        let dir = TempDir::new("outside");
-        let root = dir.0.join("app");
-        dir.write(&[
-            ("app/Duck.toml", &library("util = { path = \"../util\" }\n")),
-            ("app/lib.duck", "import \"../util/inner.duck\"\n"),
-            ("util/Duck.toml", LIBRARY),
-            ("util/lib.duck", ""),
-            ("util/inner.duck", ""),
         ]);
         assert_eq!(
             check(&root),
             Err(vec![
-                "lib.duck: `../util/inner.duck` is outside this package; import its package by name"
-                    .to_string()
+                "lib.duck: cannot find `util` in this package or its dependencies".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn a_dependency_is_reached_through_its_library_only() {
+        let dir = TempDir::new("outside");
+        let root = dir.0.join("app");
+        dir.write(&[
+            ("app/Duck.toml", &library("util = { path = \"../util\" }\n")),
+            ("app/lib.duck", "use util.inner\n"),
+            ("util/Duck.toml", LIBRARY),
+            ("util/lib.duck", ""),
+            ("util/inner.duck", "pub let x = 1\n"),
+        ]);
+        assert_eq!(
+            check(&root),
+            Err(vec!["lib.duck: `util` has no item `inner`".to_string()])
+        );
+
+        dir.write(&[
+            ("app/lib.duck", "use util.inner.x\nlet y: i32 = x\n"),
+            ("util/lib.duck", "pub use inner\n"),
+        ]);
+        assert_eq!(check(&root), Ok(()));
+    }
+
+    #[test]
+    fn a_dependency_is_not_named_as_a_module_is() {
+        let dir = TempDir::new("ambiguous");
+        let root = dir.0.join("app");
+        dir.write(&[
+            ("app/Duck.toml", &library("util = { path = \"../util\" }\n")),
+            ("app/lib.duck", "use util\n"),
+            ("app/util.duck", ""),
+            ("util/Duck.toml", LIBRARY),
+            // Its own module of the name is no dependency of it.
+            ("util/lib.duck", "use util\n"),
+            ("util/util.duck", ""),
+        ]);
+        assert_eq!(
+            check(&root),
+            Err(vec![
+                "lib.duck: `util` is both a module of this package and a dependency".to_string()
             ])
         );
     }
@@ -497,7 +554,7 @@ mod tests {
                 "app/Duck.toml",
                 &library(&format!("json = {{ git = \"{url}\", tag = \"v1\" }}\n")),
             ),
-            ("app/lib.duck", "import json\nlet x: i32 = json.v\n"),
+            ("app/lib.duck", "use json\nlet x: i32 = json.v\n"),
         ]);
         let cache = Cache::new(dir.0.join("cache"));
         assert_eq!(check_with(&root, &cache), Ok(()));
@@ -537,7 +594,7 @@ mod tests {
                         "json = {{ git = \"{url}\", rev = \"{rev}\", path = \"libs/json\" }}\n"
                     )),
                 ),
-                ("app/lib.duck", "import json\nlet x: i32 = json.v\n"),
+                ("app/lib.duck", "use json\nlet x: i32 = json.v\n"),
             ]);
             let cache = Cache::new(dir.0.join(format!("cache-{}", rev.len())));
             assert_eq!(check_with(&root, &cache), Ok(()), "{rev}");

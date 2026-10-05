@@ -1,21 +1,24 @@
-//! Field defaults: the constant a struct's field has where a constructor
-//! gives it no value. Each is folded once, in declaration order with the
-//! globals and enum members it may use, and every instance of a generic
-//! struct shares its declaration's.
+//! Defaults: the constant a struct's field has where a constructor gives it
+//! no value, and a function's parameter where a call gives it no argument.
+//! Each is folded once, and every instance of a generic struct or function
+//! shares its declaration's. A field's is folded in declaration order with
+//! the globals and enum members it may use. A parameter's is folded after
+//! them all, as nothing constant calls a function.
 
-use crate::ir::{Const, Expr};
+use crate::ir::Const;
 use crate::lex::Span;
-use crate::parse::{self, Arg, ExprKind, Ident, StructDecl, TypeKind};
+use crate::load::Program;
+use crate::parse::{self, Arg, ExprKind, FnSig, Ident, StructDecl, TypeKind};
 
-use super::{Body, Checker, StructId, Ty, TypeErrorKind, Value, zero};
+use super::{Body, Checker, StructId, Ty, TypeErrorKind, Value, fn_sigs};
 
-/// The default of a struct field that has one.
+/// The default of a struct field or function parameter that has one.
 #[derive(Clone)]
-pub(super) enum FieldDefault {
+pub(super) enum DefaultValue {
     /// Not folded yet. Global initializers, enum members and other defaults
-    /// can only use those of earlier structs.
+    /// can only use those of earlier structs' fields.
     Pending,
-    /// One constant per scalar leaf of the field's type.
+    /// One constant per scalar leaf of the field's or parameter's type.
     Folded(Vec<Const>),
     /// Reported as an error.
     Failed,
@@ -34,20 +37,63 @@ impl Checker {
                 continue;
             };
             let default = match self.fold_default(fields[index].ty, expr, &decl.params) {
-                Some(consts) => FieldDefault::Folded(consts),
-                None => FieldDefault::Failed,
+                Some(consts) => DefaultValue::Folded(consts),
+                None => DefaultValue::Failed,
             };
             self.structs[id.0 as usize].fields[index].default = Some(default);
         }
     }
 
-    /// The folded value of `expr`, the default of a field of type `ty` in a
-    /// struct with type parameters `params`. `None` after reporting an
-    /// error, or if `ty` is the error type.
+    /// Checks and folds the defaults of every function's parameters.
+    pub(super) fn define_param_defaults(&mut self, program: &Program) {
+        for (id, (_, sig)) in fn_sigs(program).enumerate() {
+            self.module = sig.name.span.file;
+            let params = self.funcs[id].params.clone();
+            self.funcs[id].defaults = self.fold_param_defaults(sig, &params);
+        }
+        self.define_generic_fn_defaults(program);
+    }
+
+    /// The default of each parameter of `sig` that has one, checked and
+    /// folded. `params` are its parameters as resolved.
+    pub(super) fn fold_param_defaults(
+        &mut self,
+        sig: &FnSig,
+        params: &[(String, Ty)],
+    ) -> Vec<Option<DefaultValue>> {
+        let names: Vec<_> = sig.params.iter().map(|param| param.name.clone()).collect();
+        let mut defaults = Vec::new();
+        for (param, (_, ty)) in sig.params.iter().zip(params) {
+            let Some(expr) = &param.default else {
+                defaults.push(None);
+                continue;
+            };
+            // The default is folded once for every call, none of whose
+            // arguments it can read. A global of the name isn't meant.
+            let named = param_in_expr(expr, &names, false);
+            let consts = match named.map(|(name, span)| (name.to_string(), span)) {
+                Some((name, span)) => {
+                    self.error(TypeErrorKind::DefaultReadsParam(name), span);
+                    None
+                }
+                None => self.fold_default(*ty, expr, &sig.type_params),
+            };
+            defaults.push(Some(match consts {
+                Some(consts) => DefaultValue::Folded(consts),
+                None => DefaultValue::Failed,
+            }));
+        }
+        defaults
+    }
+
+    /// The folded value of `expr`, the default of a field or parameter of
+    /// type `ty` in a struct or function with type parameters `params`.
+    /// `None` after reporting an error, or if `ty` is the error type.
     fn fold_default(&mut self, ty: Ty, expr: &parse::Expr, params: &[Ident]) -> Option<Vec<Const>> {
         // The default is folded once for every instance, so it can neither
         // name a type parameter nor be a value laid out by one.
-        let named = param_in_expr(expr, params).map(|(name, span)| (name.to_string(), span));
+        let named = param_in_expr(expr, params, true);
+        let named = named.map(|(name, span)| (name.to_string(), span));
         let held = self.held_param(ty, true);
         let held = held.map(|param| (self.param_name(param), expr.span));
         if let Some((param, span)) = named.or(held) {
@@ -66,7 +112,7 @@ impl Checker {
     /// The default of field `index` of struct `id`. An instance of a generic
     /// struct is given its fields before defaults are folded, so its own
     /// is read from its declaration.
-    fn field_default(&self, id: StructId, index: usize) -> Option<&FieldDefault> {
+    fn field_default(&self, id: StructId, index: usize) -> Option<&DefaultValue> {
         let def = &self.structs[id.0 as usize];
         let decl = def
             .instance
@@ -121,42 +167,37 @@ impl Body<'_> {
             }
         }
         let params: Vec<_> = fields.iter().map(|f| (f.name.clone(), f.ty)).collect();
-        let binding = self.match_args(&params, args, true);
-        let mut defaults = vec![Vec::new(); params.len()];
-        let mut pending = false;
-        for (i, (name, field_ty)) in params.iter().enumerate() {
-            if binding.contains(&Some(i)) {
-                continue;
-            }
-            let types = self.ck.val_types(*field_ty);
-            let consts = match self.ck.field_default(id, i) {
-                Some(FieldDefault::Folded(consts)) => consts.clone(),
-                Some(default) => {
-                    pending |= matches!(default, FieldDefault::Pending);
-                    types.iter().map(|ty| zero(*ty)).collect()
-                }
-                None => {
-                    self.error(TypeErrorKind::MissingArg(name.clone()), span);
-                    continue;
-                }
-            };
-            let consts = consts.into_iter().map(Expr::Const);
-            defaults[i] = types.into_iter().zip(consts).collect();
-        }
+        let defaults: Vec<_> = (0..params.len())
+            .map(|i| self.ck.field_default(id, i).cloned())
+            .collect();
+        let binding = self.bind_args(&params, &defaults, args, true, span);
         // Only reachable from an earlier global's or member's initializer,
         // or an earlier default.
-        if pending {
+        let mut used = (0..)
+            .zip(&defaults)
+            .filter(|(i, _)| !binding.contains(&Some(*i)));
+        if used.any(|(_, default)| matches!(default, Some(DefaultValue::Pending))) {
             self.error(TypeErrorKind::NotConstant, span);
         }
         let checked = args.iter().map(|_| None).collect();
-        self.filled_args(&params, args, binding, checked, defaults)
+        self.bound_args(&params, &defaults, args, binding, checked)
     }
 }
 
-/// The first of the type parameters `params` that `expr` names, and where.
-/// No item or local shares a type parameter's name.
-fn param_in_expr<'a>(expr: &'a parse::Expr, params: &[Ident]) -> Option<(&'a str, Span)> {
-    let any = |exprs: &'a [parse::Expr]| exprs.iter().find_map(|e| param_in_expr(e, params));
+/// The first of the parameters `params` that `expr` names, and where. With
+/// `types` they are type parameters, which a type may name too. No item or
+/// local shares a type parameter's name.
+fn param_in_expr<'a>(
+    expr: &'a parse::Expr,
+    params: &[Ident],
+    types: bool,
+) -> Option<(&'a str, Span)> {
+    let within = |e: &'a parse::Expr| param_in_expr(e, params, types);
+    let any = |exprs: &'a [parse::Expr]| exprs.iter().find_map(within);
+    let in_type = |ty: &'a parse::Type| match types {
+        true => param_in_type(ty, params, false),
+        false => None,
+    };
     match &expr.kind {
         ExprKind::Name(name) => {
             let named = params.iter().any(|param| param.name == *name);
@@ -173,19 +214,16 @@ fn param_in_expr<'a>(expr: &'a parse::Expr, params: &[Ident]) -> Option<(&'a str
         ExprKind::Unary(_, inner)
         | ExprKind::Field(inner, _)
         | ExprKind::Deref(inner)
-        | ExprKind::AddrOf(_, inner) => param_in_expr(inner, params),
+        | ExprKind::AddrOf(_, inner) => within(inner),
         ExprKind::Repeat(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
-        | ExprKind::Pipe(a, b) => param_in_expr(a, params).or_else(|| param_in_expr(b, params)),
-        ExprKind::Call(callee, args) => param_in_expr(callee, params).or_else(|| {
-            args.iter()
-                .find_map(|arg| param_in_expr(&arg.value, params))
-        }),
-        ExprKind::Cast(value, ty) => {
-            param_in_expr(value, params).or_else(|| param_in_type(ty, params, false))
+        | ExprKind::Pipe(a, b) => within(a).or_else(|| within(b)),
+        ExprKind::Call(callee, args) => {
+            within(callee).or_else(|| args.iter().find_map(|arg| within(&arg.value)))
         }
-        ExprKind::FnType(ty) => param_in_type(ty, params, false),
+        ExprKind::Cast(value, ty) => within(value).or_else(|| in_type(ty)),
+        ExprKind::FnType(ty) => in_type(ty),
     }
 }
 

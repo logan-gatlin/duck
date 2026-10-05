@@ -55,6 +55,7 @@ module.exports = grammar({
     // inside brackets, where line breaks mean nothing.
     ')',
     ']',
+    '}',
     // Never used in the grammar: only valid during error recovery.
     $._error_sentinel,
   ],
@@ -76,7 +77,7 @@ module.exports = grammar({
       $.struct_declaration,
       $.enum_declaration,
       $.binding,
-      $.import,
+      $.use,
     ),
 
     function_declaration: $ => seq(
@@ -101,6 +102,7 @@ module.exports = grammar({
       field('name', $.identifier),
       ':',
       field('type', $._type),
+      optional(seq('=', field('default', $._expression))),
     ),
 
     extern_block: $ => seq(
@@ -161,13 +163,36 @@ module.exports = grammar({
       $._newline,
     ),
 
-    // `import "path"` names a file; `import name` a dependency's library.
-    import: $ => seq(
+    // `use a.b` names a module or an item of one; `use a.{b, c}` several.
+    use: $ => seq(
       optional('pub'),
-      'import',
-      choice(field('path', $.string), field('package', $.identifier)),
-      optional(seq('as', field('alias', $.identifier))),
+      'use',
+      $._use_tree,
       $._newline,
+    ),
+
+    _use_tree: $ => choice($._use_path, $.use_alias, $.use_group),
+
+    _use_path: $ => choice($.identifier, $.use_path),
+
+    use_path: $ => seq(
+      field('path', $._use_path),
+      '.',
+      field('name', $.identifier),
+    ),
+
+    use_alias: $ => seq(
+      field('path', $._use_path),
+      'as',
+      field('alias', $.identifier),
+    ),
+
+    use_group: $ => seq(
+      field('path', $._use_path),
+      '.',
+      '{',
+      commaSep($._use_tree),
+      '}',
     ),
 
     // `let` and `var`, both as items and as statements; only items take `pub`.

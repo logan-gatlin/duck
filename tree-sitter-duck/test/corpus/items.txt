@@ -1,27 +1,50 @@
 ====================
-Import
+Use
 ====================
 
-import "lib/util.duck"
-pub import "value.duck" as v
-import json
-import json as j
+use json
+use util.strings
+pub use lib.value.Value as V
+use geo.{Point, len as length}
+use a.b.{
+	c.{d, e},
+	f,
+}
 
 ---
 
 (source_file
-  (import
-    path: (string
-      (string_content)))
-  (import
-    path: (string
-      (string_content))
-    alias: (identifier))
-  (import
-    package: (identifier))
-  (import
-    package: (identifier)
-    alias: (identifier)))
+  (use
+    (identifier))
+  (use
+    (use_path
+      path: (identifier)
+      name: (identifier)))
+  (use
+    (use_alias
+      path: (use_path
+        path: (use_path
+          path: (identifier)
+          name: (identifier))
+        name: (identifier))
+      alias: (identifier)))
+  (use
+    (use_group
+      path: (identifier)
+      (identifier)
+      (use_alias
+        path: (identifier)
+        alias: (identifier))))
+  (use
+    (use_group
+      path: (use_path
+        path: (identifier)
+        name: (identifier))
+      (use_group
+        path: (identifier)
+        (identifier)
+        (identifier))
+      (identifier))))
 
 ====================
 Extern block
@@ -125,6 +148,63 @@ struct Counter:
         (pointer_type
           (named_type
             (identifier)))))))
+
+====================
+Parameter defaults
+====================
+
+fn scale(x: f32, by: f32 = 2.0, name: array(u8) = "x") -> f32:
+    return x * by
+
+extern:
+    fn log(n: i32, base: i32 = 10) = "log_int"
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier)))
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))
+        (float))
+      (parameter
+        (identifier)
+        (named_type
+          (identifier)
+          (type_arguments
+            (named_type
+              (identifier))))
+        (string
+          (string_content))))
+    (named_type
+      (identifier))
+    (block
+      (return_statement
+        (binary_expression
+          (identifier)
+          (identifier)))))
+  (extern_block
+    (extern_function
+      (identifier)
+      (parameters
+        (parameter
+          (identifier)
+          (named_type
+            (identifier)))
+        (parameter
+          (identifier)
+          (named_type
+            (identifier))
+          (integer)))
+      (string
+        (string_content)))))
 
 ====================
 Generic struct

@@ -456,7 +456,7 @@ mod tests {
         let dir = TempDir::new("server");
         dir.write(&[
             ("Duck.toml", MODULE),
-            ("main.duck", "import \"a.duck\"\nlet x = a.y\n"),
+            ("main.duck", "use a\nlet x = a.y\n"),
             ("a.duck", "pub let y: Nope = 1\n"),
         ]);
         let main = dir.0.join("main.duck");
@@ -471,8 +471,8 @@ mod tests {
             published("a.duck", None, &[error])
         );
 
-        // Unsaved changes are checked, and fix errors in files that import
-        // the changed one.
+        // Unsaved changes are checked, and fix errors in files that use the
+        // changed one.
         editor.open(&a, "pub let y: Nope = 1\n");
         editor.change(&a, 2, "pub let z = 1\n");
         let error = "1:10 `a` has no item `y`";
@@ -482,8 +482,8 @@ mod tests {
             published("main.duck", None, &[error])
         );
 
-        editor.open(&main, "import \"a.duck\"\nlet x = a.y\n");
-        editor.change(&main, 2, "import \"a.duck\"\n\nlet x = a.y\n");
+        editor.open(&main, "use a\nlet x = a.y\n");
+        editor.change(&main, 2, "use a\n\nlet x = a.y\n");
         let error = "2:10 `a` has no item `y`";
         assert_eq!(
             editor.diagnostics(&dir),
