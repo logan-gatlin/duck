@@ -2,6 +2,7 @@
 
 (struct_declaration) @class.around
 (enum_declaration) @class.around
+(union_declaration) @class.around
 
 (parameter) @parameter.inside
 (labeled_argument) @parameter.inside

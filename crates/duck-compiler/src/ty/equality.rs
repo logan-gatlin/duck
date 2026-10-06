@@ -1,7 +1,8 @@
 //! `==` and `!=` on values of any type that can be stored in memory. Values
 //! are equal when every field is: scalars compare as `==` does on their own,
 //! except within enums, which compare bit for bit, and arrays compare their
-//! elements through a generated function per array type.
+//! elements through a generated function per array type. Unions are equal
+//! when they hold the same variant and its values are equal.
 
 use crate::ir::{self, BinOp as IrBinOp, Const, Expr, FuncId, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
@@ -9,11 +10,20 @@ use crate::parse::BinOp;
 
 use super::{
     Body, Checker, FuncSig, Prim, Synth, Ty, TypeErrorKind, Value, binary, binop_symbol,
-    element_addr, exprs, is_pure, is_stable, scalar, split1,
+    element_addr, exprs, is_pure, is_simple, is_stable, scalar, split1, tags_are, unions,
 };
 
-/// How one piece of a value is compared, in leaf order.
-enum Part {
+/// One piece of a value that is compared, in leaf order.
+struct Part {
+    how: Compare,
+    /// For a piece of a union's variant, the leaf that is the union's tag
+    /// and the value it has when the union holds the variant, for each union
+    /// the piece is in, outermost first. Otherwise the piece isn't compared.
+    when: Vec<(usize, i32)>,
+}
+
+/// How a piece of a value is compared.
+enum Compare {
     /// A scalar, compared as `==` compares its primitive type.
     Scalar(ValType),
     /// A scalar of an enum, compared by its bits.
@@ -25,9 +35,9 @@ enum Part {
 impl Part {
     /// How many scalar leaves the part covers.
     fn width(&self) -> usize {
-        match self {
-            Part::Scalar(_) | Part::Bits(_) => 1,
-            Part::Array(_) => 2,
+        match self.how {
+            Compare::Scalar(_) | Compare::Bits(_) => 1,
+            Compare::Array(_) => 2,
         }
     }
 }
@@ -36,21 +46,38 @@ impl Checker {
     /// The pieces `==` compares values of the storable type `ty` by.
     fn parts(&self, ty: Ty) -> Vec<Part> {
         let mut out = Vec::new();
-        self.push_parts(ty, &mut out);
+        self.push_parts(ty, false, &[], &mut out);
         out
     }
 
-    fn push_parts(&self, ty: Ty, out: &mut Vec<Part>) {
+    /// Pushes the pieces of a `ty`, which are compared where each tag of
+    /// `when` has its value, and by their `bits` within an enum.
+    fn push_parts(&self, ty: Ty, bits: bool, when: &[(usize, i32)], out: &mut Vec<Part>) {
+        let scalar = |vt| match bits {
+            true => Compare::Bits(vt),
+            false => Compare::Scalar(vt),
+        };
+        let part = |how| Part {
+            how,
+            when: when.to_vec(),
+        };
         match ty {
-            Ty::Prim(prim) => out.push(Part::Scalar(prim.val_type())),
-            Ty::Ptr(_) | Ty::Fn(_) => out.push(Part::Scalar(ValType::I32)),
-            Ty::Enum(id) => {
-                out.extend(self.val_types(self.enum_ty(id)).into_iter().map(Part::Bits))
+            Ty::Prim(prim) => out.push(part(scalar(prim.val_type()))),
+            Ty::Ptr(_) | Ty::Fn(_) => out.push(part(scalar(ValType::I32))),
+            Ty::Enum(id) => self.push_parts(self.enum_ty(id), true, when, out),
+            Ty::Array(_) if !bits => out.push(part(Compare::Array(ty))),
+            Ty::Struct(_) if self.union_id(ty).is_some() => {
+                let tag = out.iter().map(Part::width).sum();
+                out.push(part(scalar(unions::TAG.val_type())));
+                for (index, variant) in self.members(ty).into_iter().enumerate() {
+                    let mut when = when.to_vec();
+                    when.push((tag, index as i32));
+                    self.push_parts(variant, bits, &when, out);
+                }
             }
-            Ty::Array(_) => out.push(Part::Array(ty)),
-            Ty::Struct(_) | Ty::Tuple(_) | Ty::Type => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 for member in self.members(ty) {
-                    self.push_parts(member, out);
+                    self.push_parts(member, bits, when, out);
                 }
             }
             Ty::ExternRef => unreachable!("`externref` can't be compared"),
@@ -60,9 +87,8 @@ impl Checker {
 
     /// Whether comparing values of type `ty` compares arrays.
     fn compares_arrays(&self, ty: Ty) -> bool {
-        self.parts(ty)
-            .iter()
-            .any(|part| matches!(part, Part::Array(_)))
+        let mut parts = self.parts(ty).into_iter();
+        parts.any(|part| matches!(part.how, Compare::Array(_)))
     }
 
     /// The function comparing two arrays of type `ty`, created the first time
@@ -135,15 +161,20 @@ impl Body<'_> {
     }
 
     /// Compares every scalar at once, then any arrays one at a time, only
-    /// while the result is still undecided.
+    /// while the result is still undecided. What a union's variant holds is
+    /// compared only where both values hold it.
     fn compare(&mut self, op: BinOp, ty: Ty, lhs: Value, rhs: Value) -> Value {
         let parts = self.ck.parts(ty);
         let width = parts.iter().map(Part::width).sum::<usize>();
-        let has_array = parts.iter().any(|part| matches!(part, Part::Array(_)));
+        let has_array = parts.iter().any(|p| matches!(p.how, Compare::Array(_)));
+        let has_union = parts.iter().any(|part| !part.when.is_empty());
         let mut value = self.seq(vec![lhs, rhs]);
         // Scalars are compared in pairs, out of source order, and those of
-        // arrays may not be read at all.
-        if has_array {
+        // arrays may not be read at all. A union's tags are read again for
+        // each piece of its variants, but a constant has no temporaries.
+        if has_union && self.global.is_none() {
+            self.spill(&mut value, is_simple);
+        } else if has_array {
             self.spill(&mut value, is_stable);
         } else if width > 1 {
             self.spill(&mut value, is_pure);
@@ -153,34 +184,54 @@ impl Body<'_> {
         if lhs.len() != 2 * width {
             return scalar(ValType::I32, Expr::Const(Const::I32(0)));
         }
-        let mut rhs = lhs.split_off(width).into_iter();
-        let mut lhs = lhs.into_iter();
+        let rhs = lhs.split_off(width);
         let (cmp, join, empty) = match op {
             BinOp::Eq => (IrBinOp::Eq, IrBinOp::And, 1),
             _ => (IrBinOp::Ne, IrBinOp::Or, 0),
         };
         let mut scalars = Vec::new();
         let mut arrays = Vec::new();
+        let mut leaf = 0;
         for part in parts {
-            let (a, b) = (lhs.next().unwrap(), rhs.next().unwrap());
-            match part {
-                Part::Scalar(vt) => scalars.push(binary(vt, cmp, a, b)),
-                Part::Bits(vt) => {
+            let (a, b) = (lhs[leaf].clone(), rhs[leaf].clone());
+            let compared = match part.how {
+                Compare::Scalar(vt) => binary(vt, cmp, a, b),
+                Compare::Bits(vt) => {
                     let bits = |e| Expr::Unary(vt, IrUnOp::Reinterpret, Box::new(e));
-                    scalars.push(match vt {
+                    match vt {
                         ValType::F32 => binary(ValType::I32, cmp, bits(a), bits(b)),
                         ValType::F64 => binary(ValType::I64, cmp, bits(a), bits(b)),
                         _ => binary(vt, cmp, a, b),
-                    });
+                    }
                 }
-                Part::Array(ty) => {
-                    let (a_ptr, b_ptr) = (lhs.next().unwrap(), rhs.next().unwrap());
+                Compare::Array(ty) => {
+                    let (a_ptr, b_ptr) = (lhs[leaf + 1].clone(), rhs[leaf + 1].clone());
                     let call = Expr::Call(self.ck.eq_func(ty), vec![a, a_ptr, b, b_ptr]);
-                    arrays.push(match op {
+                    match op {
                         BinOp::Eq => call,
                         _ => Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(call)),
-                    });
+                    }
                 }
+            };
+            leaf += part.width();
+            // The tags are compared too, so one value's say whether both
+            // hold the variant: those that are known, if either's are.
+            let held = match (tags_are(&part.when, &lhs), tags_are(&part.when, &rhs)) {
+                (Expr::Const(Const::I32(0)), _) | (_, Expr::Const(Const::I32(0))) => continue,
+                (Expr::Const(_), held) | (held, _) => held,
+            };
+            let compared = match held {
+                Expr::Const(_) => compared,
+                held => Expr::If {
+                    ty: ValType::I32,
+                    cond: Box::new(held),
+                    then_expr: Box::new(compared),
+                    else_expr: Box::new(Expr::Const(Const::I32(empty))),
+                },
+            };
+            match part.how {
+                Compare::Array(_) => arrays.push(compared),
+                Compare::Scalar(_) | Compare::Bits(_) => scalars.push(compared),
             }
         }
         let scalars = scalars

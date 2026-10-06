@@ -65,7 +65,7 @@ pub enum ValType {
     I64,
     F32,
     F64,
-    /// An opaque reference from the host. Nothing constant has this type.
+    /// An opaque reference from the host. Only null is constant.
     ExternRef,
 }
 
@@ -82,6 +82,9 @@ pub enum Const {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// The null `externref`, which a union has for a variant it doesn't
+    /// hold.
+    Null,
 }
 
 /// A `var`, or an exported `let`. A `let` is a [`Expr::Const`] wherever it

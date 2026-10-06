@@ -55,7 +55,7 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - A parameter anywhere in the list may have a default. Label a later argument
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
-  struct enum extern use module and or not true false as`. No item is
+  struct enum union extern use module and or not true false as`. No item is
   named `array`, `varray`, `tuple` or `type`.
 
 ## Types
@@ -73,8 +73,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   `Point.size`, `(&Point).size` and `i64.align`.
 - `externref`: an opaque host reference. It is never stored in memory or
   compared.
-- `Name`, `Name(T)`, `mod.Name`: structs and enums, passed by value like
-  tuples and arrays.
+- `Name`, `Name(T)`, `mod.Name`: structs, unions and enums, passed by value
+  like tuples and arrays.
 - `enum(T) Name:` makes each member a constant of any type `T`. Integer
   members count up from the one before, and other types need every value.
   Enums support `Name.member`, `==`, `!=`, `e as T` and `for m in Name`.
@@ -83,6 +83,48 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 A `&var T` is accepted as a `&T`, and a `varray(T)` as an `array(T)`, for the
 type as a whole only: a `tuple(&var T, i32)` is not a `tuple(&T, i32)`, and a
 `fn(&T)` is not a `fn(&var T)`.
+
+## Unions
+
+```duck
+union Shape:
+	circle: f32                  # a variant holds one value
+	rect: tuple(f32, f32)
+	empty                        # or none
+
+union(T, E) Result:              # generic, as a struct is
+	ok: T
+	err: E
+
+enum(u8) Fault:
+	empty
+	huge
+
+fn area(s: Shape) -> Result(f32, Fault):
+	let unit = Shape.rect((1.0, 1.0))  # one argument: a tuple is not spread
+	if s == unit:
+		return Result(f32, Fault).ok(1.0)
+	if s == .empty:                    # `.name`: the type expected has it
+		return .err(.empty)            # an enum's member too
+	return .err(.huge)
+```
+
+- A value holds one variant. `Shape.circle(1.0)` builds one that holds a
+  value and `Shape.empty` one that doesn't. A generic union takes its type
+  arguments, as in `Result(f32, Fault).ok(1.0)`.
+- `.name` and `.name(value)` are the variant, or the enum member, of the type
+  expected there: by a `return`, an annotated binding, an assignment, an
+  argument, the value of a field or variant, or the other side of an
+  operator. `let x = .empty` is an error. So is `.name` where a type
+  parameter `T` is expected: write `T.name`.
+- `==` and `!=` compare which variant each holds and then its value. Nothing
+  else reads a union: it has no fields.
+- A union has 1 to 256 variants, which are as `pub` as it is, and holds
+  itself only behind a pointer. A variant named `size` or `align` hides that
+  of the type.
+- In memory a union is a `u8` that counts its variants from 0 and then the
+  largest variant, at the largest alignment, as C lays out
+  `struct { uint8_t tag; union { ... }; }`.
 
 ## Literals and globals
 
@@ -321,6 +363,13 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   `(i32 len, i32 ptr) -> (f32, f32)`.
 - An exported aggregate global is one wasm global per scalar, named with
   dots: `origin.x`, `name.len`, `name.ptr`.
+- A union is an `i32` that counts its variants from 0, then the scalars of
+  every variant in order: `union Shape` with `circle: f32` and
+  `rect: tuple(f32, f32)` is `(i32, f32, f32, f32)`. Those of a variant the
+  value doesn't hold are zero in every value Duck builds, a null `externref`
+  among them, and are never read: the host may pass anything in them. An
+  exported `shape` is the globals `shape`, `shape.circle`, `shape.rect.0` and
+  `shape.rect.1`.
 
 ## Duck.toml
 

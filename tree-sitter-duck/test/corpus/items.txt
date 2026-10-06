@@ -255,6 +255,43 @@ pub enum(i8) ReturnCode:
         (integer)))))
 
 ====================
+Union
+====================
+
+pub union Shape:
+    circle: f32
+    empty
+
+union(T, E) Result:
+    ok: T
+    err: E
+
+---
+
+(source_file
+  (union_declaration
+    (identifier)
+    (union_variant
+      (identifier)
+      (named_type
+        (identifier)))
+    (union_variant
+      (identifier)))
+  (union_declaration
+    (type_parameters
+      (identifier)
+      (identifier))
+    (identifier)
+    (union_variant
+      (identifier)
+      (named_type
+        (identifier)))
+    (union_variant
+      (identifier)
+      (named_type
+        (identifier)))))
+
+====================
 Function
 ====================
 

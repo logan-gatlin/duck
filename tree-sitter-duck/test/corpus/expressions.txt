@@ -523,3 +523,37 @@ let _: &fn(lib.T) -> &R = pick()(1)
         (arguments))
       (arguments
         (integer)))))
+
+====================
+Dot names
+====================
+
+let a: Color = .red
+let b = f(.some(1), x: .none) == .ok
+
+---
+
+(source_file
+  (binding
+    (identifier)
+    (named_type
+      (identifier))
+    (dot_expression
+      (identifier)))
+  (binding
+    (identifier)
+    (binary_expression
+      (call_expression
+        (identifier)
+        (arguments
+          (call_expression
+            (dot_expression
+              (identifier))
+            (arguments
+              (integer)))
+          (labeled_argument
+            (identifier)
+            (dot_expression
+              (identifier)))))
+      (dot_expression
+        (identifier)))))

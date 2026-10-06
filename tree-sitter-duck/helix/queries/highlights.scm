@@ -13,6 +13,8 @@
 (module_property name: (identifier) @variable.other.member)
 
 (enum_member name: (identifier) @type.enum.variant)
+(union_variant name: (identifier) @type.enum.variant)
+(dot_expression name: (identifier) @type.enum.variant)
 
 ; Functions
 
@@ -29,6 +31,7 @@
 (type_parameters (identifier) @type.parameter)
 (struct_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
+(union_declaration name: (identifier) @type)
 
 ; Modules
 
@@ -66,6 +69,7 @@
   "var"
   "struct"
   "enum"
+  "union"
 ] @keyword.storage.type
 
 [

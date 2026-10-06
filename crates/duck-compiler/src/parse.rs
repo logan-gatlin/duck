@@ -22,6 +22,7 @@ pub enum ItemKind {
     Extern(ExternBlock),
     Struct(StructDecl),
     Enum(EnumDecl),
+    Union(UnionDecl),
     Binding(Binding),
     /// Resolved by [`crate::load`], so later stages never see one.
     Use(Use),
@@ -123,6 +124,24 @@ pub struct EnumDecl {
 pub struct Member {
     pub name: Ident,
     pub value: Option<Expr>,
+    pub span: Span,
+}
+
+/// `union Name:` and its variants, one of which a value holds at a time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionDecl {
+    pub name: Ident,
+    /// The names of `union(A, B) Name`'s type parameters, if it has any.
+    pub params: Vec<Ident>,
+    pub variants: Vec<Variant>,
+}
+
+/// A `name` or `name: Type` variant of a union.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Variant {
+    pub name: Ident,
+    /// The type of the value it holds, if it holds one.
+    pub ty: Option<Type>,
     pub span: Span,
 }
 
@@ -263,6 +282,8 @@ pub enum ExprKind {
     Pipe(Box<Expr>, Box<Expr>),
     /// `_`, the value piped into the nearest pipe whose body it's in.
     Placeholder,
+    /// `.name`, a variant of the union or member of the enum expected of it.
+    Dot(Ident),
 }
 
 /// A call argument, optionally labelled as in `f(name: value)`.
@@ -459,6 +480,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Struct => ItemKind::Struct(self.struct_decl()?),
             TokenKind::Enum => ItemKind::Enum(self.enum_decl()?),
+            TokenKind::Union => ItemKind::Union(self.union_decl()?),
             TokenKind::Let | TokenKind::Var => ItemKind::Binding(self.binding()?),
             TokenKind::Use => ItemKind::Use(self.use_decl()?),
             _ => return Err(self.unexpected("item")),
@@ -598,8 +620,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// The `(A, B)` after `struct` or `fn` that makes a declaration generic,
-    /// if there is one.
+    /// The `(A, B)` after `struct`, `union` or `fn` that makes a declaration
+    /// generic, if there is one.
     fn type_params(&mut self) -> PResult<Vec<Ident>> {
         if !self.eat(TokenKind::LParen) {
             return Ok(Vec::new());
@@ -628,6 +650,28 @@ impl<'a> Parser<'a> {
             Ok(Member { name, value, span })
         })?;
         Ok(EnumDecl { name, ty, members })
+    }
+
+    fn union_decl(&mut self) -> PResult<UnionDecl> {
+        self.expect(TokenKind::Union)?;
+        let params = self.type_params()?;
+        let name = self.ident()?;
+        let variants = self.indented(|p| {
+            let start = p.peek().span;
+            let name = p.ident()?;
+            let ty = match p.eat(TokenKind::Colon) {
+                true => Some(p.ty()?),
+                false => None,
+            };
+            let span = p.span_from(start);
+            p.expect(TokenKind::Newline)?;
+            Ok(Variant { name, ty, span })
+        })?;
+        Ok(UnionDecl {
+            name,
+            params,
+            variants,
+        })
     }
 
     fn param(&mut self) -> PResult<Param> {
@@ -1083,6 +1127,14 @@ impl<'a> Parser<'a> {
                     span: self.span_from(token.span),
                 });
             }
+            TokenKind::Dot => {
+                self.bump();
+                let name = self.ident()?;
+                return Ok(Expr {
+                    kind: ExprKind::Dot(name),
+                    span: self.span_from(token.span),
+                });
+            }
             _ => return Err(self.unexpected("expression")),
         };
         self.bump();
@@ -1422,6 +1474,7 @@ mod tests {
             ExprKind::FnType(ty) => render_ty(ty),
             ExprKind::Pipe(value, body) => format!("(|> {} {})", sexpr(value), sexpr(body)),
             ExprKind::Placeholder => "_".to_string(),
+            ExprKind::Dot(name) => format!(".{}", name.name),
         }
     }
 
@@ -2190,6 +2243,85 @@ enum(tuple(u8, u8)) Pair:
                 expected("identifier", TokenKind::Pub),
                 expected("identifier", TokenKind::Pass),
             ]
+        );
+    }
+
+    #[test]
+    fn unions() {
+        let src = "\
+pub union Shape:
+    circle: f32
+    rect: tuple(f32, f32)
+    empty
+union(T, E,) Result:
+    ok: T
+    err: E
+";
+        let module = parse_src(src).unwrap();
+        assert!(module.items[0].is_pub);
+        let decls: Vec<_> = module
+            .items
+            .iter()
+            .map(|item| match &item.kind {
+                ItemKind::Union(u) => u,
+                _ => panic!(),
+            })
+            .collect();
+        let variants = |decl: &UnionDecl| -> Vec<_> {
+            let variants = decl.variants.iter();
+            variants
+                .map(|v| (v.name.name.clone(), v.ty.as_ref().map(render_ty)))
+                .collect()
+        };
+        assert_eq!(decls[0].name.name, "Shape");
+        assert!(decls[0].params.is_empty());
+        assert_eq!(
+            variants(decls[0]),
+            [
+                ("circle".to_string(), Some("f32".to_string())),
+                ("rect".to_string(), Some("tuple(f32, f32)".to_string())),
+                ("empty".to_string(), None),
+            ]
+        );
+        let rect = &decls[0].variants[1];
+        assert_eq!(
+            &src[rect.span.start..rect.span.end],
+            "rect: tuple(f32, f32)"
+        );
+        let params: Vec<_> = decls[1].params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(params, vec!["T", "E"]);
+        assert_eq!(
+            variants(decls[1]),
+            [
+                ("ok".to_string(), Some("T".to_string())),
+                ("err".to_string(), Some("E".to_string())),
+            ]
+        );
+
+        assert_eq!(
+            errors("union U:\n    pub a\n    pass\n    b = 1\n"),
+            vec![
+                expected("identifier", TokenKind::Pub),
+                expected("identifier", TokenKind::Pass),
+                expected("newline", TokenKind::Eq),
+            ]
+        );
+        assert_eq!(
+            errors("union() U:\n    a\n"),
+            vec![expected("type parameter", TokenKind::RParen)]
+        );
+    }
+
+    #[test]
+    fn dot_names() {
+        assert_eq!(expr(".red"), ".red");
+        assert_eq!(expr(".some(1)"), "(call .some 1)");
+        assert_eq!(expr("a == .none"), "(Eq a .none)");
+        assert_eq!(expr("f(.a, x: .b(.c))"), "(call f .a x:(call .b .c))");
+        assert_eq!(expr(".a.b"), "(. .a b)");
+        assert_eq!(
+            errors("let _ = .1\n"),
+            vec![expected("identifier", TokenKind::Int(1))]
         );
     }
 

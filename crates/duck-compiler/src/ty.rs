@@ -19,7 +19,7 @@ use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
-    PatternKind, StmtKind, TypeKind, UnaryOp,
+    PatternKind, StmtKind, StructDecl, TypeKind, UnaryOp, UnionDecl,
 };
 
 use defaults::DefaultValue;
@@ -33,6 +33,7 @@ mod equality;
 mod fn_ptr;
 mod generic;
 mod generic_fn;
+mod unions;
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
 /// signed type `$s` and unsigned counterpart `$u`. Returns from the enclosing
@@ -209,6 +210,8 @@ struct GenericFnId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     Prim(Prim),
+    /// A struct, or a union, which is declared as a struct is: with a field
+    /// per variant.
     Struct(StructId),
     /// An enum, stored as the value of its member, so laid out like the type
     /// of its values.
@@ -282,6 +285,24 @@ pub enum TypeErrorKind {
     RecursiveStruct(String),
     /// An enum whose values hold the enum itself, outside of any struct.
     RecursiveEnum(String),
+    /// A union that contains itself by value.
+    RecursiveUnion(String),
+    DuplicateVariant(String),
+    /// A union with more variants than its tag tells apart.
+    TooManyVariants(String),
+    NoVariant {
+        ty: String,
+        variant: String,
+    },
+    /// A variant that holds no value, given one.
+    VariantTakesNothing(String),
+    /// A variant that holds a `ty`, given none, or more than one.
+    VariantNeedsValue {
+        variant: String,
+        ty: String,
+    },
+    /// `.name` where nothing says what type it's a variant or member of.
+    UntypedDot(String),
     DuplicateMember(String),
     /// Two members of an enum with the same bits.
     DuplicateValue {
@@ -301,8 +322,8 @@ pub enum TypeErrorKind {
         ty: String,
         member: String,
     },
-    /// A generic struct that uses itself with ever larger type arguments,
-    /// so it has no end of instances.
+    /// A generic struct or union that uses itself with ever larger type
+    /// arguments, so it has no end of instances.
     ExpansiveRecursion(String),
     /// A type without type parameters given a list of type arguments, as in
     /// `i32()`.
@@ -619,6 +640,7 @@ struct Entry {
     is_pub: bool,
 }
 
+/// A struct, or a union, whose fields are its variants.
 struct StructDef {
     /// The declared name, or for an instance, its type as written.
     name: String,
@@ -628,6 +650,9 @@ struct StructDef {
     /// declaration.
     item: usize,
     is_pub: bool,
+    /// Whether it's a union: a value holds one of its fields, and a tag
+    /// that says which.
+    union: bool,
     /// The [`Ty::Param`] of each type parameter of a generic declaration.
     params: Vec<Ty>,
     /// Set for instances of generic declarations.
@@ -643,6 +668,9 @@ struct FieldDef {
     ty: Ty,
     /// Whether modules other than the struct's can use it.
     is_pub: bool,
+    /// Whether it's a variant of a union that holds no value. Its `ty` is
+    /// `tuple()`, as is that of one that holds a `tuple()`.
+    bare: bool,
     /// What it is where a constructor gives it no value, if anything. An
     /// instance's is its declaration's, as it was when the instance was made.
     default: Option<DefaultValue>,
@@ -795,6 +823,10 @@ struct Cell {
     store: StoreOp,
     /// Whether the cell holds a `bool`, which may be any byte in memory.
     bool: bool,
+    /// For a cell of a union's variant, the leaf that is the union's tag and
+    /// the value it has when the union holds the variant, for each union
+    /// the cell is in, outermost first. Otherwise the cell holds nothing.
+    when: Vec<(usize, i32)>,
 }
 
 /// Why a global initializer could not be folded.
@@ -919,6 +951,30 @@ impl fmt::Display for TypeErrorKind {
             Self::DuplicateBinding(name) => write!(f, "`{name}` is bound more than once"),
             Self::RecursiveStruct(name) => write!(f, "struct `{name}` contains itself"),
             Self::RecursiveEnum(name) => write!(f, "enum `{name}` contains itself"),
+            Self::RecursiveUnion(name) => write!(f, "union `{name}` contains itself"),
+            Self::DuplicateVariant(name) => write!(f, "duplicate variant `{name}`"),
+            Self::TooManyVariants(name) => write!(
+                f,
+                "union `{name}` has more than {} variants",
+                unions::MAX_VARIANTS
+            ),
+            Self::NoVariant { ty, variant } => write!(f, "`{ty}` has no variant `{variant}`"),
+            Self::VariantTakesNothing(name) => {
+                write!(
+                    f,
+                    "variant `{name}` holds no value, so it takes no argument"
+                )
+            }
+            Self::VariantNeedsValue { variant, ty } => {
+                write!(
+                    f,
+                    "variant `{variant}` holds a `{ty}`, and takes it as its one argument"
+                )
+            }
+            Self::UntypedDot(name) => write!(
+                f,
+                "nothing says what type `.{name}` is of; name it, as in `Type.{name}`"
+            ),
             Self::DuplicateMember(name) => write!(f, "duplicate member `{name}`"),
             Self::DuplicateValue { member, same_as } => {
                 write!(f, "member `{member}` has the same value as `{same_as}`")
@@ -931,10 +987,9 @@ impl fmt::Display for TypeErrorKind {
                 write!(f, "member `{member}` counts past the largest `{ty}`")
             }
             Self::NoMember { ty, member } => write!(f, "`{ty}` has no member `{member}`"),
-            Self::ExpansiveRecursion(name) => write!(
-                f,
-                "struct `{name}` uses itself with ever larger type arguments"
-            ),
+            Self::ExpansiveRecursion(name) => {
+                write!(f, "`{name}` uses itself with ever larger type arguments")
+            }
             Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
             Self::InstanceTooDeep(name) => write!(
                 f,
@@ -1231,19 +1286,21 @@ impl Checker {
             };
             self.constants.push(Constants { id, state });
             let (name, entry) = match &item.kind {
-                ItemKind::Struct(s) => {
+                ItemKind::Struct(StructDecl { name, params, .. })
+                | ItemKind::Union(UnionDecl { name, params, .. }) => {
                     let id = StructId(self.structs.len() as u32);
-                    let params = self.new_params(&s.params);
+                    let params = self.new_params(params);
                     self.structs.push(StructDef {
-                        name: s.name.name.clone(),
+                        name: name.name.clone(),
                         module: self.module,
                         item: index,
                         is_pub: item.is_pub,
+                        union: matches!(item.kind, ItemKind::Union(_)),
                         params,
                         instance: None,
                         fields: Vec::new(),
                     });
-                    (&s.name, Item::Struct(id))
+                    (name, Item::Struct(id))
                 }
                 ItemKind::Fn(f) if !f.sig.type_params.is_empty() => {
                     (&f.sig.name, Item::GenericFn(self.declare_generic_fn(f)))
@@ -1408,40 +1465,29 @@ impl Checker {
         }
     }
 
-    /// Resolves the type of every enum's values and every struct's fields,
-    /// reporting generic structs that recurse without end and types that
-    /// contain themselves, then gives every instance used so far its fields.
+    /// Resolves the type of every enum's values, every struct's fields and
+    /// every union's variants, reporting generic structs that recurse
+    /// without end and types that contain themselves, then gives every
+    /// instance used so far its fields.
     fn define_structs(&mut self, program: &Program) {
         self.resolve_enums(program);
-        let decls = program.items.iter().filter_map(|item| match &item.kind {
-            ItemKind::Struct(s) => Some(s),
-            _ => None,
-        });
         let mut decl_count = 0;
-        for (id, decl) in decls.enumerate() {
+        for item in &program.items {
+            let (params, name) = match &item.kind {
+                ItemKind::Struct(decl) => (&decl.params, &decl.name),
+                ItemKind::Union(decl) => (&decl.params, &decl.name),
+                _ => continue,
+            };
+            let id = decl_count;
             decl_count += 1;
-            self.module = decl.name.span.file;
-            let params = self.structs[id].params.clone();
-            self.declare_type_params(&decl.params, &params);
-            let mut fields: Vec<FieldDef> = Vec::new();
-            for field in &decl.fields {
-                let ty = self.resolve_ty(&field.ty);
-                if self.structs[id].is_pub && field.is_pub {
-                    self.check_public(ty, field.ty.span, &field.name.name);
-                }
-                if fields.iter().any(|f| f.name == field.name.name) {
-                    let kind = TypeErrorKind::DuplicateField(field.name.name.clone());
-                    self.error(kind, field.name.span);
-                    continue;
-                }
-                fields.push(FieldDef {
-                    name: field.name.name.clone(),
-                    ty,
-                    is_pub: field.is_pub,
-                    default: field.default.as_ref().map(|_| DefaultValue::Pending),
-                    span: field.span,
-                });
-            }
+            self.module = name.span.file;
+            let tys = self.structs[id].params.clone();
+            self.declare_type_params(params, &tys);
+            let fields = match &item.kind {
+                ItemKind::Struct(decl) => self.struct_fields(id, decl),
+                ItemKind::Union(decl) => self.union_variants(id, decl),
+                _ => unreachable!("only structs and unions have fields"),
+            };
             self.type_params.clear();
             self.structs[id].fields = fields;
         }
@@ -1470,6 +1516,32 @@ impl Checker {
         self.check_field_pointers(0..self.structs.len());
         self.check_enum_pointers();
         self.structs_defined = true;
+    }
+
+    /// Resolves the fields of struct `id`, which `decl` declares, with its
+    /// type parameters in scope.
+    fn struct_fields(&mut self, id: usize, decl: &StructDecl) -> Vec<FieldDef> {
+        let mut fields: Vec<FieldDef> = Vec::new();
+        for field in &decl.fields {
+            let ty = self.resolve_ty(&field.ty);
+            if self.structs[id].is_pub && field.is_pub {
+                self.check_public(ty, field.ty.span, &field.name.name);
+            }
+            if fields.iter().any(|f| f.name == field.name.name) {
+                let kind = TypeErrorKind::DuplicateField(field.name.name.clone());
+                self.error(kind, field.name.span);
+                continue;
+            }
+            fields.push(FieldDef {
+                name: field.name.name.clone(),
+                ty,
+                is_pub: field.is_pub,
+                bare: false,
+                default: field.default.as_ref().map(|_| DefaultValue::Pending),
+                span: field.span,
+            });
+        }
+        fields
     }
 
     /// Reports pointer fields whose pointee can't be stored in memory, which
@@ -1532,7 +1604,11 @@ impl Checker {
                 }
                 match visits[child] {
                     Visit::Active => {
-                        let kind = TypeErrorKind::RecursiveStruct(self.structs[id].name.clone());
+                        let name = self.structs[id].name.clone();
+                        let kind = match self.structs[id].union {
+                            true => TypeErrorKind::RecursiveUnion(name),
+                            false => TypeErrorKind::RecursiveStruct(name),
+                        };
                         self.error(kind, self.field_site(id, i));
                         self.structs[id].fields[i].ty = Ty::Error;
                         break;
@@ -2066,9 +2142,9 @@ impl Checker {
         self.storable(ty)
     }
 
-    /// The types of a struct's fields, a tuple's elements, an array's `len`
-    /// and `ptr`, or a `type`'s `size` and `align`, in order. Empty for any
-    /// other type.
+    /// The types of a struct's fields, a union's variants, a tuple's
+    /// elements, an array's `len` and `ptr`, or a `type`'s `size` and
+    /// `align`, in order. Empty for any other type.
     fn members(&self, ty: Ty) -> Vec<Ty> {
         match ty {
             Ty::Struct(id) => self.structs[id.0 as usize]
@@ -2303,6 +2379,10 @@ impl Checker {
             Ty::ExternRef => out.push((name, ValType::ExternRef)),
             Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
             Ty::Struct(id) => {
+                // A union's tag has the name of the union itself.
+                if self.union_id(ty).is_some() {
+                    out.push((name.clone(), ValType::I32));
+                }
                 for field in &self.structs[id.0 as usize].fields {
                     self.push_leaves(field.ty, format!("{name}.{}", field.name), out);
                 }
@@ -2339,6 +2419,9 @@ impl Checker {
             Ty::Ptr(_) | Ty::Fn(_) | Ty::ExternRef => out.push(None),
             Ty::Enum(id) => self.push_leaf_prims(self.enum_ty(id), out),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
+                if self.union_id(ty).is_some() {
+                    out.push(Some(unions::TAG));
+                }
                 for member in self.members(ty) {
                     self.push_leaf_prims(member, out);
                 }
@@ -2352,7 +2435,8 @@ impl Checker {
     /// reporting an error.
     fn field(&mut self, ty: Ty, field: &parse::Ident) -> Option<(Ty, Range<usize>, u32)> {
         let index = match ty {
-            Ty::Struct(id) => self.structs[id.0 as usize]
+            // A union's variants are only read by `match`.
+            Ty::Struct(id) if self.union_id(ty).is_none() => self.structs[id.0 as usize]
                 .fields
                 .iter()
                 .position(|def| def.name == field.name),
@@ -2490,6 +2574,10 @@ impl Checker {
             Ty::Ptr(_) | Ty::Fn(_) => (4, 4),
             Ty::Enum(id) => self.layout(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
+                if let Some(id) = self.union_id(ty) {
+                    let (_, size, align) = self.union_layout(id);
+                    return (size, align);
+                }
                 let (_, size, align) = self.aggregate_layout(ty);
                 (size, align)
             }
@@ -2518,11 +2606,14 @@ impl Checker {
     /// Where each scalar leaf of `ty` lives in memory, in leaf order.
     fn cells(&self, ty: Ty) -> Vec<Cell> {
         let mut out = Vec::new();
-        self.push_cells(ty, 0, &mut out);
+        self.push_cells(ty, 0, &[], &mut out);
         out
     }
 
-    fn push_cells(&self, ty: Ty, offset: u32, out: &mut Vec<Cell>) {
+    /// Pushes the cells of a `ty` at `offset`, which hold nothing unless
+    /// each tag of `when` has its value.
+    fn push_cells(&self, ty: Ty, offset: u32, when: &[(usize, i32)], out: &mut Vec<Cell>) {
+        let when = when.to_vec();
         match ty {
             Ty::Prim(prim) => out.push(Cell {
                 offset,
@@ -2530,6 +2621,7 @@ impl Checker {
                 load: prim.load(),
                 store: prim.store(),
                 bool: prim == Prim::Bool,
+                when,
             }),
             Ty::Ptr(_) | Ty::Fn(_) => out.push(Cell {
                 offset,
@@ -2537,16 +2629,38 @@ impl Checker {
                 load: LoadOp::Load,
                 store: StoreOp::Store,
                 bool: false,
+                when,
             }),
-            Ty::Enum(id) => self.push_cells(self.enum_ty(id), offset, out),
+            Ty::Enum(id) => self.push_cells(self.enum_ty(id), offset, &when, out),
+            Ty::Struct(id) if self.union_id(ty).is_some() => {
+                let tag = out.len();
+                self.push_cells(Ty::Prim(unions::TAG), offset, &when, out);
+                let start = offset + self.union_layout(id).0;
+                for (index, variant) in self.members(ty).into_iter().enumerate() {
+                    let mut when = when.clone();
+                    when.push((tag, index as i32));
+                    self.push_cells(variant, start, &when, out);
+                }
+            }
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 let offsets = self.aggregate_layout(ty).0;
                 for (member, member_offset) in self.members(ty).into_iter().zip(offsets) {
-                    self.push_cells(member, offset + member_offset, out);
+                    self.push_cells(member, offset + member_offset, &when, out);
                 }
             }
             Ty::ExternRef => unreachable!("`externref` has no pointer type"),
             Ty::Param(_) | Ty::Unit | Ty::Error => {}
+        }
+    }
+
+    /// Writes a value whose scalars are `consts` to the start of `out`, as
+    /// storing each to its cell of `cells` would.
+    fn write_consts(&self, out: &mut [u8], cells: &[Cell], consts: &[Const]) {
+        for (cell, c) in cells.iter().zip(consts) {
+            let held = |(tag, value): &(usize, i32)| consts.get(*tag) == Some(&Const::I32(*value));
+            if cell.when.iter().all(held) {
+                write_const(&mut out[cell.offset as usize..], cell.store, *c);
+            }
         }
     }
 
@@ -2578,9 +2692,7 @@ impl Checker {
     fn repeat_data(&mut self, ty: Ty, consts: Vec<Const>, count: u32) -> u32 {
         let (size, align) = self.layout(ty);
         let mut bytes = vec![0; size as usize];
-        for (cell, c) in self.cells(ty).iter().zip(consts) {
-            write_const(&mut bytes[cell.offset as usize..], cell.store, c);
-        }
+        self.write_consts(&mut bytes, &self.cells(ty), &consts);
         let offset = self.reserve_data(u64::from(size) * u64::from(count), align);
         // Memory starts out zeroed, and data that doesn't fit is an error, so
         // neither is written out.
@@ -3267,7 +3379,14 @@ impl<'c> Body<'c> {
     fn assign(&mut self, place: &Place, mut value: Value, out: &mut Vec<Stmt>) {
         // Every scalar is read before any slot is written, so `p = Point(x:
         // p.y, y: p.x)` swaps. Stores can't change locals.
-        if value.scalars.len() > 1 {
+        let cells = match place.slots {
+            Slots::Memory { .. } => self.ck.cells(place.ty),
+            _ => Vec::new(),
+        };
+        if cells.iter().any(|cell| !cell.when.is_empty()) {
+            // A union's tag is read again to store the variant it holds.
+            self.spill(&mut value, is_simple);
+        } else if value.scalars.len() > 1 {
             match place.slots {
                 Slots::Memory { .. } => self.spill(&mut value, is_stable),
                 _ => self.spill(&mut value, |e| matches!(e, Expr::Const(_))),
@@ -3289,14 +3408,20 @@ impl<'c> Body<'c> {
             // Only after an error: an inlined global is immutable.
             Slots::Const(_) => {}
             Slots::Memory { addr, offset } => {
-                for (cell, scalar) in self.ck.cells(place.ty).into_iter().zip(scalars) {
-                    out.push(Stmt::Store {
-                        ty: cell.ty,
-                        op: cell.store,
-                        offset: offset + cell.offset,
-                        addr: addr.clone(),
-                        value: scalar,
-                    });
+                let store = |(cell, scalar): (&Cell, &Expr)| Stmt::Store {
+                    ty: cell.ty,
+                    op: cell.store,
+                    offset: offset + cell.offset,
+                    addr: addr.clone(),
+                    value: scalar.clone(),
+                };
+                let stores: Vec<_> = cells.iter().zip(&scalars).map(store).collect();
+                // The cells of a union's variant are stored where the value
+                // holds it.
+                let mut stores = stores.into_iter();
+                for variant in cells.chunk_by(|a, b| a.when == b.when) {
+                    let stores = stores.by_ref().take(variant.len()).collect();
+                    out.extend(held(&variant[0].when, &scalars, stores));
                 }
             }
         }
@@ -3353,7 +3478,11 @@ impl<'c> Body<'c> {
             ExprKind::Tuple(elems) => self.tuple(elems, expected),
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expected, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expected, expr.span),
-            ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
+            ExprKind::Dot(name) => self.dot(name, None, expected),
+            ExprKind::Call(callee, args) => match &callee.kind {
+                ExprKind::Dot(name) => self.dot(name, Some(args), expected),
+                _ => self.call(callee, args, expr.span),
+            },
             ExprKind::Field(inner, field) if self.names_module(inner).is_some() => {
                 match self.member(inner, field) {
                     Some(item) => self.item_value(item, &field.name, expected, field.span),
@@ -3375,6 +3504,9 @@ impl<'c> Body<'c> {
                         let id = self.enum_name(inner);
                         if let Some(member) = id.and_then(|id| self.enum_member(id, field)) {
                             return member;
+                        }
+                        if let Some(variant) = self.union_variant(inner, field, None) {
+                            return variant;
                         }
                     }
                 }
@@ -3669,6 +3801,7 @@ impl<'c> Body<'c> {
     fn list(&mut self, items: &[parse::Expr], expected: Option<Ty>, span: Span) -> (Ty, Value) {
         let mutable = self.literal_writes(expected);
         self.check_shared(mutable, items.len(), span);
+        let errors = self.ck.errors.len();
         let mut elem = match expected {
             Some(Ty::Array(id)) => Some(self.ck.element(id)),
             // An array type that failed to resolve, already reported.
@@ -3691,21 +3824,33 @@ impl<'c> Body<'c> {
             self.error(TypeErrorKind::UntypedEmptyArray, span);
             return (Ty::Error, Value::default());
         };
-        // Nothing holding an `externref` is constant, so that's reported.
-        if elem == Ty::Error || !self.ck.storable(elem) {
+        if !self.places(elem, errors, span) {
             return (Ty::Error, Value::default());
         }
         let (size, align) = self.ck.layout(elem);
         let cells = self.ck.cells(elem);
         let mut bytes = vec![0; size as usize * items.len()];
         for (i, consts) in consts.iter().enumerate() {
-            let start = i * size as usize;
-            for (cell, c) in cells.iter().zip(consts) {
-                write_const(&mut bytes[start + cell.offset as usize..], cell.store, *c);
-            }
+            self.ck
+                .write_consts(&mut bytes[i * size as usize..], &cells, consts);
         }
         let value = self.ck.push_data(bytes, align, items.len() as u32);
         (self.ck.array_of(elem, mutable), value)
+    }
+
+    /// Whether a constant of type `ty` can be placed in memory. One that
+    /// holds an `externref` is reported at `span`, unless the literal it's
+    /// in has an error already, having had `errors` before it: only a union
+    /// that holds none in place of one is constant.
+    fn places(&mut self, ty: Ty, errors: usize, span: Span) -> bool {
+        if ty == Ty::Error {
+            return false;
+        }
+        let storable = self.ck.storable(ty);
+        if !storable && self.ck.errors.len() == errors {
+            self.error(TypeErrorKind::NotStorable(self.ck.ty_name(ty)), span);
+        }
+        storable
     }
 
     /// `[value; len]`, an array of `len` copies of `value`, which is typed
@@ -3726,14 +3871,14 @@ impl<'c> Body<'c> {
             Some(Ty::Error) => Some(Ty::Error),
             _ => None,
         };
+        let errors = self.ck.errors.len();
         let (ty, lowered) = self.expr(value, want);
         let elem = want.unwrap_or(ty);
         self.expect(ty, elem, value.span);
         let consts = self.ck.fold_value(&lowered, value.span);
         let lowered = self.check(len, Ty::Prim(Prim::U32));
         let count = self.ck.fold_value(&lowered, len.span);
-        // Nothing holding an `externref` is constant, so that's reported.
-        if !self.ck.fits(ty, elem) || elem == Ty::Error || !self.ck.storable(elem) {
+        if !self.ck.fits(ty, elem) || !self.places(elem, errors, span) {
             return (Ty::Error, Value::default());
         }
         let [Const::I32(count)] = count[..] else {
@@ -3985,8 +4130,9 @@ impl<'c> Body<'c> {
         } else {
             let expected = if is_comparison(op) { None } else { expected };
             // A literal operand takes the type of the other side, so both
-            // `x + 1` and `1 + x` work for any integer `x`.
-            if is_literal(lhs) && !is_literal(rhs) {
+            // `x + 1` and `1 + x` work for any integer `x`, and so does a
+            // `.name`, as in `.red == c`.
+            if is_typed_by_other(lhs) && !is_typed_by_other(rhs) {
                 let (ty, rhs) = self.expr(rhs, expected);
                 let ty = self.compared(op, ty);
                 (ty, self.check(lhs, ty), rhs)
@@ -4163,10 +4309,12 @@ impl<'c> Body<'c> {
             Some(Ty::Ptr(id)) => Some(self.ck.pointee(id)),
             _ => None,
         };
-        // An enum member and a module's function are written like fields.
+        // An enum member, a union's variant and a module's function are
+        // written like fields.
         let is_value = match &inner.kind {
             ExprKind::Field(of, _) => {
                 self.enum_name(of).is_some()
+                    || self.names_union(of)
                     || matches!(self.named(inner), Some(item) if !matches!(item, Item::Global(_)))
             }
             ExprKind::Deref(_) | ExprKind::Index(..) => false,
@@ -4229,9 +4377,9 @@ impl<'c> Body<'c> {
         if self.default && mutable {
             self.error(TypeErrorKind::SharedPointee, span);
         }
+        let errors = self.ck.errors.len();
         let consts = self.ck.fold_value(&value, span);
-        // Nothing holding an `externref` is constant, so that's reported.
-        if ty == Ty::Error || !self.ck.storable(ty) {
+        if !self.places(ty, errors, span) {
             return (Ty::Error, Value::default());
         }
         let ty = want.filter(|want| self.ck.fits(ty, *want)).unwrap_or(ty);
@@ -4269,6 +4417,13 @@ impl<'c> Body<'c> {
                     Some(item) => Ok(item),
                     None => Err(None),
                 }
+            }
+            ExprKind::Field(inner, field) if self.names_union(inner) => {
+                return match self.union_variant(inner, field, Some(args)) {
+                    Some(variant) => variant,
+                    // A field of the union as a `type`, which isn't called.
+                    None => self.call_value(callee, args, span),
+                };
             }
             // A type given type arguments, such as `array(u8)`.
             ExprKind::Call(inner, targs) if self.names_type(inner, targs) => {
@@ -4346,7 +4501,9 @@ impl<'c> Body<'c> {
     /// labelled fields.
     fn construct(&mut self, ty: Ty, args: &[Arg], span: Span) -> (Ty, Value) {
         let fields: Vec<_> = match ty {
-            Ty::Struct(id) => return (ty, self.construct_struct(id, args, span)),
+            Ty::Struct(id) if self.ck.union_id(ty).is_none() => {
+                return (ty, self.construct_struct(id, args, span));
+            }
             Ty::Array(_) | Ty::Type => builtin_fields(ty)
                 .iter()
                 .map(|name| name.to_string())
@@ -4536,31 +4693,46 @@ impl<'c> Body<'c> {
         binding
     }
 
-    /// Reads a `ty` at `offset` bytes past the address in `ptr`.
+    /// Reads a `ty` at `offset` bytes past the address in `ptr`. Of a union,
+    /// only the variant it holds is read, and the rest are zero.
     fn load(&mut self, ptr: Value, offset: u32, ty: Ty) -> Value {
         let cells = self.ck.cells(ty);
-        let (pre, addr) = if cells.len() > 1 {
+        let (mut pre, addr) = if cells.len() > 1 {
             self.reusable_addr(ptr)
         } else {
             split1(ptr)
         };
-        let scalars = cells
-            .into_iter()
-            .map(|cell| {
-                let load = Expr::Load {
+        let mut scalars: Vec<Expr> = Vec::new();
+        for (leaf, cell) in cells.iter().enumerate() {
+            let load = Expr::Load {
+                ty: cell.ty,
+                op: cell.load,
+                offset: offset + cell.offset,
+                addr: Box::new(addr.clone()),
+            };
+            // Any nonzero byte is `true`.
+            let mut load = match cell.bool {
+                true => into_range(Prim::Bool, load),
+                false => load,
+            };
+            if !cell.when.is_empty() {
+                load = Expr::If {
                     ty: cell.ty,
-                    op: cell.load,
-                    offset: offset + cell.offset,
-                    addr: Box::new(addr.clone()),
+                    cond: Box::new(tags_are(&cell.when, &scalars)),
+                    then_expr: Box::new(load),
+                    else_expr: Box::new(Expr::Const(zero(cell.ty))),
                 };
-                // Any nonzero byte is `true`.
-                let load = match cell.bool {
-                    true => into_range(Prim::Bool, load),
-                    false => load,
-                };
-                (cell.ty, load)
-            })
-            .collect();
+            }
+            // A tag is read again for each cell of its variants.
+            let is_tag = |cell: &Cell| cell.when.iter().any(|(tag, _)| *tag == leaf);
+            if cells.iter().any(is_tag) {
+                let tmp = self.temp(cell.ty);
+                pre.push(Stmt::SetLocal(tmp, load));
+                load = Expr::Local(tmp);
+            }
+            scalars.push(load);
+        }
+        let scalars = cells.iter().map(|cell| cell.ty).zip(scalars).collect();
         Value { pre, scalars }
     }
 
@@ -4625,6 +4797,47 @@ fn exprs(scalars: Vec<(ValType, Expr)>) -> Vec<Expr> {
     scalars.into_iter().map(|(_, e)| e).collect()
 }
 
+/// Whether every tag of `when`, each a leaf of the value with scalars
+/// `leaves`, has its value: whether the unions hold the variants.
+fn tags_are(when: &[(usize, i32)], leaves: &[Expr]) -> Expr {
+    let mut tests = Vec::new();
+    for (tag, value) in when {
+        match &leaves[*tag] {
+            // The tag of a variant built in place is known.
+            Expr::Const(Const::I32(tag)) if tag == value => {}
+            Expr::Const(_) => return Expr::Const(Const::I32(0)),
+            tag => {
+                let value = Expr::Const(Const::I32(*value));
+                tests.push(binary(ValType::I32, IrBinOp::Eq, tag.clone(), value));
+            }
+        }
+    }
+    let tests = tests.into_iter();
+    tests
+        .reduce(|all, test| binary(ValType::I32, IrBinOp::And, all, test))
+        .unwrap_or(Expr::Const(Const::I32(1)))
+}
+
+/// `stmts`, run only where the value with scalars `leaves` has each tag of
+/// `when` at its value.
+fn held(when: &[(usize, i32)], leaves: &[Expr], stmts: Vec<Stmt>) -> Vec<Stmt> {
+    match tags_are(when, leaves) {
+        Expr::Const(Const::I32(0)) => Vec::new(),
+        Expr::Const(_) => stmts,
+        cond => vec![Stmt::If {
+            cond,
+            then_body: stmts,
+            else_body: Vec::new(),
+        }],
+    }
+}
+
+/// Whether `expr` is a local or a constant, which is as cheap to read again
+/// as to keep.
+fn is_simple(expr: &Expr) -> bool {
+    matches!(expr, Expr::Local(_) | Expr::Const(_))
+}
+
 /// Splits a single-scalar value into its prelude and scalar.
 fn split1(value: Value) -> (Vec<Stmt>, Expr) {
     let expr = match <[_; 1]>::try_from(value.scalars) {
@@ -4678,6 +4891,16 @@ fn is_literal(expr: &parse::Expr) -> bool {
     }
 }
 
+/// Whether `expr` is a literal, or a `.name`, with or without arguments:
+/// what only the type expected of it types.
+fn is_typed_by_other(expr: &parse::Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Dot(_) => true,
+        ExprKind::Call(callee, _) => matches!(callee.kind, ExprKind::Dot(_)),
+        _ => is_literal(expr),
+    }
+}
+
 fn is_comparison(op: BinOp) -> bool {
     matches!(
         op,
@@ -4719,6 +4942,7 @@ fn write_const(out: &mut [u8], store: StoreOp, c: Const) {
         Const::I64(x) => x.to_le_bytes().to_vec(),
         Const::F32(x) => x.to_le_bytes().to_vec(),
         Const::F64(x) => x.to_le_bytes().to_vec(),
+        Const::Null => unreachable!("`externref` has no pointer type"),
     };
     let width = match store {
         StoreOp::Store8 => 1,
@@ -4745,8 +4969,8 @@ fn element_addr(ptr: Expr, index: Expr, stride: u32) -> Expr {
 
 fn zero(ty: ValType) -> Const {
     match ty {
-        // Only after a type error: nothing constant has this type.
-        ValType::I32 | ValType::ExternRef => Const::I32(0),
+        ValType::ExternRef => Const::Null,
+        ValType::I32 => Const::I32(0),
         ValType::I64 => Const::I64(0),
         ValType::F32 => Const::F32(0.0),
         ValType::F64 => Const::F64(0.0),
@@ -5132,6 +5356,7 @@ fn float(c: Const) -> f64 {
         Const::F64(x) => x,
         Const::I32(x) => x as f64,
         Const::I64(x) => x as f64,
+        Const::Null => unreachable!("only numbers convert"),
     }
 }
 
@@ -5309,6 +5534,7 @@ mod tests {
             Const::I64(x) => format!("{x}i64"),
             Const::F32(x) => format!("{x}f32"),
             Const::F64(x) => format!("{x}f64"),
+            Const::Null => "null".to_string(),
         }
     }
 
@@ -8947,6 +9173,461 @@ enum(i32) Later:
                 mismatch("i32", "bool"),
             ]
         );
+    }
+
+    #[test]
+    fn unions_are_a_tag_and_the_scalars_of_every_variant() {
+        let src = "\
+union Shape:
+    circle: f32
+    rect: tuple(f32, i64)
+    empty
+fn f(s: Shape) -> Shape:
+    let a = Shape.circle(1.5)
+    let b = Shape.rect((2.0, 3))
+    let c = Shape.empty
+    return s
+";
+        let module = lower(src);
+        let f = &module.funcs[0];
+        let wasm = [ValType::I32, ValType::F32, ValType::F32, ValType::I64];
+        assert_eq!(f.params, wasm);
+        assert_eq!(f.results, wasm);
+        let names: Vec<_> = f.locals[..4].iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["s", "s.circle", "s.rect.0", "s.rect.1"]);
+        assert_eq!(
+            body(&module, "f"),
+            "(set a 0) (set a.circle 1.5f32) (set a.rect.0 0f32) (set a.rect.1 0i64) \
+             (set b 1) (set b.circle 0f32) (set b.rect.0 2f32) (set b.rect.1 3i64) \
+             (set c 2) (set c.circle 0f32) (set c.rect.0 0f32) (set c.rect.1 0i64) \
+             (return s s.circle s.rect.0 s.rect.1)"
+        );
+    }
+
+    #[test]
+    fn dot_names_are_of_the_type_expected_of_them() {
+        let src = "\
+enum(u8) Color:
+    red
+    green
+union Shape:
+    circle: f32
+    tinted: Color
+    empty
+struct Pen:
+    color: Color
+    shape: Shape = .empty
+let ink: Color = .green
+fn paint(c: Color, s: Shape) -> Shape:
+    return s
+fn f(c: Color) -> Shape:
+    let a: Shape = .circle(1.5)
+    var p = Pen(color: .green)
+    p.color = .red
+    if c == .green or .red == c:
+        return paint(.red, .tinted(.green))
+    let (x, y): tuple(Color, Shape) = (.red, .empty)
+    return .empty
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set a 0) (set a.circle 1.5f32) (set a.tinted 0) \
+             (set p.color 1) (set p.shape 2) (set p.shape.circle 0f32) (set p.shape.tinted 0) \
+             (set p.color 0) \
+             (if (if (I32.Eq c 1) 1 (I32.Eq 0 c)) \
+             (then (call paint [0 1 0f32 1] -> [tmp8 tmp9 tmp10]) (return tmp8 tmp9 tmp10)) (else )) \
+             (set x 0) (set y 2) (set y.circle 0f32) (set y.tinted 0) \
+             (return 2 0f32 0)"
+        );
+    }
+
+    #[test]
+    fn dot_names_need_a_union_or_enum_to_be_of() {
+        use TypeErrorKind::*;
+        let src = "\
+enum(u8) Color:
+    red
+union Shape:
+    circle: f32
+    empty
+fn(T) g(x: T) -> T:
+    return .red
+fn f(c: Color, s: Shape, n: i32) -> Color:
+    let a = .red
+    let b: i32 = .red
+    let d: Color = .blue
+    let e: Color = .size
+    let h: Color = .red(1)
+    let i: Shape = .square
+    let j: Shape = .empty()
+    let k: Shape = .circle
+    let l: Shape = .circle(1.0, 2.0)
+    let m: Shape = .circle(r: 1.0)
+    let o: Shape = .circle(true)
+    .red
+    return g(.red)
+";
+        let untyped = || UntypedDot("red".into());
+        let needs_value = || VariantNeedsValue {
+            variant: "circle".into(),
+            ty: "f32".into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                untyped(),
+                untyped(),
+                untyped(),
+                NoMember {
+                    ty: "Color".into(),
+                    member: "blue".into()
+                },
+                NoMember {
+                    ty: "Color".into(),
+                    member: "size".into()
+                },
+                NotCallable(".red".into()),
+                NoVariant {
+                    ty: "Shape".into(),
+                    variant: "square".into()
+                },
+                VariantTakesNothing("empty".into()),
+                needs_value(),
+                needs_value(),
+                needs_value(),
+                mismatch("f32", "bool"),
+                untyped(),
+                untyped(),
+            ]
+        );
+    }
+
+    #[test]
+    fn union_variants_are_built_by_name_and_read_by_nothing() {
+        use TypeErrorKind::*;
+        let src = "\
+union Shape:
+    circle: f32
+    size
+    unit: tuple()
+union Shape:
+    a
+union Dup:
+    a
+    a: i32
+struct Wrap:
+    inner: Loop
+union Loop:
+    next: Wrap
+union(T) Opt:
+    some: T
+    none
+fn f(s: Shape) -> u32:
+    let a = Shape(circle: 1.0)
+    let b = s.circle
+    let c = Shape.square
+    let d = Shape.circle
+    let e = Shape.size(1)
+    let g = Opt.none
+    let h = Opt(i32).some(true)
+    let i = Shape.unit(())
+    let j = Shape.unit
+    return Shape.align + Opt(i64).size
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateItem("Shape".into()),
+                DuplicateVariant("a".into()),
+                RecursiveUnion("Loop".into()),
+                NotCallable("Shape".into()),
+                NoField {
+                    ty: "Shape".into(),
+                    field: "circle".into()
+                },
+                NoVariant {
+                    ty: "Shape".into(),
+                    variant: "square".into()
+                },
+                VariantNeedsValue {
+                    variant: "circle".into(),
+                    ty: "f32".into()
+                },
+                VariantTakesNothing("size".into()),
+                MissingTypeArgs("Opt".into()),
+                mismatch("i32", "bool"),
+                VariantNeedsValue {
+                    variant: "unit".into(),
+                    ty: "tuple()".into()
+                },
+            ]
+        );
+        let variants = |count: usize| -> String {
+            let variants = (0..count).map(|i| format!("    v{i}\n"));
+            format!("union Big:\n{}", variants.collect::<String>())
+        };
+        assert_eq!(check_src(&variants(256)).err(), None);
+        assert_eq!(errors(&variants(257)), vec![TooManyVariants("Big".into())]);
+    }
+
+    #[test]
+    fn unions_in_memory_are_a_tag_and_room_for_the_largest_variant() {
+        let src = "\
+union Shape:
+    circle: f32
+    rect: tuple(u8, i64)
+    empty
+struct S:
+    flag: bool
+    shape: Shape
+let shapes: array(Shape) = [.circle(1.0), .rect((2, 3)), .empty]
+fn sizes() -> tuple(u32, u32, u32):
+    return (Shape.size, Shape.align, S.size)
+fn get(p: &Shape) -> Shape:
+    return p.*
+fn set(p: &var S, s: Shape):
+    p.shape = s
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "sizes"), "(return 24 8 32)");
+        let mut bytes = [0u8; 72];
+        bytes[8..12].copy_from_slice(&1f32.to_le_bytes());
+        (bytes[24], bytes[32], bytes[40], bytes[48]) = (1, 2, 3, 2);
+        assert_eq!(data(&module), [(0, &bytes[..])]);
+        // Only the variant the tag names is read or written.
+        assert_eq!(
+            body(&module, "get"),
+            "(set tmp1 (I32.Load8U offset=0 p)) \
+             (return tmp1 \
+             (if (I32.Eq tmp1 0) (F32.Load offset=8 p) 0f32) \
+             (if (I32.Eq tmp1 1) (I32.Load8U offset=8 p) 0) \
+             (if (I32.Eq tmp1 1) (I64.Load offset=16 p) 0i64))"
+        );
+        assert_eq!(
+            body(&module, "set"),
+            "(I32.Store8 offset=8 p s) \
+             (if (I32.Eq s 0) (then (F32.Store offset=16 p s.circle)) (else )) \
+             (if (I32.Eq s 1) \
+             (then (I32.Store8 offset=16 p s.rect.0) (I64.Store offset=24 p s.rect.1)) (else ))"
+        );
+    }
+
+    #[test]
+    fn unions_within_unions_are_read_where_every_tag_holds_them() {
+        let src = "\
+union Inner:
+    a: bool
+    b: i16
+union Outer:
+    none
+    some: Inner
+fn get(p: &Outer) -> Outer:
+    return p.*
+fn set(p: &var Outer, x: i16):
+    p.* = .some(.b(x + 1))
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "get"),
+            "(set tmp1 (I32.Load8U offset=0 p)) \
+             (set tmp2 (if (I32.Eq tmp1 1) (I32.Load8U offset=2 p) 0)) \
+             (return tmp1 tmp2 \
+             (if (I32.And (I32.Eq tmp1 1) (I32.Eq tmp2 0)) \
+             (I32.Ne (I32.Load8U offset=4 p) 0) 0) \
+             (if (I32.And (I32.Eq tmp1 1) (I32.Eq tmp2 1)) (I32.Load16S offset=4 p) 0))"
+        );
+        assert_eq!(
+            body(&module, "set"),
+            "(set tmp2 (I32.Extend16S (I32.Add x 1))) \
+             (I32.Store8 offset=0 p 1) \
+             (I32.Store8 offset=2 p 1) \
+             (I32.Store16 offset=4 p tmp2)"
+        );
+    }
+
+    #[test]
+    fn unions_compare_their_tags_and_the_variant_they_hold() {
+        let src = "\
+union Shape:
+    circle: f32
+    named: array(u8)
+    empty
+union Size:
+    exact: f32
+    any
+let same = Size.exact(1.0 + 1.0) == Size.exact(2.0)
+let differ = Size.exact(0.0) == Size.any
+fn consts() -> tuple(bool, bool):
+    return (same, differ)
+fn eq(a: Shape, b: Shape) -> bool:
+    return a == b
+fn ne(a: Shape, b: Shape) -> bool:
+    return a != b
+fn empty(a: Shape) -> bool:
+    return a == .empty
+fn round(a: Shape) -> bool:
+    return .circle(1.0) != a
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "consts"), "(return 1 0)");
+        let named = "a.named.len a.named.ptr b.named.len b.named.ptr";
+        assert_eq!(
+            body(&module, "eq"),
+            format!(
+                "(return (if \
+                 (I32.And (I32.Eq a b) (if (I32.Eq a 0) (F32.Eq a.circle b.circle) 1)) \
+                 (if (I32.Eq a 1) (call ==(array(u8)) {named}) 1) 0))"
+            )
+        );
+        assert_eq!(
+            body(&module, "ne"),
+            format!(
+                "(return (if \
+                 (I32.Or (I32.Ne a b) (if (I32.Eq a 0) (F32.Ne a.circle b.circle) 0)) \
+                 1 (if (I32.Eq a 1) (I32.Eqz (call ==(array(u8)) {named})) 0)))"
+            )
+        );
+        // A variant built in place is all that is compared with.
+        assert_eq!(body(&module, "empty"), "(return (I32.Eq a 2))");
+        assert_eq!(
+            body(&module, "round"),
+            "(return (I32.Or (I32.Ne 0 a) (if (I32.Eq a 0) (F32.Ne 1f32 a.circle) 0)))"
+        );
+        assert_eq!(
+            errors(
+                "union R:\n    r: externref\n    none\nfn f(a: R) -> bool:\n    return a == .none\n"
+            ),
+            vec![TypeErrorKind::InvalidOperand {
+                op: "==",
+                ty: "R".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn unions_holding_externrefs_are_constants_that_memory_cannot_hold() {
+        use TypeErrorKind::*;
+        let src = "\
+union Ref:
+    some: externref
+    none
+var held: Ref = .none
+let a = &Ref.none
+let b = [Ref.none]
+let c = [Ref.none; 2]
+fn f() -> u32:
+    return Ref.size
+";
+        let not_storable = || NotStorable("Ref".into());
+        assert_eq!(
+            errors(src),
+            vec![
+                not_storable(),
+                not_storable(),
+                not_storable(),
+                not_storable()
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_unions_are_instantiated_per_type_argument() {
+        let src = "\
+union(T) Option:
+    some: T
+    none
+union(T, E) Result:
+    ok: T
+    err: E
+struct(T) Node:
+    value: T
+    next: Option(&Node(T))
+fn(T) wrap(x: T) -> Option(T):
+    return .some(x)
+fn(T) nothing() -> Option(T):
+    return Option(T).none
+fn size() -> u32:
+    return Node(i64).size
+fn f(n: &Node(i64)) -> Result(i64, Option(u8)):
+    let a = wrap(1 as u8)
+    let b: Option(u8) = nothing(u8)()
+    if a == b:
+        return .err(a)
+    return .ok(n.value)
+";
+        let module = lower(src);
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(
+            f.results,
+            [ValType::I32, ValType::I64, ValType::I32, ValType::I32]
+        );
+        assert_eq!(body(&module, "size"), "(return 16)");
+        assert_eq!(body(&module, "wrap(u8)"), "(return 0 x)");
+        assert_eq!(body(&module, "nothing(u8)"), "(return 1 0)");
+
+        use TypeErrorKind::*;
+        let src = "\
+union(T) Option:
+    some: T
+    none
+union(T) Grow:
+    more: &Grow(Option(T))
+    done
+fn f(o: Option(i32)) -> Option(u8):
+    let a = Option.some(1)
+    let b = Option(i32, u8).none
+    return o
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                ExpansiveRecursion("Grow".into()),
+                MissingTypeArgs("Option".into()),
+                TypeArgCount {
+                    name: "Option".into(),
+                    expected: 1,
+                    found: 2
+                },
+                mismatch("Option(u8)", "Option(i32)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unions_cross_to_the_host_as_their_scalars() {
+        let src = "\
+extern:
+    fn get() -> Shape
+pub union Shape:
+    circle: f32
+    empty
+pub let unit: Shape = .circle(1.0)
+pub var current: Shape = .empty
+pub fn f() -> Shape:
+    current = get()
+    return current
+";
+        let module = lower(src);
+        assert_eq!(module.imports[0].results, [ValType::I32, ValType::F32]);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| (g.export.as_deref().unwrap(), g.init))
+            .collect();
+        assert_eq!(
+            globals,
+            [
+                ("unit", Const::I32(0)),
+                ("unit.circle", Const::F32(1.0)),
+                ("current", Const::I32(1)),
+                ("current.circle", Const::F32(0.0)),
+            ]
+        );
+        // The host may give any `i32` for the tag, which is a byte.
+        let f = body(&module, "f");
+        assert!(f.contains("(I32.And tmp0 255)"), "{f}");
+        assert!(f.ends_with("(return @current @current.circle)"), "{f}");
     }
 
     #[test]

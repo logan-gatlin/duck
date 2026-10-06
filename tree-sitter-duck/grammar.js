@@ -76,6 +76,7 @@ module.exports = grammar({
       $.extern_block,
       $.struct_declaration,
       $.enum_declaration,
+      $.union_declaration,
       $.binding,
       $.use,
     ),
@@ -160,6 +161,24 @@ module.exports = grammar({
     enum_member: $ => seq(
       field('name', $.identifier),
       optional(seq('=', field('value', $._expression))),
+      $._newline,
+    ),
+
+    union_declaration: $ => seq(
+      optional('pub'),
+      'union',
+      field('type_parameters', optional($.type_parameters)),
+      field('name', $.identifier),
+      ':',
+      $._newline,
+      $._indent,
+      repeat1($.union_variant),
+      $._dedent,
+    ),
+
+    union_variant: $ => seq(
+      field('name', $.identifier),
+      optional(seq(':', field('type', $._type))),
       $._newline,
     ),
 
@@ -346,6 +365,7 @@ module.exports = grammar({
       $.repeated_list,
       $.parenthesized_expression,
       $.placeholder,
+      $.dot_expression,
       $.pipe_expression,
       $.unary_expression,
       $.binary_expression,
@@ -379,6 +399,9 @@ module.exports = grammar({
 
     // `_`, the value piped into the nearest pipe whose body it's in.
     placeholder: _ => '_',
+
+    // `.name`, a variant of the union or member of the enum expected of it.
+    dot_expression: $ => seq('.', field('name', $.identifier)),
 
     // `value |> body`. The scanner lets a deeper line that starts with `|>`
     // continue the line above.

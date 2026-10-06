@@ -366,6 +366,7 @@ impl Checker {
             module: decl.module,
             item: decl.item,
             is_pub: decl.is_pub,
+            union: decl.union,
             params: Vec::new(),
             instance: Some(Instance {
                 generic,

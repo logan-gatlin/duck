@@ -294,7 +294,9 @@ fn const_int(prim: Prim, c: Const) -> i128 {
         Const::I32(x) => (x as u32).into(),
         Const::I64(x) if prim.is_signed() => x.into(),
         Const::I64(x) => (x as u64).into(),
-        Const::F32(_) | Const::F64(_) => unreachable!("integers are never floats"),
+        Const::F32(_) | Const::F64(_) | Const::Null => {
+            unreachable!("integers are never floats or references")
+        }
     }
 }
 
@@ -314,5 +316,6 @@ fn const_bits(c: Const) -> u64 {
         Const::I64(x) => x as u64,
         Const::F32(x) => x.to_bits().into(),
         Const::F64(x) => x.to_bits(),
+        Const::Null => 0,
     }
 }

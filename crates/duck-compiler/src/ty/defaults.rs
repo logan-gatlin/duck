@@ -220,7 +220,8 @@ fn param_in_expr<'a>(
         | ExprKind::Bool(_)
         | ExprKind::Unit
         | ExprKind::Module(_)
-        | ExprKind::Placeholder => None,
+        | ExprKind::Placeholder
+        | ExprKind::Dot(_) => None,
         ExprKind::Tuple(items) | ExprKind::List(items) => any(items),
         ExprKind::Unary(_, inner)
         | ExprKind::Field(inner, _)

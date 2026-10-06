@@ -11,9 +11,9 @@ use std::collections::HashMap;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
-    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    IndirectNameMap, Instruction, MemArg, MemorySection, MemoryType, NameMap, NameSection, RefType,
-    StartSection, TableSection, TableType, TypeSection,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, HeapType,
+    ImportSection, IndirectNameMap, Instruction, MemArg, MemorySection, MemoryType, NameMap,
+    NameSection, RefType, StartSection, TableSection, TableType, TypeSection,
 };
 
 use crate::ir::{BinOp, Const, Expr, Func, FuncType, LoadOp, Module, Stmt, StoreOp, UnOp, ValType};
@@ -366,6 +366,7 @@ fn konst(c: Const) -> Instruction<'static> {
         Const::I64(x) => Instruction::I64Const(x),
         Const::F32(x) => Instruction::F32Const(x.into()),
         Const::F64(x) => Instruction::F64Const(x.into()),
+        Const::Null => Instruction::RefNull(HeapType::EXTERN),
     }
 }
 
@@ -375,6 +376,7 @@ fn const_expr(c: Const) -> ConstExpr {
         Const::I64(x) => ConstExpr::i64_const(x),
         Const::F32(x) => ConstExpr::f32_const(x.into()),
         Const::F64(x) => ConstExpr::f64_const(x.into()),
+        Const::Null => ConstExpr::ref_null(HeapType::EXTERN),
     }
 }
 
@@ -620,6 +622,38 @@ mod tests {
             "{wat}"
         );
         assert!(wat.contains(r#"(global $counter (;1;) (mut i32) i32.const 0)"#));
+    }
+
+    #[test]
+    fn unions_hold_externrefs_and_null_in_place_of_them() {
+        let src = "\
+extern:
+    fn get() -> externref
+    fn put(r: Ref)
+pub union Ref:
+    some: externref
+    none
+pub var held: Ref = .none
+pub fn f():
+    held = .some(get())
+    put(held)
+    put(.none)
+";
+        let bytes = emit_src(src);
+        let wat = wat(&bytes);
+        assert!(
+            wat.contains(r#"(global $held.some (;1;) (mut externref) ref.null extern)"#),
+            "{wat}"
+        );
+        assert!(
+            wat.contains("(type (;1;) (func (param i32 externref)))"),
+            "{wat}"
+        );
+        let f = func_wat(&bytes, "f");
+        assert!(
+            f.contains("i32.const 1\n    ref.null extern\n    call $put"),
+            "{f}"
+        );
     }
 
     #[test]

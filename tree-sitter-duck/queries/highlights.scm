@@ -11,6 +11,8 @@
 (module_property name: (identifier) @property)
 
 (enum_member name: (identifier) @constant)
+(union_variant name: (identifier) @constant)
+(dot_expression name: (identifier) @constant)
 
 ; Functions
 
@@ -27,6 +29,7 @@
 (type_parameters (identifier) @type)
 (struct_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
+(union_declaration name: (identifier) @type)
 
 ; Modules
 
@@ -63,6 +66,7 @@
   "var"
   "struct"
   "enum"
+  "union"
   "extern"
   "pass"
 ] @keyword
