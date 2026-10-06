@@ -147,7 +147,7 @@ const EXTERNREF: &str = "externref";
 const TYPE: &str = "type";
 
 /// The fields of every array, in order.
-const ARRAY_FIELDS: [&str; 2] = ["len", "ptr"];
+const ARRAY_FIELDS: [&str; 2] = ["ptr", "len"];
 
 /// The fields of a `type`, in order.
 const TYPE_FIELDS: [&str; 2] = ["size", "align"];
@@ -233,7 +233,7 @@ pub enum Ty {
     /// `tuple(A, B)`, which is laid out like a struct with a field per element.
     Tuple(TupleId),
     /// `array(T)`, a view of elements in linear memory that it doesn't own.
-    /// Laid out like a struct with the fields `len: u32` and `ptr: &T`.
+    /// Laid out like a struct with the fields `ptr: &T` and `len: u32`.
     /// `varray(T)` is one whose elements can be written, so its `ptr` is a
     /// `&var T`.
     Array(ArrayId),
@@ -2234,7 +2234,7 @@ impl Checker {
     }
 
     /// The types of a struct's fields, a union's variants, a tuple's
-    /// elements, an array's `len` and `ptr`, or a `type`'s `size` and
+    /// elements, an array's `ptr` and `len`, or a `type`'s `size` and
     /// `align`, in order. Empty for any other type.
     fn members(&self, ty: Ty) -> Vec<Ty> {
         match ty {
@@ -2244,7 +2244,7 @@ impl Checker {
                 .map(|field| field.ty)
                 .collect(),
             Ty::Tuple(id) => self.tuples[id.0 as usize].clone(),
-            Ty::Array(id) => vec![Ty::Prim(Prim::U32), self.arrays[id.0 as usize]],
+            Ty::Array(id) => vec![self.arrays[id.0 as usize], Ty::Prim(Prim::U32)],
             Ty::Type => vec![Ty::Prim(Prim::U32); TYPE_FIELDS.len()],
             _ => Vec::new(),
         }
@@ -2762,7 +2762,7 @@ impl Checker {
     /// multiple of `align`, or right at the end if there are none. Returns the
     /// array of them.
     fn push_data(&mut self, bytes: Vec<u8>, align: u32, len: u32) -> Value {
-        array_value(len, self.place_data(bytes, align))
+        array_value(self.place_data(bytes, align), len)
     }
 
     /// Places `bytes` in memory at the next multiple of `align`, or right
@@ -3180,7 +3180,7 @@ impl<'c> Body<'c> {
 
     /// `for var in iter`, which copies each element of the array `iter`, or
     /// each member of the enum `iter` names, to `var` in turn. The array's
-    /// `len` and `ptr` are read once, before the first iteration.
+    /// `ptr` and `len` are read once, before the first iteration.
     fn for_loop(
         &mut self,
         stmt: &parse::Stmt,
@@ -3223,14 +3223,14 @@ impl<'c> Body<'c> {
             _ => self.invalid_operand("for", ty, iter.span).0,
         };
         self.record(stmt, Some(elem));
-        let (len, ptr, index) = (
+        let (ptr, len, index) = (
             self.temp(ValType::I32),
             self.temp(ValType::I32),
             self.temp(ValType::I32),
         );
         out.extend(value.pre);
         let mut scalars = exprs(value.scalars).into_iter();
-        for dest in [len, ptr] {
+        for dest in [ptr, len] {
             let scalar = scalars.next().unwrap_or(Expr::Const(Const::I32(0)));
             out.push(Stmt::SetLocal(dest, scalar));
         }
@@ -3421,7 +3421,7 @@ impl<'c> Body<'c> {
         // after the prelude.
         self.spill(&mut value, |e| matches!(e, Expr::Local(_) | Expr::Const(_)));
         // Only a mistyped index has other than one scalar.
-        let [len, ptr, index] = <[_; 3]>::try_from(exprs(value.scalars)).ok()?;
+        let [ptr, len, index] = <[_; 3]>::try_from(exprs(value.scalars)).ok()?;
         let mut pre = value.pre;
         pre.push(Stmt::If {
             cond: binary(ValType::I32, IrBinOp::GeU, index.clone(), len),
@@ -3753,7 +3753,7 @@ impl<'c> Body<'c> {
                 self.ck.read_unfitted |= self.ck.unfitted;
                 let StaticSection { start, end } = self.ck.static_section;
                 let ty = self.ck.array_of(Ty::Prim(Prim::U8), false);
-                (ty, array_value(end - start, start))
+                (ty, array_value(start, end - start))
             }
             "page_size" => page_count(PAGE_SIZE as u32),
             "min" => {
@@ -3825,7 +3825,7 @@ impl<'c> Body<'c> {
                 );
                 let ptr = Expr::Const(Const::I32(0));
                 let ty = self.ck.array_of(byte, true);
-                (ty, vec![(ValType::I32, len), (ValType::I32, ptr)])
+                (ty, vec![(ValType::I32, ptr), (ValType::I32, len)])
             }
             "size" => (count, vec![(ValType::I32, Expr::MemorySize)]),
             "grow" => {
@@ -3997,7 +3997,7 @@ impl<'c> Body<'c> {
         let count = count as u32;
         self.check_shared(mutable, count as usize, span);
         let offset = self.ck.repeat_data(elem, consts, count);
-        (self.ck.array_of(elem, mutable), array_value(count, offset))
+        (self.ck.array_of(elem, mutable), array_value(offset, count))
     }
 
     /// An integer literal, typed by `expected` and defaulting to `i32`. Where
@@ -4895,8 +4895,8 @@ fn scalar(ty: ValType, expr: Expr) -> Value {
 }
 
 /// The constant array of `len` elements at `ptr`.
-fn array_value(len: u32, ptr: u32) -> Value {
-    let consts = [len, ptr].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
+fn array_value(ptr: u32, len: u32) -> Value {
+    let consts = [ptr, len].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
     Value {
         pre: Vec::new(),
         scalars: consts.to_vec(),
@@ -5665,7 +5665,7 @@ mod tests {
         assert!(
             main.contains(
                 "(call logi [c] -> []) (call logf [1.5f32] -> []) \
-                 (call logs [12 0] -> [])"
+                 (call logs [0 12] -> [])"
             ),
             "{main}"
         );
@@ -5683,10 +5683,10 @@ mod tests {
             vec![
                 ("global", false, Const::I32(1)),
                 ("counter", true, Const::I32(0)),
-                ("greeting.len", false, Const::I32(12)),
                 ("greeting.ptr", false, Const::I32(0)),
-                ("primes.len", false, Const::I32(4)),
+                ("greeting.len", false, Const::I32(12)),
                 ("primes.ptr", false, Const::I32(12)),
+                ("primes.len", false, Const::I32(4)),
             ]
         );
     }
@@ -6222,7 +6222,7 @@ let LAST = 3
         // A global follows those its initializer is first to use, as its
         // literals do theirs.
         let expected = [
-            "b 14", "a 44", "e.len 3", "e.ptr 0", "c.len 3", "c.ptr 0", "d.len 2", "d.ptr 3",
+            "b 14", "a 44", "e.ptr 0", "e.len 3", "c.ptr 0", "c.len 3", "d.ptr 3", "d.len 2",
             "f 44",
         ];
         assert_eq!(globals, expected);
@@ -7020,7 +7020,7 @@ fn f() -> i32:
                 (16, &[1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]),
                 (24, &[7]),
                 (25, b"hi"),
-                (28, &[2, 0, 0, 0, 25, 0, 0, 0]),
+                (28, &[25, 0, 0, 0, 2, 0, 0, 0]),
             ]
         );
         let inits: Vec<_> = module
@@ -8292,7 +8292,7 @@ fn f(t: type):
     }
 
     #[test]
-    fn arrays_are_a_length_then_a_pointer() {
+    fn arrays_are_a_pointer_then_a_length() {
         let src = "\
 extern:
     fn put(s: array(u8)) -> array(i32)
@@ -8304,8 +8304,8 @@ fn f(a: array(u8)) -> array(u8):
         assert_eq!(module.imports[0].results, [ValType::I32, ValType::I32]);
         let f = &module.funcs[0];
         let locals: Vec<_> = f.locals.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(locals, ["a.len", "a.ptr"]);
-        assert_eq!(body(&module, "f"), "(return a.len a.ptr)");
+        assert_eq!(locals, ["a.ptr", "a.len"]);
+        assert_eq!(body(&module, "f"), "(return a.ptr a.len)");
     }
 
     #[test]
@@ -8323,16 +8323,16 @@ fn g(t: &tuple(u8, array(i32))) -> &i32:
     return t.1.ptr
 ";
         let module = lower(src);
-        assert_eq!(body(&module, "g"), "(return (I32.Load offset=8 t))");
+        assert_eq!(body(&module, "g"), "(return (I32.Load offset=4 t))");
         assert_eq!(
             body(&module, "f"),
-            "(set b.len a.len) (set b.ptr a.ptr) (set b.len 2) \
-             (I32.Store offset=8 s b.ptr) (return (I32.Load offset=4 s))"
+            "(set b.ptr a.ptr) (set b.len a.len) (set b.len 2) \
+             (I32.Store offset=4 s b.ptr) (return (I32.Load offset=8 s))"
         );
     }
 
     #[test]
-    fn arrays_are_constructed_from_a_length_and_pointer() {
+    fn arrays_are_constructed_from_a_pointer_and_length() {
         let src = "\
 fn f(n: u32, p: &u8) -> array(u8):
     let b = array(u8)(len: n, ptr: p)
@@ -8341,7 +8341,7 @@ fn f(n: u32, p: &u8) -> array(u8):
 ";
         assert_eq!(
             body(&lower(src), "f"),
-            "(set b.len n) (set b.ptr p) (set c.len 3) (set c.ptr p) (return 0 0)"
+            "(set b.ptr p) (set b.len n) (set c.ptr p) (set c.len 3) (return 0 0)"
         );
         let src = "\
 fn f(n: u32, p: &u8, q: &i8, a: array(u8)):
@@ -8644,9 +8644,9 @@ fn f(a: array(u16)):
 ";
         assert_eq!(
             body(&lower(src), "f"),
-            "(set tmp2 a.len) (set tmp3 a.ptr) (set tmp4 0) (block (loop \
-             (br_if 1 (I32.GeU tmp4 tmp2)) \
-             (set x (I32.Load16U offset=0 (I32.Add tmp3 (I32.Mul tmp4 2)))) \
+            "(set tmp2 a.ptr) (set tmp3 a.len) (set tmp4 0) (block (loop \
+             (br_if 1 (I32.GeU tmp4 tmp3)) \
+             (set x (I32.Load16U offset=0 (I32.Add tmp2 (I32.Mul tmp4 2)))) \
              (set tmp4 (I32.Add tmp4 1)) \
              (if (I32.Eq x 0) (then (br 2)) (else )) (call log [x] -> []) (br 0)))"
         );
@@ -8685,10 +8685,10 @@ var duck = \"🦆\"
         assert_eq!(
             globals[..4],
             [
-                ("greeting.len", Some("greeting.len"), Const::I32(2)),
                 ("greeting.ptr", Some("greeting.ptr"), Const::I32(0)),
-                ("duck.len", None, Const::I32(4)),
+                ("greeting.len", Some("greeting.len"), Const::I32(2)),
                 ("duck.ptr", None, Const::I32(2)),
+                ("duck.len", None, Const::I32(4)),
             ]
         );
     }
@@ -8712,12 +8712,12 @@ pub let nested: array(array(i8)) = [[], [-1]]
             [
                 (0, &b"foo"[..]),
                 (3, b"bar"),
-                (8, &[3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0]),
+                (8, &[0, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0]),
                 (24, &[1, 0, 2, 0, 0xff, 0xff]),
                 (32, &[1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]),
                 (40, &[1, 0]),
                 (42, &[0xff]),
-                (44, &[0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 0, 0, 42, 0, 0, 0]),
+                (44, &[42, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 0, 0]),
             ]
         );
         let inits: Vec<_> = module
@@ -8754,7 +8754,7 @@ pub let last: array(u8) = [1; 1]
         let module = lower(src);
         let point = [1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff];
         // `"ab"` is at 8032, which is 0x1f60.
-        let name = [2, 0, 0, 0, 0x60, 0x1f, 0, 0];
+        let name = [0x60, 0x1f, 0, 0, 2, 0, 0, 0];
         assert_eq!(
             data(&module),
             [
@@ -8878,12 +8878,12 @@ fn f() -> u32:
         assert_eq!(
             globals,
             [
-                ("s.len", Const::I32(3)),
                 ("s.ptr", Const::I32(1025)),
-                ("t.len", Const::I32(1)),
+                ("s.len", Const::I32(3)),
                 ("t.ptr", Const::I32(1028)),
-                ("all.len", Const::I32(1023)),
+                ("t.len", Const::I32(1)),
                 ("all.ptr", Const::I32(1025)),
+                ("all.len", Const::I32(1023)),
             ]
         );
         assert_eq!(body(&module, "f"), "(return 1023)");
@@ -8942,7 +8942,7 @@ fn copy(a: varray(u8), b: array(u8)):
         assert_eq!(module.funcs.len(), 5);
         assert_eq!(
             body(&module, "all"),
-            "(return (I32.Mul memory.size 65536) 0)"
+            "(return 0 (I32.Mul memory.size 65536))"
         );
         assert_eq!(body(&module, "size"), "(return memory.size)");
         assert_eq!(body(&module, "grow"), "(return (memory.grow n))");
@@ -9185,8 +9185,8 @@ fn f() -> u32:
         assert_eq!(
             globals(&module)[..3],
             [
-                ("all.len".to_string(), Const::I32(8)),
                 ("all.ptr".to_string(), Const::I32(0)),
+                ("all.len".to_string(), Const::I32(8)),
                 ("pages".to_string(), Const::I32(1)),
             ]
         );
@@ -9628,7 +9628,7 @@ fn round(a: Shape) -> bool:
 ";
         let module = lower(src);
         assert_eq!(body(&module, "consts"), "(return 1 0)");
-        let named = "a.named.len a.named.ptr b.named.len b.named.ptr";
+        let named = "a.named.ptr a.named.len b.named.ptr b.named.len";
         assert_eq!(
             body(&module, "eq"),
             format!(
@@ -10074,14 +10074,14 @@ fn half(x: f32, b: bool) -> bool:
         assert_eq!(data(&module), [(0, &b"zero"[..])]);
         assert_eq!(
             body(&module, "word"),
-            "(set tmp2 s.len) (set tmp3 s.ptr) \
+            "(set tmp2 s.ptr) (set tmp3 s.len) \
              (block \
-             (if (call ==(array(u8)) tmp2 tmp3 4 0) (then (return 0)) (else )) \
-             (if (if (I32.Eq tmp2 3) \
-             (seq (set a (I32.Load8U offset=0 tmp3)) \
-             (seq (set tmp5 (I32.Load8U offset=2 tmp3)) (I32.Eq tmp5 3))) 0) \
+             (if (call ==(array(u8)) tmp2 tmp3 0 4) (then (return 0)) (else )) \
+             (if (if (I32.Eq tmp3 3) \
+             (seq (set a (I32.Load8U offset=0 tmp2)) \
+             (seq (set tmp5 (I32.Load8U offset=2 tmp2)) (I32.Eq tmp5 3))) 0) \
              (then (return a)) (else )) \
-             (if (I32.Eq tmp2 0) (then (return 1)) (else )) \
+             (if (I32.Eq tmp3 0) (then (return 1)) (else )) \
              (return 2)) \
              unreachable"
         );
@@ -10129,8 +10129,8 @@ fn f(s: array(u8)) -> i32:
             [(0, &b"hi"[..]), (2, &b"one"[..]), (5, &b"two"[..])]
         );
         let f = body(&module, "f");
-        assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 3 5)"), "{f}");
-        assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 3 2)"), "{f}");
+        assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 5 3)"), "{f}");
+        assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 2 3)"), "{f}");
         assert!(f.ends_with("(return 8)"), "{f}");
     }
 
@@ -10492,9 +10492,9 @@ fn f(a: array(u8), b: array(u8), s: S, t: S) -> bool:
         let module = lower(src);
         assert_eq!(
             body(&module, "f"),
-            "(set x (call ==(array(u8)) a.len a.ptr b.len b.ptr)) \
+            "(set x (call ==(array(u8)) a.ptr a.len b.ptr b.len)) \
              (set y (if (I32.Ne s.n t.n) 1 \
-             (I32.Eqz (call ==(array(u8)) s.name.len s.name.ptr t.name.len t.name.ptr)))) \
+             (I32.Eqz (call ==(array(u8)) s.name.ptr s.name.len t.name.ptr t.name.len)))) \
              (return (if x y 0))"
         );
         let helpers: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
@@ -10523,7 +10523,7 @@ fn f(a: N, b: N) -> bool:
         assert_eq!(
             body(&module, "f"),
             "(return (if (F32.Eq a.v b.v) \
-             (call ==(array(N)) a.kids.len a.kids.ptr b.kids.len b.kids.ptr) 0))"
+             (call ==(array(N)) a.kids.ptr a.kids.len b.kids.ptr b.kids.len) 0))"
         );
         assert_eq!(
             body(&module, "==(array(N))"),
@@ -11210,13 +11210,13 @@ fn g() -> Inner:
             "made.mode 3",
             "made.inner.a 20",
             "made.inner.b 2f32",
-            "made.name.len 4",
             "made.name.ptr 0",
+            "made.name.len 4",
             "made.next 0",
             "made.cb 1",
         ];
         assert_eq!(globals, expected);
-        assert_eq!(body(&module, "f"), "(return x 1i64 0 20 2f32 4 0 0 1)");
+        assert_eq!(body(&module, "f"), "(return x 1i64 0 20 2f32 0 4 0 1)");
         assert_eq!(body(&module, "g"), "(return 20 1f32)");
     }
 
@@ -11263,8 +11263,8 @@ fn g() -> Vec(u8):
 ";
         let module = lower(src);
         // The empty literal is at the end of the data so far.
-        assert_eq!(body(&module, "f"), "(return 0 3 0 0 5i64)");
-        assert_eq!(body(&module, "g"), "(return 0 3 0 2 1)");
+        assert_eq!(body(&module, "f"), "(return 3 0 0 0 5i64)");
+        assert_eq!(body(&module, "g"), "(return 3 0 0 2 1)");
     }
 
     #[test]
@@ -11386,7 +11386,7 @@ fn g():
         assert_eq!(
             body(&module, "g"),
             "(drop (call mid 7 1)) (drop (call mid 2 3)) \
-             (drop (call wide 1 3 4 0 1)) (drop (call wide 4 5 4 0 1)) \
+             (drop (call wide 1 3 0 4 1)) (drop (call wide 4 5 0 4 1)) \
              (drop (call tick 0.5f64))"
         );
         assert_eq!(data(&module), [(0, &b"duck"[..])]);
@@ -11527,8 +11527,8 @@ fn g() -> i32:
         let module = lower(src);
         assert_eq!(
             body(&module, "f"),
-            "(return (I32.Add (I32.Add (call fill(i64) 4 0 3 0) (call fill(i64) 4 0 2 0)) \
-             (call outer(i64) 4 0)))"
+            "(return (I32.Add (I32.Add (call fill(i64) 0 4 3 0) (call fill(i64) 0 4 2 0)) \
+             (call outer(i64) 0 4)))"
         );
         assert_eq!(
             body(&module, "g"),
@@ -11536,7 +11536,7 @@ fn g() -> i32:
         );
         assert_eq!(
             body(&module, "outer(i64)"),
-            "(return (I32.Add (call fill(i64) a.len a.ptr 3 0) (call fill(i64) a.len a.ptr 3 8)))"
+            "(return (I32.Add (call fill(i64) a.ptr a.len 3 0) (call fill(i64) a.ptr a.len 3 8)))"
         );
     }
 

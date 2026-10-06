@@ -65,7 +65,7 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
   `u32` addresses. There is no null: `0` is an address like any other.
-- `array(T)`: a view of `len: u32` and `ptr: &T` that owns nothing.
+- `array(T)`: a view of `ptr: &T` and `len: u32` that owns nothing.
   `varray(T)` has a `ptr: &var T`, so its elements are assignable. Strings
   are `array(u8)` of UTF-8.
 - `fn(A, B) -> R`: a function pointer. `fn(A)` returns nothing.
@@ -274,7 +274,7 @@ fn push(head: &Node, v: i32) -> &Node:
 	return n
 
 fn view(p: &i32, len: u32) -> array(i32):
-	return array(i32)(len: len, ptr: p) # slice by building a new view
+	return array(i32)(ptr: p, len: len) # slice by building a new view
 ```
 
 - `&` and `&var` take the address of `p.field`, `p.*` and `a[i]` only. Locals,
@@ -431,9 +431,9 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   wasm `i32`. `i64`, `f32`, `f64` and `externref` are themselves, and an enum
   is its value type. Structs, tuples, arrays and `type` are one wasm value
   per scalar, in field order: `fn f(s: array(u8)) -> Point` is
-  `(i32 len, i32 ptr) -> (f32, f32)`.
+  `(i32 ptr, i32 len) -> (f32, f32)`.
 - An exported aggregate global is one wasm global per scalar, named with
-  dots: `origin.x`, `name.len`, `name.ptr`.
+  dots: `origin.x`, `name.ptr`, `name.len`.
 - A union is an `i32` that counts its variants from 0, then the scalars of
   every variant in order: `union Shape` with `circle: f32` and
   `rect: tuple(f32, f32)` is `(i32, f32, f32, f32)`. Those of a variant the

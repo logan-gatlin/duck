@@ -1118,10 +1118,10 @@ fn f(a: array(i32)):
     block ;; label = @1
       loop ;; label = @2
         local.get $\"#local4 tmp\"
-        local.get $tmp
+        local.get $\"#local3 tmp\"
         i32.ge_u
         br_if 1 (;@1;)
-        local.get $\"#local3 tmp\"
+        local.get $tmp
         local.get $\"#local4 tmp\"
         i32.const 4
         i32.mul

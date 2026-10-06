@@ -29,7 +29,7 @@ enum Compare {
     Scalar(ValType),
     /// A scalar of an enum, compared by its bits.
     Bits(ValType),
-    /// An array's `len` and `ptr`, compared element by element.
+    /// An array's `ptr` and `len`, compared element by element.
     Array(Ty),
 }
 
@@ -206,8 +206,8 @@ impl Body<'_> {
                     }
                 }
                 Compare::Array(ty) => {
-                    let (a_ptr, b_ptr) = (lhs[leaf + 1].clone(), rhs[leaf + 1].clone());
-                    let call = Expr::Call(self.ck.eq_func(ty), vec![a, a_ptr, b, b_ptr]);
+                    let (a_len, b_len) = (lhs[leaf + 1].clone(), rhs[leaf + 1].clone());
+                    let call = Expr::Call(self.ck.eq_func(ty), vec![a, a_len, b, b_len]);
                     match op {
                         BinOp::Eq => call,
                         _ => Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(call)),
@@ -262,11 +262,11 @@ impl Body<'_> {
     }
 
     /// The body of the function comparing the arrays `a` and `b` of type
-    /// `ty`, given the locals of their `len` and `ptr`. Returns at the first
+    /// `ty`, given the locals of their `ptr` and `len`. Returns at the first
     /// element that differs.
     fn array_eq_body(&mut self, ty: Ty, a: [ir::LocalId; 2], b: [ir::LocalId; 2]) -> Vec<Stmt> {
-        let [a_len, a_ptr] = a.map(Expr::Local);
-        let [b_len, b_ptr] = b.map(Expr::Local);
+        let [a_ptr, a_len] = a.map(Expr::Local);
+        let [b_ptr, b_len] = b.map(Expr::Local);
         let differ = || vec![Stmt::Return(vec![Expr::Const(Const::I32(0))])];
         let mut out = vec![Stmt::If {
             cond: binary(ValType::I32, IrBinOp::Ne, a_len.clone(), b_len),

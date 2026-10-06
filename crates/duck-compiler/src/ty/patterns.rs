@@ -408,7 +408,7 @@ impl Body<'_> {
                     return self.failed(pattern, case);
                 };
                 let elem = self.ck.element(id);
-                let (len, ptr) = (Expr::Local(subject[0]), Expr::Local(subject[1]));
+                let (ptr, len) = (Expr::Local(subject[0]), Expr::Local(subject[1]));
                 let count = Expr::Const(Const::I32(elems.len() as i32));
                 let has_all = binary(ValType::I32, IrBinOp::Eq, len, count);
                 case.steps.push(Step::Test(has_all));
@@ -490,7 +490,7 @@ impl Body<'_> {
                 let value = self.read_locals(ty, subject);
                 // Every function's are placed before any is lowered.
                 let placed = self.ck.pattern_strings[string];
-                let string_value = array_value(string.len() as u32, placed);
+                let string_value = array_value(placed, string.len() as u32);
                 let equal = self.compare(BinOp::Eq, ty, value, string_value);
                 case.steps.push(Step::Test(single(equal)));
                 // What it matches is the array of its bytes, which an array
