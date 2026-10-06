@@ -3528,6 +3528,9 @@ impl<'c> Body<'c> {
             }
             // Only after an error: an inlined global is immutable.
             Slots::Const(_) => {}
+            // Only a mistyped value has other scalars than the place's, and
+            // so may lack the tags that say which variants to store.
+            Slots::Memory { .. } if scalars.len() != cells.len() => {}
             Slots::Memory { addr, offset } => {
                 let store = |(cell, scalar): (&Cell, &Expr)| Stmt::Store {
                     ty: cell.ty,
@@ -9612,6 +9615,24 @@ fn set(p: &var Outer, x: i16):
              (I32.Store8 offset=0 p 1) \
              (I32.Store8 offset=2 p 1) \
              (I32.Store16 offset=4 p tmp2)"
+        );
+    }
+
+    #[test]
+    fn mistyped_values_are_not_stored_to_unions_in_memory() {
+        // Neither has the tags that say which variants to store.
+        let src = "\
+let items: varray(option(option(u32))) = [.none; 1]
+fn f():
+    items[0] = missing
+    items[0] = 5
+";
+        assert_eq!(
+            errors(src),
+            [
+                TypeErrorKind::UnknownName("missing".into()),
+                mismatch("option(option(u32))", "i32"),
+            ]
         );
     }
 
