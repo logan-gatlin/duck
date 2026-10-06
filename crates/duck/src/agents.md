@@ -75,6 +75,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   compared.
 - `Name`, `Name(T)`, `mod.Name`: structs, unions and enums, passed by value
   like tuples and arrays.
+- A struct or union holds itself only behind a pointer, whatever its type
+  arguments, and holds others by value at most 64 deep.
 - `enum(T) Name:` makes each member a constant of any type `T`. Integer
   members count up from the one before, and other types need every value.
   Enums support `Name.member`, `==`, `!=`, `e as T` and `for m in Name`.
@@ -119,9 +121,8 @@ fn area(s: Shape) -> Result(f32, Fault):
   parameter `T` is expected: write `T.name`.
 - `==` and `!=` compare which variant each holds and then its value. Only
   `match` reads that value: a union has no fields.
-- A union has 1 to 256 variants, which are as `pub` as it is, and holds
-  itself only behind a pointer. A variant named `size` or `align` hides that
-  of the type.
+- A union has 1 to 256 variants, which are as `pub` as it is. A variant
+  named `size` or `align` hides that of the type.
 - In memory a union is a `u8` that counts its variants from 0 and then the
   largest variant, at the largest alignment, as C lays out
   `struct { uint8_t tag; union { ... }; }`.

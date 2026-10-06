@@ -155,6 +155,12 @@ const TYPE_FIELDS: [&str; 2] = ["size", "align"];
 /// The module that `extern` blocks without one import from.
 const DEFAULT_IMPORT_MODULE: &str = "env";
 
+/// The most structs and unions that can be nested by value, each a field of
+/// the one before or a variant, or in a tuple or enum of one. Generics can
+/// nest far more than are ever written, as one that holds another of itself
+/// twice over does.
+const MAX_VALUE_DEPTH: usize = 64;
+
 /// The name of a local the compiler makes, which holds no variable.
 const TEMP: &str = "tmp";
 
@@ -334,6 +340,9 @@ pub enum TypeErrorKind {
     /// A generic struct or union that uses itself with ever larger type
     /// arguments, so it has no end of instances.
     ExpansiveRecursion(String),
+    /// A struct or union that holds others by value, each holding the next,
+    /// too many deep. It is the generic one of an instance.
+    NestedTooDeep(String),
     /// A type without type parameters given a list of type arguments, as in
     /// `i32()`.
     NotGeneric(String),
@@ -541,6 +550,9 @@ struct Checker {
     enums: Vec<EnumDef>,
     /// Instances whose fields wait on every generic struct's being defined.
     pending: Vec<StructId>,
+    /// Where a struct that holds others nested too deep is reported, which
+    /// it is once.
+    deep_sites: Vec<Span>,
     /// Whether every generic struct's fields are known, so instances can
     /// be given theirs.
     generics_defined: bool,
@@ -671,6 +683,9 @@ struct StructDef {
     /// An instance's are its declaration's, with its type arguments in place
     /// of the type parameters.
     fields: Vec<FieldDef>,
+    /// How many structs and unions nest by value in it, itself included, as
+    /// [`Checker::value_depth`] found. `None` until it is asked for.
+    depth: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1008,6 +1023,10 @@ impl fmt::Display for TypeErrorKind {
             Self::ExpansiveRecursion(name) => {
                 write!(f, "`{name}` uses itself with ever larger type arguments")
             }
+            Self::NestedTooDeep(name) => write!(
+                f,
+                "`{name}` holds structs and unions nested more than {MAX_VALUE_DEPTH} deep"
+            ),
             Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
             Self::InstanceTooDeep(name) => write!(
                 f,
@@ -1317,6 +1336,7 @@ impl Checker {
                         params,
                         instance: None,
                         fields: Vec::new(),
+                        depth: None,
                     });
                     (name, Item::Struct(id))
                 }
@@ -1531,9 +1551,61 @@ impl Checker {
         for id in 0..self.structs.len() {
             self.break_cycles(id, &mut visits, false);
         }
+        // What was measured as instances were filled may have been cut.
+        for id in 0..self.structs.len() {
+            self.structs[id].depth = None;
+        }
+        for id in 0..self.structs.len() {
+            self.value_depth(StructId(id as u32));
+        }
         self.check_field_pointers(0..self.structs.len());
         self.check_enum_pointers();
         self.structs_defined = true;
+    }
+
+    /// How many structs and unions nest by value in struct `id`, itself
+    /// included, which is found once. A field that holds as many as may nest
+    /// is reported and given the error type, so that no value nests deeper.
+    /// A struct being measured counts for nothing: it contains itself, and
+    /// is reported for that.
+    fn value_depth(&mut self, id: StructId) -> usize {
+        let index = id.0 as usize;
+        if let Some(depth) = self.structs[index].depth {
+            return depth;
+        }
+        // An instance that waits on its fields is given them.
+        if self.generics_defined {
+            self.fill_instance(id);
+        }
+        self.structs[index].depth = Some(0);
+        let mut deepest = 0;
+        for i in 0..self.structs[index].fields.len() {
+            let mut held = Vec::new();
+            self.push_inline_structs(self.structs[index].fields[i].ty, &mut held);
+            let depths = held.into_iter().map(|held| self.value_depth(held));
+            let depth = depths.max().unwrap_or(0);
+            if depth < MAX_VALUE_DEPTH {
+                deepest = deepest.max(depth);
+                continue;
+            }
+            let site = self.field_site(index, i);
+            let def = &mut self.structs[index];
+            def.fields[i].ty = Ty::Error;
+            let named = match &mut def.instance {
+                Some(instance) => {
+                    instance.too_deep = true;
+                    instance.generic.0 as usize
+                }
+                None => index,
+            };
+            let name = self.structs[named].name.clone();
+            if !self.deep_sites.contains(&site) {
+                self.deep_sites.push(site);
+                self.error(TypeErrorKind::NestedTooDeep(name), site);
+            }
+        }
+        self.structs[index].depth = Some(deepest + 1);
+        deepest + 1
     }
 
     /// Resolves the fields of struct `id`, which `decl` declares, with its
@@ -8017,6 +8089,82 @@ fn f(a: List(i32), p: Pair(i32, u8), c: C(u8), b: Bad(i32), m: M(f32)):
                 (RecursiveStruct("B".into()), "a: A(T)"),
                 (RecursiveStruct("W(S)".into()), "W(S)"),
             ]
+        );
+    }
+
+    #[test]
+    fn type_arguments_cannot_make_a_type_contain_itself() {
+        use TypeErrorKind::*;
+        let src = "\
+union(T) Opt:
+    some: T
+    none
+union(T) R:
+    me: Opt(R(T))
+    end
+struct(T) W:
+    x: T
+struct(T) S:
+    w: W(S(T))
+fn f(r: &R(i32)) -> u32:
+    return R(i32).size + S(u8).size + S(u8).align
+fn(T) g(s: S(T)) -> u32:
+    return 1
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (RecursiveUnion("Opt(R(i32))".into()), "R(i32)"),
+                (RecursiveStruct("W(S(T))".into()), "S(T)"),
+                (RecursiveStruct("W(S(u8))".into()), "S(u8)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn structs_and_unions_nest_only_so_deep() {
+        use TypeErrorKind::*;
+        // Each struct holds the one before it twice over, so it holds one
+        // more than twice as many as that one does: the sixth holds 63.
+        let doubling = |levels: usize| -> String {
+            let mut src = "struct(T) L1:\n    x: T\n".to_string();
+            for level in 2..=levels {
+                let below = level - 1;
+                src += &format!("struct(T) L{level}:\n    x: L{below}(L{below}(T))\n");
+            }
+            src + &format!("fn f() -> u32:\n    return L{levels}(u8).size\n")
+        };
+        assert_eq!(body(&lower(&doubling(6)), "f"), "(return 1)");
+        // The declaration nests too deep whatever it is given, so it is
+        // reported and no use of it is.
+        let too_deep = vec![(NestedTooDeep("L1".into()), "L6(L6(T))")];
+        assert_eq!(errors_at(&doubling(7)), too_deep);
+        assert_eq!(errors_at(&doubling(40)), too_deep);
+
+        // A union written with as many type arguments as may nest, and one
+        // more.
+        let written = |depth: usize| -> String {
+            let ty = format!("{}u8{}", "Opt(".repeat(depth), ")".repeat(depth));
+            format!(
+                "union(T) Opt:\n    some: T\n    none\nfn f(o: &{ty}) -> u32:\n    return {ty}.size\n"
+            )
+        };
+        assert_eq!(body(&lower(&written(64)), "f"), "(return 65)");
+        let src = written(65);
+        let errors = errors_at(&src);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, NestedTooDeep("Opt".into()));
+        assert!(errors[0].1.starts_with("Opt(Opt(") && errors[0].1.len() == 4 * 65 + 2 + 65);
+
+        // Structs that are no instances, each holding the next.
+        let chain = |len: usize| -> String {
+            let structs = (1..len).map(|i| format!("struct S{i}:\n    x: S{}\n", i + 1));
+            structs.collect::<String>() + &format!("struct S{len}:\n    x: u8\n")
+        };
+        assert_eq!(check_src(&chain(64)).err(), None);
+        assert_eq!(
+            errors_at(&chain(65)),
+            vec![(NestedTooDeep("S1".into()), "x: S2")]
         );
     }
 

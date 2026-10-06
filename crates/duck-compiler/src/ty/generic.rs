@@ -3,12 +3,14 @@
 //! instantiating them with type arguments, including those written in
 //! expressions, like the `i32` in `Box(i32)(value: 1)`.
 
+use std::mem;
+
 use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeKind};
 
 use super::{
     ARRAY, Body, Checker, Item, ParamId, StructDef, StructId, TUPLE, Ty, TypeErrorKind, VARRAY,
-    Value, is_builtin_type, module_path, path_text,
+    Value, Visit, is_builtin_type, module_path, path_text,
 };
 
 /// A use of a generic struct with type arguments.
@@ -17,6 +19,11 @@ pub(super) struct Instance {
     pub(super) args: Vec<Ty>,
     /// Where it was first used, which errors in its fields are reported at.
     pub(super) site: Span,
+    /// Whether it has been given its fields.
+    filled: bool,
+    /// Whether it holds values nested too deep, or would if its fields
+    /// weren't cut short, so that nothing is made of it.
+    pub(super) too_deep: bool,
 }
 
 /// A type parameter of a generic struct or function.
@@ -350,63 +357,123 @@ impl Checker {
     /// The instance of generic struct `generic` with type arguments `args`,
     /// first used at `site`. Instances are given their fields as soon as
     /// every generic struct is defined, and reported at `site` if a pointer
-    /// in them can't be stored once every struct is. One whose type
-    /// arguments hold type parameters is reported once they are given theirs,
-    /// which the body of a generic function checked as declared needs.
+    /// in them can't be stored once every struct is, or if they contain
+    /// themselves. One whose type arguments hold type parameters has its
+    /// pointers reported once they are given theirs, which the body of a
+    /// generic function checked as declared needs. The error type if a type
+    /// argument is, or if the instance holds values nested too deep, which
+    /// is reported.
     pub(super) fn instantiate(&mut self, generic: StructId, args: Vec<Ty>, site: Span) -> Ty {
+        if args.contains(&Ty::Error) {
+            return Ty::Error;
+        }
         self.deferred |= self.open && args.iter().any(|arg| self.has_param(*arg));
-        if let Some(id) = self.instances.get(&(generic, args.clone())) {
-            return Ty::Struct(*id);
+        let id = match self.instances.get(&(generic, args.clone())) {
+            Some(id) => *id,
+            None => {
+                let id = StructId(self.structs.len() as u32);
+                let names: Vec<_> = args.iter().map(|arg| self.ty_name(*arg)).collect();
+                let decl = &self.structs[generic.0 as usize];
+                self.structs.push(StructDef {
+                    name: format!("{}({})", decl.name, names.join(", ")),
+                    module: decl.module,
+                    item: decl.item,
+                    is_pub: decl.is_pub,
+                    union: decl.union,
+                    params: Vec::new(),
+                    instance: Some(Instance {
+                        generic,
+                        args: args.clone(),
+                        site,
+                        filled: false,
+                        too_deep: false,
+                    }),
+                    fields: Vec::new(),
+                    depth: None,
+                });
+                self.instances.insert((generic, args), id);
+                if !self.generics_defined {
+                    self.pending.push(id);
+                    return Ty::Struct(id);
+                }
+                self.fill_instance(id);
+                if self.structs_defined {
+                    self.check_instances(id.0 as usize);
+                }
+                // Measured as soon as it has its fields, so that instances
+                // which hold ever more of each other stop at the limit.
+                self.value_depth(id);
+                id
+            }
+        };
+        let instance = &self.structs[id.0 as usize].instance;
+        match instance.as_ref().is_some_and(|instance| instance.too_deep) {
+            true => Ty::Error,
+            false => Ty::Struct(id),
         }
-        let id = StructId(self.structs.len() as u32);
-        let names: Vec<_> = args.iter().map(|arg| self.ty_name(*arg)).collect();
-        let decl = &self.structs[generic.0 as usize];
-        self.structs.push(StructDef {
-            name: format!("{}({})", decl.name, names.join(", ")),
-            module: decl.module,
-            item: decl.item,
-            is_pub: decl.is_pub,
-            union: decl.union,
-            params: Vec::new(),
-            instance: Some(Instance {
-                generic,
-                args: args.clone(),
-                site,
-            }),
-            fields: Vec::new(),
-        });
-        self.instances.insert((generic, args), id);
-        if !self.generics_defined {
-            self.pending.push(id);
-            return Ty::Struct(id);
+    }
+
+    /// Checks the instances from `first` on, which were made after every
+    /// struct was defined, as those before them were then: reports each that
+    /// contains itself, and each pointer in them that can't be stored.
+    fn check_instances(&mut self, first: usize) {
+        // Those before them are known not to contain themselves.
+        let mut visits = vec![Visit::Done; first];
+        visits.resize(self.structs.len(), Visit::New);
+        for id in first..self.structs.len() {
+            self.break_cycles(id, &mut visits, false);
+            // What it holds was measured before it was all there.
+            self.structs[id].depth = None;
         }
-        let first_new = id.0 as usize;
-        self.fill_instance(id);
-        if self.structs_defined {
-            self.check_field_pointers(first_new..self.structs.len());
-        }
-        Ty::Struct(id)
+        self.check_field_pointers(first..self.structs.len());
     }
 
     /// Gives instance `id` the fields of its generic declaration, with type
-    /// arguments in place of type parameters.
+    /// arguments in place of type parameters, unless it has them. Does
+    /// nothing for a struct that is no instance.
     pub(super) fn fill_instance(&mut self, id: StructId) {
-        let instance = self.structs[id.0 as usize].instance.as_ref().unwrap();
-        let (generic, args, site) = (instance.generic, instance.args.clone(), instance.site);
-        let mut fields = self.structs[generic.0 as usize].fields.clone();
-        for field in &mut fields {
-            field.ty = self.substitute(field.ty, &args, site);
+        let index = id.0 as usize;
+        let Some(instance) = &mut self.structs[index].instance else {
+            return;
+        };
+        if mem::replace(&mut instance.filled, true) {
+            return;
         }
-        self.structs[id.0 as usize].fields = fields;
+        let (generic, args, site) = (instance.generic, instance.args.clone(), instance.site);
+        // Until it has its fields, it counts for nothing in what holds it.
+        self.structs[index].depth = Some(0);
+        let mut fields = self.structs[generic.0 as usize].fields.clone();
+        let mut too_deep = false;
+        for field in &mut fields {
+            let ty = self.substitute(field.ty, &args, site);
+            // Only an instance nested too deep is an error the declaration
+            // doesn't have.
+            too_deep |= ty == Ty::Error && field.ty != Ty::Error;
+            field.ty = ty;
+        }
+        let def = &mut self.structs[index];
+        def.fields = fields;
+        def.depth = None;
+        if let Some(instance) = &mut def.instance {
+            instance.too_deep |= too_deep;
+        }
     }
 
-    /// `ty` with each type parameter replaced by its argument in `args`.
+    /// `ty` with each type parameter replaced by its argument in `args`. The
+    /// error type if that nests an instance too deep, which is reported at
+    /// `site`, unless it is where the declaration is.
     pub(super) fn substitute(&mut self, ty: Ty, args: &[Ty], site: Span) -> Ty {
         match ty {
             Ty::Param(id) => args[self.params[id.0 as usize].index],
             Ty::Struct(id) => match &self.structs[id.0 as usize].instance {
                 Some(instance) if self.is_open(id) => {
                     let (generic, inner) = (instance.generic, instance.args.clone());
+                    // Nested too deep whatever its type parameters are.
+                    self.value_depth(id);
+                    let instance = &self.structs[id.0 as usize].instance;
+                    if instance.as_ref().is_some_and(|instance| instance.too_deep) {
+                        return Ty::Error;
+                    }
                     let inner = inner
                         .into_iter()
                         .map(|arg| self.substitute(arg, args, site))
@@ -416,11 +483,15 @@ impl Checker {
                 _ => ty,
             },
             _ => {
-                let components = self
+                let components: Vec<_> = self
                     .components(ty)
                     .into_iter()
                     .map(|component| self.substitute(component, args, site))
                     .collect();
+                // An instance within it is nested too deep.
+                if components.contains(&Ty::Error) {
+                    return Ty::Error;
+                }
                 self.rebuild(ty, components)
             }
         }
