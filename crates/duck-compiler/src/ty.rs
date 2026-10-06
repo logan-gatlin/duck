@@ -140,6 +140,12 @@ const VARRAY: &str = "varray";
 /// The name of the built-in tuple type.
 const TUPLE: &str = "tuple";
 
+/// The name of the built-in union that holds a value or `none`.
+const OPTION: &str = "option";
+
+/// The name of the built-in union that holds a value or an error.
+const RESULT: &str = "result";
+
 /// The name of the host reference type.
 const EXTERNREF: &str = "externref";
 
@@ -535,9 +541,11 @@ struct Checker {
     module: FileId,
     /// The module whose `pub` items are exported.
     entry: FileId,
-    /// Struct declarations in declaration order, then instances of generic
-    /// ones as they are used.
+    /// Struct declarations in declaration order, then the built-in unions,
+    /// then instances of generic ones as they are used.
     structs: Vec<StructDef>,
+    /// The built-in unions, `option` and then `result`, once declared.
+    builtin_unions: Vec<StructId>,
     /// Each instance of a generic struct by its declaration and type
     /// arguments.
     instances: HashMap<(StructId, Vec<Ty>), StructId>,
@@ -670,7 +678,7 @@ struct StructDef {
     /// The module that declares it, or for an instance, its declaration.
     module: FileId,
     /// The item of the program that declares it, or for an instance, its
-    /// declaration.
+    /// declaration. Unused for a built-in union, which no item declares.
     item: usize,
     is_pub: bool,
     /// Whether it's a union: a value holds one of its fields, and a tag
@@ -1371,6 +1379,7 @@ impl Checker {
             };
             self.declare_item(item, name, entry);
         }
+        self.declare_builtin_unions();
         self.uses = vec![Visit::New; program.uses.len()];
         for index in 0..program.uses.len() {
             self.declare_use(program, index);
@@ -1454,7 +1463,7 @@ impl Checker {
     fn declare_name(&mut self, name: &Ident, item: Item, is_pub: bool) {
         let scope = self.scopes.entry(self.module).or_default();
         if scope.contains_key(&name.name)
-            || [ARRAY, VARRAY, TUPLE, TYPE].contains(&name.name.as_str())
+            || [ARRAY, VARRAY, TUPLE, TYPE, OPTION, RESULT].contains(&name.name.as_str())
         {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
@@ -2187,6 +2196,8 @@ impl Checker {
             Ty::ExternRef
         } else if name == TYPE {
             Ty::Type
+        } else if let Some(union) = self.builtin_union(name) {
+            self.instantiate(union, args, span)
         } else if name == TUPLE && args.is_empty() {
             Ty::Unit
         } else if name == TUPLE {
@@ -5236,7 +5247,8 @@ fn module_path(expr: &parse::Expr) -> Option<Vec<Ident>> {
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
-    [ARRAY, VARRAY, TUPLE, EXTERNREF, TYPE].contains(&name) || Prim::from_name(name).is_some()
+    [ARRAY, VARRAY, TUPLE, EXTERNREF, TYPE, OPTION, RESULT].contains(&name)
+        || Prim::from_name(name).is_some()
 }
 
 /// The names of the fields of an array or `type`, in order. Empty for any
@@ -9689,6 +9701,94 @@ fn f() -> u32:
     }
 
     #[test]
+    fn option_and_result_are_unions_that_need_no_declaration() {
+        let src = "\
+struct Node:
+    value: i32
+    next: option(&Node)
+let slots: array(option(u8)) = [.none, .some(7)]
+fn find(n: &Node, v: i32) -> option(&Node):
+    if n.value == v:
+        return .some(n)
+    match n.next:
+        .some(next):
+            return find(next, v)
+        .none:
+            return .none
+fn parse(x: i32) -> result(u8, bool):
+    if x < 0:
+        return result(u8, bool).err(false)
+    return .ok(x as u8)
+fn sizes() -> tuple(u32, u32, u32):
+    return (option(i64).size, result(u8, f64).size, Node.size)
+fn nothing(o: option(result(i32, f32))) -> bool:
+    return o == .none
+";
+        let module = lower(src);
+        // `none` is the variant that zeroed memory holds.
+        assert_eq!(data(&module), [(0, &[0, 0, 1, 7][..])]);
+        assert_eq!(body(&module, "sizes"), "(return 16 16 12)");
+        assert_eq!(
+            body(&module, "parse"),
+            "(if (I32.LtS x 0) (then (return 1 0 0)) (else )) (return 0 (I32.And x 255) 0)"
+        );
+        let find = module.funcs.iter().find(|f| f.name == "find").unwrap();
+        assert_eq!(find.results, [ValType::I32, ValType::I32]);
+        let find = body(&module, "find");
+        assert!(
+            find.starts_with("(if (I32.Eq (I32.Load offset=0 n) v) (then (return 1 n)) (else ))"),
+            "{find}"
+        );
+        assert!(find.contains("(then (return 0 0)) (else ))"), "{find}");
+        assert_eq!(body(&module, "nothing"), "(return (I32.Eq o 0))");
+
+        use TypeErrorKind::*;
+        let src = "\
+struct option:
+    pass
+fn result():
+    pass
+fn f(a: option, b: option(i32, u8), c: result(i32), o: option(bool)) -> option(i32):
+    let x = option(i32).both(1)
+    let y = result.ok(1)
+    let z = option
+    match o:
+        .some(true):
+            pass
+        .none:
+            pass
+    return .ok(1)
+";
+        let no_variant = |variant: &str| NoVariant {
+            ty: "option(i32)".into(),
+            variant: variant.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                DuplicateItem("option".into()),
+                DuplicateItem("result".into()),
+                MissingTypeArgs("option".into()),
+                TypeArgCount {
+                    name: "option".into(),
+                    expected: 1,
+                    found: 2
+                },
+                TypeArgCount {
+                    name: "result".into(),
+                    expected: 2,
+                    found: 1
+                },
+                no_variant("both"),
+                MissingTypeArgs("result".into()),
+                MissingTypeArgs("option".into()),
+                NonExhaustive(".some(false)".into()),
+                no_variant("ok"),
+            ]
+        );
+    }
+
+    #[test]
     fn generic_unions_are_instantiated_per_type_argument() {
         let src = "\
 union(T) Option:
@@ -10818,7 +10918,7 @@ fn field(s: S) -> i32:
     return s.run(1)
 fn element(fs: array(fn(i32) -> i32)) -> i32:
     return fs[1](2)
-fn result() -> i32:
+fn returned() -> i32:
     return pick()(3)
 fn deref(p: &fn(i32) -> tuple(i32, i32)) -> i32:
     let (a, b) = p.*(4)
@@ -10840,7 +10940,7 @@ fn cast(i: u32) -> i32:
         let call = "(return (call_indirect (I32.Load offset=0 tmp2) 2))";
         assert!(element.ends_with(call), "{element}");
         assert_eq!(
-            body(&module, "result"),
+            body(&module, "returned"),
             "(return (call_indirect (call pick ) 3))"
         );
         assert_eq!(

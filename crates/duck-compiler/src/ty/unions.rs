@@ -8,10 +8,12 @@
 use std::ops::Range;
 
 use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, ValType};
+use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
-    Body, Checker, FieldDef, Item, Prim, StructId, TYPE_FIELDS, Ty, TypeErrorKind, Value, binary,
+    Body, Checker, FieldDef, Item, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS, Ty,
+    TypeErrorKind, Value, binary,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -19,6 +21,29 @@ pub(super) const TAG: Prim = Prim::U8;
 
 /// The most variants a union can have: as many as its tag tells apart.
 pub(super) const MAX_VARIANTS: usize = 256;
+
+/// The built-in unions. `none` is the first variant of `option`, so that
+/// zeroed memory holds it.
+const BUILTIN_UNIONS: [Builtin; 2] = [
+    Builtin {
+        name: OPTION,
+        params: &["T"],
+        variants: &[("none", None), ("some", Some(0))],
+    },
+    Builtin {
+        name: RESULT,
+        params: &["T", "E"],
+        variants: &[("ok", Some(0)), ("err", Some(1))],
+    },
+];
+
+/// A generic union that the language declares.
+struct Builtin {
+    name: &'static str,
+    params: &'static [&'static str],
+    /// The name of each variant, and which type parameter it holds, if any.
+    variants: &'static [(&'static str, Option<usize>)],
+}
 
 /// That a union within a value holds one of its variants.
 #[derive(Clone, Copy, PartialEq)]
@@ -54,6 +79,57 @@ impl Checker {
             Ty::Struct(id) if self.structs[id.0 as usize].union => Some(id),
             _ => None,
         }
+    }
+
+    /// Declares the built-in unions, which are generic unions that no module
+    /// declares and every module sees.
+    pub(super) fn declare_builtin_unions(&mut self) {
+        // Nothing is reported in them, so they are written nowhere.
+        let span = Span {
+            file: self.entry,
+            start: 0,
+            end: 0,
+        };
+        for union in BUILTIN_UNIONS {
+            let Builtin {
+                name,
+                params,
+                variants,
+            } = union;
+            let ident = |name: &&str| Ident {
+                name: name.to_string(),
+                span,
+            };
+            let params: Vec<_> = params.iter().map(ident).collect();
+            let params = self.new_params(&params);
+            let variant = |(name, holds): &(&str, Option<usize>)| FieldDef {
+                name: name.to_string(),
+                ty: holds.map_or(Ty::Unit, |param| params[param]),
+                is_pub: true,
+                bare: holds.is_none(),
+                default: None,
+                span,
+            };
+            self.builtin_unions
+                .push(StructId(self.structs.len() as u32));
+            self.structs.push(StructDef {
+                name: name.to_string(),
+                module: self.entry,
+                item: 0,
+                is_pub: true,
+                union: true,
+                fields: variants.iter().map(variant).collect(),
+                params,
+                instance: None,
+                depth: None,
+            });
+        }
+    }
+
+    /// The built-in union `name`, if it names one.
+    pub(super) fn builtin_union(&self, name: &str) -> Option<StructId> {
+        let index = BUILTIN_UNIONS.iter().position(|union| union.name == name)?;
+        self.builtin_unions.get(index).copied()
     }
 
     /// Resolves the variants of union `id`, which `decl` declares, with its
@@ -135,9 +211,19 @@ impl Checker {
 
 impl Body<'_> {
     /// Whether `expr` names a union: one that no variable shadows, one in a
-    /// module, a type parameter that stands for one, or a generic one given
-    /// type arguments.
+    /// module, a type parameter that stands for one, a generic one given
+    /// type arguments, or a built-in one, with them or without.
     pub(super) fn names_union(&self, expr: &parse::Expr) -> bool {
+        let generic = match &expr.kind {
+            ExprKind::Call(callee, args) if self.names_type(callee, args) => callee,
+            _ => expr,
+        };
+        if let ExprKind::Name(name) = &generic.kind
+            && self.lookup(name).is_none()
+            && self.ck.builtin_union(name).is_some()
+        {
+            return true;
+        }
         let item = match &expr.kind {
             ExprKind::Call(callee, args) if self.names_type(callee, args) => self.named(callee),
             ExprKind::Name(name) if self.lookup(name).is_none() && self.ck.item(name).is_none() => {

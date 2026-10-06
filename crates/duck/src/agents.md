@@ -56,7 +56,7 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
   match struct enum union extern use module and or not true false as`. No
-  item is named `array`, `varray`, `tuple` or `type`.
+  item is named `array`, `varray`, `tuple`, `type`, `option` or `result`.
 
 ## Types
 
@@ -65,6 +65,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
   `u32` addresses. There is no null: `0` is an address like any other.
+- `option(T)`: the union of `none` and `some: T`. `result(T, E)`: the union
+  of `ok: T` and `err: E`. Both are built in, and are unions in every way.
 - `array(T)`: a view of `ptr: &T` and `len: u32` that owns nothing.
   `varray(T)` has a `ptr: &var T`, so its elements are assignable. Strings
   are `array(u8)` of UTF-8.
@@ -94,18 +96,18 @@ union Shape:
 	rect: tuple(f32, f32)
 	empty                        # or none
 
-union(T, E) Result:              # generic, as a struct is
-	ok: T
-	err: E
+union(A, B) Either:              # generic, as a struct is
+	left: A
+	right: B
 
 enum(u8) Fault:
 	empty
 	huge
 
-fn area(s: Shape) -> Result(f32, Fault):
+fn area(s: Shape) -> result(f32, Fault):  # built in, as `option(T)` is
 	let unit = Shape.rect((1.0, 1.0))  # one argument: a tuple is not spread
 	if s == unit:
-		return Result(f32, Fault).ok(1.0)
+		return result(f32, Fault).ok(1.0)
 	if s == .empty:                    # `.name`: the type expected has it
 		return .err(.empty)            # an enum's member too
 	return .err(.huge)
@@ -113,7 +115,7 @@ fn area(s: Shape) -> Result(f32, Fault):
 
 - A value holds one variant. `Shape.circle(1.0)` builds one that holds a
   value and `Shape.empty` one that doesn't. A generic union takes its type
-  arguments, as in `Result(f32, Fault).ok(1.0)`.
+  arguments, as in `result(f32, Fault).ok(1.0)`.
 - `.name` and `.name(value)` are the variant, or the enum member, of the type
   expected there: by a `return`, an annotated binding, an assignment, an
   argument, the value of a field or variant, or the other side of an
@@ -436,7 +438,9 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   dots: `origin.x`, `name.ptr`, `name.len`.
 - A union is an `i32` that counts its variants from 0, then the scalars of
   every variant in order: `union Shape` with `circle: f32` and
-  `rect: tuple(f32, f32)` is `(i32, f32, f32, f32)`. Those of a variant the
+  `rect: tuple(f32, f32)` is `(i32, f32, f32, f32)`. `option(f32)` is
+  `(i32, f32)` with 0 for `none`, its first variant, so that zeroed memory
+  holds it, and `result(T, E)` has 0 for `ok`. The scalars of a variant the
   value doesn't hold are zero in every value Duck builds, a null `externref`
   among them, and are never read: the host may pass anything in them. A
   count that no variant has matches no arm, and memory keeps only its low
