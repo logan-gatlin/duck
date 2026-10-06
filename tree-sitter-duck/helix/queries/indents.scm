@@ -19,6 +19,7 @@
   (repeated_list)
   (tuple)
   (tuple_pattern)
+  (array_pattern)
   (parenthesized_expression)
 ] @indent
 

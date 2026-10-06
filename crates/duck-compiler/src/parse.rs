@@ -170,9 +170,14 @@ pub enum PatternKind {
     Discard,
     /// `(a, b)`, which takes a tuple apart. `()` is the empty tuple.
     Tuple(Vec<Pattern>),
-    /// `.name` or `.name(pattern)`, which only an arm of a `match` has: a
-    /// variant of a union and what it holds, or a member of an enum.
+    /// `.name` or `.name(pattern)`: a variant of a union and what it holds,
+    /// or a member of an enum. Only an arm of a `match` has one, or any of
+    /// the patterns below, as a value can fail to match them.
     Variant(Ident, Option<Box<Pattern>>),
+    /// A number, which may be negative, a string, `true` or `false`.
+    Literal(Expr),
+    /// `[a, b]`, which takes apart an array of as many elements.
+    Array(Vec<Pattern>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,33 +956,83 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// The pattern of an arm of a `match`: one a binding takes, or `.name`
-    /// or `.name(pattern)`.
+    /// The pattern of an arm of a `match`, which can fail to match, as that
+    /// of a binding can't.
     fn arm_pattern(&mut self) -> PResult<Pattern> {
-        let start = self.peek().span;
-        if !self.eat(TokenKind::Dot) {
-            let qualified = matches!(self.peek().kind, TokenKind::Ident(_))
-                && self.peek_second().kind == TokenKind::Dot;
-            let pattern = self.pattern()?;
-            if qualified {
+        let token = self.peek();
+        let kind = match &token.kind {
+            TokenKind::Dot => {
+                self.bump();
+                let name = self.ident()?;
+                let holds = match self.eat(TokenKind::LParen) {
+                    true => {
+                        let holds = self.arm_pattern()?;
+                        self.expect(TokenKind::RParen)?;
+                        Some(Box::new(holds))
+                    }
+                    false => None,
+                };
+                PatternKind::Variant(name, holds)
+            }
+            TokenKind::Ident(_) if self.peek_second().kind == TokenKind::Dot => {
+                self.bump();
                 self.bump();
                 self.ident()?;
-                return Err(self.error_from(ParseErrorKind::QualifiedPattern, start));
+                return Err(self.error_from(ParseErrorKind::QualifiedPattern, token.span));
             }
-            return Ok(pattern);
-        }
-        let name = self.ident()?;
-        let holds = match self.eat(TokenKind::LParen) {
-            true => {
-                let holds = self.pattern()?;
-                self.expect(TokenKind::RParen)?;
-                Some(Box::new(holds))
+            TokenKind::Ident(_) => return self.pattern(),
+            TokenKind::LParen => {
+                self.bump();
+                match self.parens(token.span, Self::arm_pattern)? {
+                    Parens::Empty => PatternKind::Tuple(Vec::new()),
+                    Parens::Group(inner) => inner.kind,
+                    Parens::Tuple(items) => PatternKind::Tuple(items),
+                }
             }
-            false => None,
+            TokenKind::LBracket => {
+                self.bump();
+                PatternKind::Array(self.comma_list(TokenKind::RBracket, Self::arm_pattern)?)
+            }
+            TokenKind::Minus
+            | TokenKind::Int(_)
+            | TokenKind::Float(_)
+            | TokenKind::Str(_)
+            | TokenKind::True
+            | TokenKind::False => PatternKind::Literal(self.literal_pattern()?),
+            _ => return Err(self.unexpected("pattern")),
         };
         Ok(Pattern {
-            kind: PatternKind::Variant(name, holds),
-            span: self.span_from(start),
+            kind,
+            span: self.span_from(token.span),
+        })
+    }
+
+    /// A literal that a pattern is: a number, which may follow a `-`, a
+    /// string, `true` or `false`.
+    fn literal_pattern(&mut self) -> PResult<Expr> {
+        let start = self.peek().span;
+        let negative = self.eat(TokenKind::Minus);
+        let token = self.peek();
+        let kind = match &token.kind {
+            TokenKind::Int(n) => ExprKind::Int(*n),
+            TokenKind::Float(x) => ExprKind::Float(*x),
+            _ if negative => return Err(self.unexpected("number")),
+            TokenKind::Str(s) => ExprKind::Str(s.clone()),
+            TokenKind::True => ExprKind::Bool(true),
+            TokenKind::False => ExprKind::Bool(false),
+            _ => return Err(self.unexpected("pattern")),
+        };
+        self.bump();
+        let literal = Expr {
+            kind,
+            span: token.span,
+        };
+        Ok(match negative {
+            true => Expr {
+                kind: ExprKind::Unary(UnaryOp::Neg, Box::new(literal)),
+                span: self.span_from(start),
+            },
+            false => literal,
         })
     }
 
@@ -1619,6 +1674,11 @@ mod tests {
             PatternKind::Variant(name, Some(holds)) => {
                 format!(".{}({})", name.name, render_pattern(holds))
             }
+            PatternKind::Literal(literal) => sexpr(literal),
+            PatternKind::Array(elems) => {
+                let elems: Vec<_> = elems.iter().map(render_pattern).collect();
+                format!("[{}]", elems.join(" "))
+            }
         }
     }
 
@@ -2199,6 +2259,50 @@ fn f():
     }
 
     #[test]
+    fn match_patterns_nest_and_test_literals() {
+        let src = "\
+fn f():
+    match s:
+        .some((0, _)):
+            pass
+        (.none, -1, -1.5):
+            pass
+        [a, _, 3,]:
+            pass
+        []:
+            pass
+        \"zero\":
+            pass
+        true:
+            pass
+        .rect((.a, [x, false])):
+            pass
+        (((x))):
+            pass
+";
+        let arms = arms(src);
+        let patterns: Vec<_> = arms
+            .iter()
+            .map(|arm| render_pattern(&arm.pattern))
+            .collect();
+        assert_eq!(
+            patterns,
+            [
+                ".some((0 _))",
+                "(.none (Neg 1) (Neg 1.5))",
+                "[a _ 3]",
+                "[]",
+                "\"zero\"",
+                "true",
+                ".rect((.a [x false]))",
+                "x",
+            ]
+        );
+        let span = arms[1].pattern.span;
+        assert_eq!(&src[span.start..span.end], "(.none, -1, -1.5)");
+    }
+
+    #[test]
     fn match_errors() {
         let arm = |arm: &str| format!("fn f():\n    match s:\n        {arm}:\n            pass\n");
         assert_eq!(
@@ -2231,9 +2335,32 @@ fn f():
             errors("fn f():\n    match s:\n        .a: pass\n"),
             vec![expected("newline", TokenKind::Pass)]
         );
+        let x = || TokenKind::Ident("x".into());
+        assert_eq!(errors(&arm("-x")), vec![expected("number", x())]);
+        assert_eq!(
+            errors(&arm("-true")),
+            vec![expected("number", TokenKind::True)]
+        );
+        assert_eq!(
+            errors(&arm("[a; 2]")),
+            vec![expected("`]`", TokenKind::Semi)]
+        );
+        assert_eq!(errors(&arm("(.a,)")), vec![ParseErrorKind::OneElementTuple]);
+        assert_eq!(
+            errors(&arm("(a, T.b)")),
+            vec![ParseErrorKind::QualifiedPattern]
+        );
         assert_eq!(
             errors("let .a = s\n"),
             vec![expected("pattern", TokenKind::Dot)]
+        );
+        assert_eq!(
+            errors("let [a] = s\n"),
+            vec![expected("pattern", TokenKind::LBracket)]
+        );
+        assert_eq!(
+            errors("let (a, 1) = s\n"),
+            vec![expected("pattern", TokenKind::Int(1))]
         );
         assert_eq!(
             errors("let match = 1\n"),

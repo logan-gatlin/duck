@@ -235,6 +235,12 @@ module.exports = grammar({
       $.tuple_pattern,
       $.parenthesized_pattern,
       $.variant_pattern,
+      $.array_pattern,
+      $.negative_pattern,
+      $.integer,
+      $.float,
+      $.string,
+      $.boolean,
     ),
 
     discard: _ => '_',
@@ -250,6 +256,11 @@ module.exports = grammar({
       field('name', $.identifier),
       optional(seq('(', field('value', $._pattern), ')')),
     ),
+
+    // `[a, b]`, which takes apart an array of as many elements.
+    array_pattern: $ => seq('[', commaSep($._pattern), ']'),
+
+    negative_pattern: $ => seq('-', choice($.integer, $.float)),
 
     // Types
 

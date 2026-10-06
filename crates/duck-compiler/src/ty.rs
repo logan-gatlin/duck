@@ -620,6 +620,8 @@ struct Checker {
     /// The first address after `data`, or the start of the static data
     /// section if there is none.
     data_end: u64,
+    /// The address of each string that a pattern is, which is placed once.
+    pattern_strings: HashMap<String, u32>,
     errors: Vec<TypeError>,
 }
 
@@ -1825,6 +1827,7 @@ impl Checker {
         ck.define_funcs(program);
         ck.define_globals(program);
         ck.define_param_defaults(program);
+        ck.place_pattern_strings(program);
         ck
     }
 
@@ -2580,7 +2583,9 @@ impl Checker {
                     start += self.val_types(member).len();
                 }
             }
-            PatternKind::Variant(..) => unreachable!("only an arm of a `match` has one"),
+            PatternKind::Variant(..) | PatternKind::Literal(_) | PatternKind::Array(_) => {
+                unreachable!("only an arm of a `match` has one")
+            }
         }
     }
 
@@ -5215,7 +5220,9 @@ fn pattern_names(pattern: &Pattern) -> Vec<Ident> {
                     push(elem, out);
                 }
             }
-            PatternKind::Variant(..) => unreachable!("only an arm of a `match` has one"),
+            PatternKind::Variant(..) | PatternKind::Literal(_) | PatternKind::Array(_) => {
+                unreachable!("only an arm of a `match` has one")
+            }
         }
     }
     let mut out = Vec::new();
@@ -9886,6 +9893,281 @@ fn f(s: Shape, c: Color, o: Option(Color), n: i32):
                 (VariantTakesNothing("empty".into()), "empty"),
                 (DuplicateBinding("a".into()), "a"),
                 (mismatch("tuple(_, _, _)", "tuple(f32, f32)"), "(a, b, c)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn match_patterns_test_literals_tuples_and_arrays() {
+        let src = "\
+fn sign(n: i32, strict: bool) -> i32:
+    match (n, strict):
+        (0, _):
+            return 0
+        (-1, true):
+            return -1
+        (x, false):
+            return x
+        else:
+            return 1
+fn word(s: array(u8)) -> u8:
+    match s:
+        \"zero\":
+            return 0
+        [a, _, 3]:
+            return a
+        []:
+            return 1
+        else:
+            return 2
+fn half(x: f32, b: bool) -> bool:
+    match x:
+        0.5:
+            return true
+        -2:
+            return b
+        else:
+            pass
+    match b:
+        true:
+            return false
+        false:
+            return true
+";
+        let module = lower(src);
+        // Each test of a pattern is made only if those before it passed.
+        assert_eq!(
+            body(&module, "sign"),
+            "(set x n) (set tmp3 strict) \
+             (block \
+             (if (I32.Eq x 0) (then (return 0)) (else )) \
+             (if (if (I32.Eq x -1) tmp3 0) (then (return -1)) (else )) \
+             (if (I32.Eqz tmp3) (then (return x)) (else )) \
+             (return 1)) \
+             unreachable"
+        );
+        // A string is placed in memory, and an element is read once the
+        // array is known to have it.
+        assert_eq!(data(&module), [(0, &b"zero"[..])]);
+        assert_eq!(
+            body(&module, "word"),
+            "(set tmp2 s.len) (set tmp3 s.ptr) \
+             (block \
+             (if (call ==(array(u8)) tmp2 tmp3 4 0) (then (return 0)) (else )) \
+             (if (if (I32.Eq tmp2 3) \
+             (seq (set a (I32.Load8U offset=0 tmp3)) \
+             (seq (set tmp5 (I32.Load8U offset=2 tmp3)) (I32.Eq tmp5 3))) 0) \
+             (then (return a)) (else )) \
+             (if (I32.Eq tmp2 0) (then (return 1)) (else )) \
+             (return 2)) \
+             unreachable"
+        );
+        assert_eq!(
+            body(&module, "half"),
+            "(set tmp2 x) \
+             (block \
+             (if (F32.Eq tmp2 0.5f32) (then (return 1)) (else )) \
+             (if (F32.Eq tmp2 -2f32) (then (return b)) (else ))) \
+             (set tmp3 b) \
+             (block \
+             (if tmp3 (then (return 0)) (else )) \
+             (if (I32.Eqz tmp3) (then (return 1)) (else )) \
+             unreachable) \
+             unreachable"
+        );
+    }
+
+    #[test]
+    fn strings_in_patterns_are_placed_once_with_the_literals() {
+        let src = "\
+let greeting = \"hi\"
+fn(T) kind(s: array(u8), x: T) -> i32:
+    match s:
+        \"one\":
+            return 1
+        \"\":
+            return 0
+        else:
+            return 2
+fn f(s: array(u8)) -> i32:
+    if s == greeting:
+        match s:
+            \"two\":
+                return kind(s, 1) + kind(s, true)
+            \"one\":
+                return 1
+            else:
+                pass
+    return module.static.len as i32
+";
+        let module = lower(src);
+        assert_eq!(
+            data(&module),
+            [(0, &b"hi"[..]), (2, &b"one"[..]), (5, &b"two"[..])]
+        );
+        let f = body(&module, "f");
+        assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 3 5)"), "{f}");
+        assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 3 2)"), "{f}");
+        assert!(f.ends_with("(return 8)"), "{f}");
+    }
+
+    #[test]
+    fn nested_patterns_cover_every_value_between_them() {
+        use TypeErrorKind::*;
+        let src = "\
+enum(u8) Color:
+    red
+    green
+union(T) Option:
+    some: T
+    none
+fn f(a: bool, b: bool, o: Option(bool), n: u8, s: array(u8), t: tuple(Color, bool)):
+    match (a, b):
+        (true, _):
+            pass
+        (false, true):
+            pass
+        (false, false):
+            pass
+    match (a, b):
+        (true, _):
+            pass
+        (_, true):
+            pass
+    match o:
+        .some(true):
+            pass
+        .none:
+            pass
+    match n:
+        0:
+            pass
+        1:
+            pass
+    match n:
+        0:
+            pass
+        0:
+            pass
+        else:
+            pass
+    match s:
+        \"a\":
+            pass
+        [x]:
+            pass
+        [_]:
+            pass
+        \"a\":
+            pass
+        else:
+            pass
+    match t:
+        (.red, true):
+            pass
+        (_, false):
+            pass
+    match (a, b):
+        (true, _):
+            pass
+        (_, _):
+            pass
+        else:
+            pass
+    match 0.0:
+        0.0:
+            pass
+        -0.0:
+            pass
+        else:
+            pass
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (NonExhaustive("(false, false)".into()), "(a, b)"),
+                (NonExhaustive(".some(false)".into()), "o"),
+                (NonExhaustive("_".into()), "n"),
+                (UnreachableArm, "0"),
+                (UnreachableArm, "[_]"),
+                (UnreachableArm, "\"a\""),
+                (NonExhaustive("(.green, true)".into()), "t"),
+                (UnreachableArm, "else"),
+                (UnreachableArm, "-0.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_patterns_are_of_the_type_they_test() {
+        use TypeErrorKind::*;
+        let src = "\
+union(T) Option:
+    some: T
+    none
+fn(T) g(o: Option(T)):
+    match o:
+        .some(0):
+            pass
+        else:
+            pass
+fn f(n: u8, p: &u8, s: array(i32), w: varray(u8)):
+    match n:
+        255:
+            pass
+        300:
+            pass
+        -1:
+            pass
+        1.5:
+            pass
+        true:
+            pass
+        \"a\":
+            pass
+        [a]:
+            pass
+        else:
+            pass
+    match p:
+        0:
+            pass
+        else:
+            pass
+    match s:
+        \"a\":
+            pass
+        [1.5, b]:
+            pass
+        else:
+            pass
+    match w:
+        \"a\":
+            pass
+        [1, 2]:
+            pass
+        else:
+            pass
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (mismatch("i32", "T"), "0"),
+                (IntOutOfRange("u8".into()), "300"),
+                (
+                    InvalidOperand {
+                        op: "-",
+                        ty: "u8".into()
+                    },
+                    "-1"
+                ),
+                (mismatch("f64", "u8"), "1.5"),
+                (mismatch("bool", "u8"), "true"),
+                (mismatch("array(u8)", "u8"), "\"a\""),
+                (mismatch("array(_)", "u8"), "[a]"),
+                (mismatch("i32", "&u8"), "0"),
+                (mismatch("array(u8)", "array(i32)"), "\"a\""),
+                (mismatch("f64", "i32"), "1.5"),
             ]
         );
     }

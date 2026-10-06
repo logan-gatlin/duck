@@ -348,3 +348,51 @@ fn f():
         (else_arm
           (block
             (pass_statement)))))))
+
+====================
+Match patterns
+====================
+
+fn f():
+    match s:
+        (0, -1.5, true):
+            pass
+        [a, _, "x",]:
+            pass
+        .some((.none, [])):
+            pass
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (match_statement
+        (identifier)
+        (match_arm
+          (tuple_pattern
+            (integer)
+            (negative_pattern
+              (float))
+            (boolean))
+          (block
+            (pass_statement)))
+        (match_arm
+          (array_pattern
+            (identifier)
+            (discard)
+            (string
+              (string_content)))
+          (block
+            (pass_statement)))
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (tuple_pattern
+              (variant_pattern
+                (identifier))
+              (array_pattern)))
+          (block
+            (pass_statement)))))))

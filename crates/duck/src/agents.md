@@ -158,18 +158,38 @@ fn code(c: Color, s: Shape) -> i32:
 			return 2
 		other:                   # a name matches every value, and is it
 			return 3
+
+fn word(s: array(u8), strict: bool) -> i32:
+	match (s, strict):           # patterns nest
+		("zero", _):             # a string, compared whole
+			return 0
+		([first, _], true):      # an array of exactly two elements
+			return first as i32
+		([], false):
+			return -1
+		else:
+			return 1
 ```
 
 - The first arm whose pattern matches runs, and no other. `break` and
   `continue` in an arm act on the loop around the `match`.
-- A pattern is a name, `_`, a tuple of those, or `.name` or `.name(pattern)`
-  for a variant of the value's union and what it holds, or `.name` for a
-  member of its enum. It never names the type: `Shape.empty:` is an error.
+- A pattern is one of these, and those within it are too:
+  - a name, which matches every value, or `_`, which also does
+  - `.name` or `.name(pattern)`: a variant of the value's union and what it
+    holds, or `.name`, a member of its enum
+  - `(a, b)`: a tuple, by its elements
+  - `[a, b]`: an array of exactly as many elements, by each
+  - a number, which may be negative, `true`, `false`, or a string for an
+    `array(u8)`: the value that `==` finds equal
+- A pattern never names a type or a constant: `Shape.empty:` is an error,
+  and `LIMIT:` is a new name. Structs, pointers and function pointers match
+  names and `_` only.
 - A name is an immutable copy of what it matches. Match memory through
   `match p.*`, and change it by writing a whole value: `p.* = .circle(1.0)`.
 - The arms match every value of the type between them, or the `match` is an
-  error that names what is left out. An arm that those before it leave
-  nothing for is an error too, as an `else` after every variant is.
+  error that names what is left out. Numbers, arrays and strings have no end
+  of values, so they need a name, `_` or `else`. An arm that those before it
+  leave nothing for is an error too, as an `else` after every variant is.
 - A value that no arm matches traps: memory cast to a union or enum can hold
   one, as can a value from the host.
 - In a generic body a value of type `T` matches a name, `_` or `else` only.
@@ -178,7 +198,8 @@ fn code(c: Color, s: Shape) -> i32:
 ## Literals and globals
 
 **String and array literals belong in global initializers and defaults only.**
-In a function, name a global.
+In a function, name a global. Only a string that is a pattern of a `match` is
+written in one.
 
 ```duck
 let greeting = "hello"             # array(u8)

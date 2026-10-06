@@ -4,12 +4,14 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{BinOp as IrBinOp, Const, Expr, LocalId, Stmt, ValType};
+use crate::ir::{self, BinOp as IrBinOp, Const, Expr, LocalId, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
-use crate::parse::{self, Arm, BinOp, Ident, Pattern, PatternKind};
+use crate::load::Program;
+use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, PatternKind, StmtKind};
 
 use super::{
-    Body, Checker, Label, Need, StructId, TUPLE, Ty, TypeErrorKind, Value, binary, single,
+    ARRAY, Body, Checker, Label, Need, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value,
+    array_value, binary, scalar, single,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -29,14 +31,28 @@ enum Ctor {
     Member(usize),
     /// A tuple, from its elements: the one way it's built.
     Tuple,
+    Bool(bool),
+    /// A number, by its bits. Zero has those of the positive one.
+    Number(u64),
+    Str(String),
+    /// An array, from as many elements.
+    Array(usize),
+}
+
+/// One step of telling whether a value matches a pattern.
+enum Test {
+    /// What the value passes to match.
+    Pass(Expr),
+    /// What reads the part of the value that the tests after it are of.
+    Read(Vec<Stmt>),
 }
 
 /// The pattern of an arm, checked against the type of the value.
 #[derive(Default)]
 struct Case<'p> {
-    /// What a value passes to match, each tested only if those before it
-    /// passed.
-    tests: Vec<Expr>,
+    /// What tells whether a value matches, each step taken only if the
+    /// tests before it passed.
+    tests: Vec<Test>,
     /// The names the pattern binds, with the type and the locals of the
     /// part of the value each is.
     names: Vec<(&'p str, Ty, Vec<LocalId>)>,
@@ -56,6 +72,10 @@ impl Checker {
                 }
             }
             (Ctor::Tuple, _) => self.members(ty),
+            (Ctor::Array(len), _) => match ty {
+                Ty::Array(id) => vec![self.element(id); *len],
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
@@ -73,6 +93,7 @@ impl Checker {
                 members.map(Ctor::Member).collect()
             }
             (Ty::Tuple(_) | Ty::Unit, _) => vec![Ctor::Tuple],
+            (Ty::Prim(Prim::Bool), _) => vec![Ctor::Bool(false), Ctor::Bool(true)],
             _ => return None,
         };
         let parts = |ctor: Ctor| {
@@ -171,7 +192,33 @@ impl Checker {
             (Ctor::Member(index), Ty::Enum(id), _) => {
                 format!(".{}", self.enums[id.0 as usize].members[*index].name)
             }
+            (Ctor::Bool(value), ..) => value.to_string(),
+            (Ctor::Array(_), ..) => format!("[{}]", parts.join(", ")),
+            // One of endlessly many, so no arm is ever said to lack it.
+            (Ctor::Number(_) | Ctor::Str(_), ..) => "_".to_string(),
             _ => format!("({})", parts.join(", ")),
+        }
+    }
+
+    /// Places each string that a pattern of `program` is in memory, after
+    /// the literals of its globals: a `match` compares with it there.
+    pub(super) fn place_pattern_strings(&mut self, program: &Program) {
+        let mut strings = Vec::new();
+        for item in &program.items {
+            if let ItemKind::Fn(decl) = &item.kind {
+                push_pattern_strings(&decl.body, &mut strings);
+            }
+        }
+        for string in strings {
+            if self.pattern_strings.contains_key(string) {
+                continue;
+            }
+            let offset = self.reserve_data(string.len() as u64, 1);
+            if !string.is_empty() {
+                let bytes = string.as_bytes().to_vec();
+                self.data.push(ir::Data { offset, bytes });
+            }
+            self.pattern_strings.insert(string.to_string(), offset);
         }
     }
 }
@@ -235,12 +282,20 @@ impl Body<'_> {
             for (name, ty, slots) in case.names {
                 self.bind(name, ty, false, slots);
             }
-            let tests = case.tests.into_iter().rev();
-            let test = tests.reduce(|rest, test| Expr::If {
-                ty: ValType::I32,
-                cond: Box::new(test),
-                then_expr: Box::new(rest),
-                else_expr: Box::new(Expr::Const(Const::I32(0))),
+            let test = case.tests.into_iter().rev().fold(None, |rest, test| {
+                Some(match (test, rest) {
+                    (Test::Pass(test), None) => test,
+                    (Test::Pass(test), Some(rest)) => Expr::If {
+                        ty: ValType::I32,
+                        cond: Box::new(test),
+                        then_expr: Box::new(rest),
+                        else_expr: Box::new(Expr::Const(Const::I32(0))),
+                    },
+                    (Test::Read(read), rest) => {
+                        let rest = rest.unwrap_or(Expr::Const(Const::I32(1)));
+                        Expr::Seq(read, Box::new(rest))
+                    }
+                })
             });
             let mut body = match test {
                 Some(_) => self.labelled(Label::Other, &arm.body),
@@ -324,13 +379,8 @@ impl Body<'_> {
                     }
                     Ty::Unit if elems.is_empty() => Vec::new(),
                     _ => {
-                        if ty != Ty::Error {
-                            let kind = TypeErrorKind::Mismatch {
-                                expected: format!("{TUPLE}({})", vec!["_"; elems.len()].join(", ")),
-                                found: self.ck.ty_name(ty),
-                            };
-                            self.error(kind, pattern.span);
-                        }
+                        let expected = format!("{TUPLE}({})", vec!["_"; elems.len()].join(", "));
+                        self.unmatched(expected, ty, pattern.span);
                         return self.failed(pattern, case);
                     }
                 };
@@ -360,7 +410,115 @@ impl Body<'_> {
                 };
                 built.unwrap_or_else(|| self.failed(pattern, case))
             }
+            PatternKind::Literal(literal) => {
+                let built = self.literal_pattern(literal, ty, subject, case);
+                built.unwrap_or_else(|| self.failed(pattern, case))
+            }
+            PatternKind::Array(elems) => {
+                let Ty::Array(id) = ty else {
+                    self.unmatched(format!("{ARRAY}(_)"), ty, pattern.span);
+                    return self.failed(pattern, case);
+                };
+                let elem = self.ck.element(id);
+                let (len, ptr) = (Expr::Local(subject[0]), Expr::Local(subject[1]));
+                let count = Expr::Const(Const::I32(elems.len() as i32));
+                let has_all = binary(ValType::I32, IrBinOp::Eq, len, count);
+                case.tests.push(Test::Pass(has_all));
+                let stride = self.ck.layout(elem).0;
+                let mut parts = Vec::new();
+                for (i, pattern) in elems.iter().enumerate() {
+                    // What matches every element reads none.
+                    if pattern.kind == PatternKind::Discard {
+                        parts.push(Pat::Any);
+                        continue;
+                    }
+                    let ptr = scalar(ValType::I32, ptr.clone());
+                    let value = self.load(ptr, i as u32 * stride, elem);
+                    let mut read = value.pre;
+                    let mut locals = Vec::new();
+                    for (vt, scalar) in value.scalars {
+                        let local = self.temp(vt);
+                        read.push(Stmt::SetLocal(local, scalar));
+                        locals.push(local);
+                    }
+                    case.tests.push(Test::Read(read));
+                    parts.push(self.pattern(pattern, elem, &locals, case));
+                }
+                Pat::Built(Ctor::Array(elems.len()), parts)
+            }
         }
+    }
+
+    /// Reports at `span` that a pattern matches values of the type
+    /// `expected`, as written, and not a `found`, unless that is the error
+    /// type.
+    fn unmatched(&mut self, expected: String, found: Ty, span: Span) {
+        if found != Ty::Error {
+            let found = self.ck.ty_name(found);
+            self.error(TypeErrorKind::Mismatch { expected, found }, span);
+        }
+    }
+
+    /// `literal` against a value of type `ty` held in the locals `subject`:
+    /// the value that `==` finds equal to it. `None` after reporting an
+    /// error.
+    fn literal_pattern(
+        &mut self,
+        literal: &parse::Expr,
+        ty: Ty,
+        subject: &[LocalId],
+        case: &mut Case,
+    ) -> Option<Pat> {
+        let number = match &literal.kind {
+            ExprKind::Unary(_, number) => &number.kind,
+            kind => kind,
+        };
+        let value = |subject: &[LocalId]| Expr::Local(subject[0]);
+        let ctor = match (number, ty) {
+            (ExprKind::Bool(wanted), Ty::Prim(Prim::Bool)) => {
+                case.tests.push(Test::Pass(match wanted {
+                    true => value(subject),
+                    false => Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(value(subject))),
+                }));
+                Ctor::Bool(*wanted)
+            }
+            (ExprKind::Int(_), Ty::Prim(prim)) | (ExprKind::Float(_), Ty::Prim(prim))
+                if prim.is_float() || prim.is_int() && matches!(number, ExprKind::Int(_)) =>
+            {
+                let errors = self.ck.errors.len();
+                let (_, number) = self.expr(literal, Some(ty));
+                let [(vt, Expr::Const(number))] = number.scalars[..] else {
+                    return None;
+                };
+                if self.ck.errors.len() > errors {
+                    return None;
+                }
+                let equal = binary(vt, IrBinOp::Eq, value(subject), Expr::Const(number));
+                case.tests.push(Test::Pass(equal));
+                Ctor::Number(number_bits(number))
+            }
+            (ExprKind::Str(string), Ty::Array(id)) if self.ck.element(id) == Ty::Prim(Prim::U8) => {
+                let ty = self.ck.with_writes(ty, false);
+                let locals = subject.iter().map(|local| Expr::Local(*local));
+                let value = self.scalars(ty, locals.collect());
+                let placed = self.ck.pattern_strings.get(string).copied();
+                let string_value = array_value(string.len() as u32, placed.unwrap_or(0));
+                let equal = self.compare(BinOp::Eq, ty, value, string_value);
+                case.tests.push(Test::Pass(single(equal)));
+                Ctor::Str(string.clone())
+            }
+            _ => {
+                let expected = match number {
+                    ExprKind::Bool(_) => Prim::Bool.name().to_string(),
+                    ExprKind::Int(_) => Prim::I32.name().to_string(),
+                    ExprKind::Float(_) => Prim::F64.name().to_string(),
+                    _ => format!("{ARRAY}({})", Prim::U8.name()),
+                };
+                self.unmatched(expected, ty, literal.span);
+                return None;
+            }
+        };
+        Some(Pat::Built(ctor, Vec::new()))
     }
 
     /// `.name` or `.name(holds)` against a value of union `id` held in the
@@ -398,7 +556,7 @@ impl Body<'_> {
         }
         let tag = Expr::Const(Const::I32(index as i32));
         let is_variant = binary(ValType::I32, IrBinOp::Eq, Expr::Local(subject[0]), tag);
-        case.tests.push(is_variant);
+        case.tests.push(Test::Pass(is_variant));
         let leaves = &subject[self.ck.variant_leaves(id, index)];
         let parts = holds.map(|holds| self.pattern(holds, held, leaves, case));
         Some(Pat::Built(
@@ -443,8 +601,8 @@ impl Body<'_> {
         };
         let locals = subject.iter().map(|local| Expr::Local(*local));
         let value = self.scalars(ty, locals.collect());
-        case.tests
-            .push(single(self.compare(BinOp::Eq, ty, value, member)));
+        let equal = self.compare(BinOp::Eq, ty, value, member);
+        case.tests.push(Test::Pass(single(equal)));
         Some(Pat::Built(Ctor::Member(index?), Vec::new()))
     }
 
@@ -454,9 +612,9 @@ impl Body<'_> {
     fn failed<'p>(&mut self, pattern: &'p Pattern, case: &mut Case<'p>) -> Pat {
         case.failed = true;
         let within: Vec<&Pattern> = match &pattern.kind {
-            PatternKind::Tuple(elems) => elems.iter().collect(),
+            PatternKind::Tuple(elems) | PatternKind::Array(elems) => elems.iter().collect(),
             PatternKind::Variant(_, holds) => holds.as_deref().into_iter().collect(),
-            PatternKind::Name(_) | PatternKind::Discard => Vec::new(),
+            PatternKind::Name(_) | PatternKind::Discard | PatternKind::Literal(_) => Vec::new(),
         };
         for pattern in within {
             self.pattern(pattern, Ty::Error, &[], case);
@@ -484,4 +642,62 @@ fn specialize(rows: &[Vec<Pat>], ctor: &Ctor, arity: usize) -> Vec<Vec<Pat>> {
 fn rest_of_any(rows: &[Vec<Pat>]) -> Vec<Vec<Pat>> {
     let rows = rows.iter().filter(|row| matches!(row[0], Pat::Any));
     rows.map(|row| row[1..].to_vec()).collect()
+}
+
+/// The bits of a number that a pattern is, which tell it apart from every
+/// number that `==` finds different: those of `0.0` for `-0.0` too.
+fn number_bits(number: Const) -> u64 {
+    match number {
+        Const::I32(x) => x as u32 as u64,
+        Const::I64(x) => x as u64,
+        Const::F32(x) => (x + 0.0).to_bits().into(),
+        Const::F64(x) => (x + 0.0).to_bits(),
+        Const::Null => unreachable!("only numbers are literals"),
+    }
+}
+
+/// Pushes each string that a pattern in `block` is, in source order.
+fn push_pattern_strings<'p>(block: &'p [parse::Stmt], out: &mut Vec<&'p str>) {
+    fn push<'p>(pattern: &'p Pattern, out: &mut Vec<&'p str>) {
+        match &pattern.kind {
+            PatternKind::Literal(literal) => {
+                if let ExprKind::Str(string) = &literal.kind {
+                    out.push(string);
+                }
+            }
+            PatternKind::Tuple(elems) | PatternKind::Array(elems) => {
+                for elem in elems {
+                    push(elem, out);
+                }
+            }
+            PatternKind::Variant(_, holds) => {
+                if let Some(holds) = holds {
+                    push(holds, out);
+                }
+            }
+            PatternKind::Name(_) | PatternKind::Discard => {}
+        }
+    }
+    for stmt in block {
+        match &stmt.kind {
+            StmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                push_pattern_strings(then_body, out);
+                push_pattern_strings(else_body.as_deref().unwrap_or_default(), out);
+            }
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
+                push_pattern_strings(body, out);
+            }
+            StmtKind::Match { arms, .. } => {
+                for arm in arms {
+                    push(&arm.pattern, out);
+                    push_pattern_strings(&arm.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }

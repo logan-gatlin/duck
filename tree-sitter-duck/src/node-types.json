@@ -136,7 +136,19 @@
     "named": true,
     "subtypes": [
       {
+        "type": "array_pattern",
+        "named": true
+      },
+      {
+        "type": "boolean",
+        "named": true
+      },
+      {
         "type": "discard",
+        "named": true
+      },
+      {
+        "type": "float",
         "named": true
       },
       {
@@ -144,7 +156,19 @@
         "named": true
       },
       {
+        "type": "integer",
+        "named": true
+      },
+      {
+        "type": "negative_pattern",
+        "named": true
+      },
+      {
         "type": "parenthesized_pattern",
+        "named": true
+      },
+      {
+        "type": "string",
         "named": true
       },
       {
@@ -269,6 +293,21 @@
         },
         {
           "type": "labeled_argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "array_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "_pattern",
           "named": true
         }
       ]
@@ -1184,6 +1223,25 @@
           }
         ]
       }
+    }
+  },
+  {
+    "type": "negative_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "float",
+          "named": true
+        },
+        {
+          "type": "integer",
+          "named": true
+        }
+      ]
     }
   },
   {
