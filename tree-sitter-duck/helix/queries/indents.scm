@@ -7,6 +7,9 @@
   (if_statement)
   (while_statement)
   (for_statement)
+  (match_statement)
+  (match_arm)
+  (else_arm)
 
   (parameters)
   (type_parameters)
@@ -28,6 +31,9 @@
   (if_statement)
   (while_statement)
   (for_statement)
+  (match_statement)
+  (match_arm)
+  (else_arm)
 ] @extend
 
 [

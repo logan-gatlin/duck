@@ -13,6 +13,7 @@
 (enum_member name: (identifier) @constant)
 (union_variant name: (identifier) @constant)
 (dot_expression name: (identifier) @constant)
+(variant_pattern name: (identifier) @constant)
 
 ; Functions
 
@@ -78,6 +79,7 @@
 [
   "if"
   "else"
+  "match"
 ] @keyword.conditional
 
 [

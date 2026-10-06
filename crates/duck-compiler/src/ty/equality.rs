@@ -163,7 +163,7 @@ impl Body<'_> {
     /// Compares every scalar at once, then any arrays one at a time, only
     /// while the result is still undecided. What a union's variant holds is
     /// compared only where both values hold it.
-    fn compare(&mut self, op: BinOp, ty: Ty, lhs: Value, rhs: Value) -> Value {
+    pub(super) fn compare(&mut self, op: BinOp, ty: Ty, lhs: Value, rhs: Value) -> Value {
         let parts = self.ck.parts(ty);
         let width = parts.iter().map(Part::width).sum::<usize>();
         let has_array = parts.iter().any(|p| matches!(p.how, Compare::Array(_)));

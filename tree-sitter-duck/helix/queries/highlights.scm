@@ -15,6 +15,7 @@
 (enum_member name: (identifier) @type.enum.variant)
 (union_variant name: (identifier) @type.enum.variant)
 (dot_expression name: (identifier) @type.enum.variant)
+(variant_pattern name: (identifier) @type.enum.variant)
 
 ; Functions
 
@@ -84,6 +85,7 @@
 [
   "if"
   "else"
+  "match"
 ] @keyword.control.conditional
 
 [

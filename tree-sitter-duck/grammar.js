@@ -227,11 +227,14 @@ module.exports = grammar({
 
     // Patterns
 
+    // A binding takes the first four. The rest can fail to match, so only
+    // the arms of a `match` take them.
     _pattern: $ => choice(
       $.identifier,
       $.discard,
       $.tuple_pattern,
       $.parenthesized_pattern,
+      $.variant_pattern,
     ),
 
     discard: _ => '_',
@@ -239,6 +242,14 @@ module.exports = grammar({
     tuple_pattern: $ => seq('(', optional(commaSep2($._pattern)), ')'),
 
     parenthesized_pattern: $ => seq('(', $._pattern, ')'),
+
+    // `.name` or `.name(pattern)`: a variant of a union and what it holds,
+    // or a member of an enum.
+    variant_pattern: $ => seq(
+      '.',
+      field('name', $.identifier),
+      optional(seq('(', field('value', $._pattern), ')')),
+    ),
 
     // Types
 
@@ -300,6 +311,7 @@ module.exports = grammar({
       $.if_statement,
       $.while_statement,
       $.for_statement,
+      $.match_statement,
       $.break_statement,
       $.continue_statement,
       $.pass_statement,
@@ -342,6 +354,27 @@ module.exports = grammar({
       field('iterable', $._expression),
       field('body', $.block),
     ),
+
+    // `else` is an arm that matches every value, and comes last.
+    match_statement: $ => seq(
+      'match',
+      field('value', $._expression),
+      ':',
+      $._newline,
+      $._indent,
+      choice(
+        seq(repeat1($.match_arm), optional($.else_arm)),
+        $.else_arm,
+      ),
+      $._dedent,
+    ),
+
+    match_arm: $ => seq(
+      field('pattern', $._pattern),
+      field('body', $.block),
+    ),
+
+    else_arm: $ => seq('else', field('body', $.block)),
 
     break_statement: $ => seq('break', $._newline),
 

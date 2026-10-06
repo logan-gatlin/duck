@@ -33,6 +33,7 @@ mod equality;
 mod fn_ptr;
 mod generic;
 mod generic_fn;
+mod patterns;
 mod unions;
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
@@ -152,6 +153,9 @@ const TYPE_FIELDS: [&str; 2] = ["size", "align"];
 
 /// The module that `extern` blocks without one import from.
 const DEFAULT_IMPORT_MODULE: &str = "env";
+
+/// The name of a local the compiler makes, which holds no variable.
+const TEMP: &str = "tmp";
 
 /// The most constants that can be nested, each folded where the last is
 /// first to use it.
@@ -303,6 +307,10 @@ pub enum TypeErrorKind {
     },
     /// `.name` where nothing says what type it's a variant or member of.
     UntypedDot(String),
+    /// A `match` whose arms leave out values that this pattern matches.
+    NonExhaustive(String),
+    /// An arm of a `match` after others that match every value it does.
+    UnreachableArm,
     DuplicateMember(String),
     /// Two members of an enum with the same bits.
     DuplicateValue {
@@ -986,6 +994,14 @@ impl fmt::Display for TypeErrorKind {
             Self::MemberOutOfRange { member, ty } => {
                 write!(f, "member `{member}` counts past the largest `{ty}`")
             }
+            Self::NonExhaustive(pattern) => write!(
+                f,
+                "`match` has no arm for `{pattern}`; give it one, or an `else`"
+            ),
+            Self::UnreachableArm => write!(
+                f,
+                "this arm is never reached: those before it match every value it does"
+            ),
             Self::NoMember { ty, member } => write!(f, "`{ty}` has no member `{member}`"),
             Self::ExpansiveRecursion(name) => {
                 write!(f, "`{name}` uses itself with ever larger type arguments")
@@ -2564,6 +2580,7 @@ impl Checker {
                     start += self.val_types(member).len();
                 }
             }
+            PatternKind::Variant(..) => unreachable!("only an arm of a `match` has one"),
         }
     }
 
@@ -2867,7 +2884,16 @@ impl<'c> Body<'c> {
     }
 
     fn temp(&mut self, ty: ValType) -> LocalId {
-        self.push_local("tmp".to_string(), ty)
+        self.push_local(TEMP.to_string(), ty)
+    }
+
+    /// Names the temporary `local` for what it turned out to hold, unless
+    /// it has a name.
+    fn name_temp(&mut self, local: LocalId, name: String) {
+        let local = &mut self.locals[local.0 as usize];
+        if local.name == TEMP {
+            local.name = name;
+        }
     }
 
     fn push_local(&mut self, name: String, ty: ValType) -> LocalId {
@@ -3002,6 +3028,7 @@ impl<'c> Body<'c> {
                 out.push(self.loop_stmt(inner, body));
             }
             StmtKind::For { var, iter, body } => self.for_loop(stmt, var, iter, body, out),
+            StmtKind::Match { value, arms } => self.match_stmt(stmt, value, arms, out),
             StmtKind::Break => match self.depth(Label::Break) {
                 Some(depth) => out.push(Stmt::Br(depth)),
                 None => self.error(TypeErrorKind::BreakOutsideLoop, stmt.span),
@@ -5188,6 +5215,7 @@ fn pattern_names(pattern: &Pattern) -> Vec<Ident> {
                     push(elem, out);
                 }
             }
+            PatternKind::Variant(..) => unreachable!("only an arm of a `match` has one"),
         }
     }
     let mut out = Vec::new();
@@ -5250,6 +5278,8 @@ fn diverges(block: &[parse::Stmt]) -> bool {
         StmtKind::While { cond, body } => {
             matches!(cond.kind, ExprKind::Bool(true)) && !breaks(body)
         }
+        // One of its arms runs, or it traps.
+        StmtKind::Match { arms, .. } => arms.iter().all(|arm| diverges(&arm.body)),
         _ => false,
     })
 }
@@ -5271,6 +5301,7 @@ fn breaks(block: &[parse::Stmt]) -> bool {
             else_body,
             ..
         } => breaks(then_body) || else_body.as_deref().is_some_and(breaks),
+        StmtKind::Match { arms, .. } => arms.iter().any(|arm| breaks(&arm.body)),
         _ => false,
     })
 }
@@ -9628,6 +9659,292 @@ pub fn f() -> Shape:
         let f = body(&module, "f");
         assert!(f.contains("(I32.And tmp0 255)"), "{f}");
         assert!(f.ends_with("(return @current @current.circle)"), "{f}");
+    }
+
+    #[test]
+    fn match_runs_the_first_arm_whose_pattern_matches() {
+        let src = "\
+union Shape:
+    circle: f32
+    rect: tuple(f32, f32)
+    empty
+enum(u8) Color:
+    red
+    green = 5
+fn area(s: Shape) -> f32:
+    match s:
+        .circle(r):
+            return r * r
+        .rect((w, h)):
+            return w * h
+        .empty:
+            return 0.0
+fn code(c: Color) -> i32:
+    var n = 0
+    match c:
+        .red:
+            n = 1
+        .green:
+            n = 2
+    return n
+fn other(get: fn() -> Shape) -> f32:
+    match get():
+        .circle(_):
+            pass
+        whole:
+            return area(whole)
+    return 1.0
+";
+        let module = lower(src);
+        // The value is read once, and each arm tests and reads its copy. A
+        // function ends in a trap where wasm can't tell that it has returned.
+        assert_eq!(
+            body(&module, "area"),
+            "(set tmp4 s) (set r s.circle) (set w s.rect.0) (set h s.rect.1) \
+             (block \
+             (if (I32.Eq tmp4 0) (then (return (F32.Mul r r))) (else )) \
+             (if (I32.Eq tmp4 1) (then (return (F32.Mul w h))) (else )) \
+             (if (I32.Eq tmp4 2) (then (return 0f32)) (else )) \
+             unreachable) \
+             unreachable"
+        );
+        assert_eq!(
+            body(&module, "code"),
+            "(set n 0) (set tmp2 c) \
+             (block \
+             (if (I32.Eq tmp2 0) (then (set n 1) (br 1)) (else )) \
+             (if (I32.Eq tmp2 5) (then (set n 2) (br 1)) (else )) \
+             unreachable) \
+             (return n)"
+        );
+        // An arm that matches every value needs no test, and ends the rest.
+        assert_eq!(
+            body(&module, "other"),
+            "(call_indirect get [] -> [tmp1 tmp2 tmp3 tmp4]) \
+             (set whole tmp1) (set whole.circle tmp2) (set whole.rect.0 tmp3) \
+             (set whole.rect.1 tmp4) \
+             (block \
+             (if (I32.Eq whole 0) (then (br 1)) (else )) \
+             (return (call area whole whole.circle whole.rect.0 whole.rect.1))) \
+             (return 1f32)"
+        );
+    }
+
+    #[test]
+    fn match_arms_break_and_continue_the_loop_around_them() {
+        let src = "\
+union Shape:
+    circle: f32
+    empty
+fn count(shapes: array(Shape)) -> i32:
+    var n = 0
+    for s in shapes:
+        match s:
+            .empty:
+                continue
+            .circle(r):
+                if r > 1.0:
+                    break
+        n += 1
+    return n
+";
+        let count = body(&lower(src), "count");
+        assert!(count.contains("(then (br 2)) (else ))"), "{count}");
+        assert!(count.contains("(then (br 4)) (else ))"), "{count}");
+        // A function whose `match` returns in every arm returns.
+        let src = "\
+enum(u8) Color:
+    red
+    green
+fn f(c: Color) -> i32:
+    match c:
+        .red:
+            return 1
+        .green:
+            module.unreachable()
+fn g(c: Color) -> i32:
+    match c:
+        .red:
+            return 1
+        else:
+            pass
+";
+        assert_eq!(errors(src), vec![TypeErrorKind::MissingReturn("g".into())]);
+    }
+
+    #[test]
+    fn match_arms_cover_every_value_and_each_matches_some() {
+        use TypeErrorKind::*;
+        let src = "\
+union Shape:
+    circle: f32
+    rect: tuple(f32, f32)
+    empty
+enum(u8) Color:
+    red
+    green
+union(T) Option:
+    some: T
+    none
+fn f(s: Shape, c: Color, o: Option(Color), n: i32):
+    match s:
+        .circle(r):
+            pass
+    match c:
+        .green:
+            pass
+    match c:
+        .red:
+            pass
+        else:
+            pass
+    match c:
+        .red:
+            pass
+        .green:
+            pass
+        else:
+            pass
+    match s:
+        x:
+            pass
+        .empty:
+            pass
+    match o:
+        .some(a):
+            pass
+        .some(b):
+            pass
+        .none:
+            pass
+    match n:
+        x:
+            pass
+    match n:
+        .zero:
+            pass
+        else:
+            pass
+    match c:
+        .blue:
+            pass
+        .red(x):
+            pass
+        else:
+            pass
+    match s:
+        .square:
+            pass
+        .circle:
+            pass
+        .empty(x):
+            pass
+        .rect((a, a)):
+            pass
+        .rect((a, b, c)):
+            pass
+        else:
+            pass
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (NonExhaustive(".rect(_)".into()), "s"),
+                (NonExhaustive(".red".into()), "c"),
+                (UnreachableArm, "else"),
+                (UnreachableArm, ".empty"),
+                (UnreachableArm, ".some(b)"),
+                (
+                    NoVariant {
+                        ty: "i32".into(),
+                        variant: "zero".into()
+                    },
+                    "zero"
+                ),
+                (
+                    NoMember {
+                        ty: "Color".into(),
+                        member: "blue".into()
+                    },
+                    "blue"
+                ),
+                (NotCallable(".red".into()), "red"),
+                (
+                    NoVariant {
+                        ty: "Shape".into(),
+                        variant: "square".into()
+                    },
+                    "square"
+                ),
+                (
+                    VariantNeedsValue {
+                        variant: "circle".into(),
+                        ty: "f32".into()
+                    },
+                    "circle"
+                ),
+                (VariantTakesNothing("empty".into()), "empty"),
+                (DuplicateBinding("a".into()), "a"),
+                (mismatch("tuple(_, _, _)", "tuple(f32, f32)"), "(a, b, c)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn match_in_a_generic_function_binds_what_holds_its_type_parameters() {
+        use TypeErrorKind::*;
+        let src = "\
+union(T) Option:
+    some: T
+    none
+fn(T) unwrap_or(o: Option(T), d: T) -> T:
+    match o:
+        .some(x):
+            return x
+        .none:
+            return d
+fn(T) first(pair: T) -> i32:
+    match pair:
+        whole:
+            return 1
+fn f() -> i64:
+    return unwrap_or(Option(i64).some(1), 2) + first(true) as i64
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "unwrap_or(i64)"),
+            "(set tmp3 o) (set x o.some) \
+             (block \
+             (if (I32.Eq tmp3 0) (then (return x)) (else )) \
+             (if (I32.Eq tmp3 1) (then (return d)) (else )) \
+             unreachable) \
+             unreachable"
+        );
+        // A type parameter is no union, enum or tuple until it's given a type.
+        let src = "\
+enum(u8) Color:
+    red
+fn(T) f(x: T) -> i32:
+    match x:
+        .red:
+            return 1
+        (a, b):
+            return 2
+        else:
+            return 0
+fn g() -> i32:
+    return f(Color.red)
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                NoVariant {
+                    ty: "T".into(),
+                    variant: "red".into()
+                },
+                mismatch("tuple(_, _)", "T"),
+            ]
+        );
     }
 
     #[test]

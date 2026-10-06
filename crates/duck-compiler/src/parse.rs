@@ -155,7 +155,8 @@ pub struct Binding {
     pub value: Expr,
 }
 
-/// What a binding assigns its value to.
+/// What a binding assigns its value to, or an arm of a `match` tests its
+/// value against.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub kind: PatternKind,
@@ -169,6 +170,9 @@ pub enum PatternKind {
     Discard,
     /// `(a, b)`, which takes a tuple apart. `()` is the empty tuple.
     Tuple(Vec<Pattern>),
+    /// `.name` or `.name(pattern)`, which only an arm of a `match` has: a
+    /// variant of a union and what it holds, or a member of an enum.
+    Variant(Ident, Option<Box<Pattern>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,9 +241,23 @@ pub enum StmtKind {
         iter: Expr,
         body: Block,
     },
+    /// `match value:`, which runs the first of `arms` whose pattern the
+    /// value matches.
+    Match {
+        value: Expr,
+        arms: Vec<Arm>,
+    },
     Break,
     Continue,
     Pass,
+}
+
+/// `pattern:` and the block a `match` runs for a value that matches it.
+/// `else:` is an arm whose pattern is `_`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Arm {
+    pub pattern: Pattern,
+    pub body: Block,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -356,6 +374,11 @@ pub enum ParseErrorKind {
     /// A line starting with `|>` that isn't indented deeper than the
     /// statement above it, so it continues nothing.
     LeadingPipe,
+    /// An arm of a `match` after its `else`.
+    ArmAfterElse,
+    /// A pattern that names a variant or member through its type, as in
+    /// `Shape.circle`.
+    QualifiedPattern,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -414,6 +437,11 @@ impl fmt::Display for ParseErrorKind {
             Self::LeadingPipe => write!(
                 f,
                 "a line starting with `|>` must be indented deeper than the statement it continues"
+            ),
+            Self::ArmAfterElse => write!(f, "`else` must be the last arm of a `match`"),
+            Self::QualifiedPattern => write!(
+                f,
+                "a pattern names a variant or member without its type, as in `.name`"
             ),
         }
     }
@@ -862,6 +890,12 @@ impl<'a> Parser<'a> {
                 let body = self.block()?;
                 StmtKind::For { var, iter, body }
             }
+            TokenKind::Match => {
+                self.bump();
+                let value = self.expr()?;
+                let arms = self.arms()?;
+                StmtKind::Match { value, arms }
+            }
             TokenKind::Break => self.keyword_stmt(StmtKind::Break)?,
             TokenKind::Continue => self.keyword_stmt(StmtKind::Continue)?,
             TokenKind::Pass => self.keyword_stmt(StmtKind::Pass)?,
@@ -890,6 +924,59 @@ impl<'a> Parser<'a> {
                 then_body,
                 else_body,
             },
+            span: self.span_from(start),
+        })
+    }
+
+    /// The arms of a `match`, after its value. Its `else`, if it has one,
+    /// is the last.
+    fn arms(&mut self) -> PResult<Vec<Arm>> {
+        let mut else_seen = false;
+        self.indented(|p| {
+            let start = p.peek().span;
+            let is_else = p.eat(TokenKind::Else);
+            let pattern = match is_else {
+                true => Pattern {
+                    kind: PatternKind::Discard,
+                    span: start,
+                },
+                false => p.arm_pattern()?,
+            };
+            if else_seen {
+                return Err(p.error_from(ParseErrorKind::ArmAfterElse, start));
+            }
+            else_seen = is_else;
+            let body = p.block()?;
+            Ok(Arm { pattern, body })
+        })
+    }
+
+    /// The pattern of an arm of a `match`: one a binding takes, or `.name`
+    /// or `.name(pattern)`.
+    fn arm_pattern(&mut self) -> PResult<Pattern> {
+        let start = self.peek().span;
+        if !self.eat(TokenKind::Dot) {
+            let qualified = matches!(self.peek().kind, TokenKind::Ident(_))
+                && self.peek_second().kind == TokenKind::Dot;
+            let pattern = self.pattern()?;
+            if qualified {
+                self.bump();
+                self.ident()?;
+                return Err(self.error_from(ParseErrorKind::QualifiedPattern, start));
+            }
+            return Ok(pattern);
+        }
+        let name = self.ident()?;
+        let holds = match self.eat(TokenKind::LParen) {
+            true => {
+                let holds = self.pattern()?;
+                self.expect(TokenKind::RParen)?;
+                Some(Box::new(holds))
+            }
+            false => None,
+        };
+        Ok(Pattern {
+            kind: PatternKind::Variant(name, holds),
             span: self.span_from(start),
         })
     }
@@ -1508,6 +1595,7 @@ mod tests {
                 StmtKind::If { .. } => "if",
                 StmtKind::While { .. } => "while",
                 StmtKind::For { .. } => "for",
+                StmtKind::Match { .. } => "match",
                 StmtKind::Break => "break",
                 StmtKind::Continue => "continue",
                 StmtKind::Pass => "pass",
@@ -1517,6 +1605,33 @@ mod tests {
 
     fn named(name: &str) -> TypeKind {
         TypeKind::Named(name.to_string(), None)
+    }
+
+    fn render_pattern(pattern: &Pattern) -> String {
+        match &pattern.kind {
+            PatternKind::Name(name) => name.clone(),
+            PatternKind::Discard => "_".to_string(),
+            PatternKind::Tuple(elems) => {
+                let elems: Vec<_> = elems.iter().map(render_pattern).collect();
+                format!("({})", elems.join(" "))
+            }
+            PatternKind::Variant(name, None) => format!(".{}", name.name),
+            PatternKind::Variant(name, Some(holds)) => {
+                format!(".{}({})", name.name, render_pattern(holds))
+            }
+        }
+    }
+
+    /// The arms of the `match` that is the only statement of `f` in `src`.
+    fn arms(src: &str) -> Vec<Arm> {
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        let StmtKind::Match { arms, .. } = &f.body[0].kind else {
+            panic!()
+        };
+        arms.clone()
     }
 
     #[test]
@@ -1760,19 +1875,7 @@ mod tests {
             };
             binding.pattern.clone()
         };
-        let render = |p: &Pattern| -> String {
-            fn go(p: &Pattern) -> String {
-                match &p.kind {
-                    PatternKind::Name(name) => name.clone(),
-                    PatternKind::Discard => "_".to_string(),
-                    PatternKind::Tuple(elems) => {
-                        let elems: Vec<_> = elems.iter().map(go).collect();
-                        format!("({})", elems.join(" "))
-                    }
-                }
-            }
-            go(p)
-        };
+        let render = render_pattern;
         assert_eq!(render(&pattern("let x = 1\n")), "x");
         assert_eq!(render(&pattern("let _ = 1\n")), "_");
         assert_eq!(render(&pattern("var (a, _) = t\n")), "(a _)");
@@ -2049,6 +2152,93 @@ fn f():
         };
         assert_eq!(sexpr(cond), "b");
         assert_eq!(stmt_kinds(last), vec!["pass"]);
+    }
+
+    #[test]
+    fn matches() {
+        let src = "\
+fn f():
+    match g(s):
+        .circle(r):
+            pass
+        .rect((w, _)):
+            return
+        .empty:
+            pass
+        other:
+            pass
+        else:
+            x = 1
+            return
+";
+        let arms = arms(src);
+        let patterns: Vec<_> = arms
+            .iter()
+            .map(|arm| render_pattern(&arm.pattern))
+            .collect();
+        assert_eq!(
+            patterns,
+            [".circle(r)", ".rect((w _))", ".empty", "other", "_"]
+        );
+        let bodies: Vec<_> = arms.iter().map(|arm| stmt_kinds(&arm.body)).collect();
+        assert_eq!(bodies[1], ["return"]);
+        assert_eq!(bodies[4], ["assign", "return"]);
+        let span = arms[1].pattern.span;
+        assert_eq!(&src[span.start..span.end], ".rect((w, _))");
+        let span = arms[4].pattern.span;
+        assert_eq!(&src[span.start..span.end], "else");
+
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        let StmtKind::Match { value, .. } = &f.body[0].kind else {
+            panic!()
+        };
+        assert_eq!(sexpr(value), "(call g s)");
+    }
+
+    #[test]
+    fn match_errors() {
+        let arm = |arm: &str| format!("fn f():\n    match s:\n        {arm}:\n            pass\n");
+        assert_eq!(
+            errors(&arm("Shape.circle(r)")),
+            vec![ParseErrorKind::QualifiedPattern]
+        );
+        assert_eq!(
+            errors(&arm(".circle(a, b)")),
+            vec![expected("`)`", TokenKind::Comma)]
+        );
+        assert_eq!(
+            errors(&arm(".circle()")),
+            vec![expected("pattern", TokenKind::RParen)]
+        );
+        assert_eq!(
+            errors(&arm("x + 1")),
+            vec![expected("`:`", TokenKind::Plus)]
+        );
+        assert_eq!(
+            errors(
+                "fn f():\n    match s:\n        else:\n            pass\n        .a:\n            pass\n"
+            ),
+            vec![ParseErrorKind::ArmAfterElse]
+        );
+        assert_eq!(
+            errors("fn f():\n    match s:\n    pass\n"),
+            vec![expected("indented block", TokenKind::Pass)]
+        );
+        assert_eq!(
+            errors("fn f():\n    match s:\n        .a: pass\n"),
+            vec![expected("newline", TokenKind::Pass)]
+        );
+        assert_eq!(
+            errors("let .a = s\n"),
+            vec![expected("pattern", TokenKind::Dot)]
+        );
+        assert_eq!(
+            errors("let match = 1\n"),
+            vec![expected("pattern", TokenKind::Match)]
+        );
     }
 
     #[test]

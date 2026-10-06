@@ -150,6 +150,10 @@
       {
         "type": "tuple_pattern",
         "named": true
+      },
+      {
+        "type": "variant_pattern",
+        "named": true
       }
     ]
   },
@@ -183,6 +187,10 @@
       },
       {
         "type": "if_statement",
+        "named": true
+      },
+      {
+        "type": "match_statement",
         "named": true
       },
       {
@@ -589,6 +597,22 @@
         "types": [
           {
             "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "else_arm",
+    "named": true,
+    "fields": {
+      "body": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "block",
             "named": true
           }
         ]
@@ -1059,6 +1083,62 @@
       "types": [
         {
           "type": "_expression",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "match_arm",
+    "named": true,
+    "fields": {
+      "body": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "block",
+            "named": true
+          }
+        ]
+      },
+      "pattern": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_pattern",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "match_statement",
+    "named": true,
+    "fields": {
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_expression",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "else_arm",
+          "named": true
+        },
+        {
+          "type": "match_arm",
           "named": true
         }
       ]
@@ -1702,6 +1782,32 @@
     }
   },
   {
+    "type": "variant_pattern",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "_pattern",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "while_statement",
     "named": true,
     "fields": {
@@ -1930,6 +2036,10 @@
   },
   {
     "type": "let",
+    "named": false
+  },
+  {
+    "type": "match",
     "named": false
   },
   {

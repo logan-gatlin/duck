@@ -284,3 +284,67 @@ fn f():
             (call_expression
               (identifier)
               (arguments))))))))
+
+====================
+Match
+====================
+
+fn f():
+    match g(s):
+        .circle(r):
+            pass
+        .rect((w, _)):
+            return
+        .empty:
+            pass
+        other:
+            pass
+        else:
+            pass
+    match c:
+        else:
+            pass
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (match_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier)))
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (identifier))
+          (block
+            (pass_statement)))
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (tuple_pattern
+              (identifier)
+              (discard)))
+          (block
+            (return_statement)))
+        (match_arm
+          (variant_pattern
+            (identifier))
+          (block
+            (pass_statement)))
+        (match_arm
+          (identifier)
+          (block
+            (pass_statement)))
+        (else_arm
+          (block
+            (pass_statement))))
+      (match_statement
+        (identifier)
+        (else_arm
+          (block
+            (pass_statement)))))))

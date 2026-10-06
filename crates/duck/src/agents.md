@@ -6,8 +6,8 @@ memory, and the host supplies all I/O through `extern`. `duck build` compiles
 the package of the nearest `Duck.toml`.
 
 Absent: allocator, GC, standard library, closures, anonymous functions,
-methods, traits, overloading, varargs, `match`, ternary, ranges, exceptions,
-char type, string operations.
+methods, traits, overloading, varargs, ternary, ranges, exceptions, char type,
+string operations.
 
 ## Syntax
 
@@ -55,8 +55,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - A parameter anywhere in the list may have a default. Label a later argument
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
-  struct enum union extern use module and or not true false as`. No item is
-  named `array`, `varray`, `tuple` or `type`.
+  match struct enum union extern use module and or not true false as`. No
+  item is named `array`, `varray`, `tuple` or `type`.
 
 ## Types
 
@@ -117,14 +117,63 @@ fn area(s: Shape) -> Result(f32, Fault):
   argument, the value of a field or variant, or the other side of an
   operator. `let x = .empty` is an error. So is `.name` where a type
   parameter `T` is expected: write `T.name`.
-- `==` and `!=` compare which variant each holds and then its value. Nothing
-  else reads a union: it has no fields.
+- `==` and `!=` compare which variant each holds and then its value. Only
+  `match` reads that value: a union has no fields.
 - A union has 1 to 256 variants, which are as `pub` as it is, and holds
   itself only behind a pointer. A variant named `size` or `align` hides that
   of the type.
 - In memory a union is a `u8` that counts its variants from 0 and then the
   largest variant, at the largest alignment, as C lays out
   `struct { uint8_t tag; union { ... }; }`.
+
+## Match
+
+```duck
+union Shape:
+	circle: f32
+	rect: tuple(f32, f32)
+	empty
+
+enum(u8) Color:
+	red
+	green
+
+fn area(s: Shape) -> f32:
+	match s:                     # evaluated once
+		.circle(r):              # `r` is the `f32` the variant holds
+			return r * r
+		.rect((w, _)):           # in a pattern that `let` takes
+			return w
+		.empty:
+			return 0.0
+
+fn code(c: Color, s: Shape) -> i32:
+	match c:
+		.red:                    # an enum's member
+			return 1
+		else:                    # every other value: the last arm
+			pass
+	match s:
+		.empty:
+			return 2
+		other:                   # a name matches every value, and is it
+			return 3
+```
+
+- The first arm whose pattern matches runs, and no other. `break` and
+  `continue` in an arm act on the loop around the `match`.
+- A pattern is a name, `_`, a tuple of those, or `.name` or `.name(pattern)`
+  for a variant of the value's union and what it holds, or `.name` for a
+  member of its enum. It never names the type: `Shape.empty:` is an error.
+- A name is an immutable copy of what it matches. Match memory through
+  `match p.*`, and change it by writing a whole value: `p.* = .circle(1.0)`.
+- The arms match every value of the type between them, or the `match` is an
+  error that names what is left out. An arm that those before it leave
+  nothing for is an error too, as an `else` after every variant is.
+- A value that no arm matches traps: memory cast to a union or enum can hold
+  one, as can a value from the host.
+- In a generic body a value of type `T` matches a name, `_` or `else` only.
+- `let` and `var` take names, `_` and tuples, which can't fail to match.
 
 ## Literals and globals
 

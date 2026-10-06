@@ -657,6 +657,40 @@ pub fn f():
     }
 
     #[test]
+    fn match_arms_leave_the_block_they_are_in() {
+        let src = "\
+enum(u8) Color:
+    red
+    green
+union(T) Option:
+    some: T
+    none
+fn code(o: Option(Color)) -> i32:
+    var n = 0
+    match o:
+        .some(c):
+            match c:
+                .red:
+                    n = 1
+                .green:
+                    return 2
+        .none:
+            n = 3
+    return n
+";
+        let bytes = emit_src(src);
+        let code = func_wat(&bytes, "code");
+        let lines: Vec<_> = code.lines().map(str::trim).collect();
+        let count = |line: &str| lines.iter().filter(|l| l.starts_with(line)).count();
+        // A block for each `match`, an `if` for each arm, and a branch out
+        // of the block from each arm that doesn't return.
+        assert_eq!(count("block"), 2, "{code}");
+        assert_eq!(count("if"), 4, "{code}");
+        assert_eq!(count("br 1"), 3, "{code}");
+        assert_eq!(count("unreachable"), 2, "{code}");
+    }
+
+    #[test]
     fn array_equality_functions_follow_defined_functions() {
         let src = "\
 pub struct N:
