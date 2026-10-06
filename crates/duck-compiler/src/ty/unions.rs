@@ -7,16 +7,45 @@
 
 use std::ops::Range;
 
-use crate::ir::{Const, Expr};
+use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, ValType};
 use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
-use super::{Body, Checker, FieldDef, Item, Prim, StructId, TYPE_FIELDS, Ty, TypeErrorKind, Value};
+use super::{
+    Body, Checker, FieldDef, Item, Prim, StructId, TYPE_FIELDS, Ty, TypeErrorKind, Value, binary,
+};
 
 /// The type of a union's tag in memory, which counts its variants from 0.
 pub(super) const TAG: Prim = Prim::U8;
 
 /// The most variants a union can have: as many as its tag tells apart.
 pub(super) const MAX_VARIANTS: usize = 256;
+
+/// That a union within a value holds one of its variants.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct Holds {
+    /// The leaf of the value that is the union's tag.
+    tag: usize,
+    /// The tag of the variant.
+    variant: i32,
+}
+
+impl Holds {
+    /// That the union whose tag is leaf `tag` holds its variant `index`.
+    pub(super) fn new(tag: usize, index: usize) -> Self {
+        let variant = index as i32;
+        Self { tag, variant }
+    }
+
+    /// Whether the union is the one whose tag is leaf `tag`.
+    pub(super) fn is_of(self, tag: usize) -> bool {
+        self.tag == tag
+    }
+
+    /// Whether it's so of the value with the scalars `consts`.
+    pub(super) fn in_consts(self, consts: &[Const]) -> bool {
+        consts.get(self.tag) == Some(&Const::I32(self.variant))
+    }
+}
 
 impl Checker {
     /// The union that `ty` is, if it's one.
@@ -79,6 +108,19 @@ impl Checker {
         }
         let start = TAG.size().next_multiple_of(align);
         (start, (start + size).next_multiple_of(align), align)
+    }
+
+    /// The error for giving variant `index` of union `id` a value it doesn't
+    /// hold, or none where it holds one.
+    pub(super) fn misused_variant(&self, id: StructId, index: usize) -> TypeErrorKind {
+        let variant = &self.structs[id.0 as usize].fields[index];
+        match variant.bare {
+            true => TypeErrorKind::VariantTakesNothing(variant.name.clone()),
+            false => TypeErrorKind::VariantNeedsValue {
+                variant: variant.name.clone(),
+                ty: self.ty_name(variant.ty),
+            },
+        }
     }
 
     /// The leaves of a value of union `id` that variant `index` is held in:
@@ -195,15 +237,7 @@ impl Body<'_> {
             (true, None) => Value::default(),
             (false, Some([arg])) if arg.label.is_none() => self.check(&arg.value, holds),
             _ => {
-                let variant = name.name.clone();
-                let kind = match bare {
-                    true => TypeErrorKind::VariantTakesNothing(variant),
-                    false => TypeErrorKind::VariantNeedsValue {
-                        variant,
-                        ty: self.ck.ty_name(holds),
-                    },
-                };
-                self.error(kind, name.span);
+                self.error(self.ck.misused_variant(id, index), name.span);
                 for arg in args.into_iter().flatten() {
                     self.expr(&arg.value, None);
                 }
@@ -220,5 +254,39 @@ impl Body<'_> {
         value.scalars.splice(leaves, held.scalars);
         value.pre = held.pre;
         (ty, value)
+    }
+}
+
+/// Whether the value with scalars `leaves` holds every variant of `when`.
+pub(super) fn tags_are(when: &[Holds], leaves: &[Expr]) -> Expr {
+    let mut tests = Vec::new();
+    for holds in when {
+        match &leaves[holds.tag] {
+            // The tag of a variant built in place is known.
+            Expr::Const(Const::I32(tag)) if *tag == holds.variant => {}
+            Expr::Const(_) => return Expr::Const(Const::I32(0)),
+            tag => {
+                let variant = Expr::Const(Const::I32(holds.variant));
+                tests.push(binary(ValType::I32, IrBinOp::Eq, tag.clone(), variant));
+            }
+        }
+    }
+    let tests = tests.into_iter();
+    tests
+        .reduce(|all, test| binary(ValType::I32, IrBinOp::And, all, test))
+        .unwrap_or(Expr::Const(Const::I32(1)))
+}
+
+/// `stmts`, run only where the value with scalars `leaves` holds every
+/// variant of `when`.
+pub(super) fn where_held(when: &[Holds], leaves: &[Expr], stmts: Vec<Stmt>) -> Vec<Stmt> {
+    match tags_are(when, leaves) {
+        Expr::Const(Const::I32(0)) => Vec::new(),
+        Expr::Const(_) => stmts,
+        cond => vec![Stmt::If {
+            cond,
+            then_body: stmts,
+            else_body: Vec::new(),
+        }],
     }
 }

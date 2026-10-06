@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{self, BinOp as IrBinOp, Const, Expr, LocalId, Stmt, UnOp as IrUnOp, ValType};
+use crate::ir::{BinOp as IrBinOp, Const, Expr, LocalId, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, PatternKind, StmtKind};
@@ -34,15 +34,14 @@ enum Ctor {
     Bool(bool),
     /// A number, by its bits. Zero has those of the positive one.
     Number(u64),
-    Str(String),
-    /// An array, from as many elements.
+    /// An array, from as many elements. A string is one of its bytes.
     Array(usize),
 }
 
 /// One step of telling whether a value matches a pattern.
-enum Test {
+enum Step {
     /// What the value passes to match.
-    Pass(Expr),
+    Test(Expr),
     /// What reads the part of the value that the tests after it are of.
     Read(Vec<Stmt>),
 }
@@ -50,9 +49,9 @@ enum Test {
 /// The pattern of an arm, checked against the type of the value.
 #[derive(Default)]
 struct Case<'p> {
-    /// What tells whether a value matches, each step taken only if the
-    /// tests before it passed.
-    tests: Vec<Test>,
+    /// What tells whether a value matches, each taken only if the tests
+    /// before it passed.
+    steps: Vec<Step>,
     /// The names the pattern binds, with the type and the locals of the
     /// part of the value each is.
     names: Vec<(&'p str, Ty, Vec<LocalId>)>,
@@ -107,11 +106,8 @@ impl Checker {
     /// starts one of `rows`: the rows tell every value of the type apart.
     fn complete(&self, rows: &[Vec<Pat>], ty: Ty) -> Option<Vec<(Ctor, Vec<Ty>)>> {
         let ctors = self.ctors(ty)?;
-        let starts = |ctor: &Ctor| {
-            let mut heads = rows.iter().map(|row| &row[0]);
-            heads.any(|head| matches!(head, Pat::Built(built, _) if built == ctor))
-        };
-        ctors.iter().all(|(ctor, _)| starts(ctor)).then_some(ctors)
+        let all_start = ctors.iter().all(|(ctor, _)| starts(rows, ctor));
+        all_start.then_some(ctors)
     }
 
     /// Whether `row`, a pattern for each of `tys`, matches values that none
@@ -151,12 +147,8 @@ impl Checker {
         let Some(ctors) = self.complete(rows, *ty) else {
             let mut missing = self.uncovered(&rest_of_any(rows), rest)?;
             // One of the ways that start no row, if the type's are known.
-            let starts = |ctor: &Ctor| {
-                let mut heads = rows.iter().map(|row| &row[0]);
-                heads.any(|head| matches!(head, Pat::Built(built, _) if built == ctor))
-            };
             let mut ctors = self.ctors(*ty).into_iter().flatten();
-            let head = match ctors.find(|(ctor, _)| !starts(ctor)) {
+            let head = match ctors.find(|(ctor, _)| !starts(rows, ctor)) {
                 Some((ctor, part_tys)) => Pat::Built(ctor, vec![Pat::Any; part_tys.len()]),
                 None => Pat::Any,
             };
@@ -195,7 +187,7 @@ impl Checker {
             (Ctor::Bool(value), ..) => value.to_string(),
             (Ctor::Array(_), ..) => format!("[{}]", parts.join(", ")),
             // One of endlessly many, so no arm is ever said to lack it.
-            (Ctor::Number(_) | Ctor::Str(_), ..) => "_".to_string(),
+            (Ctor::Number(_), ..) => "_".to_string(),
             _ => format!("({})", parts.join(", ")),
         }
     }
@@ -213,11 +205,7 @@ impl Checker {
             if self.pattern_strings.contains_key(string) {
                 continue;
             }
-            let offset = self.reserve_data(string.len() as u64, 1);
-            if !string.is_empty() {
-                let bytes = string.as_bytes().to_vec();
-                self.data.push(ir::Data { offset, bytes });
-            }
+            let offset = self.place_data(string.as_bytes().to_vec(), 1);
             self.pattern_strings.insert(string.to_string(), offset);
         }
     }
@@ -282,16 +270,16 @@ impl Body<'_> {
             for (name, ty, slots) in case.names {
                 self.bind(name, ty, false, slots);
             }
-            let test = case.tests.into_iter().rev().fold(None, |rest, test| {
-                Some(match (test, rest) {
-                    (Test::Pass(test), None) => test,
-                    (Test::Pass(test), Some(rest)) => Expr::If {
+            let test = case.steps.into_iter().rev().fold(None, |rest, step| {
+                Some(match (step, rest) {
+                    (Step::Test(test), None) => test,
+                    (Step::Test(test), Some(rest)) => Expr::If {
                         ty: ValType::I32,
                         cond: Box::new(test),
                         then_expr: Box::new(rest),
                         else_expr: Box::new(Expr::Const(Const::I32(0))),
                     },
-                    (Test::Read(read), rest) => {
+                    (Step::Read(read), rest) => {
                         let rest = rest.unwrap_or(Expr::Const(Const::I32(1)));
                         Expr::Seq(read, Box::new(rest))
                     }
@@ -423,7 +411,7 @@ impl Body<'_> {
                 let (len, ptr) = (Expr::Local(subject[0]), Expr::Local(subject[1]));
                 let count = Expr::Const(Const::I32(elems.len() as i32));
                 let has_all = binary(ValType::I32, IrBinOp::Eq, len, count);
-                case.tests.push(Test::Pass(has_all));
+                case.steps.push(Step::Test(has_all));
                 let stride = self.ck.layout(elem).0;
                 let mut parts = Vec::new();
                 for (i, pattern) in elems.iter().enumerate() {
@@ -441,7 +429,7 @@ impl Body<'_> {
                         read.push(Stmt::SetLocal(local, scalar));
                         locals.push(local);
                     }
-                    case.tests.push(Test::Read(read));
+                    case.steps.push(Step::Read(read));
                     parts.push(self.pattern(pattern, elem, &locals, case));
                 }
                 Pat::Built(Ctor::Array(elems.len()), parts)
@@ -476,7 +464,7 @@ impl Body<'_> {
         let value = |subject: &[LocalId]| Expr::Local(subject[0]);
         let ctor = match (number, ty) {
             (ExprKind::Bool(wanted), Ty::Prim(Prim::Bool)) => {
-                case.tests.push(Test::Pass(match wanted {
+                case.steps.push(Step::Test(match wanted {
                     true => value(subject),
                     false => Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(value(subject))),
                 }));
@@ -494,18 +482,22 @@ impl Body<'_> {
                     return None;
                 }
                 let equal = binary(vt, IrBinOp::Eq, value(subject), Expr::Const(number));
-                case.tests.push(Test::Pass(equal));
+                case.steps.push(Step::Test(equal));
                 Ctor::Number(number_bits(number))
             }
             (ExprKind::Str(string), Ty::Array(id)) if self.ck.element(id) == Ty::Prim(Prim::U8) => {
                 let ty = self.ck.with_writes(ty, false);
-                let locals = subject.iter().map(|local| Expr::Local(*local));
-                let value = self.scalars(ty, locals.collect());
-                let placed = self.ck.pattern_strings.get(string).copied();
-                let string_value = array_value(string.len() as u32, placed.unwrap_or(0));
+                let value = self.read_locals(ty, subject);
+                // Every function's are placed before any is lowered.
+                let placed = self.ck.pattern_strings[string];
+                let string_value = array_value(string.len() as u32, placed);
                 let equal = self.compare(BinOp::Eq, ty, value, string_value);
-                case.tests.push(Test::Pass(single(equal)));
-                Ctor::Str(string.clone())
+                case.steps.push(Step::Test(single(equal)));
+                // What it matches is the array of its bytes, which an array
+                // pattern may match too.
+                let bytes = string.bytes().map(|byte| Ctor::Number(byte.into()));
+                let bytes = bytes.map(|byte| Pat::Built(byte, Vec::new())).collect();
+                return Some(Pat::Built(Ctor::Array(string.len()), bytes));
             }
             _ => {
                 let expected = match number {
@@ -543,20 +535,12 @@ impl Body<'_> {
         };
         let (held, bare) = (def.fields[index].ty, def.fields[index].bare);
         if bare != holds.is_none() {
-            let variant = name.name.clone();
-            let kind = match bare {
-                true => TypeErrorKind::VariantTakesNothing(variant),
-                false => TypeErrorKind::VariantNeedsValue {
-                    variant,
-                    ty: self.ck.ty_name(held),
-                },
-            };
-            self.error(kind, name.span);
+            self.error(self.ck.misused_variant(id, index), name.span);
             return None;
         }
         let tag = Expr::Const(Const::I32(index as i32));
         let is_variant = binary(ValType::I32, IrBinOp::Eq, Expr::Local(subject[0]), tag);
-        case.tests.push(Test::Pass(is_variant));
+        case.steps.push(Step::Test(is_variant));
         let leaves = &subject[self.ck.variant_leaves(id, index)];
         let parts = holds.map(|holds| self.pattern(holds, held, leaves, case));
         Some(Pat::Built(
@@ -599,11 +583,16 @@ impl Body<'_> {
                 return None;
             }
         };
-        let locals = subject.iter().map(|local| Expr::Local(*local));
-        let value = self.scalars(ty, locals.collect());
+        let value = self.read_locals(ty, subject);
         let equal = self.compare(BinOp::Eq, ty, value, member);
-        case.tests.push(Test::Pass(single(equal)));
+        case.steps.push(Step::Test(single(equal)));
         Some(Pat::Built(Ctor::Member(index?), Vec::new()))
+    }
+
+    /// The value of type `ty` that the locals `subject` hold.
+    fn read_locals(&self, ty: Ty, subject: &[LocalId]) -> Value {
+        let locals = subject.iter().map(|local| Expr::Local(*local));
+        self.scalars(ty, locals.collect())
     }
 
     /// Marks `case` as having an error in `pattern`, which is reported, and
@@ -621,6 +610,12 @@ impl Body<'_> {
         }
         Pat::Any
     }
+}
+
+/// Whether one of `rows` starts with a pattern for values built by `ctor`.
+fn starts(rows: &[Vec<Pat>], ctor: &Ctor) -> bool {
+    let mut heads = rows.iter().map(|row| &row[0]);
+    heads.any(|head| matches!(head, Pat::Built(built, _) if built == ctor))
 }
 
 /// The rows of `rows` that match values built by `ctor` from `arity` parts,
@@ -697,7 +692,14 @@ fn push_pattern_strings<'p>(block: &'p [parse::Stmt], out: &mut Vec<&'p str>) {
                     push_pattern_strings(&arm.body, out);
                 }
             }
-            _ => {}
+            // Every statement that holds others is above.
+            StmtKind::Binding(_)
+            | StmtKind::Assign { .. }
+            | StmtKind::Expr(_)
+            | StmtKind::Return(_)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Pass => {}
         }
     }
 }

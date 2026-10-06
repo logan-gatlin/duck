@@ -437,9 +437,10 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   every variant in order: `union Shape` with `circle: f32` and
   `rect: tuple(f32, f32)` is `(i32, f32, f32, f32)`. Those of a variant the
   value doesn't hold are zero in every value Duck builds, a null `externref`
-  among them, and are never read: the host may pass anything in them. An
-  exported `shape` is the globals `shape`, `shape.circle`, `shape.rect.0` and
-  `shape.rect.1`.
+  among them, and are never read: the host may pass anything in them. A
+  count that no variant has matches no arm, and memory keeps only its low
+  byte. An exported `shape` is the globals `shape`, `shape.circle`,
+  `shape.rect.0` and `shape.rect.1`.
 
 ## Duck.toml
 

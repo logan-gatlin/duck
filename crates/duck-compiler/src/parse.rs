@@ -974,10 +974,11 @@ impl<'a> Parser<'a> {
                 };
                 PatternKind::Variant(name, holds)
             }
-            TokenKind::Ident(_) if self.peek_second().kind == TokenKind::Dot => {
+            // `Shape.circle`, or `Option(i32).some`.
+            TokenKind::Ident(_)
+                if matches!(self.peek_second().kind, TokenKind::Dot | TokenKind::LParen) =>
+            {
                 self.bump();
-                self.bump();
-                self.ident()?;
                 return Err(self.error_from(ParseErrorKind::QualifiedPattern, token.span));
             }
             TokenKind::Ident(_) => return self.pattern(),
@@ -2307,6 +2308,10 @@ fn f():
         let arm = |arm: &str| format!("fn f():\n    match s:\n        {arm}:\n            pass\n");
         assert_eq!(
             errors(&arm("Shape.circle(r)")),
+            vec![ParseErrorKind::QualifiedPattern]
+        );
+        assert_eq!(
+            errors(&arm("Option(f32).some(x)")),
             vec![ParseErrorKind::QualifiedPattern]
         );
         assert_eq!(

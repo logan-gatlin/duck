@@ -26,6 +26,7 @@ use defaults::DefaultValue;
 use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
 use generic_fn::{FnInstance, GenericFn, InstanceCall, Need, Needs};
+use unions::{Holds, tags_are, where_held};
 
 mod defaults;
 mod enums;
@@ -775,7 +776,7 @@ enum Label {
     Break,
     /// The `loop` itself.
     Continue,
-    /// An `if`.
+    /// An `if`, a `match`, or an arm of one.
     Other,
 }
 
@@ -833,10 +834,9 @@ struct Cell {
     store: StoreOp,
     /// Whether the cell holds a `bool`, which may be any byte in memory.
     bool: bool,
-    /// For a cell of a union's variant, the leaf that is the union's tag and
-    /// the value it has when the union holds the variant, for each union
-    /// the cell is in, outermost first. Otherwise the cell holds nothing.
-    when: Vec<(usize, i32)>,
+    /// For a cell of a union's variant, each union it's in and the variant
+    /// of it, outermost first: the cell holds nothing unless they all hold.
+    when: Vec<Holds>,
 }
 
 /// Why a global initializer could not be folded.
@@ -1491,10 +1491,10 @@ impl Checker {
         self.resolve_enums(program);
         let mut decl_count = 0;
         for item in &program.items {
-            let (params, name) = match &item.kind {
-                ItemKind::Struct(decl) => (&decl.params, &decl.name),
-                ItemKind::Union(decl) => (&decl.params, &decl.name),
-                _ => continue,
+            let (ItemKind::Struct(StructDecl { name, params, .. })
+            | ItemKind::Union(UnionDecl { name, params, .. })) = &item.kind
+            else {
+                continue;
             };
             let id = decl_count;
             decl_count += 1;
@@ -1502,9 +1502,9 @@ impl Checker {
             let tys = self.structs[id].params.clone();
             self.declare_type_params(params, &tys);
             let fields = match &item.kind {
-                ItemKind::Struct(decl) => self.struct_fields(id, decl),
                 ItemKind::Union(decl) => self.union_variants(id, decl),
-                _ => unreachable!("only structs and unions have fields"),
+                ItemKind::Struct(decl) => self.struct_fields(id, decl),
+                _ => Vec::new(),
             };
             self.type_params.clear();
             self.structs[id].fields = fields;
@@ -2425,7 +2425,8 @@ impl Checker {
     }
 
     /// The primitive type of each scalar leaf of `ty`, or `None` for
-    /// pointers, function pointers, and `externref`s.
+    /// pointers, function pointers, `externref`s, and the tags of unions,
+    /// which are only bytes in memory.
     fn leaf_prims(&self, ty: Ty) -> Vec<Option<Prim>> {
         let mut out = Vec::new();
         self.push_leaf_prims(ty, &mut out);
@@ -2439,7 +2440,7 @@ impl Checker {
             Ty::Enum(id) => self.push_leaf_prims(self.enum_ty(id), out),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 if self.union_id(ty).is_some() {
-                    out.push(Some(unions::TAG));
+                    out.push(None);
                 }
                 for member in self.members(ty) {
                     self.push_leaf_prims(member, out);
@@ -2633,8 +2634,8 @@ impl Checker {
     }
 
     /// Pushes the cells of a `ty` at `offset`, which hold nothing unless
-    /// each tag of `when` has its value.
-    fn push_cells(&self, ty: Ty, offset: u32, when: &[(usize, i32)], out: &mut Vec<Cell>) {
+    /// every union of `when` holds its variant.
+    fn push_cells(&self, ty: Ty, offset: u32, when: &[Holds], out: &mut Vec<Cell>) {
         let when = when.to_vec();
         match ty {
             Ty::Prim(prim) => out.push(Cell {
@@ -2660,7 +2661,7 @@ impl Checker {
                 let start = offset + self.union_layout(id).0;
                 for (index, variant) in self.members(ty).into_iter().enumerate() {
                     let mut when = when.clone();
-                    when.push((tag, index as i32));
+                    when.push(Holds::new(tag, index));
                     self.push_cells(variant, start, &when, out);
                 }
             }
@@ -2679,8 +2680,7 @@ impl Checker {
     /// storing each to its cell of `cells` would.
     fn write_consts(&self, out: &mut [u8], cells: &[Cell], consts: &[Const]) {
         for (cell, c) in cells.iter().zip(consts) {
-            let held = |(tag, value): &(usize, i32)| consts.get(*tag) == Some(&Const::I32(*value));
-            if cell.when.iter().all(held) {
+            if cell.when.iter().all(|holds| holds.in_consts(consts)) {
                 write_const(&mut out[cell.offset as usize..], cell.store, *c);
             }
         }
@@ -2690,11 +2690,17 @@ impl Checker {
     /// multiple of `align`, or right at the end if there are none. Returns the
     /// array of them.
     fn push_data(&mut self, bytes: Vec<u8>, align: u32, len: u32) -> Value {
+        array_value(len, self.place_data(bytes, align))
+    }
+
+    /// Places `bytes` in memory at the next multiple of `align`, or right
+    /// at the end if there are none. Returns their address.
+    fn place_data(&mut self, bytes: Vec<u8>, align: u32) -> u32 {
         let offset = self.reserve_data(bytes.len() as u64, align);
         if !bytes.is_empty() {
             self.data.push(ir::Data { offset, bytes });
         }
-        array_value(len, offset)
+        offset
     }
 
     /// Makes room in memory for `size` bytes at the next multiple of `align`,
@@ -2849,7 +2855,7 @@ impl<'c> Body<'c> {
 
     /// Records what `stmt`, checked just now in a generic function as
     /// declared, needs of the type arguments. `bound` is the type of what it
-    /// binds names in, if it's a `let`, `var` or `for`.
+    /// binds names in, if it's a `let`, `var`, `for` or `match`.
     fn record(&mut self, stmt: &parse::Stmt, bound: Option<Ty>) {
         if !self.ck.open {
             return;
@@ -3056,9 +3062,9 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// The type and value of what a `let`, `var` or `for` that isn't checked
-    /// for an instance binds names in: `ty`, as its declaration found it,
-    /// with the instance's type arguments.
+    /// The type and value of what a `let`, `var`, `for` or `match` that isn't
+    /// checked for an instance binds names in: `ty`, as its declaration
+    /// found it, with the instance's type arguments.
     fn unchecked(&mut self, ty: Ty, span: Span) -> (Ty, Value) {
         let args: Vec<_> = self.ck.type_params.iter().map(|(_, arg)| *arg).collect();
         let ty = self.ck.substitute(ty, &args, span);
@@ -3453,7 +3459,7 @@ impl<'c> Body<'c> {
                 let mut stores = stores.into_iter();
                 for variant in cells.chunk_by(|a, b| a.when == b.when) {
                     let stores = stores.by_ref().take(variant.len()).collect();
-                    out.extend(held(&variant[0].when, &scalars, stores));
+                    out.extend(where_held(&variant[0].when, &scalars, stores));
                 }
             }
         }
@@ -3856,7 +3862,7 @@ impl<'c> Body<'c> {
             self.error(TypeErrorKind::UntypedEmptyArray, span);
             return (Ty::Error, Value::default());
         };
-        if !self.places(elem, errors, span) {
+        if !self.placeable(elem, errors, span) {
             return (Ty::Error, Value::default());
         }
         let (size, align) = self.ck.layout(elem);
@@ -3874,7 +3880,7 @@ impl<'c> Body<'c> {
     /// holds an `externref` is reported at `span`, unless the literal it's
     /// in has an error already, having had `errors` before it: only a union
     /// that holds none in place of one is constant.
-    fn places(&mut self, ty: Ty, errors: usize, span: Span) -> bool {
+    fn placeable(&mut self, ty: Ty, errors: usize, span: Span) -> bool {
         if ty == Ty::Error {
             return false;
         }
@@ -3910,7 +3916,7 @@ impl<'c> Body<'c> {
         let consts = self.ck.fold_value(&lowered, value.span);
         let lowered = self.check(len, Ty::Prim(Prim::U32));
         let count = self.ck.fold_value(&lowered, len.span);
-        if !self.ck.fits(ty, elem) || !self.places(elem, errors, span) {
+        if !self.ck.fits(ty, elem) || !self.placeable(elem, errors, span) {
             return (Ty::Error, Value::default());
         }
         let [Const::I32(count)] = count[..] else {
@@ -4411,7 +4417,7 @@ impl<'c> Body<'c> {
         }
         let errors = self.ck.errors.len();
         let consts = self.ck.fold_value(&value, span);
-        if !self.places(ty, errors, span) {
+        if !self.placeable(ty, errors, span) {
             return (Ty::Error, Value::default());
         }
         let ty = want.filter(|want| self.ck.fits(ty, *want)).unwrap_or(ty);
@@ -4756,7 +4762,7 @@ impl<'c> Body<'c> {
                 };
             }
             // A tag is read again for each cell of its variants.
-            let is_tag = |cell: &Cell| cell.when.iter().any(|(tag, _)| *tag == leaf);
+            let is_tag = |cell: &Cell| cell.when.iter().any(|holds| holds.is_of(leaf));
             if cells.iter().any(is_tag) {
                 let tmp = self.temp(cell.ty);
                 pre.push(Stmt::SetLocal(tmp, load));
@@ -4827,41 +4833,6 @@ fn array_value(len: u32, ptr: u32) -> Value {
 
 fn exprs(scalars: Vec<(ValType, Expr)>) -> Vec<Expr> {
     scalars.into_iter().map(|(_, e)| e).collect()
-}
-
-/// Whether every tag of `when`, each a leaf of the value with scalars
-/// `leaves`, has its value: whether the unions hold the variants.
-fn tags_are(when: &[(usize, i32)], leaves: &[Expr]) -> Expr {
-    let mut tests = Vec::new();
-    for (tag, value) in when {
-        match &leaves[*tag] {
-            // The tag of a variant built in place is known.
-            Expr::Const(Const::I32(tag)) if tag == value => {}
-            Expr::Const(_) => return Expr::Const(Const::I32(0)),
-            tag => {
-                let value = Expr::Const(Const::I32(*value));
-                tests.push(binary(ValType::I32, IrBinOp::Eq, tag.clone(), value));
-            }
-        }
-    }
-    let tests = tests.into_iter();
-    tests
-        .reduce(|all, test| binary(ValType::I32, IrBinOp::And, all, test))
-        .unwrap_or(Expr::Const(Const::I32(1)))
-}
-
-/// `stmts`, run only where the value with scalars `leaves` has each tag of
-/// `when` at its value.
-fn held(when: &[(usize, i32)], leaves: &[Expr], stmts: Vec<Stmt>) -> Vec<Stmt> {
-    match tags_are(when, leaves) {
-        Expr::Const(Const::I32(0)) => Vec::new(),
-        Expr::Const(_) => stmts,
-        cond => vec![Stmt::If {
-            cond,
-            then_body: stmts,
-            else_body: Vec::new(),
-        }],
-    }
 }
 
 /// Whether `expr` is a local or a constant, which is as cheap to read again
@@ -9662,10 +9633,14 @@ pub fn f() -> Shape:
                 ("current.circle", Const::F32(0.0)),
             ]
         );
-        // The host may give any `i32` for the tag, which is a byte.
-        let f = body(&module, "f");
-        assert!(f.contains("(I32.And tmp0 255)"), "{f}");
-        assert!(f.ends_with("(return @current @current.circle)"), "{f}");
+        // The tag is as the host gives it: one that no variant has is told
+        // from every one that a variant does.
+        assert_eq!(
+            body(&module, "f"),
+            "(call get [] -> [tmp0 tmp1]) (set tmp2 tmp0) (set tmp3 tmp1) \
+             (set @current tmp2) (set @current.circle tmp3) \
+             (return @current @current.circle)"
+        );
     }
 
     #[test]
@@ -10062,6 +10037,19 @@ fn f(a: bool, b: bool, o: Option(bool), n: u8, s: array(u8), t: tuple(Color, boo
             pass
         else:
             pass
+    match s:
+        [_]:
+            pass
+        \"b\":
+            pass
+        \"cd\":
+            pass
+        [99, 100]:
+            pass
+        [99, _]:
+            pass
+        else:
+            pass
     match t:
         (.red, true):
             pass
@@ -10091,6 +10079,8 @@ fn f(a: bool, b: bool, o: Option(bool), n: u8, s: array(u8), t: tuple(Color, boo
                 (UnreachableArm, "0"),
                 (UnreachableArm, "[_]"),
                 (UnreachableArm, "\"a\""),
+                (UnreachableArm, "\"b\""),
+                (UnreachableArm, "[99, 100]"),
                 (NonExhaustive("(.green, true)".into()), "t"),
                 (UnreachableArm, "else"),
                 (UnreachableArm, "-0.0"),
@@ -10189,8 +10179,12 @@ fn(T) first(pair: T) -> i32:
     match pair:
         whole:
             return 1
+fn(T) either(a: Option(T), b: Option(T)) -> Option(T):
+    return a
 fn f() -> i64:
-    return unwrap_or(Option(i64).some(1), 2) + first(true) as i64
+    let a = either(.none, Option(u8).some(1))
+    let b = either(Option(u8).some(1), .none)
+    return unwrap_or(Option(i64).some(1), 2) + first(a == b) as i64
 ";
         let module = lower(src);
         assert_eq!(

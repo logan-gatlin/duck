@@ -10,16 +10,17 @@ use crate::parse::BinOp;
 
 use super::{
     Body, Checker, FuncSig, Prim, Synth, Ty, TypeErrorKind, Value, binary, binop_symbol,
-    element_addr, exprs, is_pure, is_simple, is_stable, scalar, split1, tags_are, unions,
+    element_addr, exprs, is_pure, is_simple, is_stable, scalar, split1,
+    unions::{self, Holds, tags_are},
 };
 
 /// One piece of a value that is compared, in leaf order.
 struct Part {
     how: Compare,
-    /// For a piece of a union's variant, the leaf that is the union's tag
-    /// and the value it has when the union holds the variant, for each union
-    /// the piece is in, outermost first. Otherwise the piece isn't compared.
-    when: Vec<(usize, i32)>,
+    /// For a piece of a union's variant, each union it's in and the variant
+    /// of it, outermost first: the piece is compared only where they all
+    /// hold.
+    when: Vec<Holds>,
 }
 
 /// How a piece of a value is compared.
@@ -50,9 +51,9 @@ impl Checker {
         out
     }
 
-    /// Pushes the pieces of a `ty`, which are compared where each tag of
-    /// `when` has its value, and by their `bits` within an enum.
-    fn push_parts(&self, ty: Ty, bits: bool, when: &[(usize, i32)], out: &mut Vec<Part>) {
+    /// Pushes the pieces of a `ty`, which are compared where every union of
+    /// `when` holds its variant, and by their `bits` within an enum.
+    fn push_parts(&self, ty: Ty, bits: bool, when: &[Holds], out: &mut Vec<Part>) {
         let scalar = |vt| match bits {
             true => Compare::Bits(vt),
             false => Compare::Scalar(vt),
@@ -71,7 +72,7 @@ impl Checker {
                 out.push(part(scalar(unions::TAG.val_type())));
                 for (index, variant) in self.members(ty).into_iter().enumerate() {
                     let mut when = when.to_vec();
-                    when.push((tag, index as i32));
+                    when.push(Holds::new(tag, index));
                     self.push_parts(variant, bits, &when, out);
                 }
             }

@@ -126,7 +126,8 @@ pub struct Func {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Local {
     /// Source name for debugging, with a `.field` suffix per level for split
-    /// structs. Compiler temporaries are named `tmp`.
+    /// structs. Compiler temporaries are named `tmp`, but for those that
+    /// hold what a pattern names.
     pub name: String,
     pub ty: ValType,
 }

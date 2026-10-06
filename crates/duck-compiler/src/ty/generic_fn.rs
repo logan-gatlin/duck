@@ -21,7 +21,7 @@ use crate::parse::{self, Arg};
 use super::generic::Arity;
 use super::{
     Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
-    generic_fn_decls, is_literal, path_text, pending_defaults,
+    generic_fn_decls, is_typed_by_other, path_text, pending_defaults,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -70,14 +70,15 @@ pub(super) struct Needs {
 }
 
 /// What a statement in the body of a generic function needs of its type
-/// arguments. That of an `if` or `while` is its condition's, and that of a
-/// `for` is its array's: the statements within have their own.
+/// arguments. That of an `if` or `while` is its condition's, that of a `for`
+/// is its array's, and that of a `match` is its value's and its patterns':
+/// the statements within have their own.
 #[derive(Clone, Copy)]
 pub(super) enum Need {
     /// Something that not every type has, so it's checked for each instance.
     Check,
-    /// Nothing, but it's a `let`, `var` or `for` that binds names in a value
-    /// of this type, which may hold type parameters.
+    /// Nothing, but it's a `let`, `var`, `for` or `match` that binds names
+    /// in a value of this type, which may hold type parameters.
     Bind(Ty),
     /// Nothing.
     Skip,
@@ -544,9 +545,10 @@ impl Body<'_> {
 
     /// Infers the type arguments of a call of generic function `generic`
     /// from the `args` that `binding` matches with its parameters. Arguments
-    /// that aren't literals go first, so that literals take the types they
-    /// settle, and those naming generic functions are left for last. Those it checks are kept in `checked`. Type parameters that
-    /// no argument settles are reported at `span`, and given the error type.
+    /// that aren't literals or `.name`s go first, so that those take the
+    /// types they settle, and those naming generic functions are left for
+    /// last. Those it checks are kept in `checked`. Type parameters that no
+    /// argument settles are reported at `span`, and given the error type.
     fn infer_type_args(
         &mut self,
         generic: GenericFnId,
@@ -567,7 +569,7 @@ impl Body<'_> {
                 // type, so it settles nothing.
                 let generic = matches!(self.named(&arg.value), Some(Item::GenericFn(_)));
                 if generic
-                    || is_literal(&arg.value) != literals
+                    || is_typed_by_other(&arg.value) != literals
                     || !self.ck.has_unbound(patterns[i], &bound)
                 {
                     continue;
