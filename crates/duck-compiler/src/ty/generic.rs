@@ -364,6 +364,7 @@ impl Checker {
         self.structs.push(StructDef {
             name: format!("{}({})", decl.name, names.join(", ")),
             module: decl.module,
+            item: decl.item,
             is_pub: decl.is_pub,
             params: Vec::new(),
             instance: Some(Instance {

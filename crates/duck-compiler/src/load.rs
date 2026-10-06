@@ -4,7 +4,7 @@
 //! `util/strings.duck` is `util.strings`. Its items are kept apart from those
 //! of other modules, which it reaches through the names `use` gives them.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::Error;
@@ -26,9 +26,6 @@ pub enum UseErrorKind {
     /// A path starting with the name of both a module of the package and a
     /// dependency.
     Ambiguous(String),
-    /// A module that uses itself, through the modules named in order,
-    /// starting and ending with itself.
-    Cycle(Vec<String>),
 }
 
 /// The items of every module of a program, and the names modules give what
@@ -36,9 +33,10 @@ pub enum UseErrorKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     /// Every module's items, each module's after those of every module it
-    /// uses, which is the order globals are initialized in.
+    /// uses that doesn't use it in turn.
     pub items: Vec<Item>,
-    /// Each after every `use` of the module it leads into.
+    /// Each after every `use` of the module it leads into, unless that
+    /// module uses this one in turn.
     pub uses: Vec<Use>,
     /// The module whose `pub` items the program exports.
     pub entry: FileId,
@@ -60,19 +58,10 @@ pub struct Use {
     pub is_pub: bool,
 }
 
-/// How far a module has been loaded.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// Loading it or a module it uses.
-    Loading,
-    Loaded,
-}
-
 struct Loader<'f, F> {
     files: &'f mut F,
-    states: HashMap<FileId, State>,
-    /// The modules being loaded, each used by the one before.
-    stack: Vec<FileId>,
+    /// The modules loaded or being loaded, which are not loaded again.
+    seen: HashSet<FileId>,
     items: Vec<Item>,
     uses: Vec<Use>,
     errors: Vec<Error>,
@@ -89,7 +78,6 @@ impl fmt::Display for UseErrorKind {
                 f,
                 "`{name}` is both a module of this package and a dependency"
             ),
-            Self::Cycle(modules) => write!(f, "use cycle: {}", modules.join(" -> ")),
         }
     }
 }
@@ -116,20 +104,20 @@ impl Program {
 /// Lexes and parses the entry point of `files` and every module it uses,
 /// recursively.
 ///
-/// Each module is loaded once, however many modules use it. Errors in one
-/// file don't stop the others from loading, but the uses of a file that
-/// fails to lex or parse are not followed.
+/// Each module is loaded once, however many modules use it, and modules may
+/// use one another. Errors in one file don't stop the others from loading,
+/// but the uses of a file that fails to lex or parse are not followed.
 pub fn load(files: &mut impl FileManager) -> Result<Program, Vec<Error>> {
     let entry = files.entry_point();
     let mut loader = Loader {
         files,
-        states: HashMap::new(),
-        stack: Vec::new(),
+        seen: HashSet::new(),
         items: Vec::new(),
         uses: Vec::new(),
         errors: Vec::new(),
     };
-    loader.file(entry);
+    loader.seen.insert(entry);
+    loader.items_of(entry);
     if loader.errors.is_empty() {
         Ok(Program {
             items: loader.items,
@@ -142,14 +130,6 @@ pub fn load(files: &mut impl FileManager) -> Result<Program, Vec<Error>> {
 }
 
 impl<F: FileManager> Loader<'_, F> {
-    fn file(&mut self, id: FileId) {
-        self.states.insert(id, State::Loading);
-        self.stack.push(id);
-        self.items_of(id);
-        self.stack.pop();
-        self.states.insert(id, State::Loaded);
-    }
-
     fn items_of(&mut self, id: FileId) {
         let src = self.files.contents(id);
         let tokens = match lex::tokenize(id, &src) {
@@ -160,7 +140,8 @@ impl<F: FileManager> Loader<'_, F> {
             Ok(module) => module,
             Err(errors) => return self.errors.extend(errors.into_iter().map(Error::Parse)),
         };
-        // Uses come first, so the modules they load precede these items.
+        // Uses come first, so the modules they load precede these items,
+        // but for one that is being loaded: it uses this module in turn.
         for item in module.items {
             match &item.kind {
                 ItemKind::Use(decl) => {
@@ -193,15 +174,8 @@ impl<F: FileManager> Loader<'_, F> {
             (None, Some(library)) => (library, 1),
             (None, None) => return Err(UseErrorKind::NotFound(names.join("."))),
         };
-        match self.states.get(&target) {
-            None => self.file(target),
-            Some(State::Loaded) => {}
-            Some(State::Loading) => {
-                let start = self.stack.iter().position(|id| *id == target).unwrap();
-                let cycle = self.stack[start..].iter().chain([&target]);
-                let names = cycle.map(|id| self.files.display_name(*id)).collect();
-                return Err(UseErrorKind::Cycle(names));
-            }
+        if self.seen.insert(target) {
+            self.items_of(target);
         }
         let name = path.alias.as_ref().or(path.segments.last()).unwrap();
         self.uses.push(Use {
@@ -385,17 +359,59 @@ mod tests {
     }
 
     #[test]
-    fn use_cycles_are_errors_at_the_use_that_closes_them() {
+    fn modules_use_each_other() {
         let mut files = Memory(vec![
-            ("main", "use a\n"),
-            ("a", "use b\n"),
-            ("b", "use main.x\nuse b\n"),
+            (
+                "main",
+                "use a\nuse b\npub let x = a.y + 1\npub let v = b.w\npub fn f() -> i32:\n    return a.g()\n",
+            ),
+            (
+                "a",
+                "use b\npub let y = b.z * 2\npub fn g() -> i32:\n    return b.h(b.P(n: y))\n",
+            ),
+            (
+                "b",
+                "use main.x\nuse a\nuse b\npub let z = 3\npub let w = x + a.y + b.z\npub struct P:\n    pub n: i32 = w\npub fn h(p: P) -> i32:\n    return p.n + P().n + a.g()\n",
+            ),
+        ]);
+        let program = load(&mut files).unwrap();
+        let modules: Vec<_> = program.items.iter().map(|item| item.span.file).collect();
+        // Each is loaded once, after those it uses that aren't being loaded.
+        let (main, a, b) = (files.id("main"), files.id("a"), files.id("b"));
+        assert_eq!(modules, [b, b, b, b, a, a, main, main, main]);
+        let module = lower(&mut files);
+        let inits: Vec<_> = module.globals.iter().map(|g| g.init).collect();
+        // `w` is first to use `x`, which is first to use `y`.
+        assert_eq!(inits, [Const::I32(7), Const::I32(16)]);
+    }
+
+    #[test]
+    fn uses_reach_names_through_uses_that_follow_them() {
+        let mut files = Memory(vec![
+            ("main", "use a\npub let n = a.b.m\n"),
+            ("a", "pub use b\npub use b.T\npub let one = 1\n"),
+            (
+                "b",
+                "use a\nuse a.T as U\nuse a.b.T as V\npub struct T:\n    pub n: i32 = 2\npub let m = U().n + V().n + a.one\n",
+            ),
+        ]);
+        let module = lower(&mut files);
+        assert_eq!(module.globals[0].init, Const::I32(5));
+    }
+
+    #[test]
+    fn uses_do_not_lead_back_to_themselves() {
+        let mut files = Memory(vec![
+            ("main", "use a.{x, y}\nuse main.me\nlet z = x + y + me\n"),
+            ("a", "use b\npub use b.x\npub use b.y\n"),
+            ("b", "pub use a.x\npub use b.c.y\nuse b as c\n"),
         ]);
         assert_eq!(
             errors(&mut files),
             [
-                "b \"main.x\": use cycle: main -> a -> b -> main",
-                "b \"b\": use cycle: b -> b",
+                "a \"x\": `use` of `b.x` leads back to itself",
+                "b \"y\": `use` of `b.c.y` leads back to itself",
+                "main \"me\": `use` of `main.me` leads back to itself",
             ]
         );
     }

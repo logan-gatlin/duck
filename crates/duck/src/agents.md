@@ -64,7 +64,7 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   Numeric types never mix (`u8 + i32` is an error): convert with `as`.
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
-  `u32` addresses, and `0` is null.
+  `u32` addresses. There is no null: `0` is an address like any other.
 - `array(T)`: a view of `len: u32` and `ptr: &T` that owns nothing.
   `varray(T)` has a `ptr: &var T`, so its elements are assignable. Strings
   are `array(u8)` of UTF-8.
@@ -111,15 +111,16 @@ fn f(i: u32) -> u8:
   pointer (`let p: &u8 = 16`), and is otherwise `i32`. A float literal is
   `f64` by default and has a digit on each side of the `.`.
 - A global initializer is constant: literals, operators, casts, constructors,
-  function names and earlier `let` globals. Calls and `var` globals are out.
-- A field default is constant too. It and other initializers use only the
-  defaults of structs declared earlier. A `varray` literal in one is empty
-  and it has no `&var value`, as every value would share the memory.
+  function names and `let` globals. Calls and `var` globals are out.
+- A field default is constant too. A `varray` literal in one is empty and it
+  has no `&var value`, as every value would share the memory.
+- Constants are declared in any order, in any file. None is used in its own
+  definition: a global in its initializer, an enum in its members' values, or
+  a struct's defaults in that struct's defaults.
 - Only a constructor applies field defaults. Memory that is cast to a struct
   holds whatever was there.
 - A parameter default is constant, with the same `varray` and `&var` rule. It
-  uses any global or struct, declared before or after, and never another
-  parameter: `end: u32 = a.len` is an error.
+  never uses another parameter: `end: u32 = a.len` is an error.
 
 ## Operators
 
@@ -157,8 +158,6 @@ fn push(head: &Node, v: i32) -> &Node:
 	n.val += 1                         # fields auto-dereference
 	let r: &var i32 = &var n.val       # `&place` gives a `&T`
 	r.* = 0
-	if head != 0:
-		return head
 	return n
 
 fn view(p: &i32, len: u32) -> array(i32):
@@ -222,7 +221,7 @@ fn demo() -> u8:
 - In a generic body `T` is also a value (`T.size`), a constructor (`T(x: 1)`)
   and an enum (`T.ok`). `T.size` and `T.align` are always those of the type.
 - A default never names `T`, and a field or parameter holding a `T` by value
-  has none. `head: &var T = 0` and `items: varray(T) = []` are fine. An
+  has none. A `&var T` or a `varray(T)` may: `items: varray(T) = []`. An
   argument left to its default infers nothing: `f(u8)()` if no other does.
 - `p: &T` takes a `&var i32` with `T` as `i32`, and `array(T)` a `varray(i32)`.
   Nothing is generic over writability: write both, or cast.
@@ -294,7 +293,8 @@ pub use geo.Color                # also reachable as `this.Color`
   only `pub` types.
 - Another file constructs a struct only if every private field has a default,
   and never gives a private field a value.
-- Uses form no cycles.
+- Files may use one another. A `use` never leads back to itself, as
+  `pub use b.x` in `a` does when `b` has `pub use a.x`.
 
 ## Host
 

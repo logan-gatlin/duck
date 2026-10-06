@@ -15,15 +15,14 @@ use super::{
 
 pub(super) struct EnumDef {
     pub(super) name: String,
+    /// The item of the program that declares it.
+    item: usize,
     pub(super) is_pub: bool,
     /// The type of every member's value. [`Ty::Error`] until resolved.
     pub(super) ty: Ty,
     /// Where the type of the values is written.
     ty_span: Span,
     pub(super) members: Vec<MemberDef>,
-    /// Whether the members' values are known. Global initializers and
-    /// members of other enums can only use those of earlier enums.
-    defined: bool,
 }
 
 pub(super) struct MemberDef {
@@ -33,9 +32,9 @@ pub(super) struct MemberDef {
 }
 
 impl Checker {
-    /// Registers `decl`'s name and the names of its members, whose values
-    /// are defined later.
-    pub(super) fn declare_enum(&mut self, decl: &EnumDecl, is_pub: bool) -> EnumId {
+    /// Registers the name of `decl`, which is item `item` of the program,
+    /// and the names of its members, whose values are defined later.
+    pub(super) fn declare_enum(&mut self, decl: &EnumDecl, item: usize, is_pub: bool) -> EnumId {
         let members = decl
             .members
             .iter()
@@ -46,11 +45,11 @@ impl Checker {
             .collect();
         self.enums.push(EnumDef {
             name: decl.name.name.clone(),
+            item,
             is_pub,
             ty: Ty::Error,
             ty_span: decl.ty.span,
             members,
-            defined: false,
         });
         EnumId(self.enums.len() as u32 - 1)
     }
@@ -123,7 +122,7 @@ impl Checker {
     /// Checks and folds the values of enum `id`'s members. An integer
     /// member without one is the previous member's value plus one, or zero
     /// if it's first.
-    pub(super) fn define_members(&mut self, id: EnumId, decl: &EnumDecl) {
+    pub(super) fn define_members(&mut self, program: &Program, id: EnumId, decl: &EnumDecl) {
         let ty = self.enum_ty(id);
         let int = match ty {
             Ty::Prim(prim) if prim.is_int() => Some(prim),
@@ -139,7 +138,7 @@ impl Checker {
                 self.error(TypeErrorKind::DuplicateMember(name.name.clone()), name.span);
                 None
             } else {
-                self.member_value(ty, int, next, member)
+                self.member_value(program, ty, int, next, member)
             };
             next = match (int, &value) {
                 (Some(prim), Some(value)) => Some(const_int(prim, value[0]) + 1),
@@ -162,7 +161,6 @@ impl Checker {
             let zeros = || self.val_types(ty).into_iter().map(zero).collect();
             self.enums[id.0 as usize].members[i].value = value.unwrap_or_else(zeros);
         }
-        self.enums[id.0 as usize].defined = true;
     }
 
     /// The folded value of `member` of an enum whose values have type `ty`,
@@ -170,6 +168,7 @@ impl Checker {
     /// an error, or if `ty` is the error type.
     fn member_value(
         &mut self,
+        program: &Program,
         ty: Ty,
         int: Option<Prim>,
         next: Option<i128>,
@@ -199,7 +198,7 @@ impl Checker {
         };
         let errors = self.errors.len();
         let mut body = Body::new(self, Ty::Unit);
-        body.global = true;
+        body.global = Some(program);
         let value = body.check(expr, ty);
         let consts = self.fold_value(&value, expr.span);
         (self.errors.len() == errors && ty != Ty::Error).then_some(consts)
@@ -231,22 +230,22 @@ impl Body<'_> {
     /// `None` for a field of `type`, which `E` is as a value.
     pub(super) fn enum_member(&mut self, id: EnumId, field: &Ident) -> Option<(Ty, Value)> {
         let def = &self.ck.enums[id.0 as usize];
-        let Some(member) = def.members.iter().find(|m| m.name == field.name) else {
+        let (name, item) = (def.name.clone(), def.item);
+        let Some(index) = def.members.iter().position(|m| m.name == field.name) else {
             if TYPE_FIELDS.contains(&field.name.as_str()) {
                 return None;
             }
             let kind = TypeErrorKind::NoMember {
-                ty: def.name.clone(),
+                ty: name,
                 member: field.name.clone(),
             };
             self.error(kind, field.span);
             return Some((Ty::Error, Value::default()));
         };
-        // Only reachable from an earlier global's or member's initializer.
-        if !def.defined {
-            self.error(TypeErrorKind::NotConstant, field.span);
+        if !self.folded(item, &name, field.span) {
             return Some((Ty::Error, Value::default()));
         }
+        let member = &self.ck.enums[id.0 as usize].members[index];
         let consts = member.value.iter().map(|c| Expr::Const(*c)).collect();
         Some((Ty::Enum(id), self.scalars(Ty::Enum(id), consts)))
     }

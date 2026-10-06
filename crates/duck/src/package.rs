@@ -448,7 +448,7 @@ mod tests {
             ("app/Duck.toml", "[library]\nentry = \"src/lib.duck\"\n"),
             (
                 "app/src/lib.duck",
-                "use geo\nuse util.strings.{len, deep.empty}\nlet x: i32 = geo.zero + len + empty\n",
+                "use geo\nuse util.strings.{len, deep.empty}\nuse lib.x as own\nlet x: i32 = geo.zero + len + empty\n",
             ),
             // From the root, wherever the file using them is.
             ("app/src/geo.duck", "use util.strings\npub let zero = strings.len\n"),
@@ -458,15 +458,13 @@ mod tests {
         ]);
         assert_eq!(check(&root), Ok(()));
 
-        dir.write(&[("app/src/lib.duck", "use src.geo\nuse util\nuse lib.x\n")]);
-        let lib = root.join("src/lib.duck").display().to_string();
+        dir.write(&[("app/src/lib.duck", "use src.geo\nuse util\n")]);
         assert_eq!(
             check(&root),
             Err(vec![
                 "src/lib.duck: cannot find `src.geo` in this package or its dependencies"
                     .to_string(),
                 "src/lib.duck: cannot find `util` in this package or its dependencies".to_string(),
-                format!("src/lib.duck: use cycle: {lib} -> {lib}"),
             ])
         );
     }

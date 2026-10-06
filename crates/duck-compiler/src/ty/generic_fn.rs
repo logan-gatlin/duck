@@ -138,7 +138,8 @@ impl Checker {
         for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
             self.module = item.span.file;
             let params = self.generic_fns[i].sig.params.clone();
-            self.generic_fns[i].sig.defaults = self.fold_param_defaults(&decl.sig, &params);
+            let defaults = self.fold_param_defaults(program, &decl.sig, &params);
+            self.generic_fns[i].sig.defaults = defaults;
         }
     }
 

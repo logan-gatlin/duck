@@ -16,7 +16,7 @@ use crate::ir::{
     UnOp as IrUnOp, ValType,
 };
 use crate::lex::Span;
-use crate::load::{Program, Use};
+use crate::load::Program;
 use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
     PatternKind, StmtKind, TypeKind, UnaryOp,
@@ -151,6 +151,10 @@ const TYPE_FIELDS: [&str; 2] = ["size", "align"];
 
 /// The module that `extern` blocks without one import from.
 const DEFAULT_IMPORT_MODULE: &str = "env";
+
+/// The most constants that can be nested, each folded where the last is
+/// first to use it.
+const MAX_CONSTANT_DEPTH: usize = 64;
 
 /// A primitive stored as exactly one wasm value. `tuple()` is [`Ty::Unit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -396,6 +400,12 @@ pub enum TypeErrorKind {
     NotConstant,
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
+    /// A global, enum or struct that the global's initializer, the enum's
+    /// members' values or the struct's fields' defaults use.
+    RecursiveConstant(String),
+    /// A global, enum or struct first used by a constant that is itself
+    /// nested within too many others, each first used by the one before.
+    ConstantTooDeep(String),
     /// A `pub` item whose export name is taken by the module itself.
     ReservedExport(String),
     /// An item of another module that isn't `pub`.
@@ -407,6 +417,9 @@ pub enum TypeErrorKind {
     },
     /// An item that a `use` path goes on past, as only a module's can.
     NotAModule(String),
+    /// A `use` path through a name that another `use` gives what this one
+    /// names.
+    RecursiveUse(String),
     /// A field that isn't `pub`, used outside the module of its struct.
     PrivateField {
         ty: String,
@@ -477,6 +490,8 @@ struct Checker {
     /// The names each module uses that weren't found, which are reported
     /// where they are used and not again where they are named.
     unresolved: HashSet<(FileId, String)>,
+    /// How far each `use` of the program is declared.
+    uses: Vec<Visit>,
     /// The module whose names are in scope.
     module: FileId,
     /// The module whose `pub` items are exported.
@@ -550,6 +565,12 @@ struct Checker {
     deferred: bool,
     /// `None` until the global's initializer has been checked.
     globals: Vec<Option<GlobalDef>>,
+    /// The item of the program that binds each global.
+    global_items: Vec<usize>,
+    /// The constants of each item of the program.
+    constants: Vec<Constants>,
+    /// How many constants are being folded, each within the one before.
+    constant_depth: usize,
     ir_globals: Vec<ir::Global>,
     /// The memory's size limits, which `module.min` and `module.max` are.
     memory: MemoryLimits,
@@ -603,6 +624,9 @@ struct StructDef {
     name: String,
     /// The module that declares it, or for an instance, its declaration.
     module: FileId,
+    /// The item of the program that declares it, or for an instance, its
+    /// declaration.
+    item: usize,
     is_pub: bool,
     /// The [`Ty::Param`] of each type parameter of a generic declaration.
     params: Vec<Ty>,
@@ -652,6 +676,18 @@ struct GlobalDef {
     slots: Slots,
 }
 
+/// What an item of the program has that is folded when first used: the
+/// initializer of a binding's globals, the values of an enum's members or
+/// the defaults of a struct's fields.
+#[derive(Clone, Copy)]
+struct Constants {
+    /// The first of a binding's globals, or the enum or struct by its id.
+    id: usize,
+    /// Whether they are folded, or being folded. An item without any is
+    /// done.
+    state: Visit,
+}
+
 /// A name bound by a pattern.
 struct Bound<'p> {
     name: &'p str,
@@ -670,9 +706,10 @@ struct Body<'c> {
     scopes: Vec<HashMap<String, Var>>,
     /// Enclosing wasm labels, innermost last.
     labels: Vec<Label>,
-    /// Whether this is a global initializer, the only place literals that
-    /// need memory can be.
-    global: bool,
+    /// The program, if this is a global initializer: the only place
+    /// literals that need memory can be, and where a constant that isn't
+    /// folded yet is folded to be read.
+    global: Option<&'c Program>,
     /// Whether this is a field's or parameter's default, a kind of global
     /// initializer whose value is shared wherever the default is used.
     default: bool,
@@ -992,11 +1029,20 @@ impl fmt::Display for TypeErrorKind {
                 "global initializers, enum members and defaults must be constant"
             ),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
+            Self::RecursiveConstant(name) => {
+                write!(f, "`{name}` is used in its own definition")
+            }
+            Self::ConstantTooDeep(name) => write!(
+                f,
+                "`{name}` is first used more than {MAX_CONSTANT_DEPTH} constants deep; \
+                 declare it before the constants that use it"
+            ),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
             Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
             Self::Private(name) => write!(f, "`{name}` is private"),
             Self::NoItem { module, item } => write!(f, "`{module}` has no item `{item}`"),
             Self::NotAModule(name) => write!(f, "`{name}` is not a module"),
+            Self::RecursiveUse(path) => write!(f, "`use` of `{path}` leads back to itself"),
             Self::PrivateField { ty, field } => write!(f, "field `{field}` of `{ty}` is private"),
             Self::PrivateInPublic { ty, item } => {
                 write!(f, "private type `{ty}` in the type of `pub` item `{item}`")
@@ -1175,8 +1221,15 @@ impl Checker {
             })
             .collect();
         let (mut next_import, mut next_def) = (0, self.import_count);
-        for item in &program.items {
+        for (index, item) in program.items.iter().enumerate() {
             self.module = item.span.file;
+            let (id, state) = match &item.kind {
+                ItemKind::Struct(_) => (self.structs.len(), Visit::New),
+                ItemKind::Enum(_) => (self.enums.len(), Visit::New),
+                ItemKind::Binding(_) => (self.globals.len(), Visit::New),
+                _ => (0, Visit::Done),
+            };
+            self.constants.push(Constants { id, state });
             let (name, entry) = match &item.kind {
                 ItemKind::Struct(s) => {
                     let id = StructId(self.structs.len() as u32);
@@ -1184,6 +1237,7 @@ impl Checker {
                     self.structs.push(StructDef {
                         name: s.name.name.clone(),
                         module: self.module,
+                        item: index,
                         is_pub: item.is_pub,
                         params,
                         instance: None,
@@ -1208,31 +1262,54 @@ impl Checker {
                 ItemKind::Binding(b) => {
                     for name in pattern_names(&b.pattern) {
                         self.globals.push(None);
+                        self.global_items.push(index);
                         self.declare_item(item, &name, Item::Global(self.globals.len() - 1));
                     }
                     continue;
                 }
-                ItemKind::Enum(e) => (&e.name, Item::Enum(self.declare_enum(e, item.is_pub))),
+                ItemKind::Enum(e) => {
+                    let id = self.declare_enum(e, index, item.is_pub);
+                    (&e.name, Item::Enum(id))
+                }
                 // Replaced by the items of the modules used when loading.
                 ItemKind::Use(_) => continue,
             };
             self.declare_item(item, name, entry);
         }
-        // Each leads into a module whose own are declared by now.
-        for used in &program.uses {
-            self.declare_use(used);
+        self.uses = vec![Visit::New; program.uses.len()];
+        for index in 0..program.uses.len() {
+            self.declare_use(program, index);
         }
     }
 
-    /// Declares the name `used` gives the module its path leads into, or
-    /// what the rest of the path reaches from there.
-    fn declare_use(&mut self, used: &Use) {
+    /// Declares the name that use `index` of `program` gives the module its
+    /// path leads into, or what the rest of the path reaches from there,
+    /// unless it's declared or being declared.
+    fn declare_use(&mut self, program: &Program, index: usize) {
+        if self.uses[index] != Visit::New {
+            return;
+        }
+        self.uses[index] = Visit::Active;
+        let used = &program.uses[index];
         self.module = used.module;
         let mut item = Some(Item::Module(used.target));
         let mut path = used.target_path.clone();
         for member in &used.members {
             item = match item {
-                Some(Item::Module(module)) => self.reach(module, &path, member),
+                Some(Item::Module(module)) => {
+                    let declared = self.declare_uses_of(program, module, &member.name);
+                    self.module = used.module;
+                    if !declared {
+                        let path = format!("{path}.{}", member.name);
+                        self.error(TypeErrorKind::RecursiveUse(path), member.span);
+                        None
+                    } else if self.unresolved.contains(&(module, member.name.clone())) {
+                        // Reported where `module` uses it.
+                        None
+                    } else {
+                        self.reach(module, &path, member)
+                    }
+                }
                 Some(_) => {
                     self.error(TypeErrorKind::NotAModule(path.clone()), member.span);
                     None
@@ -1248,6 +1325,26 @@ impl Checker {
                 self.unresolved.insert((used.module, name));
             }
         }
+        self.uses[index] = Visit::Done;
+    }
+
+    /// Declares what `module` uses as `name`, if it has no such name yet:
+    /// modules that use each other reach names through uses that come
+    /// later. Returns whether none of them is being declared, as one that a
+    /// path leads back to is.
+    fn declare_uses_of(&mut self, program: &Program, module: FileId, name: &str) -> bool {
+        let scope = self.scopes.get(&module);
+        if scope.is_some_and(|scope| scope.contains_key(name)) {
+            return true;
+        }
+        let mut declared = true;
+        for (index, used) in program.uses.iter().enumerate() {
+            if used.module == module && used.name.name == name {
+                declared &= self.uses[index] != Visit::Active;
+                self.declare_use(program, index);
+            }
+        }
+        declared
     }
 
     /// Declares a name defined by `item`, which may export it.
@@ -1536,63 +1633,82 @@ impl Checker {
     }
 
     /// Checks and folds global initializers, the values of enum members and
-    /// the defaults of struct fields, in declaration order.
+    /// the defaults of struct fields: in declaration order, but for those
+    /// that an earlier one uses, which are folded then.
     fn define_globals(&mut self, program: &Program) {
-        let (mut index, mut enum_index, mut struct_index) = (0, 0, 0);
-        for item in &program.items {
-            self.module = item.span.file;
-            let decl = match &item.kind {
-                ItemKind::Binding(decl) => decl,
-                ItemKind::Enum(decl) => {
-                    self.define_members(EnumId(enum_index), decl);
-                    enum_index += 1;
-                    continue;
+        for index in 0..program.items.len() {
+            self.fold_item(program, index);
+        }
+    }
+
+    /// Checks and folds the constants of item `index` of `program`, unless
+    /// they are folded or being folded, or nested too deep to be.
+    fn fold_item(&mut self, program: &Program, index: usize) {
+        let Constants { id, state } = self.constants[index];
+        if state != Visit::New || self.constant_depth == MAX_CONSTANT_DEPTH {
+            return;
+        }
+        self.constants[index].state = Visit::Active;
+        self.constant_depth += 1;
+        let item = &program.items[index];
+        let module = mem::replace(&mut self.module, item.span.file);
+        match &item.kind {
+            ItemKind::Binding(decl) => self.define_binding(program, item, decl, id),
+            ItemKind::Enum(decl) => self.define_members(program, EnumId(id as u32), decl),
+            ItemKind::Struct(decl) => self.define_defaults(program, StructId(id as u32), decl),
+            _ => {}
+        }
+        self.module = module;
+        self.constant_depth -= 1;
+        self.constants[index].state = Visit::Done;
+    }
+
+    /// Checks and folds the initializer of `decl`, the binding that `item`
+    /// is, and defines the globals it binds, the first of which is `index`.
+    fn define_binding(
+        &mut self,
+        program: &Program,
+        item: &parse::Item,
+        decl: &parse::Binding,
+        mut index: usize,
+    ) {
+        let mut body = Body::new(self, Ty::Unit);
+        body.global = Some(program);
+        let (ty, value) = body.binding_value(decl);
+        let mutable = decl.mutability == Mutability::Var;
+        let inits = self.fold_value(&value, decl.value.span);
+        let exported = self.exports(item);
+        // Each name gets its own globals, in the order `declare` gave them.
+        for bound in self.destructure(&decl.pattern, ty) {
+            let (mut wasm, mut consts) = (Vec::new(), Vec::new());
+            let leaves = self.leaves(bound.ty, bound.name);
+            for ((name, vt), i) in leaves.into_iter().zip(bound.leaves) {
+                let init = inits.get(i).copied().unwrap_or(zero(vt));
+                consts.push(init);
+                // Only a wasm global can be assigned or exported.
+                if mutable || exported {
+                    wasm.push(GlobalId(self.ir_globals.len() as u32));
+                    self.ir_globals.push(ir::Global {
+                        export: exported.then(|| name.clone()),
+                        name,
+                        ty: vt,
+                        mutable,
+                        init,
+                    });
                 }
-                ItemKind::Struct(decl) => {
-                    self.define_defaults(StructId(struct_index), decl);
-                    struct_index += 1;
-                    continue;
-                }
-                _ => continue,
-            };
-            let mut body = Body::new(self, Ty::Unit);
-            body.global = true;
-            let (ty, value) = body.binding_value(decl);
-            let mutable = decl.mutability == Mutability::Var;
-            let inits = self.fold_value(&value, decl.value.span);
-            let exported = self.exports(item);
-            // Each name gets its own globals, in the order `declare` gave them.
-            for bound in self.destructure(&decl.pattern, ty) {
-                let (mut wasm, mut consts) = (Vec::new(), Vec::new());
-                let leaves = self.leaves(bound.ty, bound.name);
-                for ((name, vt), i) in leaves.into_iter().zip(bound.leaves) {
-                    let init = inits.get(i).copied().unwrap_or(zero(vt));
-                    consts.push(init);
-                    // Only a wasm global can be assigned or exported.
-                    if mutable || exported {
-                        wasm.push(GlobalId(self.ir_globals.len() as u32));
-                        self.ir_globals.push(ir::Global {
-                            export: exported.then(|| name.clone()),
-                            name,
-                            ty: vt,
-                            mutable,
-                            init,
-                        });
-                    }
-                }
-                // A `let` is its value wherever it is used, so an exported
-                // one's wasm globals are only read by the host.
-                let slots = match mutable {
-                    true => Slots::Global(wasm),
-                    false => Slots::Const(consts),
-                };
-                let ty = bound.ty;
-                if item.is_pub {
-                    self.check_public(ty, bound.span, bound.name);
-                }
-                self.globals[index] = Some(GlobalDef { ty, mutable, slots });
-                index += 1;
             }
+            // A `let` is its value wherever it is used, so an exported
+            // one's wasm globals are only read by the host.
+            let slots = match mutable {
+                true => Slots::Global(wasm),
+                false => Slots::Const(consts),
+            };
+            let ty = bound.ty;
+            if item.is_pub {
+                self.check_public(ty, bound.span, bound.name);
+            }
+            self.globals[index] = Some(GlobalDef { ty, mutable, slots });
+            index += 1;
         }
     }
 
@@ -2542,7 +2658,7 @@ impl<'c> Body<'c> {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
-            global: false,
+            global: None,
             default: false,
             piped: Vec::new(),
             needs: Needs::default(),
@@ -2552,6 +2668,22 @@ impl<'c> Body<'c> {
 
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
         self.ck.error(kind, span);
+    }
+
+    /// Whether the constants of item `index` of the program are folded,
+    /// which a global initializer that is first to use them has done here.
+    /// Otherwise reports why `name`, used at `span`, has none.
+    fn folded(&mut self, index: usize, name: &str, span: Span) -> bool {
+        if let Some(program) = self.global {
+            self.ck.fold_item(program, index);
+        }
+        let kind = match self.ck.constants[index].state {
+            Visit::Done => return true,
+            Visit::Active => TypeErrorKind::RecursiveConstant(name.to_string()),
+            Visit::New => TypeErrorKind::ConstantTooDeep(name.to_string()),
+        };
+        self.error(kind, span);
+        false
     }
 
     /// Reports a mismatch unless `found` fits where `want` is expected or
@@ -3033,6 +3165,9 @@ impl<'c> Body<'c> {
             self.error(TypeErrorKind::NotAssignable, span);
             return None;
         };
+        if !self.folded(self.ck.global_items[index], name, span) {
+            return None;
+        }
         let global = self.ck.globals[index].as_ref()?;
         Some(Place {
             name: name.to_string(),
@@ -3185,7 +3320,9 @@ impl<'c> Body<'c> {
                 scalar(ValType::I32, Expr::Const(Const::I32(*b as i32))),
             ),
             ExprKind::Unit => (Ty::Unit, Value::default()),
-            ExprKind::Str(_) | ExprKind::List(_) | ExprKind::Repeat(..) if !self.global => {
+            ExprKind::Str(_) | ExprKind::List(_) | ExprKind::Repeat(..)
+                if self.global.is_none() =>
+            {
                 self.error(TypeErrorKind::LiteralOutsideGlobal, expr.span);
                 (Ty::Error, Value::default())
             }
@@ -3301,7 +3438,7 @@ impl<'c> Body<'c> {
         expected: Option<Ty>,
     ) -> (Ty, Value) {
         let (value_ty, mut value) = self.expr(value, None);
-        if !self.global {
+        if self.global.is_none() {
             self.spill(&mut value, |e| matches!(e, Expr::Const(_) | Expr::Local(_)));
         }
         self.piped.push((value_ty, value.scalars));
@@ -3670,11 +3807,7 @@ impl<'c> Body<'c> {
             Item::GenericFn(generic) => self.generic_fn_value(generic, expected, span),
             Item::Global(_) => match self.item_place(item, name, span) {
                 Some(place) => (place.ty, self.read_place(&place)),
-                // Only reachable from an earlier global's initializer.
-                None => {
-                    self.error(TypeErrorKind::NotConstant, span);
-                    (Ty::Error, Value::default())
-                }
+                None => (Ty::Error, Value::default()),
             },
             // Struct and enum names are types, which `expr` makes values.
             Item::Struct(_) | Item::Enum(_) | Item::Module(_) => {
@@ -4040,7 +4173,7 @@ impl<'c> Body<'c> {
             _ => true,
         };
         if is_value {
-            if !self.global {
+            if self.global.is_none() {
                 self.error(TypeErrorKind::NotAddressable, span);
                 return (Ty::Error, Value::default());
             }
@@ -4051,7 +4184,7 @@ impl<'c> Body<'c> {
             return (Ty::Error, Value::default());
         };
         let Slots::Memory { addr, offset } = place.slots else {
-            if !self.global {
+            if self.global.is_none() {
                 self.error(TypeErrorKind::NotAddressable, span);
                 return (Ty::Error, Value::default());
             }
@@ -5746,8 +5879,6 @@ let c = f()
 let d = 1 / 0
 var m = 1
 let n = m
-let p = q
-let q = 1
 ";
         assert_eq!(
             errors(src),
@@ -5755,9 +5886,100 @@ let q = 1
                 TypeErrorKind::NotConstant,
                 TypeErrorKind::ConstTrap,
                 TypeErrorKind::NotConstant,
-                TypeErrorKind::NotConstant,
             ]
         );
+    }
+
+    #[test]
+    fn constants_are_folded_when_first_used() {
+        let src = "\
+pub let a = b + Later.x as i32
+pub let b = Late().y * 2
+pub let (c, d) = (e, \"ab\")
+pub let e = \"cde\"
+pub var f = a
+struct Late:
+    x: i32 = 1
+    y: i32 = LAST + x
+enum(i32) Later:
+    x = LAST * 10
+let x = 4
+let LAST = 3
+";
+        let module = lower(src);
+        let globals: Vec<_> = module
+            .globals
+            .iter()
+            .map(|g| format!("{} {}", g.name, konst(g.init)))
+            .collect();
+        // A global follows those its initializer is first to use, as its
+        // literals do theirs.
+        let expected = [
+            "b 14", "a 44", "e.len 3", "e.ptr 0", "c.len 3", "c.ptr 0", "d.len 2", "d.ptr 3",
+            "f 44",
+        ];
+        assert_eq!(globals, expected);
+        assert_eq!(data(&module), [(0, &b"cde"[..]), (3, &b"ab"[..])]);
+    }
+
+    #[test]
+    fn constants_are_not_used_in_their_own_definitions() {
+        use TypeErrorKind::*;
+        let src = "\
+let own = own
+let a: i32 = b + 1
+let b = c
+let c = a
+let (p, q) = (1, p)
+enum(i32) E:
+    x = 1
+    y = E.x as i32
+    z = F.w as i32
+enum(i32) F:
+    w = E.x as i32
+struct S:
+    s: i32 = S().s
+    t: i32 = S(s: 1, t: 2).t
+struct A:
+    a: i32 = B().b
+struct B:
+    b: i32 = A().a
+fn f() -> i32:
+    return a + b + c + E.z as i32 + S().t + A().a
+";
+        let recursive = |name: &str, text: &'static str| (RecursiveConstant(name.into()), text);
+        assert_eq!(
+            errors_at(src),
+            [
+                recursive("own", "own"),
+                recursive("a", "a"),
+                recursive("p", "p"),
+                recursive("E", "x"),
+                recursive("E", "x"),
+                recursive("S", "S()"),
+                recursive("A", "A()"),
+            ]
+        );
+    }
+
+    #[test]
+    fn constants_nest_only_so_deep() {
+        // Each but the last is first to use the next.
+        let chain = |last: usize| {
+            let uses = (0..last).map(|i| format!("let a{i} = a{} + 1\n", i + 1));
+            uses.collect::<String>() + &format!("let a{last} = 0\npub let first = a0\n")
+        };
+        let module = lower(&chain(MAX_CONSTANT_DEPTH - 1));
+        assert_eq!(module.globals[0].init, Const::I32(63));
+        let name = format!("a{MAX_CONSTANT_DEPTH}");
+        assert_eq!(
+            errors(&chain(MAX_CONSTANT_DEPTH)),
+            [TypeErrorKind::ConstantTooDeep(name)]
+        );
+        // Declared before those that use them, any number nest.
+        let uses = (1..1000).map(|i| format!("let a{i} = a{} + 1\n", i - 1));
+        let src = "let a0 = 0\n".to_string() + &uses.collect::<String>() + "pub let last = a999\n";
+        assert_eq!(lower(&src).globals[0].init, Const::I32(999));
     }
 
     #[test]
@@ -8721,8 +8943,7 @@ enum(i32) Later:
                 MissingValue("far".into()),
                 NotConstant,
                 NotConstant,
-                NotConstant,
-                NotConstant,
+                RecursiveConstant("Bad".into()),
                 mismatch("i32", "bool"),
             ]
         );
@@ -9578,21 +9799,11 @@ fn g() -> Inner:
     }
 
     #[test]
-    fn defaults_are_constant_and_folded_in_declaration_order() {
+    fn defaults_are_constant() {
         use TypeErrorKind::*;
         let src = "\
 fn call() -> i32:
     return 1
-let early = Late()
-struct Late:
-    x: i32 = LATER
-    y: i32 = 1
-let LATER = 2
-let fine = Late(x: 1)
-struct A:
-    a: i32 = B().b
-struct B:
-    b: i32 = A().a
 struct C:
     c: i32 = 1 / 0
     d: i32 = call()
@@ -9600,14 +9811,11 @@ struct C:
     f: bool = 1
     g: i32
 fn f() -> i32:
-    return Late().x + C(g: 1).c + C().d
+    return C(g: 1).c + C().d
 ";
         assert_eq!(
             errors(src),
             vec![
-                NotConstant,
-                NotConstant,
-                NotConstant,
                 ConstTrap,
                 NotConstant,
                 IntOutOfRange("u8".into()),

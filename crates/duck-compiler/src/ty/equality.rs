@@ -127,7 +127,7 @@ impl Body<'_> {
         }
         // Checked up front, as folding skips calls in branches it doesn't
         // take.
-        if self.global && self.ck.compares_arrays(ty) {
+        if self.global.is_some() && self.ck.compares_arrays(ty) {
             self.error(TypeErrorKind::NotConstant, span);
             return (bool, scalar(ValType::I32, Expr::Const(Const::I32(0))));
         }

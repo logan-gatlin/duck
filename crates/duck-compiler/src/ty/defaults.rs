@@ -1,9 +1,9 @@
 //! Defaults: the constant a struct's field has where a constructor gives it
 //! no value, and a function's parameter where a call gives it no argument.
 //! Each is folded once, and every instance of a generic struct or function
-//! shares its declaration's. A field's is folded in declaration order with
-//! the globals and enum members it may use. A parameter's is folded after
-//! them all, as nothing constant calls a function.
+//! shares its declaration's. A field's is folded with the globals and enum
+//! members, which may use it as it may use them. A parameter's is folded
+//! after them all, as nothing constant calls a function.
 
 use crate::ir::Const;
 use crate::lex::Span;
@@ -15,8 +15,8 @@ use super::{Body, Checker, StructId, Ty, TypeErrorKind, Value, fn_sigs};
 /// The default of a struct field or function parameter that has one.
 #[derive(Clone)]
 pub(super) enum DefaultValue {
-    /// Not folded yet. Global initializers, enum members and other defaults
-    /// can only use those of earlier structs' fields.
+    /// Not folded yet. A field's is when a global initializer, enum member
+    /// or other default first uses one of its struct's.
     Pending,
     /// One constant per scalar leaf of the field's or parameter's type.
     Folded(Vec<Const>),
@@ -26,7 +26,7 @@ pub(super) enum DefaultValue {
 
 impl Checker {
     /// Checks and folds the defaults of struct `id`'s fields.
-    pub(super) fn define_defaults(&mut self, id: StructId, decl: &StructDecl) {
+    pub(super) fn define_defaults(&mut self, program: &Program, id: StructId, decl: &StructDecl) {
         for field in &decl.fields {
             let Some(expr) = &field.default else {
                 continue;
@@ -36,7 +36,8 @@ impl Checker {
             let Some(index) = fields.iter().position(|def| def.span == field.span) else {
                 continue;
             };
-            let default = match self.fold_default(fields[index].ty, expr, &decl.params) {
+            let ty = fields[index].ty;
+            let default = match self.fold_default(program, ty, expr, &decl.params) {
                 Some(consts) => DefaultValue::Folded(consts),
                 None => DefaultValue::Failed,
             };
@@ -49,7 +50,7 @@ impl Checker {
         for (id, (_, sig)) in fn_sigs(program).enumerate() {
             self.module = sig.name.span.file;
             let params = self.funcs[id].params.clone();
-            self.funcs[id].defaults = self.fold_param_defaults(sig, &params);
+            self.funcs[id].defaults = self.fold_param_defaults(program, sig, &params);
         }
         self.define_generic_fn_defaults(program);
     }
@@ -58,6 +59,7 @@ impl Checker {
     /// folded. `params` are its parameters as resolved.
     pub(super) fn fold_param_defaults(
         &mut self,
+        program: &Program,
         sig: &FnSig,
         params: &[(String, Ty)],
     ) -> Vec<Option<DefaultValue>> {
@@ -76,7 +78,7 @@ impl Checker {
                     self.error(TypeErrorKind::DefaultReadsParam(name), span);
                     None
                 }
-                None => self.fold_default(*ty, expr, &sig.type_params),
+                None => self.fold_default(program, *ty, expr, &sig.type_params),
             };
             defaults.push(Some(match consts {
                 Some(consts) => DefaultValue::Folded(consts),
@@ -89,7 +91,13 @@ impl Checker {
     /// The folded value of `expr`, the default of a field or parameter of
     /// type `ty` in a struct or function with type parameters `params`.
     /// `None` after reporting an error, or if `ty` is the error type.
-    fn fold_default(&mut self, ty: Ty, expr: &parse::Expr, params: &[Ident]) -> Option<Vec<Const>> {
+    fn fold_default(
+        &mut self,
+        program: &Program,
+        ty: Ty,
+        expr: &parse::Expr,
+        params: &[Ident],
+    ) -> Option<Vec<Const>> {
         // The default is folded once for every instance, so it can neither
         // name a type parameter nor be a value laid out by one.
         let named = param_in_expr(expr, params, true);
@@ -102,7 +110,7 @@ impl Checker {
         }
         let errors = self.errors.len();
         let mut body = Body::new(self, Ty::Unit);
-        body.global = true;
+        body.global = Some(program);
         body.default = true;
         let value = body.check(expr, ty);
         let consts = self.fold_value(&value, expr.span);
@@ -147,6 +155,7 @@ impl Body<'_> {
     pub(super) fn construct_struct(&mut self, id: StructId, args: &[Arg], span: Span) -> Value {
         let def = &self.ck.structs[id.0 as usize];
         let (ty, foreign) = (def.name.clone(), def.module != self.ck.module);
+        let item = def.item;
         let fields = def.fields.clone();
         if foreign {
             let private = |field: &str| TypeErrorKind::PrivateField {
@@ -167,17 +176,19 @@ impl Body<'_> {
             }
         }
         let params: Vec<_> = fields.iter().map(|f| (f.name.clone(), f.ty)).collect();
-        let defaults: Vec<_> = (0..params.len())
-            .map(|i| self.ck.field_default(id, i).cloned())
-            .collect();
+        let field_defaults = |body: &Self| -> Vec<_> {
+            let defaults = (0..params.len()).map(|i| body.ck.field_default(id, i).cloned());
+            defaults.collect()
+        };
+        let mut defaults = field_defaults(self);
         let binding = self.bind_args(&params, &defaults, args, true, span);
-        // Only reachable from an earlier global's or member's initializer,
-        // or an earlier default.
+        // The defaults are folded when the first of them is used.
         let mut used = (0..)
             .zip(&defaults)
             .filter(|(i, _)| !binding.contains(&Some(*i)));
-        if used.any(|(_, default)| matches!(default, Some(DefaultValue::Pending))) {
-            self.error(TypeErrorKind::NotConstant, span);
+        let pending = used.any(|(_, default)| matches!(default, Some(DefaultValue::Pending)));
+        if pending && self.folded(item, &ty, span) {
+            defaults = field_defaults(self);
         }
         let checked = args.iter().map(|_| None).collect();
         self.bound_args(&params, &defaults, args, binding, checked)
