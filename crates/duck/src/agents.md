@@ -62,9 +62,9 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 
 - `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`. Integer arithmetic wraps.
   Numeric types never mix (`u8 + i32` is an error): convert with `as`.
-- `int` and `uint`: integers as wide as an address, which is 32 bits. They
-  count bytes and elements, and are types of their own: `uint + u32` is an
-  error too.
+- `int` and `uint`: integers as wide as an address, which is 32 bits, or 64
+  with `memory64` in `Duck.toml`. They count bytes and elements, and are
+  types of their own: `uint + u32` is an error too.
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
   addresses. There is no null: `0` is an address like any other.
@@ -292,7 +292,8 @@ fn view(p: &i32, len: uint) -> array(i32):
   `p.next.val = 1` works through a `p: &Node`. `let` and `var` govern the
   binding, not the pointee.
 - Pointer arithmetic is `((p as uint) + 4) as &T`.
-- Layout follows C, and `bool` is 1 byte.
+- Layout follows C, and `bool` is 1 byte. A pointer, a function pointer, an
+  `int` and a `uint` are each 4 bytes, or 8 with `memory64`.
 - The only runtime checks are array bounds and division by zero, which trap.
 - Literals fill the static section from address 0. Memory starts as the
   fewest pages that hold it, which is none without literals, so call
@@ -434,11 +435,12 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
 - The host gives every argument. A default is passed by the Duck call that
   leaves it out, so an `extern` function may have them, an exported one has
   them for Duck callers only, and `start` names a function with no parameters.
-- Integers of 32 bits or fewer, `bool`, `int`, `uint`, pointers and function
-  pointers are wasm `i32`. `i64`, `f32`, `f64` and `externref` are themselves,
-  and an enum is its value type. Structs, tuples, arrays and `type` are one
-  wasm value per scalar, in field order: `fn f(s: array(u8)) -> Point` is
-  `(i32 ptr, i32 len) -> (f32, f32)`.
+- Integers of 32 bits or fewer and `bool` are wasm `i32`. So are `int`,
+  `uint`, pointers and function pointers, which are `i64` with `memory64`: a
+  JS host then passes each as a `BigInt`, as in `table.get(1n)`. `i64`,
+  `f32`, `f64` and `externref` are themselves, and an enum is its value type.
+  Structs, tuples, arrays and `type` are one wasm value per scalar, in field
+  order: `fn f(s: array(u8)) -> Point` is `(i32 ptr, i32 len) -> (f32, f32)`.
 - An exported aggregate global is one wasm global per scalar, named with
   dots: `origin.x`, `name.ptr`, `name.len`.
 - A union is an `i32` that counts its variants from 0, then the values its
@@ -473,7 +475,8 @@ output = "build/out.wasm"
 start = "main"           # optional: run on instantiation
 
 [memory]                 # optional, as is each key; needs [module]
-min = "1pgs"             # sizes: B, KiB, MiB, GiB, pgs (64 KiB)
+memory64 = true          # 64-bit addresses, which are 32-bit without it
+min = "1pgs"             # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
 max = "16MiB"
 static = { start = "0B", end = "64KiB" }  # where literals go
 
@@ -484,3 +487,11 @@ entry = "src/lib.duck"
 json = { path = "../json" }
 xml = { git = "https://example.com/xml.git", tag = "v1.0" }  # or rev; no branches
 ```
+
+- `memory64` builds a wasm memory64 module, whose memory and table are
+  addressed with 64 bits: sizes may pass 4GiB, and `int`, `uint`, pointers
+  and function pointers are 64 bits wide. A `uint` past 4294967295 is an
+  error without it.
+- A library builds as the module that uses it does, so it keeps addresses and
+  lengths in `uint`, never `u32` or `u64`. On its own it is checked with
+  32-bit addresses.

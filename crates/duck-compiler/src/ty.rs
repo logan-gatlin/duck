@@ -238,7 +238,7 @@ pub enum Ty {
     /// An enum, stored as the value of its member, so laid out like the type
     /// of its values.
     Enum(EnumId),
-    /// `&T`, an address in linear memory, stored as an `i32`. `&var T` is
+    /// `&T`, an address in linear memory, stored as a `uint` is. `&var T` is
     /// one that can be written through.
     Ptr(PtrId),
     /// `tuple(A, B)`, which is laid out like a struct with a field per element.
@@ -248,8 +248,8 @@ pub enum Ty {
     /// `varray(T)` is one whose elements can be written, so its `ptr` is a
     /// `&var T`.
     Array(ArrayId),
-    /// `fn(A) -> R`, a pointer to a function, stored as an `i32` index into
-    /// the module's table.
+    /// `fn(A) -> R`, a pointer to a function, stored as its index in the
+    /// module's table, which is as wide as an address.
     Fn(FnId),
     /// `type`, the value of a type written where a value belongs, as in
     /// `malloc(Point)`. Laid out like a struct with the fields `size: uint`
@@ -492,19 +492,19 @@ pub enum TypeErrorKind {
     InvalidStart(String),
     /// Literal data that doesn't fit in the static data section.
     DataTooLarge {
-        bytes: u64,
-        capacity: u32,
+        bytes: u128,
+        capacity: u64,
     },
     /// A static data section that ends past the memory's initial pages.
     StaticOutsideMemory {
-        end: u32,
-        min_pages: u32,
+        end: u64,
+        min_pages: u64,
     },
     /// A static data section that ends past the pages the memory may grow
     /// to, where it starts with as many as hold the section.
     StaticOutsideMax {
-        end: u32,
-        max_pages: u32,
+        end: u64,
+        max_pages: u64,
     },
     /// A static data section fitted to literals that it is too small for
     /// once they are given its size.
@@ -635,6 +635,8 @@ struct Checker {
     ir_globals: Vec<ir::Global>,
     /// The memory's size limits, which `module.min` and `module.max` are.
     memory: MemoryLimits,
+    /// Whether an address is 64 bits wide rather than 32.
+    memory64: bool,
     /// Where literals are placed, which `module.static` is. While
     /// `unfitted`, it is empty.
     static_section: StaticSection,
@@ -645,15 +647,16 @@ struct Checker {
     /// the pages that hold it, while it was `unfitted`.
     read_unfitted: bool,
     /// The address literals must end by.
-    data_limit: u32,
+    data_limit: u64,
     /// The contents of literals, placed in memory in the order they are
     /// lowered.
     data: Vec<ir::Data>,
     /// The first address after `data`, or the start of the static data
-    /// section if there is none.
-    data_end: u64,
+    /// section if there is none. Data that doesn't fit may end past every
+    /// address.
+    data_end: u128,
     /// The address of each string that a pattern is, which is placed once.
-    pattern_strings: HashMap<String, u32>,
+    pattern_strings: HashMap<String, u64>,
     errors: Vec<TypeError>,
 }
 
@@ -940,7 +943,7 @@ impl Prim {
 
     /// The wasm value that holds one. An `int` or `uint` is
     /// [fixed](Checker::fixed) first, as are those of every method that
-    /// depends on a size.
+    /// depends on a size: theirs is that of an address.
     fn val_type(self) -> ValType {
         match self {
             Self::Int | Self::Uint => unreachable!("`int` and `uint` are fixed first"),
@@ -1279,12 +1282,12 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
         // Literals are only in globals, so every one has been placed.
         let fitted = StaticSection {
             start: 0,
-            end: ck.data_end.min(u32::MAX.into()) as u32,
+            end: ck.data_end.min(ck.data_limit.into()) as u64,
         };
         if ck.read_unfitted {
             // A global was given a size the section doesn't have.
             ck = Checker::define(program, settings, Some(fitted));
-            if ck.data_fits() && ck.data_end != u64::from(fitted.end) {
+            if ck.data_fits() && ck.data_end != u128::from(fitted.end) {
                 ck.errors.push(TypeError {
                     kind: TypeErrorKind::SelfSizedStatic,
                     span: None,
@@ -1316,10 +1319,12 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
             memory: ir::Memory {
                 min_pages: ck.min_pages(),
                 max_pages: settings.memory.max_pages,
+                memory64: settings.memory64,
                 export: MEMORY_EXPORT.to_string(),
             },
             data: ck.data,
             table: (!ck.table.is_empty()).then(|| ir::Table {
+                table64: settings.memory64,
                 export: TABLE_EXPORT.to_string(),
                 funcs: ck.table,
             }),
@@ -1944,13 +1949,15 @@ impl Checker {
         let mut ck = Self {
             entry: program.entry,
             memory: settings.memory,
+            memory64: settings.memory64,
             static_section,
             unfitted: settings.static_section.is_none() && fitted.is_none(),
-            data_limit: settings
-                .static_section
-                .map_or(u32::MAX, |section| section.end),
             data_end: static_section.start.into(),
             ..Self::default()
+        };
+        ck.data_limit = match settings.static_section {
+            Some(section) => section.end,
+            None => ck.max_addr(),
         };
         ck.declare(program);
         ck.define_structs(program);
@@ -1963,8 +1970,8 @@ impl Checker {
 
     /// The pages memory starts with, which `module.min` is: those of the
     /// settings, or else the fewest that hold the static data section.
-    fn min_pages(&self) -> u32 {
-        let fewest = u64::from(self.static_section.end).div_ceil(PAGE_SIZE) as u32;
+    fn min_pages(&self) -> u64 {
+        let fewest = self.static_section.end.div_ceil(PAGE_SIZE);
         self.memory.min_pages.unwrap_or(fewest)
     }
 
@@ -1974,7 +1981,7 @@ impl Checker {
         let StaticSection { start, end } = self.static_section;
         let mut errors = Vec::new();
         match (self.memory.min_pages, self.memory.max_pages) {
-            (Some(min_pages), _) if u64::from(end) > u64::from(min_pages) * PAGE_SIZE => {
+            (Some(min_pages), _) if end.div_ceil(PAGE_SIZE) > min_pages => {
                 errors.push(TypeErrorKind::StaticOutsideMemory { end, min_pages });
             }
             (None, Some(max_pages)) if self.min_pages() > max_pages => {
@@ -1984,7 +1991,7 @@ impl Checker {
         }
         if !self.data_fits() {
             errors.push(TypeErrorKind::DataTooLarge {
-                bytes: self.data_end - u64::from(start),
+                bytes: self.data_end - u128::from(start),
                 capacity: self.data_limit - start,
             });
         }
@@ -2310,14 +2317,61 @@ impl Checker {
         }
     }
 
-    /// The type of a fixed size that `prim` is held as: an `i32` for an
-    /// `int` and a `u32` for a `uint`. Any other is itself.
+    /// The type of a fixed size that `prim` is held as. An `int` and a
+    /// `uint` are as wide as an address: an `i32` and a `u32`, or an `i64`
+    /// and a `u64` where addresses are 64 bits wide. Any other is itself.
     fn fixed(&self, prim: Prim) -> Prim {
-        match prim {
-            Prim::Int => Prim::I32,
-            Prim::Uint => Prim::U32,
-            prim => prim,
+        match (prim, self.memory64) {
+            (Prim::Int, false) => Prim::I32,
+            (Prim::Int, true) => Prim::I64,
+            (Prim::Uint, false) => Prim::U32,
+            (Prim::Uint, true) => Prim::U64,
+            _ => prim,
         }
+    }
+
+    /// The wasm type of an address, which a pointer, a function pointer, an
+    /// `int` and a `uint` each are.
+    fn addr_type(&self) -> ValType {
+        self.fixed(Prim::Uint).val_type()
+    }
+
+    /// The largest address, which is the largest `uint`.
+    fn max_addr(&self) -> u64 {
+        self.fixed(Prim::Uint).range().1 as u64
+    }
+
+    /// The address `n`, or a count of `n` bytes, elements or pages, as a
+    /// constant.
+    fn addr_const(&self, n: u64) -> Const {
+        match self.memory64 {
+            true => Const::I64(n as i64),
+            false => Const::I32(n as i32),
+        }
+    }
+
+    /// The constant array of `len` elements at `ptr`.
+    fn array_value(&self, ptr: u64, len: u64) -> Value {
+        let vt = self.addr_type();
+        let consts = [ptr, len].map(|x| (vt, Expr::Const(self.addr_const(x))));
+        Value {
+            pre: Vec::new(),
+            scalars: consts.to_vec(),
+        }
+    }
+
+    /// The address of element `index` of an array whose elements start at
+    /// `ptr` and are `stride` bytes apart.
+    fn element_addr(&self, ptr: Expr, index: Expr, stride: u32) -> Expr {
+        let vt = self.addr_type();
+        let offset = match stride {
+            1 => index,
+            _ => {
+                let stride = Expr::Const(self.addr_const(stride.into()));
+                binary(vt, IrBinOp::Mul, index, stride)
+            }
+        };
+        binary(vt, IrBinOp::Add, ptr, offset)
     }
 
     /// The interned tuple type with elements `elems`.
@@ -2536,7 +2590,7 @@ impl Checker {
     fn push_leaves(&self, ty: Ty, name: String, out: &mut Vec<(String, ValType)>) {
         match ty {
             Ty::Prim(prim) => out.push((name, self.fixed(prim).val_type())),
-            Ty::Ptr(_) | Ty::Fn(_) => out.push((name, ValType::I32)),
+            Ty::Ptr(_) | Ty::Fn(_) => out.push((name, self.addr_type())),
             Ty::ExternRef => out.push((name, ValType::ExternRef)),
             Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
             Ty::Struct(id) => {
@@ -2786,7 +2840,7 @@ impl Checker {
                 let size = self.fixed(prim).size();
                 (size, size)
             }
-            Ty::Ptr(_) | Ty::Fn(_) => (4, 4),
+            Ty::Ptr(_) | Ty::Fn(_) => self.layout(Ty::Prim(Prim::Uint)),
             Ty::Enum(id) => self.layout(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 if let Some(id) = self.union_id(ty) {
@@ -2853,7 +2907,7 @@ impl Checker {
             Ty::Ptr(_) | Ty::Fn(_) => out.push(Cell {
                 offset,
                 leaf: leaves[0],
-                ty: ValType::I32,
+                ty: self.addr_type(),
                 load: LoadOp::Load,
                 store: StoreOp::Store,
                 bool: false,
@@ -2902,14 +2956,15 @@ impl Checker {
     /// Places `bytes`, which hold `len` elements, in memory at the next
     /// multiple of `align`, or right at the end if there are none. Returns the
     /// array of them.
-    fn push_data(&mut self, bytes: Vec<u8>, align: u32, len: u32) -> Value {
-        array_value(self.place_data(bytes, align), len)
+    fn push_data(&mut self, bytes: Vec<u8>, align: u32, len: u64) -> Value {
+        let ptr = self.place_data(bytes, align);
+        self.array_value(ptr, len)
     }
 
     /// Places `bytes` in memory at the next multiple of `align`, or right
     /// at the end if there are none. Returns their address.
-    fn place_data(&mut self, bytes: Vec<u8>, align: u32) -> u32 {
-        let offset = self.reserve_data(bytes.len() as u64, align);
+    fn place_data(&mut self, bytes: Vec<u8>, align: u32) -> u64 {
+        let offset = self.reserve_data(bytes.len() as u128, align);
         if !bytes.is_empty() {
             self.data.push(ir::Data { offset, bytes });
         }
@@ -2919,22 +2974,22 @@ impl Checker {
     /// Makes room in memory for `size` bytes at the next multiple of `align`,
     /// or right at the end if there are none. Returns their address, which
     /// is only meaningful while the data fits.
-    fn reserve_data(&mut self, size: u64, align: u32) -> u32 {
+    fn reserve_data(&mut self, size: u128, align: u32) -> u64 {
         let mut offset = self.data_end;
         if size > 0 {
             offset = offset.next_multiple_of(align.into());
             self.data_end = offset + size;
         }
-        offset as u32
+        offset as u64
     }
 
     /// Places `count` copies of a `ty` whose scalars are `consts` in memory.
     /// Returns the address of the first.
-    fn repeat_data(&mut self, ty: Ty, consts: Vec<Const>, count: u32) -> u32 {
+    fn repeat_data(&mut self, ty: Ty, consts: Vec<Const>, count: u64) -> u64 {
         let (size, align) = self.layout(ty);
         let mut bytes = vec![0; size as usize];
         self.write_consts(&mut bytes, &self.cells(ty), &consts);
-        let offset = self.reserve_data(u64::from(size) * u64::from(count), align);
+        let offset = self.reserve_data(u128::from(size) * u128::from(count), align);
         // Memory starts out zeroed, and data that doesn't fit is an error, so
         // neither is written out.
         let zeroed = count == 0 || bytes.iter().all(|&byte| byte == 0);
@@ -3364,30 +3419,29 @@ impl<'c> Body<'c> {
             _ => self.invalid_operand("for", ty, iter.span).0,
         };
         self.record(stmt, Some(elem));
-        let (ptr, len, index) = (
-            self.temp(ValType::I32),
-            self.temp(ValType::I32),
-            self.temp(ValType::I32),
-        );
+        let vt = self.ck.addr_type();
+        let (ptr, len, index) = (self.temp(vt), self.temp(vt), self.temp(vt));
+        let [zero, one] = [0, 1].map(|n| Expr::Const(self.ck.addr_const(n)));
         out.extend(value.pre);
         let mut scalars = exprs(value.scalars).into_iter();
         for dest in [ptr, len] {
-            let scalar = scalars.next().unwrap_or(Expr::Const(Const::I32(0)));
+            let scalar = scalars.next().unwrap_or(zero.clone());
             out.push(Stmt::SetLocal(dest, scalar));
         }
-        out.push(Stmt::SetLocal(index, Expr::Const(Const::I32(0))));
+        out.push(Stmt::SetLocal(index, zero));
         let i = Expr::Local(index);
-        let done = binary(ValType::I32, IrBinOp::GeU, i.clone(), Expr::Local(len));
+        let done = binary(vt, IrBinOp::GeU, i.clone(), Expr::Local(len));
         let mut inner = vec![Stmt::BrIf(1, done)];
-        let addr = element_addr(Expr::Local(ptr), i.clone(), self.ck.layout(elem).0);
-        let element = self.load(scalar(ValType::I32, addr), 0, elem);
+        let stride = self.ck.layout(elem).0;
+        let addr = self.ck.element_addr(Expr::Local(ptr), i.clone(), stride);
+        let element = self.load(scalar(vt, addr), 0, elem);
         let slots = self.alloc(&var.name, elem);
         inner.extend(element.pre);
         for (slot, (_, scalar)) in slots.iter().zip(element.scalars) {
             inner.push(Stmt::SetLocal(*slot, scalar));
         }
         // Advanced before the body, so `continue` moves on too.
-        let next = binary(ValType::I32, IrBinOp::Add, i, Expr::Const(Const::I32(1)));
+        let next = binary(vt, IrBinOp::Add, i, one);
         inner.push(Stmt::SetLocal(index, next));
         self.scopes.push(HashMap::new());
         self.bind(&var.name, elem, false, slots);
@@ -3564,13 +3618,14 @@ impl<'c> Body<'c> {
         // Only a mistyped index has other than one scalar.
         let [ptr, len, index] = <[_; 3]>::try_from(exprs(value.scalars)).ok()?;
         let mut pre = value.pre;
+        let vt = self.ck.addr_type();
         pre.push(Stmt::If {
-            cond: binary(ValType::I32, IrBinOp::GeU, index.clone(), len),
+            cond: binary(vt, IrBinOp::GeU, index.clone(), len),
             then_body: vec![Stmt::Unreachable],
             else_body: Vec::new(),
         });
-        let tmp = self.temp(ValType::I32);
-        let addr = element_addr(ptr, index, self.ck.layout(elem).0);
+        let tmp = self.temp(vt);
+        let addr = self.ck.element_addr(ptr, index, self.ck.layout(elem).0);
         pre.push(Stmt::SetLocal(tmp, addr));
         Some(Place {
             name: String::new(),
@@ -3608,7 +3663,7 @@ impl<'c> Body<'c> {
         if matches!(addr, Expr::Local(_) | Expr::Const(_)) {
             return (pre, addr);
         }
-        let tmp = self.temp(ValType::I32);
+        let tmp = self.temp(self.ck.addr_type());
         pre.push(Stmt::SetLocal(tmp, addr));
         (pre, Expr::Local(tmp))
     }
@@ -3620,7 +3675,7 @@ impl<'c> Body<'c> {
             Slots::Global(slots) => slots.iter().map(|g| Expr::Global(*g)).collect(),
             Slots::Const(consts) => consts.iter().map(|c| Expr::Const(*c)).collect(),
             Slots::Memory { addr, offset } => {
-                let ptr = scalar(ValType::I32, addr.clone());
+                let ptr = scalar(self.ck.addr_type(), addr.clone());
                 return self.load(ptr, *offset, place.ty);
             }
         };
@@ -3877,7 +3932,7 @@ impl<'c> Body<'c> {
         let ty = self.ck.array_of(Ty::Prim(Prim::U8), mutable);
         (
             ty,
-            self.ck.push_data(s.as_bytes().to_vec(), 1, s.len() as u32),
+            self.ck.push_data(s.as_bytes().to_vec(), 1, s.len() as u64),
         )
     }
 
@@ -3887,23 +3942,19 @@ impl<'c> Body<'c> {
     /// may grow to, `max` being the largest `uint` if it's unlimited. Each
     /// is a `uint`.
     fn module_property(&mut self, name: &Ident) -> (Ty, Value) {
-        let page_count = |pages: u32| {
-            let value = scalar(ValType::I32, Expr::Const(Const::I32(pages as i32)));
-            (Ty::Prim(Prim::Uint), value)
-        };
-        match name.name.as_str() {
+        let count = match name.name.as_str() {
             "static" => {
                 self.ck.read_unfitted |= self.ck.unfitted;
                 let StaticSection { start, end } = self.ck.static_section;
                 let ty = self.ck.array_of(Ty::Prim(Prim::U8), false);
-                (ty, array_value(start, end - start))
+                return (ty, self.ck.array_value(start, end - start));
             }
-            "page_size" => page_count(PAGE_SIZE as u32),
+            "page_size" => PAGE_SIZE,
             "min" => {
                 self.ck.read_unfitted |= self.ck.unfitted && self.ck.memory.min_pages.is_none();
-                page_count(self.ck.min_pages())
+                self.ck.min_pages()
             }
-            "max" => page_count(self.ck.memory.max_pages.unwrap_or(u32::MAX)),
+            "max" => self.ck.memory.max_pages.unwrap_or(self.ck.max_addr()),
             other => {
                 let kind = if MODULE_FUNCS.contains(&other) {
                     TypeErrorKind::NotAValue(format!("module.{other}"))
@@ -3911,9 +3962,11 @@ impl<'c> Body<'c> {
                     TypeErrorKind::UnknownModuleProperty(other.to_string())
                 };
                 self.error(kind, name.span);
-                (Ty::Error, Value::default())
+                return (Ty::Error, Value::default());
             }
-        }
+        };
+        let count = Expr::Const(self.ck.addr_const(count));
+        (Ty::Prim(Prim::Uint), scalar(self.ck.addr_type(), count))
     }
 
     /// `module.name(args)`, one of `module`'s functions, lowered to the
@@ -3958,23 +4011,20 @@ impl<'c> Body<'c> {
         }
         let mut operands = exprs(scalars).into_iter();
         let mut operand = || operands.next().unwrap();
+        let vt = self.ck.addr_type();
         let (ty, scalars) = match name.name.as_str() {
             "memory" => {
-                // Wraps to 0 if memory is the full 4 GiB.
-                let len = binary(
-                    ValType::I32,
-                    IrBinOp::Mul,
-                    Expr::MemorySize,
-                    Expr::Const(Const::I32(PAGE_SIZE as i32)),
-                );
-                let ptr = Expr::Const(Const::I32(0));
+                // Wraps to 0 if memory holds every address.
+                let page_size = Expr::Const(self.ck.addr_const(PAGE_SIZE));
+                let len = binary(vt, IrBinOp::Mul, Expr::MemorySize, page_size);
+                let ptr = Expr::Const(self.ck.addr_const(0));
                 let ty = self.ck.array_of(byte, true);
-                (ty, vec![(ValType::I32, ptr), (ValType::I32, len)])
+                (ty, vec![(vt, ptr), (vt, len)])
             }
-            "size" => (count, vec![(ValType::I32, Expr::MemorySize)]),
+            "size" => (count, vec![(vt, Expr::MemorySize)]),
             "grow" => {
                 let grow = Expr::MemoryGrow(Box::new(operand()));
-                (Ty::Prim(Prim::Int), vec![(ValType::I32, grow)])
+                (Ty::Prim(Prim::Int), vec![(vt, grow)])
             }
             "fill" => {
                 let (dst, value, len) = (operand(), operand(), operand());
@@ -4088,7 +4138,7 @@ impl<'c> Body<'c> {
             self.ck
                 .write_consts(&mut bytes[i * size as usize..], &cells, consts);
         }
-        let value = self.ck.push_data(bytes, align, items.len() as u32);
+        let value = self.ck.push_data(bytes, align, items.len() as u64);
         (self.ck.array_of(elem, mutable), value)
     }
 
@@ -4135,24 +4185,27 @@ impl<'c> Body<'c> {
         if !self.ck.fits(ty, elem) || !self.placeable(elem, errors, span) {
             return (Ty::Error, Value::default());
         }
-        let [Const::I32(count)] = count[..] else {
-            return (Ty::Error, Value::default());
+        let count = match count[..] {
+            [Const::I32(count)] => (count as u32).into(),
+            [Const::I64(count)] => count as u64,
+            _ => return (Ty::Error, Value::default()),
         };
-        let count = count as u32;
-        self.check_shared(mutable, count as usize, span);
+        let len = usize::try_from(count).unwrap_or(usize::MAX);
+        self.check_shared(mutable, len, span);
         let offset = self.ck.repeat_data(elem, consts, count);
-        (self.ck.array_of(elem, mutable), array_value(offset, count))
+        let value = self.ck.array_value(offset, count);
+        (self.ck.array_of(elem, mutable), value)
     }
 
     /// An integer literal, typed by `expected` and defaulting to `i32`. Where
     /// a pointer is expected, it is an address.
     fn int_literal(&mut self, n: i128, expected: Option<Ty>, span: Span) -> (Ty, Value) {
         if let Some(ptr @ Ty::Ptr(_)) = expected {
-            let (min, max) = self.ck.fixed(Prim::Uint).range();
-            if n < min || n > max {
+            if n < 0 || n > self.ck.max_addr().into() {
                 self.error(TypeErrorKind::IntOutOfRange(self.ck.ty_name(ptr)), span);
             }
-            return (ptr, scalar(ValType::I32, Expr::Const(Const::I32(n as i32))));
+            let addr = Expr::Const(self.ck.addr_const(n as u64));
+            return (ptr, scalar(self.ck.addr_type(), addr));
         }
         let prim = match expected {
             Some(Ty::Prim(prim)) if prim.is_numeric() => prim,
@@ -4276,7 +4329,8 @@ impl<'c> Body<'c> {
             return (Ty::Error, Value::default());
         }
         let (size, align) = self.ck.layout(ty);
-        let consts = [size, align].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
+        let vt = self.ck.addr_type();
+        let consts = [size, align].map(|x| (vt, Expr::Const(self.ck.addr_const(x.into()))));
         let value = Value {
             pre: Vec::new(),
             scalars: consts.to_vec(),
@@ -4603,18 +4657,17 @@ impl<'c> Body<'c> {
             let (ty, needs, element) = self.read_only(ty);
             self.error(TypeErrorKind::ReadOnlyAddr { ty, needs, element }, span);
         }
+        let vt = self.ck.addr_type();
         let addr = match offset {
             0 => addr,
-            _ => binary(
-                ValType::I32,
-                IrBinOp::Add,
-                addr,
-                Expr::Const(Const::I32(offset as i32)),
-            ),
+            _ => {
+                let offset = Expr::Const(self.ck.addr_const(offset.into()));
+                binary(vt, IrBinOp::Add, addr, offset)
+            }
         };
         let value = Value {
             pre: place.pre,
-            scalars: vec![(ValType::I32, addr)],
+            scalars: vec![(vt, addr)],
         };
         (self.ck.ptr_to(place.ty, mutable), value)
     }
@@ -4641,8 +4694,9 @@ impl<'c> Body<'c> {
         }
         let ty = want.filter(|want| self.ck.fits(ty, *want)).unwrap_or(ty);
         let offset = self.ck.repeat_data(ty, consts, 1);
-        let addr = Expr::Const(Const::I32(offset as i32));
-        (self.ck.ptr_to(ty, mutable), scalar(ValType::I32, addr))
+        let addr = Expr::Const(self.ck.addr_const(offset));
+        let value = scalar(self.ck.addr_type(), addr);
+        (self.ck.ptr_to(ty, mutable), value)
     }
 
     fn call(&mut self, callee: &parse::Expr, args: &[Arg], span: Span) -> (Ty, Value) {
@@ -5060,15 +5114,6 @@ fn scalar(ty: ValType, expr: Expr) -> Value {
     }
 }
 
-/// The constant array of `len` elements at `ptr`.
-fn array_value(ptr: u32, len: u32) -> Value {
-    let consts = [ptr, len].map(|x| (ValType::I32, Expr::Const(Const::I32(x as i32))));
-    Value {
-        pre: Vec::new(),
-        scalars: consts.to_vec(),
-    }
-}
-
 fn exprs(scalars: Vec<(ValType, Expr)>) -> Vec<Expr> {
     scalars.into_iter().map(|(_, e)| e).collect()
 }
@@ -5191,21 +5236,6 @@ fn write_const(out: &mut [u8], store: StoreOp, c: Const) {
         StoreOp::Store => bytes.len(),
     };
     out[..width].copy_from_slice(&bytes[..width]);
-}
-
-/// The address of element `index` of an array whose elements start at `ptr`
-/// and are `stride` bytes apart.
-fn element_addr(ptr: Expr, index: Expr, stride: u32) -> Expr {
-    let offset = match stride {
-        1 => index,
-        _ => binary(
-            ValType::I32,
-            IrBinOp::Mul,
-            index,
-            Expr::Const(Const::I32(stride as i32)),
-        ),
-    };
-    binary(ValType::I32, IrBinOp::Add, ptr, offset)
 }
 
 fn zero(ty: ValType) -> Const {
@@ -5795,7 +5825,7 @@ mod tests {
     }
 
     /// The offset and bytes of each data segment.
-    fn data(module: &Module) -> Vec<(u32, &[u8])> {
+    fn data(module: &Module) -> Vec<(u64, &[u8])> {
         module
             .data
             .iter()
@@ -6927,6 +6957,7 @@ pub fn f(p: &P, a: uint, n: int) -> &u32:
             ir::Memory {
                 min_pages: 0,
                 max_pages: None,
+                memory64: false,
                 export: "memory".to_string()
             }
         );
@@ -7057,6 +7088,280 @@ fn f(n: uint, i: int, w: u32):
                 mismatch("i32", "int"),
             ]
         );
+    }
+
+    /// Lowers `src` with addresses 64 bits wide.
+    fn lower64(src: &str) -> Module {
+        let settings = Settings {
+            memory64: true,
+            ..Settings::default()
+        };
+        match check_with(src, &settings) {
+            Ok(module) => module,
+            Err(errors) => panic!("unexpected type errors: {errors:#?}"),
+        }
+    }
+
+    #[test]
+    fn memory64_widens_addresses_and_what_counts_them() {
+        let src = "\
+pub struct S:
+    a: u8
+    p: &u8
+    n: uint
+pub let BIG: uint = 5000000000
+pub let top = 18446744073709551615 as &u8
+pub fn f(n: uint, i: int, w: u32, p: &var S) -> uint:
+    let narrow = n as u32
+    let wide = w as uint
+    let signed = n as int
+    let short = i as i32
+    let addr = p as uint
+    p.n = addr + 8
+    let q = p.p < (addr + 8) as &u8
+    let r = &var p.n
+    let t = fn()
+    return S.size + (&u8).align + array(u8).size + t.size + module.count_leading_zeros(n)
+";
+        let module = lower64(src);
+        assert!(module.memory.memory64);
+        let globals: Vec<_> = module.globals.iter().map(|g| (g.ty, g.init)).collect();
+        assert_eq!(
+            globals,
+            [
+                (ValType::I64, Const::I64(5000000000)),
+                (ValType::I64, Const::I64(-1))
+            ]
+        );
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        let wide = ValType::I64;
+        assert_eq!(f.params, [wide, wide, ValType::I32, wide]);
+        assert_eq!(f.results, [wide]);
+        assert_eq!(
+            body(&module, "f"),
+            "(set narrow (I64.Wrap n)) (set wide (I32.ExtendU w)) (set signed n) \
+             (set short (I64.Wrap i)) (set addr p) (I64.Store offset=16 p (I64.Add addr 8i64)) \
+             (set q (I64.LtU (I64.Load offset=8 p) (I64.Add addr 8i64))) \
+             (set r (I64.Add p 16i64)) (set t.size 8i64) (set t.align 8i64) \
+             (return (I64.Add (I64.Add (I64.Add (I64.Add 24i64 8i64) 16i64) t.size) \
+             (I64.Clz n)))"
+        );
+        // Neither constant is an address that 32 bits hold.
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::IntOutOfRange("uint".into()),
+                TypeErrorKind::IntOutOfRange("uint".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn memory64_indexes_arrays_with_wide_addresses() {
+        let src = "\
+let names: array(array(u8)) = [\"ab\"]
+fn at(a: array(u64), i: uint) -> u64:
+    return a[i]
+fn sum(a: array(u16)) -> u16:
+    var total: u16 = 0
+    for x in a:
+        total += x
+    return total
+fn first(a: array(u8)) -> u8:
+    match a:
+        [x, _]:
+            return x
+        else:
+            return 0
+fn same(a: array(u16), b: array(u16)) -> bool:
+    return a == b
+";
+        let module = lower64(src);
+        assert_eq!(
+            body(&module, "at"),
+            "(if (I64.GeU i a.len) (then unreachable) (else )) \
+             (set tmp3 (I64.Add a.ptr (I64.Mul i 8i64))) (return (I64.Load offset=0 tmp3))"
+        );
+        assert_eq!(
+            body(&module, "sum"),
+            "(set total 0) (set tmp3 a.ptr) (set tmp4 a.len) (set tmp5 0i64) \
+             (block (loop (br_if 1 (I64.GeU tmp5 tmp4)) \
+             (set x (I32.Load16U offset=0 (I64.Add tmp3 (I64.Mul tmp5 2i64)))) \
+             (set tmp5 (I64.Add tmp5 1i64)) (set total (I32.And (I32.Add total x) 65535)) \
+             (br 0))) (return total)"
+        );
+        assert_eq!(
+            body(&module, "first"),
+            "(set tmp2 a.ptr) (set tmp3 a.len) \
+             (block (if (if (I64.Eq tmp3 2i64) (seq (set x (I32.Load8U offset=0 tmp2)) 1) 0) \
+             (then (return x)) (else )) (return 0)) unreachable"
+        );
+        assert_eq!(
+            body(&module, "==(array(u16))"),
+            "(if (I64.Ne a.len b.len) (then (return 0)) (else )) (set tmp4 0i64) \
+             (block (loop (br_if 1 (I64.GeU tmp4 a.len)) \
+             (if (I32.Ne (I32.Load16U offset=0 (I64.Add a.ptr (I64.Mul tmp4 2i64))) \
+             (I32.Load16U offset=0 (I64.Add b.ptr (I64.Mul tmp4 2i64)))) \
+             (then (return 0)) (else )) (set tmp4 (I64.Add tmp4 1i64)) (br 0))) (return 1)"
+        );
+        let at = module.funcs.iter().find(|f| f.name == "at").unwrap();
+        assert_eq!(at.params, [ValType::I64; 3]);
+        // An array in memory is a `ptr` and a `len` of 8 bytes each.
+        let mut name = [0u8; 16];
+        name[8] = 2;
+        assert_eq!(data(&module), [(0, &b"ab"[..]), (8, &name[..])]);
+    }
+
+    #[test]
+    fn memory64_widens_the_functions_and_constants_of_module() {
+        let src = "\
+pub let limits = (module.page_size, module.min, module.max)
+fn all() -> varray(u8):
+    return module.memory()
+fn size() -> uint:
+    return module.size()
+fn grow(n: uint) -> int:
+    return module.grow(n)
+fn fill(p: &var u8, n: uint):
+    module.fill(p, 7, n)
+fn copy(a: varray(u8), b: array(u8)):
+    module.copy(src: b.ptr, dst: a.ptr, len: a.len)
+";
+        let module = lower64(src);
+        let globals: Vec<_> = module.globals.iter().map(|g| g.init).collect();
+        assert_eq!(globals, [Const::I64(65536), Const::I64(0), Const::I64(-1)]);
+        assert_eq!(
+            body(&module, "all"),
+            "(return 0i64 (I64.Mul memory.size 65536i64))"
+        );
+        assert_eq!(body(&module, "size"), "(return memory.size)");
+        assert_eq!(body(&module, "grow"), "(return (memory.grow n))");
+        assert_eq!(body(&module, "fill"), "(memory.fill p 7 n)");
+        assert_eq!(body(&module, "copy"), "(memory.copy a.ptr b.ptr a.len)");
+        for name in ["size", "grow"] {
+            let func = module.funcs.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(func.results, [ValType::I64], "{name}");
+        }
+    }
+
+    #[test]
+    fn memory64_places_literals_past_what_32_bits_address() {
+        let far = 1 << 32;
+        let settings = Settings {
+            memory: MemoryLimits {
+                min_pages: Some(1 << 17),
+                max_pages: Some(1 << 30),
+            },
+            memory64: true,
+            static_section: Some(StaticSection {
+                start: far,
+                end: far + 16,
+            }),
+            ..Settings::default()
+        };
+        let src = "\
+pub let s = \"abc\"
+pub let cell = &var 7
+pub let all = module.static
+pub let max = module.max
+";
+        let module = check_with(src, &settings).unwrap();
+        assert_eq!(
+            data(&module),
+            [(far, &b"abc"[..]), (far + 4, &[7, 0, 0, 0][..])]
+        );
+        let globals: Vec<_> = module.globals.iter().map(|g| g.init).collect();
+        let far = far as i64;
+        assert_eq!(globals, [far, 3, far + 4, far, 16, 1 << 30].map(Const::I64));
+        assert_eq!(
+            (module.memory.min_pages, module.memory.max_pages),
+            (1 << 17, Some(1 << 30))
+        );
+        // More elements than 32 bits count, in the memory fitted to them.
+        let module = lower64("pub let zeros: array(u8) = [0; 5000000000]\n");
+        assert_eq!(module.memory.min_pages, 76294);
+        assert_eq!(module.globals[1].init, Const::I64(5000000000));
+        let unfit = "let a: array(u64) = [1; 18446744073709551615]\n";
+        let settings = Settings {
+            memory64: true,
+            ..Settings::default()
+        };
+        let errors = check_with(unfit, &settings).unwrap_err();
+        assert_eq!(
+            errors.into_iter().map(|e| e.kind).collect::<Vec<_>>(),
+            [TypeErrorKind::DataTooLarge {
+                bytes: 8 * u128::from(u64::MAX),
+                capacity: u64::MAX
+            }]
+        );
+    }
+
+    #[test]
+    fn memory64_widens_function_pointers_and_the_table() {
+        let src = "\
+struct S:
+    a: u8
+    f: fn(i32) -> i32
+fn inc(x: i32) -> i32:
+    return x + 1
+fn f(p: &var S, g: fn(i32) -> i32, i: uint) -> i32:
+    p.f = g
+    let h = i as fn(i32) -> i32
+    let n = inc as uint
+    return p.f(1) + h(2) + S.size as i32
+";
+        let module = lower64(src);
+        assert!(module.table.as_ref().unwrap().table64);
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.params, [ValType::I64; 3]);
+        assert_eq!(
+            body(&module, "f"),
+            "(I64.Store offset=8 p g) (set h i) (set n 1i64) \
+             (return (I32.Add (I32.Add (call_indirect (I64.Load offset=8 p) 1) \
+             (call_indirect h 2)) (I64.Wrap 16i64)))"
+        );
+        assert!(
+            !lower("fn f():\n    pass\nlet g = f\n")
+                .table
+                .unwrap()
+                .table64
+        );
+    }
+
+    #[test]
+    fn memory64_widens_the_leaves_unions_share_with_addresses() {
+        let src = "\
+union U:
+    at: uint
+    ratio: f32
+    byte: &u8
+let units: array(U) = [.at(5000000000), .ratio(1.0)]
+fn f(u: U, p: &var U) -> uint:
+    p.* = u
+    match u:
+        .at(n):
+            return n
+        else:
+            return U.size
+";
+        let module = lower64(src);
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.params, [ValType::I32, ValType::I64, ValType::I64]);
+        assert_eq!(
+            body(&module, "f"),
+            "(I32.Store8 offset=0 p u) \
+             (if (I32.Eq u 0) (then (I64.Store offset=8 p u.0)) (else )) \
+             (if (I32.Eq u 1) \
+             (then (F32.Store offset=8 p (I32.Reinterpret (I64.Wrap u.0)))) (else )) \
+             (if (I32.Eq u 2) (then (I64.Store offset=8 p u.0)) (else )) \
+             (set tmp3 u) (set n u.0) \
+             (block (if (I32.Eq tmp3 0) (then (return n)) (else )) (return 16i64)) unreachable"
+        );
+        let mut bytes = [0u8; 32];
+        bytes[8..16].copy_from_slice(&5000000000u64.to_le_bytes());
+        bytes[16] = 1;
+        bytes[24..28].copy_from_slice(&1f32.to_le_bytes());
+        assert_eq!(data(&module), [(0, &bytes[..])]);
     }
 
     #[test]
@@ -9508,7 +9813,7 @@ fn f() -> uint:
             check_src("let a: array(u64) = [1; 4294967295]\n").unwrap_err(),
             [spanless(TypeErrorKind::DataTooLarge {
                 bytes: 34359738360,
-                capacity: u32::MAX
+                capacity: u32::MAX.into()
             })]
         );
     }

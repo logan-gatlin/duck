@@ -5,6 +5,8 @@
 //! have been split into one local or global per scalar field, function
 //! pointers are indices into the module's table, and control flow is wasm's
 //! structured `block`/`loop`/`if` with branch targets given as label depths.
+//! An address, a function pointer and a count of pages are each an `i32`, or
+//! an `i64` where [`Memory::memory64`] is set.
 
 /// A wasm function index: [`Module::imports`] come first, then
 /// [`Module::funcs`].
@@ -37,15 +39,20 @@ pub struct Module {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Memory {
     /// Initial size in 64 KiB pages.
-    pub min_pages: u32,
+    pub min_pages: u64,
     /// Size in 64 KiB pages it may grow to; `None` is unlimited.
-    pub max_pages: Option<u32>,
+    pub max_pages: Option<u64>,
+    /// Whether it is addressed with an `i64` rather than an `i32`.
+    pub memory64: bool,
     pub export: String,
 }
 
 /// The module's one table, which function pointers index.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
+    /// Whether it is indexed with an `i64` rather than an `i32`, as it is
+    /// where the memory is.
+    pub table64: bool,
     pub export: String,
     /// The function at each index from 1 up. Nothing is at index 0, so
     /// calling it traps.
@@ -55,7 +62,7 @@ pub struct Table {
 /// Bytes copied into memory at `offset` when the module is instantiated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Data {
-    pub offset: u32,
+    pub offset: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -221,10 +228,10 @@ pub enum Expr {
         offset: u32,
         addr: Box<Expr>,
     },
-    /// `memory.size`, the memory's current size in pages, as an `i32`.
+    /// `memory.size`, the memory's current size in pages.
     MemorySize,
-    /// `memory.grow`, adding the `i32` number of pages and producing the old
-    /// size, or -1 if the memory can't grow that much.
+    /// `memory.grow`, adding the number of pages and producing the old size,
+    /// or -1 if the memory can't grow that much.
     MemoryGrow(Box<Expr>),
     /// `if (result ty)`. A label, but nothing inside can branch.
     If {

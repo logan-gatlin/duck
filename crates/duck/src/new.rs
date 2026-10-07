@@ -14,8 +14,11 @@ output = "build/out.wasm"
 # A function taking and returning nothing, run when the module is instantiated.
 start = "main"
 
-# Sizes are B, KiB, MiB, GiB, or pgs (64KiB wasm pages).
+# Sizes are B, KiB, MiB, GiB, TiB, or pgs (64KiB wasm pages).
 # [memory]
+# Address memory with 64 bits rather than 32, which makes pointers, `int` and
+# `uint` 64 bits wide and lets sizes pass 4GiB.
+# memory64 = true
 # What memory starts with. If not given, it is just enough to hold `static`.
 # min = "1pgs"
 # max = "16MiB"
@@ -119,6 +122,7 @@ mod tests {
                     min_pages: None,
                     max_pages: None,
                 },
+                memory64: false,
                 static_section: None,
             })
         );

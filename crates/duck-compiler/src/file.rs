@@ -29,6 +29,10 @@ pub trait FileManager {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub memory: MemoryLimits,
+    /// Whether an address is 64 bits wide rather than 32, as the memory's
+    /// and the table's then are, and with them every pointer, function
+    /// pointer, `int` and `uint`.
+    pub memory64: bool,
     /// `None` places literals from address 0, in a section that ends where
     /// they do.
     pub static_section: Option<StaticSection>,
@@ -42,17 +46,17 @@ pub struct Settings {
 pub struct MemoryLimits {
     /// `None` starts the memory with the fewest pages that hold the static
     /// data section.
-    pub min_pages: Option<u32>,
+    pub min_pages: Option<u64>,
     /// `None` lets the memory grow without limit.
-    pub max_pages: Option<u32>,
+    pub max_pages: Option<u64>,
 }
 
 /// The addresses `start..end` that literals are placed in, from `start` up.
 /// `start` is at most `end`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StaticSection {
-    pub start: u32,
-    pub end: u32,
+    pub start: u64,
+    pub end: u64,
 }
 
 pub(crate) struct DummyManager;

@@ -10,7 +10,7 @@ use crate::parse::BinOp;
 
 use super::{
     Body, Checker, FuncSig, Leaf, Prim, Synth, Ty, TypeErrorKind, Value, binary, binop_symbol,
-    element_addr, exprs, is_pure, is_simple, is_stable, scalar, split1,
+    exprs, is_pure, is_simple, is_stable, scalar, split1,
     unions::{self, Holds, narrow, tags_are, widen},
 };
 
@@ -60,7 +60,7 @@ impl Checker {
         };
         match ty {
             Ty::Prim(prim) => out.push(part(scalar(self.fixed(prim).val_type()), leaves)),
-            Ty::Ptr(_) | Ty::Fn(_) => out.push(part(scalar(ValType::I32), leaves)),
+            Ty::Ptr(_) | Ty::Fn(_) => out.push(part(scalar(self.addr_type()), leaves)),
             Ty::Enum(id) => self.push_parts(self.enum_ty(id), true, leaves, when, out),
             Ty::Array(_) if !bits => out.push(part(Compare::Array(ty), leaves)),
             Ty::Struct(_) if self.union_id(ty).is_some() => {
@@ -215,7 +215,7 @@ impl Body<'_> {
                     let sides = [&lhs, &rhs].into_iter();
                     let args = sides.flat_map(|side| {
                         let ends = part.leaves.iter();
-                        ends.map(|end| read(side, *end, ValType::I32))
+                        ends.map(|end| read(side, *end, self.ck.addr_type()))
                     });
                     let args = args.collect();
                     let call = Expr::Call(self.ck.eq_func(ty), args);
@@ -278,8 +278,9 @@ impl Body<'_> {
         let [a_ptr, a_len] = a.map(Expr::Local);
         let [b_ptr, b_len] = b.map(Expr::Local);
         let differ = || vec![Stmt::Return(vec![Expr::Const(Const::I32(0))])];
+        let vt = self.ck.addr_type();
         let mut out = vec![Stmt::If {
-            cond: binary(ValType::I32, IrBinOp::Ne, a_len.clone(), b_len),
+            cond: binary(vt, IrBinOp::Ne, a_len.clone(), b_len),
             then_body: differ(),
             else_body: Vec::new(),
         }];
@@ -288,15 +289,15 @@ impl Body<'_> {
         };
         let elem = self.ck.element(id);
         if !self.ck.parts(elem).is_empty() {
-            let index = self.temp(ValType::I32);
+            let index = self.temp(vt);
             let i = Expr::Local(index);
-            out.push(Stmt::SetLocal(index, Expr::Const(Const::I32(0))));
-            let done = binary(ValType::I32, IrBinOp::GeU, i.clone(), a_len);
+            out.push(Stmt::SetLocal(index, Expr::Const(self.ck.addr_const(0))));
+            let done = binary(vt, IrBinOp::GeU, i.clone(), a_len);
             let mut inner = vec![Stmt::BrIf(1, done)];
             let stride = self.ck.layout(elem).0;
             let [x, y] = [a_ptr, b_ptr].map(|ptr| {
-                let addr = element_addr(ptr, i.clone(), stride);
-                self.load(scalar(ValType::I32, addr), 0, elem)
+                let addr = self.ck.element_addr(ptr, i.clone(), stride);
+                self.load(scalar(vt, addr), 0, elem)
             });
             let ne = self.compare(BinOp::NotEq, elem, x, y);
             let (pre, ne) = split1(ne);
@@ -306,7 +307,7 @@ impl Body<'_> {
                 then_body: differ(),
                 else_body: Vec::new(),
             });
-            let next = binary(ValType::I32, IrBinOp::Add, i, Expr::Const(Const::I32(1)));
+            let next = binary(vt, IrBinOp::Add, i, Expr::Const(self.ck.addr_const(1)));
             inner.push(Stmt::SetLocal(index, next));
             inner.push(Stmt::Br(0));
             out.push(Stmt::Block(vec![Stmt::Loop(inner)]));

@@ -1,9 +1,10 @@
 //! Function pointers: values of the types `fn(A) -> R`, which are indices
-//! into the module's table. A function is given an index the first time its
-//! pointer is taken, so pointers are constants. Calls through them are
-//! `call_indirect`s, which trap on a function of another wasm type.
+//! into the module's table, as wide as an address. A function is given an
+//! index the first time its pointer is taken, so pointers are constants.
+//! Calls through them are `call_indirect`s, which trap on a function of
+//! another wasm type.
 
-use crate::ir::{self, Const, Expr, FuncId, Stmt, ValType};
+use crate::ir::{self, Expr, FuncId, Stmt};
 use crate::lex::Span;
 use crate::parse::{self, Arg};
 
@@ -106,8 +107,11 @@ impl Body<'_> {
             return (Ty::Error, Value::default());
         }
         let index = self.ck.table_index(id);
-        let index = Expr::Const(Const::I32(index as i32));
-        (self.ck.fn_of(params, ret), scalar(ValType::I32, index))
+        let index = Expr::Const(self.ck.addr_const(index.into()));
+        (
+            self.ck.fn_of(params, ret),
+            scalar(self.ck.addr_type(), index),
+        )
     }
 
     /// A call of `callee`, a value rather than the name of a function, with
@@ -159,7 +163,7 @@ impl Body<'_> {
         let either_order =
             args.pre.is_empty() && (all(is_stable) || is_pure(&index) && all(is_pure));
         if !is_stable(&index) && !either_order {
-            let tmp = self.temp(ValType::I32);
+            let tmp = self.temp(self.ck.addr_type());
             pre.push(Stmt::SetLocal(tmp, index));
             index = Expr::Local(tmp);
         }

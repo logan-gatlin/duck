@@ -10,8 +10,8 @@ use crate::load::Program;
 use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, PatternKind, StmtKind};
 
 use super::{
-    ARRAY, Body, Checker, Label, Need, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value,
-    array_value, binary, scalar, single, unions::narrow,
+    ARRAY, Body, Checker, Label, Need, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary,
+    scalar, single, unions::narrow,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -409,8 +409,8 @@ impl Body<'_> {
                 };
                 let elem = self.ck.element(id);
                 let (ptr, len) = (Expr::Local(subject[0]), Expr::Local(subject[1]));
-                let count = Expr::Const(Const::I32(elems.len() as i32));
-                let has_all = binary(ValType::I32, IrBinOp::Eq, len, count);
+                let count = Expr::Const(self.ck.addr_const(elems.len() as u64));
+                let has_all = binary(self.ck.addr_type(), IrBinOp::Eq, len, count);
                 case.steps.push(Step::Test(has_all));
                 let stride = self.ck.layout(elem).0;
                 let mut parts = Vec::new();
@@ -420,7 +420,7 @@ impl Body<'_> {
                         parts.push(Pat::Any);
                         continue;
                     }
-                    let ptr = scalar(ValType::I32, ptr.clone());
+                    let ptr = scalar(self.ck.addr_type(), ptr.clone());
                     let value = self.load(ptr, i as u32 * stride, elem);
                     let mut read = value.pre;
                     let mut locals = Vec::new();
@@ -490,7 +490,7 @@ impl Body<'_> {
                 let value = self.read_locals(ty, subject);
                 // Every function's are placed before any is lowered.
                 let placed = self.ck.pattern_strings[string];
-                let string_value = array_value(placed, string.len() as u32);
+                let string_value = self.ck.array_value(placed, string.len() as u64);
                 let equal = self.compare(BinOp::Eq, ty, value, string_value);
                 case.steps.push(Step::Test(single(equal)));
                 // What it matches is the array of its bytes, which an array
