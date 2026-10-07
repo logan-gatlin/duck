@@ -1,19 +1,21 @@
 //! Unions: types whose values hold one of a fixed list of variants, and a
 //! tag that says which. A union is declared and instantiated as a struct is,
 //! with a field per variant. Outside memory a value is its tag and then the
-//! scalars of every variant, of which only those of the one it holds are
-//! read: the rest are zero in any value built here. In memory it is the tag
+//! leaves that its variants share, as the Canonical ABI of the component
+//! model flattens a variant: each holds a scalar of the variant that the
+//! value holds, and is wide enough for that of any. Those that the variant
+//! has nothing in are zero in any value built here. In memory it is the tag
 //! and then room for the largest variant.
 
-use std::ops::Range;
+use std::iter;
 
-use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, ValType};
+use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
-    Body, Checker, FieldDef, Item, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS, Ty,
-    TypeErrorKind, Value, binary,
+    Body, Checker, FieldDef, Item, Leaf, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS,
+    Ty, TypeErrorKind, Value, binary, fold_unary, is_stable,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -48,27 +50,36 @@ struct Builtin {
 /// That a union within a value holds one of its variants.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct Holds {
-    /// The leaf of the value that is the union's tag.
-    tag: usize,
+    /// The leaf of the value that holds the union's tag.
+    tag: Leaf,
     /// The tag of the variant.
     variant: i32,
 }
 
 impl Holds {
-    /// That the union whose tag is leaf `tag` holds its variant `index`.
-    pub(super) fn new(tag: usize, index: usize) -> Self {
+    /// That the union whose tag leaf `tag` holds has its variant `index`.
+    pub(super) fn new(tag: Leaf, index: usize) -> Self {
         let variant = index as i32;
         Self { tag, variant }
     }
 
-    /// Whether the union is the one whose tag is leaf `tag`.
-    pub(super) fn is_of(self, tag: usize) -> bool {
-        self.tag == tag
+    /// Whether the union is the one whose tag is in leaf `leaf`.
+    pub(super) fn is_of(self, leaf: usize) -> bool {
+        self.tag.index == leaf
     }
 
     /// Whether it's so of the value with the scalars `consts`.
     pub(super) fn in_consts(self, consts: &[Const]) -> bool {
-        consts.get(self.tag) == Some(&Const::I32(self.variant))
+        let tag = consts
+            .get(self.tag.index)
+            .map(|tag| self.tag_in(Expr::Const(*tag)));
+        tag == Some(Expr::Const(Const::I32(self.variant)))
+    }
+
+    /// The tag that `leaf` holds, which is the leaf of the union's tag: a
+    /// union within another's variant may share a wider one.
+    fn tag_in(self, leaf: Expr) -> Expr {
+        narrow(self.tag.ty, TAG.val_type(), leaf)
     }
 }
 
@@ -199,13 +210,45 @@ impl Checker {
         }
     }
 
-    /// The leaves of a value of union `id` that variant `index` is held in:
-    /// those after the tag and the variants before it.
-    pub(super) fn variant_leaves(&self, id: StructId, index: usize) -> Range<usize> {
+    /// The types of the leaves that follow the tag in a value of union `id`,
+    /// and for each variant, the leaf that holds each scalar of its value,
+    /// counting the tag as leaf 0. The variants share the leaves as the
+    /// Canonical ABI has them: the scalars of each are held in order from
+    /// the first leaf, each of which has the [`join`] of the types it holds.
+    /// An `externref` is a number in no way, so those of each variant are
+    /// held in leaves of their own, which follow the rest.
+    pub(super) fn union_leaves(&self, id: StructId) -> (Vec<ValType>, Vec<Vec<usize>>) {
         let variants = &self.structs[id.0 as usize].fields;
-        let width = |variant: &FieldDef| self.val_types(variant.ty).len();
-        let start = 1 + variants[..index].iter().map(width).sum::<usize>();
-        start..start + width(&variants[index])
+        let held: Vec<_> = variants.iter().map(|v| self.val_types(v.ty)).collect();
+        let is_ref = |vt: &&ValType| **vt == ValType::ExternRef;
+        let mut shared: Vec<ValType> = Vec::new();
+        for scalars in &held {
+            for (i, vt) in scalars.iter().filter(|vt| !is_ref(vt)).enumerate() {
+                match shared.get_mut(i) {
+                    Some(leaf) => *leaf = join(*leaf, *vt),
+                    None => shared.push(*vt),
+                }
+            }
+        }
+        let numbers = shared.len();
+        let refs = held
+            .iter()
+            .map(|scalars| scalars.iter().filter(is_ref).count());
+        shared.extend(iter::repeat_n(ValType::ExternRef, refs.max().unwrap_or(0)));
+        let leaves = |scalars: &Vec<ValType>| {
+            let (mut number, mut reference) = (1, 1 + numbers);
+            let leaf = |vt: &ValType| {
+                let next = match vt {
+                    ValType::ExternRef => &mut reference,
+                    _ => &mut number,
+                };
+                *next += 1;
+                *next - 1
+            };
+            scalars.iter().map(leaf).collect()
+        };
+        let leaves = held.iter().map(leaves).collect();
+        (shared, leaves)
     }
 }
 
@@ -298,8 +341,8 @@ impl Body<'_> {
     }
 
     /// The variant `name` of the union `ty`, holding the value that `args`
-    /// gives, if it holds one: the tag, then that value among the zeroed
-    /// scalars of the other variants.
+    /// gives, if it holds one: the tag, then that value in the leaves the
+    /// variants share, and zero in those it has nothing in.
     fn variant(&mut self, ty: Ty, name: &Ident, args: Option<&[Arg]>) -> (Ty, Value) {
         let found = self.ck.union_id(ty).and_then(|id| {
             let variants = &self.ck.structs[id.0 as usize].fields;
@@ -319,7 +362,7 @@ impl Body<'_> {
             }
             return (Ty::Error, Value::default());
         };
-        let held = match (bare, args) {
+        let mut held = match (bare, args) {
             (true, None) => Value::default(),
             (false, Some([arg])) if arg.label.is_none() => self.check(&arg.value, holds),
             _ => {
@@ -330,16 +373,80 @@ impl Body<'_> {
                 return (ty, self.blank(ty));
             }
         };
-        let leaves = self.ck.variant_leaves(id, index);
+        let leaves = self.ck.union_leaves(id).1.swap_remove(index);
         // Only a mistyped value has other scalars than the variant's.
         if held.scalars.len() != leaves.len() {
             return (ty, self.blank(ty));
         }
+        // The leaves are evaluated in their order, which isn't that of the
+        // scalars they hold where an `externref` comes before a number.
+        if !leaves.is_sorted() {
+            self.spill(&mut held, is_stable);
+        }
         let mut value = self.blank(ty);
         value.scalars[0].1 = Expr::Const(Const::I32(index as i32));
-        value.scalars.splice(leaves, held.scalars);
+        for (leaf, (vt, scalar)) in leaves.into_iter().zip(held.scalars) {
+            let (shared, zeroed) = &mut value.scalars[leaf];
+            *zeroed = widen(vt, *shared, scalar);
+        }
         value.pre = held.pre;
         (ty, value)
+    }
+}
+
+/// The type of a leaf that holds a scalar of type `a` in one variant of a
+/// union and one of type `b` in another, as the Canonical ABI joins them:
+/// one as wide as both, and an integer unless both are the same float.
+fn join(a: ValType, b: ValType) -> ValType {
+    match (a, b) {
+        _ if a == b => a,
+        (ValType::I32, ValType::F32) | (ValType::F32, ValType::I32) => ValType::I32,
+        _ => ValType::I64,
+    }
+}
+
+/// `expr`, a scalar of type `from`, as a leaf of type `to` holds it: by its
+/// bits, with zeroes above them. `to` is `from` [joined](join) with others.
+pub(super) fn widen(from: ValType, to: ValType, expr: Expr) -> Expr {
+    match (from, to) {
+        (ValType::F32, ValType::I32) | (ValType::F64, ValType::I64) => {
+            unary(from, IrUnOp::Reinterpret, expr)
+        }
+        (ValType::I32, ValType::I64) => unary(from, IrUnOp::ExtendU, expr),
+        (ValType::F32, ValType::I64) => {
+            let bits = widen(from, ValType::I32, expr);
+            widen(ValType::I32, to, bits)
+        }
+        _ => expr,
+    }
+}
+
+/// The scalar of type `to` that `expr`, a leaf of type `from`, holds: what
+/// [`widen`] made the leaf from.
+pub(super) fn narrow(from: ValType, to: ValType, expr: Expr) -> Expr {
+    match (from, to) {
+        (ValType::I32, ValType::F32) | (ValType::I64, ValType::F64) => {
+            unary(from, IrUnOp::Reinterpret, expr)
+        }
+        (ValType::I64, ValType::I32) => unary(from, IrUnOp::Wrap, expr),
+        (ValType::I64, ValType::F32) => {
+            let bits = narrow(from, ValType::I32, expr);
+            narrow(ValType::I32, to, bits)
+        }
+        _ => expr,
+    }
+}
+
+/// `<ty>.<op>` of `expr`, or its result if `expr` is a constant, so that a
+/// constant is one in whatever leaf holds it.
+fn unary(ty: ValType, op: IrUnOp, expr: Expr) -> Expr {
+    let folded = match expr {
+        Expr::Const(c) => fold_unary(op, c).ok(),
+        _ => None,
+    };
+    match folded {
+        Some(c) => Expr::Const(c),
+        None => Expr::Unary(ty, op, Box::new(expr)),
     }
 }
 
@@ -347,13 +454,13 @@ impl Body<'_> {
 pub(super) fn tags_are(when: &[Holds], leaves: &[Expr]) -> Expr {
     let mut tests = Vec::new();
     for holds in when {
-        match &leaves[holds.tag] {
+        match holds.tag_in(leaves[holds.tag.index].clone()) {
             // The tag of a variant built in place is known.
-            Expr::Const(Const::I32(tag)) if *tag == holds.variant => {}
+            Expr::Const(Const::I32(tag)) if tag == holds.variant => {}
             Expr::Const(_) => return Expr::Const(Const::I32(0)),
             tag => {
                 let variant = Expr::Const(Const::I32(holds.variant));
-                tests.push(binary(ValType::I32, IrBinOp::Eq, tag.clone(), variant));
+                tests.push(binary(ValType::I32, IrBinOp::Eq, tag, variant));
             }
         }
     }

@@ -26,7 +26,7 @@ use defaults::DefaultValue;
 use enums::EnumDef;
 use generic::{Arity, Instance, ParamDef};
 use generic_fn::{FnInstance, GenericFn, InstanceCall, Need, Needs};
-use unions::{Holds, tags_are, where_held};
+use unions::{Holds, narrow, tags_are, where_held, widen};
 
 mod defaults;
 mod enums;
@@ -848,10 +848,31 @@ enum Visit {
     Done,
 }
 
-/// Where one scalar leaf of a type lives in memory.
+/// A scalar leaf of a value: which of them it is, and its type.
+#[derive(Clone, Copy, PartialEq)]
+struct Leaf {
+    index: usize,
+    ty: ValType,
+}
+
+/// A narrow integer or `bool` in a value, which is an `i32` that the host
+/// may give out of its range.
+struct Ranged {
+    /// The leaf that holds it.
+    leaf: Leaf,
+    prim: Prim,
+    /// For one in a union's variant, each union it's in and the variant of
+    /// it, outermost first: the leaf holds it only where they all hold.
+    when: Vec<Holds>,
+}
+
+/// Where one scalar of a type lives in memory.
 struct Cell {
     /// Bytes from the start of the value.
     offset: u32,
+    /// The leaf of the value that holds the scalar, which may be wider than
+    /// it where the variants of a union share the leaf.
+    leaf: Leaf,
     ty: ValType,
     load: LoadOp,
     store: StoreOp,
@@ -2481,9 +2502,13 @@ impl Checker {
             Ty::ExternRef => out.push((name, ValType::ExternRef)),
             Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
             Ty::Struct(id) => {
-                // A union's tag has the name of the union itself.
+                // A union's tag has the name of the union itself, and the
+                // leaves its variants share are named by index.
                 if self.union_id(ty).is_some() {
                     out.push((name.clone(), ValType::I32));
+                    let shared = self.union_leaves(id).0.into_iter().enumerate();
+                    out.extend(shared.map(|(i, vt)| (format!("{name}.{i}"), vt)));
+                    return;
                 }
                 for field in &self.structs[id.0 as usize].fields {
                     self.push_leaves(field.ty, format!("{name}.{}", field.name), out);
@@ -2507,29 +2532,62 @@ impl Checker {
         self.leaves(ty, "").into_iter().map(|(_, vt)| vt).collect()
     }
 
-    /// The primitive type of each scalar leaf of `ty`, or `None` for
-    /// pointers, function pointers, `externref`s, and the tags of unions,
-    /// which are only bytes in memory.
-    fn leaf_prims(&self, ty: Ty) -> Vec<Option<Prim>> {
+    /// The leaves of a value of type `ty`, in order.
+    fn leaf_list(&self, ty: Ty) -> Vec<Leaf> {
+        let leaves = self.val_types(ty).into_iter().enumerate();
+        leaves.map(|(index, ty)| Leaf { index, ty }).collect()
+    }
+
+    /// Each of the [members](Self::members) of `ty`, and which of `leaves`,
+    /// those of a `ty`, hold it: the leaves that follow those of the member
+    /// before, or for a union's variant, those after the tag that it shares
+    /// with the others.
+    fn member_leaves(&self, ty: Ty, leaves: &[Leaf]) -> Vec<(Ty, Vec<Leaf>)> {
+        let members = self.members(ty);
+        if let Some(id) = self.union_id(ty) {
+            let held = self.union_leaves(id).1.into_iter();
+            let held = held.map(|held| held.into_iter().map(|leaf| leaves[leaf]).collect());
+            return members.into_iter().zip(held).collect();
+        }
+        let mut rest = leaves;
         let mut out = Vec::new();
-        self.push_leaf_prims(ty, &mut out);
+        for member in members {
+            let (held, after) = rest.split_at(self.val_types(member).len());
+            out.push((member, held.to_vec()));
+            rest = after;
+        }
         out
     }
 
-    fn push_leaf_prims(&self, ty: Ty, out: &mut Vec<Option<Prim>>) {
+    /// The narrow integers and `bool`s in a value of type `ty`.
+    fn ranged(&self, ty: Ty) -> Vec<Ranged> {
+        let mut out = Vec::new();
+        self.push_ranged(ty, &self.leaf_list(ty), &[], &mut out);
+        out
+    }
+
+    /// Pushes those of a `ty` held in `leaves`, which holds nothing unless
+    /// every union of `when` holds its variant.
+    fn push_ranged(&self, ty: Ty, leaves: &[Leaf], when: &[Holds], out: &mut Vec<Ranged>) {
         match ty {
-            Ty::Prim(prim) => out.push(Some(prim)),
-            Ty::Ptr(_) | Ty::Fn(_) | Ty::ExternRef => out.push(None),
-            Ty::Enum(id) => self.push_leaf_prims(self.enum_ty(id), out),
+            Ty::Prim(prim) if prim.size() < 4 => out.push(Ranged {
+                leaf: leaves[0],
+                prim,
+                when: when.to_vec(),
+            }),
+            Ty::Enum(id) => self.push_ranged(self.enum_ty(id), leaves, when, out),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
-                if self.union_id(ty).is_some() {
-                    out.push(None);
-                }
-                for member in self.members(ty) {
-                    self.push_leaf_prims(member, out);
+                let union = self.union_id(ty).is_some();
+                let members = self.member_leaves(ty, leaves).into_iter();
+                for (index, (member, held)) in members.enumerate() {
+                    let mut when = when.to_vec();
+                    if union {
+                        when.push(Holds::new(leaves[0], index));
+                    }
+                    self.push_ranged(member, &held, &when, out);
                 }
             }
-            Ty::Param(_) | Ty::Unit | Ty::Error => {}
+            _ => {}
         }
     }
 
@@ -2709,20 +2767,29 @@ impl Checker {
         (offsets, size.next_multiple_of(align), align)
     }
 
-    /// Where each scalar leaf of `ty` lives in memory, in leaf order.
+    /// Where each scalar of `ty` lives in memory, in the order they are
+    /// laid out, a union's tag before each of its variants in turn.
     fn cells(&self, ty: Ty) -> Vec<Cell> {
         let mut out = Vec::new();
-        self.push_cells(ty, 0, &[], &mut out);
+        self.push_cells(ty, 0, &self.leaf_list(ty), &[], &mut out);
         out
     }
 
-    /// Pushes the cells of a `ty` at `offset`, which hold nothing unless
-    /// every union of `when` holds its variant.
-    fn push_cells(&self, ty: Ty, offset: u32, when: &[Holds], out: &mut Vec<Cell>) {
+    /// Pushes the cells of a `ty` at `offset` whose value `leaves` hold,
+    /// which hold nothing unless every union of `when` holds its variant.
+    fn push_cells(
+        &self,
+        ty: Ty,
+        offset: u32,
+        leaves: &[Leaf],
+        when: &[Holds],
+        out: &mut Vec<Cell>,
+    ) {
         let when = when.to_vec();
         match ty {
             Ty::Prim(prim) => out.push(Cell {
                 offset,
+                leaf: leaves[0],
                 ty: prim.val_type(),
                 load: prim.load(),
                 store: prim.store(),
@@ -2731,27 +2798,29 @@ impl Checker {
             }),
             Ty::Ptr(_) | Ty::Fn(_) => out.push(Cell {
                 offset,
+                leaf: leaves[0],
                 ty: ValType::I32,
                 load: LoadOp::Load,
                 store: StoreOp::Store,
                 bool: false,
                 when,
             }),
-            Ty::Enum(id) => self.push_cells(self.enum_ty(id), offset, &when, out),
+            Ty::Enum(id) => self.push_cells(self.enum_ty(id), offset, leaves, &when, out),
             Ty::Struct(id) if self.union_id(ty).is_some() => {
-                let tag = out.len();
-                self.push_cells(Ty::Prim(unions::TAG), offset, &when, out);
+                self.push_cells(Ty::Prim(unions::TAG), offset, leaves, &when, out);
                 let start = offset + self.union_layout(id).0;
-                for (index, variant) in self.members(ty).into_iter().enumerate() {
+                let variants = self.member_leaves(ty, leaves).into_iter();
+                for (index, (variant, held)) in variants.enumerate() {
                     let mut when = when.clone();
-                    when.push(Holds::new(tag, index));
-                    self.push_cells(variant, start, &when, out);
+                    when.push(Holds::new(leaves[0], index));
+                    self.push_cells(variant, start, &held, &when, out);
                 }
             }
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
                 let offsets = self.aggregate_layout(ty).0;
-                for (member, member_offset) in self.members(ty).into_iter().zip(offsets) {
-                    self.push_cells(member, offset + member_offset, &when, out);
+                let members = self.member_leaves(ty, leaves).into_iter();
+                for ((member, held), member_offset) in members.zip(offsets) {
+                    self.push_cells(member, offset + member_offset, &held, &when, out);
                 }
             }
             Ty::ExternRef => unreachable!("`externref` has no pointer type"),
@@ -2760,11 +2829,18 @@ impl Checker {
     }
 
     /// Writes a value whose scalars are `consts` to the start of `out`, as
-    /// storing each to its cell of `cells` would.
+    /// storing it to `cells` would.
     fn write_consts(&self, out: &mut [u8], cells: &[Cell], consts: &[Const]) {
-        for (cell, c) in cells.iter().zip(consts) {
-            if cell.when.iter().all(|holds| holds.in_consts(consts)) {
-                write_const(&mut out[cell.offset as usize..], cell.store, *c);
+        for cell in cells {
+            // A value that isn't constant, already reported, lacks some.
+            let Some(c) = consts.get(cell.leaf.index) else {
+                continue;
+            };
+            let held = cell.when.iter().all(|holds| holds.in_consts(consts));
+            if let Expr::Const(c) = narrow(cell.leaf.ty, cell.ty, Expr::Const(*c))
+                && held
+            {
+                write_const(&mut out[cell.offset as usize..], cell.store, c);
             }
         }
     }
@@ -3530,21 +3606,19 @@ impl<'c> Body<'c> {
             Slots::Const(_) => {}
             // Only a mistyped value has other scalars than the place's, and
             // so may lack the tags that say which variants to store.
-            Slots::Memory { .. } if scalars.len() != cells.len() => {}
+            Slots::Memory { .. } if scalars.len() != self.ck.val_types(place.ty).len() => {}
             Slots::Memory { addr, offset } => {
-                let store = |(cell, scalar): (&Cell, &Expr)| Stmt::Store {
+                let store = |cell: &Cell| Stmt::Store {
                     ty: cell.ty,
                     op: cell.store,
                     offset: offset + cell.offset,
                     addr: addr.clone(),
-                    value: scalar.clone(),
+                    value: narrow(cell.leaf.ty, cell.ty, scalars[cell.leaf.index].clone()),
                 };
-                let stores: Vec<_> = cells.iter().zip(&scalars).map(store).collect();
                 // The cells of a union's variant are stored where the value
                 // holds it.
-                let mut stores = stores.into_iter();
                 for variant in cells.chunk_by(|a, b| a.when == b.when) {
-                    let stores = stores.by_ref().take(variant.len()).collect();
+                    let stores = variant.iter().map(store).collect();
                     out.extend(where_held(&variant[0].when, &scalars, stores));
                 }
             }
@@ -4610,12 +4684,22 @@ impl<'c> Body<'c> {
         };
         // The host may return any `i32` for a narrow integer or `bool`.
         if id.0 < self.ck.import_count {
-            let prims = self.ck.leaf_prims(ret);
-            for ((_, scalar), prim) in scalars.iter_mut().zip(prims) {
-                if let Some(prim) = prim {
-                    let expr = mem::replace(scalar, Expr::Const(Const::I32(0)));
-                    *scalar = into_range(prim, expr);
-                }
+            let given = exprs(scalars.clone());
+            for Ranged { leaf, prim, when } in self.ck.ranged(ret) {
+                let held = narrow(leaf.ty, ValType::I32, given[leaf.index].clone());
+                let in_range = widen(ValType::I32, leaf.ty, into_range(prim, held));
+                let scalar = &mut scalars[leaf.index].1;
+                // A leaf that variants share is brought into the range of
+                // the one that is held.
+                *scalar = match when.is_empty() {
+                    true => in_range,
+                    false => Expr::If {
+                        ty: leaf.ty,
+                        cond: Box::new(tags_are(&when, &given)),
+                        then_expr: Box::new(in_range),
+                        else_expr: Box::new(mem::replace(scalar, Expr::Const(Const::I32(0)))),
+                    },
+                };
             }
         }
         (ret, Value { pre, scalars })
@@ -4818,7 +4902,8 @@ impl<'c> Body<'c> {
     }
 
     /// Reads a `ty` at `offset` bytes past the address in `ptr`. Of a union,
-    /// only the variant it holds is read, and the rest are zero.
+    /// only the variant it holds is read, and the leaves that the variant
+    /// has nothing in are zero.
     fn load(&mut self, ptr: Value, offset: u32, ty: Ty) -> Value {
         let cells = self.ck.cells(ty);
         let (mut pre, addr) = if cells.len() > 1 {
@@ -4826,37 +4911,45 @@ impl<'c> Body<'c> {
         } else {
             split1(ptr)
         };
+        let types = self.ck.val_types(ty);
         let mut scalars: Vec<Expr> = Vec::new();
-        for (leaf, cell) in cells.iter().enumerate() {
-            let load = Expr::Load {
-                ty: cell.ty,
-                op: cell.load,
-                offset: offset + cell.offset,
-                addr: Box::new(addr.clone()),
-            };
-            // Any nonzero byte is `true`.
-            let mut load = match cell.bool {
-                true => into_range(Prim::Bool, load),
-                false => load,
-            };
-            if !cell.when.is_empty() {
-                load = Expr::If {
+        for (leaf, slot) in types.iter().enumerate() {
+            // A leaf that variants share is read from the cell of the one
+            // that is held, which the first that isn't leaves to the next.
+            let mut read = Expr::Const(zero(*slot));
+            for cell in cells.iter().rev().filter(|cell| cell.leaf.index == leaf) {
+                let load = Expr::Load {
                     ty: cell.ty,
-                    cond: Box::new(tags_are(&cell.when, &scalars)),
-                    then_expr: Box::new(load),
-                    else_expr: Box::new(Expr::Const(zero(cell.ty))),
+                    op: cell.load,
+                    offset: offset + cell.offset,
+                    addr: Box::new(addr.clone()),
+                };
+                // Any nonzero byte is `true`.
+                let load = match cell.bool {
+                    true => into_range(Prim::Bool, load),
+                    false => load,
+                };
+                let load = widen(cell.ty, *slot, load);
+                read = match cell.when.is_empty() {
+                    true => load,
+                    false => Expr::If {
+                        ty: *slot,
+                        cond: Box::new(tags_are(&cell.when, &scalars)),
+                        then_expr: Box::new(load),
+                        else_expr: Box::new(read),
+                    },
                 };
             }
             // A tag is read again for each cell of its variants.
             let is_tag = |cell: &Cell| cell.when.iter().any(|holds| holds.is_of(leaf));
             if cells.iter().any(is_tag) {
-                let tmp = self.temp(cell.ty);
-                pre.push(Stmt::SetLocal(tmp, load));
-                load = Expr::Local(tmp);
+                let tmp = self.temp(*slot);
+                pre.push(Stmt::SetLocal(tmp, read));
+                read = Expr::Local(tmp);
             }
-            scalars.push(load);
+            scalars.push(read);
         }
-        let scalars = cells.iter().map(|cell| cell.ty).zip(scalars).collect();
+        let scalars = types.into_iter().zip(scalars).collect();
         Value { pre, scalars }
     }
 
@@ -5393,6 +5486,8 @@ fn fold_unary(op: IrUnOp, c: Const) -> Result<Const, Fold> {
         (IrUnOp::Promote, F32(x)) => F64(x as f64),
         (IrUnOp::Reinterpret, F32(x)) => I32(x.to_bits() as i32),
         (IrUnOp::Reinterpret, F64(x)) => I64(x.to_bits() as i64),
+        (IrUnOp::Reinterpret, I32(x)) => F32(f32::from_bits(x as u32)),
+        (IrUnOp::Reinterpret, I64(x)) => F64(f64::from_bits(x as u64)),
         // Rust's float to int `as` saturates and maps NaN to 0, like wasm's
         // `trunc_sat`.
         (IrUnOp::TruncSatS(to), F32(_) | F64(_)) => {
@@ -9348,7 +9443,7 @@ enum(i32) Later:
     }
 
     #[test]
-    fn unions_are_a_tag_and_the_scalars_of_every_variant() {
+    fn unions_are_a_tag_and_the_leaves_their_variants_share() {
         let src = "\
 union Shape:
     circle: f32
@@ -9362,17 +9457,100 @@ fn f(s: Shape) -> Shape:
 ";
         let module = lower(src);
         let f = &module.funcs[0];
-        let wasm = [ValType::I32, ValType::F32, ValType::F32, ValType::I64];
+        let wasm = [ValType::I32, ValType::F32, ValType::I64];
         assert_eq!(f.params, wasm);
         assert_eq!(f.results, wasm);
-        let names: Vec<_> = f.locals[..4].iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["s", "s.circle", "s.rect.0", "s.rect.1"]);
+        let names: Vec<_> = f.locals[..3].iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["s", "s.0", "s.1"]);
         assert_eq!(
             body(&module, "f"),
-            "(set a 0) (set a.circle 1.5f32) (set a.rect.0 0f32) (set a.rect.1 0i64) \
-             (set b 1) (set b.circle 0f32) (set b.rect.0 2f32) (set b.rect.1 3i64) \
-             (set c 2) (set c.circle 0f32) (set c.rect.0 0f32) (set c.rect.1 0i64) \
-             (return s s.circle s.rect.0 s.rect.1)"
+            "(set a 0) (set a.0 1.5f32) (set a.1 0i64) \
+             (set b 1) (set b.0 2f32) (set b.1 3i64) \
+             (set c 2) (set c.0 0f32) (set c.1 0i64) \
+             (return s s.0 s.1)"
+        );
+    }
+
+    #[test]
+    fn leaves_that_variants_share_are_as_wide_as_what_each_holds() {
+        use ValType::*;
+        let src = "\
+union Mixed:
+    int: i32
+    float: f32
+    pair: tuple(u8, f64)
+    long: i64
+union Refs:
+    one: tuple(externref, f32)
+    two: tuple(i32, externref, externref)
+    none
+extern:
+    fn get() -> externref
+    fn number() -> f32
+fn order() -> Refs:
+    return .one((get(), number()))
+fn shapes(a: result(i32, f32), b: result(array(u8), f64), c: result(f32, f32), d: Refs):
+    pass
+fn build(x: i32, y: f32, z: f64, b: u8) -> Mixed:
+    if x == 0:
+        return .int(x)
+    if x == 1:
+        return .float(y)
+    if x == 2:
+        return .float(1.5)
+    return .pair((b, z))
+fn read(m: Mixed) -> f64:
+    match m:
+        .int(x):
+            return x as f64
+        .float(y):
+            return y as f64
+        .pair((b, z)):
+            return z
+        .long(_):
+            return 0.0
+";
+        let module = lower(src);
+        // An `i32` and an `f32` share an `i32`, any others that differ an
+        // `i64`, and `externref`s only leaves of their own, after the rest.
+        let shapes = module.funcs.iter().find(|f| f.name == "shapes").unwrap();
+        let (a, b, c) = ([I32, I32], [I32, I64, I32], [I32, F32]);
+        let d = [I32, I32, ExternRef, ExternRef];
+        assert_eq!(shapes.params, [&a[..], &b[..], &c[..], &d[..]].concat());
+        // What a variant holds is evaluated in the order it's written,
+        // whichever leaves hold it.
+        assert_eq!(
+            body(&module, "order"),
+            "(set tmp0 (call get )) (set tmp1 (call number )) \
+             (return 0 (F32.Reinterpret tmp1) tmp0 null)"
+        );
+        let build = module.funcs.iter().find(|f| f.name == "build").unwrap();
+        assert_eq!(build.results, [I32, I64, F64]);
+        // A leaf holds the bits of a scalar narrower than it, and zeroes
+        // above them.
+        assert_eq!(
+            body(&module, "build"),
+            "(if (I32.Eq x 0) (then (return 0 (I32.ExtendU x) 0f64)) (else )) \
+             (if (I32.Eq x 1) \
+             (then (return 1 (I32.ExtendU (F32.Reinterpret y)) 0f64)) (else )) \
+             (if (I32.Eq x 2) (then (return 1 1069547520i64 0f64)) (else )) \
+             (return 2 (I32.ExtendU b) z)"
+        );
+        // An arm reads what its variant holds out of a leaf wider than it,
+        // once the value is known to hold the variant.
+        assert_eq!(
+            body(&module, "read"),
+            "(set tmp3 m) (set tmp4 m.0) (set z m.1) \
+             (block \
+             (if (if (I32.Eq tmp3 0) (seq (set x (I64.Wrap tmp4)) 1) 0) \
+             (then (return (I32.ConvertS(F64) x))) (else )) \
+             (if (if (I32.Eq tmp3 1) (seq (set y (I32.Reinterpret (I64.Wrap tmp4))) 1) 0) \
+             (then (return (F32.Promote y))) (else )) \
+             (if (if (I32.Eq tmp3 2) (seq (set b (I64.Wrap tmp4)) 1) 0) \
+             (then (return z)) (else )) \
+             (if (I32.Eq tmp3 3) (then (return 0f64)) (else )) \
+             unreachable) \
+             unreachable"
         );
     }
 
@@ -9404,13 +9582,13 @@ fn f(c: Color) -> Shape:
         let module = lower(src);
         assert_eq!(
             body(&module, "f"),
-            "(set a 0) (set a.circle 1.5f32) (set a.tinted 0) \
-             (set p.color 1) (set p.shape 2) (set p.shape.circle 0f32) (set p.shape.tinted 0) \
+            "(set a 0) (set a.0 1069547520) \
+             (set p.color 1) (set p.shape 2) (set p.shape.0 0) \
              (set p.color 0) \
              (if (if (I32.Eq c 1) 1 (I32.Eq 0 c)) \
-             (then (call paint [0 1 0f32 1] -> [tmp8 tmp9 tmp10]) (return tmp8 tmp9 tmp10)) (else )) \
-             (set x 0) (set y 2) (set y.circle 0f32) (set y.tinted 0) \
-             (return 2 0f32 0)"
+             (then (call paint [0 1 1] -> [tmp6 tmp7]) (return tmp6 tmp7)) (else )) \
+             (set x 0) (set y 2) (set y.0 0) \
+             (return 2 0)"
         );
     }
 
@@ -9572,16 +9750,16 @@ fn set(p: &var S, s: Shape):
             body(&module, "get"),
             "(set tmp1 (I32.Load8U offset=0 p)) \
              (return tmp1 \
-             (if (I32.Eq tmp1 0) (F32.Load offset=8 p) 0f32) \
-             (if (I32.Eq tmp1 1) (I32.Load8U offset=8 p) 0) \
+             (if (I32.Eq tmp1 0) (F32.Reinterpret (F32.Load offset=8 p)) \
+             (if (I32.Eq tmp1 1) (I32.Load8U offset=8 p) 0)) \
              (if (I32.Eq tmp1 1) (I64.Load offset=16 p) 0i64))"
         );
         assert_eq!(
             body(&module, "set"),
             "(I32.Store8 offset=8 p s) \
-             (if (I32.Eq s 0) (then (F32.Store offset=16 p s.circle)) (else )) \
+             (if (I32.Eq s 0) (then (F32.Store offset=16 p (I32.Reinterpret s.0))) (else )) \
              (if (I32.Eq s 1) \
-             (then (I32.Store8 offset=16 p s.rect.0) (I64.Store offset=24 p s.rect.1)) (else ))"
+             (then (I32.Store8 offset=16 p s.0) (I64.Store offset=24 p s.1)) (else ))"
         );
     }
 
@@ -9606,8 +9784,8 @@ fn set(p: &var Outer, x: i16):
              (set tmp2 (if (I32.Eq tmp1 1) (I32.Load8U offset=2 p) 0)) \
              (return tmp1 tmp2 \
              (if (I32.And (I32.Eq tmp1 1) (I32.Eq tmp2 0)) \
-             (I32.Ne (I32.Load8U offset=4 p) 0) 0) \
-             (if (I32.And (I32.Eq tmp1 1) (I32.Eq tmp2 1)) (I32.Load16S offset=4 p) 0))"
+             (I32.Ne (I32.Load8U offset=4 p) 0) \
+             (if (I32.And (I32.Eq tmp1 1) (I32.Eq tmp2 1)) (I32.Load16S offset=4 p) 0)))"
         );
         assert_eq!(
             body(&module, "set"),
@@ -9615,6 +9793,81 @@ fn set(p: &var Outer, x: i16):
              (I32.Store8 offset=0 p 1) \
              (I32.Store8 offset=2 p 1) \
              (I32.Store16 offset=4 p tmp2)"
+        );
+        // The tag of a union within a variant is in whatever leaf the
+        // variants share, which another may widen.
+        let src = "\
+union Inner:
+    a: bool
+    b: i16
+union Outer:
+    wide: i64
+    some: Inner
+fn get(p: &Outer) -> Outer:
+    return p.*
+fn set(p: &var Outer, o: Outer):
+    p.* = o
+fn eq(a: Outer, b: Outer) -> bool:
+    return a == b
+fn held(o: Outer) -> i16:
+    match o:
+        .some(.b(x)):
+            return x
+        else:
+            return 0
+";
+        let module = lower(src);
+        let get = module.funcs.iter().find(|f| f.name == "get").unwrap();
+        assert_eq!(get.results, [ValType::I32, ValType::I64, ValType::I32]);
+        let inner = |tag: u8| format!("(I32.And (I32.Eq tmp1 1) (I32.Eq (I64.Wrap tmp2) {tag}))");
+        assert_eq!(
+            body(&module, "get"),
+            format!(
+                "(set tmp1 (I32.Load8U offset=0 p)) \
+                 (set tmp2 (if (I32.Eq tmp1 0) (I64.Load offset=8 p) \
+                 (if (I32.Eq tmp1 1) (I32.ExtendU (I32.Load8U offset=8 p)) 0i64))) \
+                 (return tmp1 tmp2 \
+                 (if {} (I32.Ne (I32.Load8U offset=10 p) 0) \
+                 (if {} (I32.Load16S offset=10 p) 0)))",
+                inner(0),
+                inner(1)
+            )
+        );
+        let inner = |tag: u8| format!("(I32.And (I32.Eq o 1) (I32.Eq (I64.Wrap o.0) {tag}))");
+        assert_eq!(
+            body(&module, "set"),
+            format!(
+                "(I32.Store8 offset=0 p o) \
+                 (if (I32.Eq o 0) (then (I64.Store offset=8 p o.0)) (else )) \
+                 (if (I32.Eq o 1) (then (I32.Store8 offset=8 p (I64.Wrap o.0))) (else )) \
+                 (if {} (then (I32.Store8 offset=10 p o.1)) (else )) \
+                 (if {} (then (I32.Store16 offset=10 p o.1)) (else ))",
+                inner(0),
+                inner(1)
+            )
+        );
+        let inner = |tag: u8| format!("(I32.And (I32.Eq a 1) (I32.Eq (I64.Wrap a.0) {tag}))");
+        assert_eq!(
+            body(&module, "eq"),
+            format!(
+                "(return (I32.And (I32.And (I32.And (I32.And (I32.Eq a b) \
+                 (if (I32.Eq a 0) (I64.Eq a.0 b.0) 1)) \
+                 (if (I32.Eq a 1) (I32.Eq (I64.Wrap a.0) (I64.Wrap b.0)) 1)) \
+                 (if {} (I32.Eq a.1 b.1) 1)) \
+                 (if {} (I32.Eq a.1 b.1) 1)))",
+                inner(0),
+                inner(1)
+            )
+        );
+        assert_eq!(
+            body(&module, "held"),
+            "(set tmp3 o) (set tmp4 o.0) (set x o.1) \
+             (block \
+             (if (if (I32.Eq tmp3 1) \
+             (seq (set tmp6 (I64.Wrap tmp4)) (I32.Eq tmp6 1)) 0) \
+             (then (return x)) (else )) \
+             (return 0)) \
+             unreachable"
         );
     }
 
@@ -9661,12 +9914,13 @@ fn round(a: Shape) -> bool:
 ";
         let module = lower(src);
         assert_eq!(body(&module, "consts"), "(return 1 0)");
-        let named = "a.named.ptr a.named.len b.named.ptr b.named.len";
+        let named = "a.0 a.1 b.0 b.1";
+        let circles = "(I32.Reinterpret a.0) (I32.Reinterpret b.0)";
         assert_eq!(
             body(&module, "eq"),
             format!(
                 "(return (if \
-                 (I32.And (I32.Eq a b) (if (I32.Eq a 0) (F32.Eq a.circle b.circle) 1)) \
+                 (I32.And (I32.Eq a b) (if (I32.Eq a 0) (F32.Eq {circles}) 1)) \
                  (if (I32.Eq a 1) (call ==(array(u8)) {named}) 1) 0))"
             )
         );
@@ -9674,7 +9928,7 @@ fn round(a: Shape) -> bool:
             body(&module, "ne"),
             format!(
                 "(return (if \
-                 (I32.Or (I32.Ne a b) (if (I32.Eq a 0) (F32.Ne a.circle b.circle) 0)) \
+                 (I32.Or (I32.Ne a b) (if (I32.Eq a 0) (F32.Ne {circles}) 0)) \
                  1 (if (I32.Eq a 1) (I32.Eqz (call ==(array(u8)) {named})) 0)))"
             )
         );
@@ -9682,7 +9936,8 @@ fn round(a: Shape) -> bool:
         assert_eq!(body(&module, "empty"), "(return (I32.Eq a 2))");
         assert_eq!(
             body(&module, "round"),
-            "(return (I32.Or (I32.Ne 0 a) (if (I32.Eq a 0) (F32.Ne 1f32 a.circle) 0)))"
+            "(return (I32.Or (I32.Ne 0 a) \
+             (if (I32.Eq a 0) (F32.Ne 1f32 (I32.Reinterpret a.0)) 0)))"
         );
         assert_eq!(
             errors(
@@ -9751,7 +10006,7 @@ fn nothing(o: option(result(i32, f32))) -> bool:
         assert_eq!(body(&module, "sizes"), "(return 16 16 12)");
         assert_eq!(
             body(&module, "parse"),
-            "(if (I32.LtS x 0) (then (return 1 0 0)) (else )) (return 0 (I32.And x 255) 0)"
+            "(if (I32.LtS x 0) (then (return 1 0)) (else )) (return 0 (I32.And x 255))"
         );
         let find = module.funcs.iter().find(|f| f.name == "find").unwrap();
         assert_eq!(find.results, [ValType::I32, ValType::I32]);
@@ -9836,10 +10091,7 @@ fn f(n: &Node(i64)) -> Result(i64, Option(u8)):
 ";
         let module = lower(src);
         let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
-        assert_eq!(
-            f.results,
-            [ValType::I32, ValType::I64, ValType::I32, ValType::I32]
-        );
+        assert_eq!(f.results, [ValType::I32, ValType::I64, ValType::I32]);
         assert_eq!(body(&module, "size"), "(return 16)");
         assert_eq!(body(&module, "wrap(u8)"), "(return 0 x)");
         assert_eq!(body(&module, "nothing(u8)"), "(return 1 0)");
@@ -9873,7 +10125,7 @@ fn f(o: Option(i32)) -> Option(u8):
     }
 
     #[test]
-    fn unions_cross_to_the_host_as_their_scalars() {
+    fn unions_cross_to_the_host_as_their_leaves() {
         let src = "\
 extern:
     fn get() -> Shape
@@ -9897,9 +10149,9 @@ pub fn f() -> Shape:
             globals,
             [
                 ("unit", Const::I32(0)),
-                ("unit.circle", Const::F32(1.0)),
+                ("unit.0", Const::F32(1.0)),
                 ("current", Const::I32(1)),
-                ("current.circle", Const::F32(0.0)),
+                ("current.0", Const::F32(0.0)),
             ]
         );
         // The tag is as the host gives it: one that no variant has is told
@@ -9907,8 +10159,32 @@ pub fn f() -> Shape:
         assert_eq!(
             body(&module, "f"),
             "(call get [] -> [tmp0 tmp1]) (set tmp2 tmp0) (set tmp3 tmp1) \
-             (set @current tmp2) (set @current.circle tmp3) \
-             (return @current @current.circle)"
+             (set @current tmp2) (set @current.0 tmp3) \
+             (return @current @current.0)"
+        );
+        // A leaf that the host gives is brought into the range of what the
+        // variant that is held has in it.
+        let src = "\
+extern:
+    fn get() -> result(u8, bool)
+    fn wide() -> result(i16, i64)
+fn f() -> result(u8, bool):
+    return get()
+fn g() -> result(i16, i64):
+    return wide()
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(call get [] -> [tmp0 tmp1]) \
+             (return tmp0 (if (I32.Eq tmp0 1) (I32.Ne tmp1 0) \
+             (if (I32.Eq tmp0 0) (I32.And tmp1 255) tmp1)))"
+        );
+        assert_eq!(
+            body(&module, "g"),
+            "(call wide [] -> [tmp0 tmp1]) \
+             (return tmp0 (if (I32.Eq tmp0 0) \
+             (I32.ExtendU (I32.Extend16S (I64.Wrap tmp1))) tmp1))"
         );
     }
 
@@ -9947,15 +10223,16 @@ fn other(get: fn() -> Shape) -> f32:
     return 1.0
 ";
         let module = lower(src);
-        // The value is read once, and each arm tests and reads its copy. A
+        // The value is read once, and each arm tests and reads its copy, in
+        // which `w` is in the leaf that the first arm named for `r`. A
         // function ends in a trap where wasm can't tell that it has returned.
         assert_eq!(
             body(&module, "area"),
-            "(set tmp4 s) (set r s.circle) (set w s.rect.0) (set h s.rect.1) \
+            "(set tmp3 s) (set r s.0) (set h s.1) \
              (block \
-             (if (I32.Eq tmp4 0) (then (return (F32.Mul r r))) (else )) \
-             (if (I32.Eq tmp4 1) (then (return (F32.Mul w h))) (else )) \
-             (if (I32.Eq tmp4 2) (then (return 0f32)) (else )) \
+             (if (I32.Eq tmp3 0) (then (return (F32.Mul r r))) (else )) \
+             (if (I32.Eq tmp3 1) (then (return (F32.Mul r h))) (else )) \
+             (if (I32.Eq tmp3 2) (then (return 0f32)) (else )) \
              unreachable) \
              unreachable"
         );
@@ -9971,12 +10248,11 @@ fn other(get: fn() -> Shape) -> f32:
         // An arm that matches every value needs no test, and ends the rest.
         assert_eq!(
             body(&module, "other"),
-            "(call_indirect get [] -> [tmp1 tmp2 tmp3 tmp4]) \
-             (set whole tmp1) (set whole.circle tmp2) (set whole.rect.0 tmp3) \
-             (set whole.rect.1 tmp4) \
+            "(call_indirect get [] -> [tmp1 tmp2 tmp3]) \
+             (set whole tmp1) (set whole.0 tmp2) (set whole.1 tmp3) \
              (block \
              (if (I32.Eq whole 0) (then (br 1)) (else )) \
-             (return (call area whole whole.circle whole.rect.0 whole.rect.1))) \
+             (return (call area whole whole.0 whole.1))) \
              (return 1f32)"
         );
     }
@@ -10458,7 +10734,7 @@ fn f() -> i64:
         let module = lower(src);
         assert_eq!(
             body(&module, "unwrap_or(i64)"),
-            "(set tmp3 o) (set x o.some) \
+            "(set tmp3 o) (set x o.0) \
              (block \
              (if (I32.Eq tmp3 0) (then (return x)) (else )) \
              (if (I32.Eq tmp3 1) (then (return d)) (else )) \

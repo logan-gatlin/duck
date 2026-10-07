@@ -436,16 +436,25 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   `(i32 ptr, i32 len) -> (f32, f32)`.
 - An exported aggregate global is one wasm global per scalar, named with
   dots: `origin.x`, `name.ptr`, `name.len`.
-- A union is an `i32` that counts its variants from 0, then the scalars of
-  every variant in order: `union Shape` with `circle: f32` and
-  `rect: tuple(f32, f32)` is `(i32, f32, f32, f32)`. `option(f32)` is
-  `(i32, f32)` with 0 for `none`, its first variant, so that zeroed memory
-  holds it, and `result(T, E)` has 0 for `ok`. The scalars of a variant the
-  value doesn't hold are zero in every value Duck builds, a null `externref`
-  among them, and are never read: the host may pass anything in them. A
-  count that no variant has matches no arm, and memory keeps only its low
-  byte. An exported `shape` is the globals `shape`, `shape.circle`,
-  `shape.rect.0` and `shape.rect.1`.
+- A union is an `i32` that counts its variants from 0, then the values its
+  variants share, as the Canonical ABI of the component model flattens a
+  variant. Each variant's scalars are held in order from the first, and each
+  shared value is as wide as what any variant has there: an `i32` and an
+  `f32` share an `i32`, and any others that differ an `i64`. `union Shape`
+  with `circle: f32` and `rect: tuple(f32, i64)` is `(i32, f32, i64)`, and
+  `result(i32, f32)` is `(i32, i32)`. `option(f32)` is `(i32, f32)` with 0
+  for `none`, its first variant, so that zeroed memory holds it, and
+  `result(T, E)` has 0 for `ok`.
+- A float held in an integer is its bits, and what is narrower than the
+  `i64` that holds it has zeroes above it, which are ignored when it's read.
+  The values the held variant doesn't use are zero in every value Duck
+  builds and are never read: the host may pass anything in them.
+  `externref`s share only values of their own, which come after the rest and
+  are null where unused. A count that no variant has matches no arm, and
+  memory keeps only its low byte.
+- A union is returned as these values, not through a pointer as the
+  Canonical ABI returns one.
+- An exported `shape` is the globals `shape`, `shape.0` and `shape.1`.
 
 ## Duck.toml
 

@@ -11,7 +11,7 @@ use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, Pattern
 
 use super::{
     ARRAY, Body, Checker, Label, Need, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value,
-    array_value, binary, scalar, single,
+    array_value, binary, scalar, single, unions::narrow,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -541,12 +541,52 @@ impl Body<'_> {
         let tag = Expr::Const(Const::I32(index as i32));
         let is_variant = binary(ValType::I32, IrBinOp::Eq, Expr::Local(subject[0]), tag);
         case.steps.push(Step::Test(is_variant));
-        let leaves = &subject[self.ck.variant_leaves(id, index)];
-        let parts = holds.map(|holds| self.pattern(holds, held, leaves, case));
+        let parts = holds.map(|holds| {
+            // What matches every value the variant holds reads none.
+            let locals = match holds.kind {
+                PatternKind::Discard => Vec::new(),
+                _ => self.variant_locals(id, index, subject, case),
+            };
+            self.pattern(holds, held, &locals, case)
+        });
         Some(Pat::Built(
             Ctor::Variant(index),
             parts.into_iter().collect(),
         ))
+    }
+
+    /// The locals of what variant `index` holds in a value of union `id`
+    /// held in the locals `subject`: those of the leaves the variants share
+    /// that hold it, but for each wider than the scalar it holds, which a
+    /// step of `case` reads out of it.
+    fn variant_locals(
+        &mut self,
+        id: StructId,
+        index: usize,
+        subject: &[LocalId],
+        case: &mut Case,
+    ) -> Vec<LocalId> {
+        let held = self.ck.structs[id.0 as usize].fields[index].ty;
+        let leaves = self.ck.union_leaves(id).1.swap_remove(index);
+        let mut read = Vec::new();
+        let mut locals = Vec::new();
+        for (leaf, vt) in leaves.into_iter().zip(self.ck.val_types(held)) {
+            let shared = subject[leaf];
+            let leaf_ty = self.locals[shared.0 as usize].ty;
+            locals.push(match leaf_ty == vt {
+                true => shared,
+                false => {
+                    let local = self.temp(vt);
+                    let scalar = narrow(leaf_ty, vt, Expr::Local(shared));
+                    read.push(Stmt::SetLocal(local, scalar));
+                    local
+                }
+            });
+        }
+        if !read.is_empty() {
+            case.steps.push(Step::Read(read));
+        }
+        locals
     }
 
     /// `.name` against a value of the enum `ty` held in the locals

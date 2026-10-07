@@ -272,7 +272,9 @@ pub enum UnOp {
     Demote,
     /// `f64.promote_f32`
     Promote,
-    /// `i32.reinterpret_f32` or `i64.reinterpret_f64`, the bits of a float.
+    /// `i32.reinterpret_f32` or `i64.reinterpret_f64`, the bits of a float,
+    /// or `f32.reinterpret_i32` or `f64.reinterpret_i64`, the float with the
+    /// bits of an integer.
     Reinterpret,
 }
 

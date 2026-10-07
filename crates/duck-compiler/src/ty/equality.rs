@@ -9,14 +9,18 @@ use crate::lex::Span;
 use crate::parse::BinOp;
 
 use super::{
-    Body, Checker, FuncSig, Prim, Synth, Ty, TypeErrorKind, Value, binary, binop_symbol,
+    Body, Checker, FuncSig, Leaf, Prim, Synth, Ty, TypeErrorKind, Value, binary, binop_symbol,
     element_addr, exprs, is_pure, is_simple, is_stable, scalar, split1,
-    unions::{self, Holds, tags_are},
+    unions::{self, Holds, narrow, tags_are, widen},
 };
 
-/// One piece of a value that is compared, in leaf order.
+/// One piece of a value that is compared, a union's tag before each of its
+/// variants in turn.
 struct Part {
     how: Compare,
+    /// The leaves of the value that hold the piece, each of which may be
+    /// wider than what it holds where the variants of a union share it.
+    leaves: Vec<Leaf>,
     /// For a piece of a union's variant, each union it's in and the variant
     /// of it, outermost first: the piece is compared only where they all
     /// hold.
@@ -33,52 +37,44 @@ enum Compare {
     Array(Ty),
 }
 
-impl Part {
-    /// How many scalar leaves the part covers.
-    fn width(&self) -> usize {
-        match self.how {
-            Compare::Scalar(_) | Compare::Bits(_) => 1,
-            Compare::Array(_) => 2,
-        }
-    }
-}
-
 impl Checker {
     /// The pieces `==` compares values of the storable type `ty` by.
     fn parts(&self, ty: Ty) -> Vec<Part> {
         let mut out = Vec::new();
-        self.push_parts(ty, false, &[], &mut out);
+        self.push_parts(ty, false, &self.leaf_list(ty), &[], &mut out);
         out
     }
 
-    /// Pushes the pieces of a `ty`, which are compared where every union of
-    /// `when` holds its variant, and by their `bits` within an enum.
-    fn push_parts(&self, ty: Ty, bits: bool, when: &[Holds], out: &mut Vec<Part>) {
+    /// Pushes the pieces of a `ty` held in `leaves`, which are compared
+    /// where every union of `when` holds its variant, and by their `bits`
+    /// within an enum.
+    fn push_parts(&self, ty: Ty, bits: bool, leaves: &[Leaf], when: &[Holds], out: &mut Vec<Part>) {
         let scalar = |vt| match bits {
             true => Compare::Bits(vt),
             false => Compare::Scalar(vt),
         };
-        let part = |how| Part {
+        let part = |how, leaves: &[Leaf]| Part {
             how,
+            leaves: leaves.to_vec(),
             when: when.to_vec(),
         };
         match ty {
-            Ty::Prim(prim) => out.push(part(scalar(prim.val_type()))),
-            Ty::Ptr(_) | Ty::Fn(_) => out.push(part(scalar(ValType::I32))),
-            Ty::Enum(id) => self.push_parts(self.enum_ty(id), true, when, out),
-            Ty::Array(_) if !bits => out.push(part(Compare::Array(ty))),
+            Ty::Prim(prim) => out.push(part(scalar(prim.val_type()), leaves)),
+            Ty::Ptr(_) | Ty::Fn(_) => out.push(part(scalar(ValType::I32), leaves)),
+            Ty::Enum(id) => self.push_parts(self.enum_ty(id), true, leaves, when, out),
+            Ty::Array(_) if !bits => out.push(part(Compare::Array(ty), leaves)),
             Ty::Struct(_) if self.union_id(ty).is_some() => {
-                let tag = out.iter().map(Part::width).sum();
-                out.push(part(scalar(unions::TAG.val_type())));
-                for (index, variant) in self.members(ty).into_iter().enumerate() {
+                out.push(part(scalar(unions::TAG.val_type()), &leaves[..1]));
+                let variants = self.member_leaves(ty, leaves).into_iter();
+                for (index, (variant, held)) in variants.enumerate() {
                     let mut when = when.to_vec();
-                    when.push(Holds::new(tag, index));
-                    self.push_parts(variant, bits, &when, out);
+                    when.push(Holds::new(leaves[0], index));
+                    self.push_parts(variant, bits, &held, &when, out);
                 }
             }
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
-                for member in self.members(ty) {
-                    self.push_parts(member, bits, when, out);
+                for (member, held) in self.member_leaves(ty, leaves) {
+                    self.push_parts(member, bits, &held, when, out);
                 }
             }
             Ty::ExternRef => unreachable!("`externref` can't be compared"),
@@ -166,7 +162,7 @@ impl Body<'_> {
     /// compared only where both values hold it.
     pub(super) fn compare(&mut self, op: BinOp, ty: Ty, lhs: Value, rhs: Value) -> Value {
         let parts = self.ck.parts(ty);
-        let width = parts.iter().map(Part::width).sum::<usize>();
+        let width = self.ck.val_types(ty).len();
         let has_array = parts.iter().any(|p| matches!(p.how, Compare::Array(_)));
         let has_union = parts.iter().any(|part| !part.when.is_empty());
         let mut value = self.seq(vec![lhs, rhs]);
@@ -192,29 +188,43 @@ impl Body<'_> {
         };
         let mut scalars = Vec::new();
         let mut arrays = Vec::new();
-        let mut leaf = 0;
         for part in parts {
-            let (a, b) = (lhs[leaf].clone(), rhs[leaf].clone());
+            // The scalar of type `vt` that a leaf of one side holds.
+            let read =
+                |side: &[Expr], leaf: Leaf, vt| narrow(leaf.ty, vt, side[leaf.index].clone());
             let compared = match part.how {
-                Compare::Scalar(vt) => binary(vt, cmp, a, b),
+                Compare::Scalar(vt) => {
+                    let leaf = part.leaves[0];
+                    binary(vt, cmp, read(&lhs, leaf, vt), read(&rhs, leaf, vt))
+                }
                 Compare::Bits(vt) => {
-                    let bits = |e| Expr::Unary(vt, IrUnOp::Reinterpret, Box::new(e));
-                    match vt {
-                        ValType::F32 => binary(ValType::I32, cmp, bits(a), bits(b)),
-                        ValType::F64 => binary(ValType::I64, cmp, bits(a), bits(b)),
-                        _ => binary(vt, cmp, a, b),
-                    }
+                    let leaf = part.leaves[0];
+                    let int = match vt {
+                        ValType::F32 => ValType::I32,
+                        ValType::F64 => ValType::I64,
+                        vt => vt,
+                    };
+                    // A leaf wider than a float holds its bits already.
+                    let bits = |side: &[Expr]| match leaf.ty == vt {
+                        true => widen(vt, int, side[leaf.index].clone()),
+                        false => read(side, leaf, int),
+                    };
+                    binary(int, cmp, bits(&lhs), bits(&rhs))
                 }
                 Compare::Array(ty) => {
-                    let (a_len, b_len) = (lhs[leaf + 1].clone(), rhs[leaf + 1].clone());
-                    let call = Expr::Call(self.ck.eq_func(ty), vec![a, a_len, b, b_len]);
+                    let sides = [&lhs, &rhs].into_iter();
+                    let args = sides.flat_map(|side| {
+                        let ends = part.leaves.iter();
+                        ends.map(|end| read(side, *end, ValType::I32))
+                    });
+                    let args = args.collect();
+                    let call = Expr::Call(self.ck.eq_func(ty), args);
                     match op {
                         BinOp::Eq => call,
                         _ => Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(call)),
                     }
                 }
             };
-            leaf += part.width();
             // The tags are compared too, so one value's say whether both
             // hold the variant: those that are known, if either's are.
             let held = match (tags_are(&part.when, &lhs), tags_are(&part.when, &rhs)) {

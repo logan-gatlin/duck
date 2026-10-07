@@ -47,9 +47,7 @@ impl Checker {
     /// lowered by [`Self::lower_wrapper`].
     fn pointer_target(&mut self, id: FuncId) -> FuncId {
         let sig = &self.funcs[id.0 as usize];
-        let prims = self.leaf_prims(sig.ret);
-        let narrow = prims.into_iter().flatten().any(|prim| prim.size() < 4);
-        if id.0 >= self.import_count || !narrow {
+        if id.0 >= self.import_count || self.ranged(sig.ret).is_empty() {
             return id;
         }
         if let Some(wrapper) = self.wrappers.get(&id) {

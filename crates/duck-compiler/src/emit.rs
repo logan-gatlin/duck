@@ -469,6 +469,8 @@ fn unary(ty: ValType, op: UnOp) -> Instruction<'static> {
         (F32, Promote) => Instruction::F64PromoteF32,
         (F32, Reinterpret) => Instruction::I32ReinterpretF32,
         (F64, Reinterpret) => Instruction::I64ReinterpretF64,
+        (I32, Reinterpret) => Instruction::F32ReinterpretI32,
+        (I64, Reinterpret) => Instruction::F64ReinterpretI64,
         _ => panic!("no wasm instruction {ty:?}.{op:?}"),
     }
 }
@@ -642,7 +644,7 @@ pub fn f():
         let bytes = emit_src(src);
         let wat = wat(&bytes);
         assert!(
-            wat.contains(r#"(global $held.some (;1;) (mut externref) ref.null extern)"#),
+            wat.contains(r#"(global $held.0 (;1;) (mut externref) ref.null extern)"#),
             "{wat}"
         );
         assert!(
@@ -654,6 +656,54 @@ pub fn f():
             f.contains("i32.const 1\n    ref.null extern\n    call $put"),
             "{f}"
         );
+    }
+
+    #[test]
+    fn leaves_that_variants_share_hold_the_bits_of_each() {
+        let src = "\
+pub union Mixed:
+    int: i32
+    float: f32
+    double: f64
+    long: i64
+let held: varray(Mixed) = [.int(0)]
+pub fn build(x: i32, y: f32, z: f64) -> tuple(Mixed, Mixed, Mixed):
+    return (.int(x), .float(y), .double(z))
+pub fn read(m: Mixed) -> f64:
+    held[0] = m
+    match held[0]:
+        .int(x):
+            return x as f64
+        .float(y):
+            return y as f64
+        .double(z):
+            return z
+        .long(l):
+            return l as f64
+";
+        let bytes = emit_src(src);
+        // The instructions of a function, one after another.
+        let code = |name: &str| {
+            let wat = func_wat(&bytes, name);
+            let lines: Vec<_> = wat.lines().map(str::trim).collect();
+            lines.join(" ")
+        };
+        let build = code("build");
+        for widened in [
+            "local.get $x i64.extend_i32_u",
+            "local.get $y i32.reinterpret_f32 i64.extend_i32_u",
+            "local.get $z i64.reinterpret_f64",
+        ] {
+            assert!(build.contains(widened), "{build}");
+        }
+        let read = code("read");
+        for narrowed in [
+            "i32.wrap_i64 local.set $x",
+            "i32.wrap_i64 f32.reinterpret_i32 local.set $y",
+            "f64.reinterpret_i64 local.set $z",
+        ] {
+            assert!(read.contains(narrowed), "{read}");
+        }
     }
 
     #[test]
