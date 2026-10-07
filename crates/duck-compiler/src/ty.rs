@@ -181,10 +181,15 @@ pub enum Prim {
     I16,
     I32,
     I64,
+    /// `int`, a signed integer as wide as an address.
+    Int,
     U8,
     U16,
     U32,
     U64,
+    /// `uint`, an unsigned integer as wide as an address, which counts
+    /// bytes and elements.
+    Uint,
     F32,
     F64,
     Bool,
@@ -239,7 +244,7 @@ pub enum Ty {
     /// `tuple(A, B)`, which is laid out like a struct with a field per element.
     Tuple(TupleId),
     /// `array(T)`, a view of elements in linear memory that it doesn't own.
-    /// Laid out like a struct with the fields `ptr: &T` and `len: u32`.
+    /// Laid out like a struct with the fields `ptr: &T` and `len: uint`.
     /// `varray(T)` is one whose elements can be written, so its `ptr` is a
     /// `&var T`.
     Array(ArrayId),
@@ -247,8 +252,8 @@ pub enum Ty {
     /// the module's table.
     Fn(FnId),
     /// `type`, the value of a type written where a value belongs, as in
-    /// `malloc(Point)`. Laid out like a struct with the fields `size: u32`
-    /// and `align: u32`, which describe the type in memory.
+    /// `malloc(Point)`. Laid out like a struct with the fields `size: uint`
+    /// and `align: uint`, which describe the type in memory.
     Type,
     /// A type parameter, which the fields of its generic struct's declaration
     /// have, and the body of its generic function's while that is checked as
@@ -390,6 +395,12 @@ pub enum TypeErrorKind {
         ty: String,
     },
     InvalidCast {
+        from: String,
+        to: String,
+    },
+    /// A cast between a pointer or function pointer and an integer other
+    /// than `int` and `uint`, which alone are as wide as an address.
+    AddressCast {
         from: String,
         to: String,
     },
@@ -896,10 +907,12 @@ impl Prim {
             "i16" => Self::I16,
             "i32" => Self::I32,
             "i64" => Self::I64,
+            "int" => Self::Int,
             "u8" => Self::U8,
             "u16" => Self::U16,
             "u32" => Self::U32,
             "u64" => Self::U64,
+            "uint" => Self::Uint,
             "f32" => Self::F32,
             "f64" => Self::F64,
             "bool" => Self::Bool,
@@ -913,18 +926,24 @@ impl Prim {
             Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::Int => "int",
             Self::U8 => "u8",
             Self::U16 => "u16",
             Self::U32 => "u32",
             Self::U64 => "u64",
+            Self::Uint => "uint",
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::Bool => "bool",
         }
     }
 
+    /// The wasm value that holds one. An `int` or `uint` is
+    /// [fixed](Checker::fixed) first, as are those of every method that
+    /// depends on a size.
     fn val_type(self) -> ValType {
         match self {
+            Self::Int | Self::Uint => unreachable!("`int` and `uint` are fixed first"),
             Self::I64 | Self::U64 => ValType::I64,
             Self::F32 => ValType::F32,
             Self::F64 => ValType::F64,
@@ -937,7 +956,10 @@ impl Prim {
     }
 
     fn is_signed(self) -> bool {
-        matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
+        matches!(
+            self,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::Int
+        )
     }
 
     fn is_float(self) -> bool {
@@ -955,6 +977,7 @@ impl Prim {
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 | Self::F32 => 4,
             Self::I64 | Self::U64 | Self::F64 => 8,
+            Self::Int | Self::Uint => unreachable!("`int` and `uint` are fixed first"),
         }
     }
 
@@ -987,6 +1010,7 @@ impl Prim {
             Self::U16 => (0, u16::MAX.into()),
             Self::U32 => (0, u32::MAX.into()),
             Self::U64 => (0, u64::MAX.into()),
+            Self::Int | Self::Uint => unreachable!("`int` and `uint` are fixed first"),
             Self::F32 | Self::F64 | Self::Bool => (0, 0),
         }
     }
@@ -1098,6 +1122,10 @@ impl fmt::Display for TypeErrorKind {
             }
             Self::InvalidOperand { op, ty } => write!(f, "`{op}` can't be applied to `{ty}`"),
             Self::InvalidCast { from, to } => write!(f, "can't cast `{from}` as `{to}`"),
+            Self::AddressCast { from, to } => write!(
+                f,
+                "can't cast `{from}` as `{to}`; pointers cast to and from `uint` and `int`"
+            ),
             Self::IntOutOfRange(ty) => write!(f, "literal out of range for `{ty}`"),
             Self::NoField { ty, field } => write!(f, "`{ty}` has no field `{field}`"),
             Self::NotAssignable => write!(f, "invalid assignment target"),
@@ -2276,9 +2304,19 @@ impl Checker {
                 .map(|field| field.ty)
                 .collect(),
             Ty::Tuple(id) => self.tuples[id.0 as usize].clone(),
-            Ty::Array(id) => vec![self.arrays[id.0 as usize], Ty::Prim(Prim::U32)],
-            Ty::Type => vec![Ty::Prim(Prim::U32); TYPE_FIELDS.len()],
+            Ty::Array(id) => vec![self.arrays[id.0 as usize], Ty::Prim(Prim::Uint)],
+            Ty::Type => vec![Ty::Prim(Prim::Uint); TYPE_FIELDS.len()],
             _ => Vec::new(),
+        }
+    }
+
+    /// The type of a fixed size that `prim` is held as: an `i32` for an
+    /// `int` and a `u32` for a `uint`. Any other is itself.
+    fn fixed(&self, prim: Prim) -> Prim {
+        match prim {
+            Prim::Int => Prim::I32,
+            Prim::Uint => Prim::U32,
+            prim => prim,
         }
     }
 
@@ -2497,7 +2535,7 @@ impl Checker {
 
     fn push_leaves(&self, ty: Ty, name: String, out: &mut Vec<(String, ValType)>) {
         match ty {
-            Ty::Prim(prim) => out.push((name, prim.val_type())),
+            Ty::Prim(prim) => out.push((name, self.fixed(prim).val_type())),
             Ty::Ptr(_) | Ty::Fn(_) => out.push((name, ValType::I32)),
             Ty::ExternRef => out.push((name, ValType::ExternRef)),
             Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
@@ -2570,7 +2608,7 @@ impl Checker {
     /// every union of `when` holds its variant.
     fn push_ranged(&self, ty: Ty, leaves: &[Leaf], when: &[Holds], out: &mut Vec<Ranged>) {
         match ty {
-            Ty::Prim(prim) if prim.size() < 4 => out.push(Ranged {
+            Ty::Prim(prim) if self.fixed(prim).size() < 4 => out.push(Ranged {
                 leaf: leaves[0],
                 prim,
                 when: when.to_vec(),
@@ -2653,12 +2691,14 @@ impl Checker {
             (from, to) if from == to => Some((to, value)),
             // Already reported.
             (Ty::Error, _) => Some((Ty::Error, Value::default())),
-            (Ty::Prim(from), Ty::Prim(to)) if convertible(from, to) => Some((
-                Ty::Prim(to),
-                map1(value, to.val_type(), |e| convert(from, to, e)),
-            )),
-            (Ty::Ptr(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Ptr(_))
-            | (Ty::Ptr(_), Ty::Prim(Prim::U32 | Prim::I32)) => Some((to, value)),
+            (Ty::Prim(from), Ty::Prim(as_)) if convertible(from, as_) => {
+                let (from, as_) = (self.fixed(from), self.fixed(as_));
+                let value = map1(value, as_.val_type(), |e| convert(from, as_, e));
+                Some((to, value))
+            }
+            // A pointer converts to and from its address.
+            (Ty::Ptr(_) | Ty::Prim(Prim::Uint | Prim::Int), Ty::Ptr(_))
+            | (Ty::Ptr(_), Ty::Prim(Prim::Uint | Prim::Int)) => Some((to, value)),
             // An array and a `varray` of the same elements convert to each
             // other.
             (Ty::Array(from), Ty::Array(as_)) if self.element(from) == self.element(as_) => {
@@ -2666,12 +2706,20 @@ impl Checker {
             }
             // Function pointers convert as pointers do: to each other, and
             // to and from their index in the table.
-            (Ty::Fn(_) | Ty::Prim(Prim::U32 | Prim::I32), Ty::Fn(_))
-            | (Ty::Fn(_), Ty::Prim(Prim::U32 | Prim::I32)) => Some((to, value)),
+            (Ty::Fn(_) | Ty::Prim(Prim::Uint | Prim::Int), Ty::Fn(_))
+            | (Ty::Fn(_), Ty::Prim(Prim::Uint | Prim::Int)) => Some((to, value)),
             // An enum casts to whatever the type of its values does.
             (Ty::Enum(id), to) => self.cast_value(self.enum_ty(id), to, value),
             _ => None,
         }
+    }
+
+    /// Whether `from as to` casts between a pointer or function pointer and
+    /// an integer.
+    fn casts_address(&self, from: Ty, to: Ty) -> bool {
+        let address = |ty| matches!(ty, Ty::Ptr(_) | Ty::Fn(_));
+        let integer = |ty| matches!(ty, Ty::Prim(prim) if prim.is_int());
+        (address(from) && integer(to)) || (integer(from) && address(to))
     }
 
     /// The names `pattern` binds when it takes apart a value of type `ty`, in
@@ -2734,7 +2782,10 @@ impl Checker {
     /// Size and alignment of `ty` in memory.
     fn layout(&self, ty: Ty) -> (u32, u32) {
         match ty {
-            Ty::Prim(prim) => (prim.size(), prim.size()),
+            Ty::Prim(prim) => {
+                let size = self.fixed(prim).size();
+                (size, size)
+            }
             Ty::Ptr(_) | Ty::Fn(_) => (4, 4),
             Ty::Enum(id) => self.layout(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
@@ -2787,15 +2838,18 @@ impl Checker {
     ) {
         let when = when.to_vec();
         match ty {
-            Ty::Prim(prim) => out.push(Cell {
-                offset,
-                leaf: leaves[0],
-                ty: prim.val_type(),
-                load: prim.load(),
-                store: prim.store(),
-                bool: prim == Prim::Bool,
-                when,
-            }),
+            Ty::Prim(prim) => {
+                let fixed = self.fixed(prim);
+                out.push(Cell {
+                    offset,
+                    leaf: leaves[0],
+                    ty: fixed.val_type(),
+                    load: fixed.load(),
+                    store: fixed.store(),
+                    bool: prim == Prim::Bool,
+                    when,
+                });
+            }
             Ty::Ptr(_) | Ty::Fn(_) => out.push(Cell {
                 offset,
                 leaf: leaves[0],
@@ -3497,7 +3551,7 @@ impl<'c> Body<'c> {
         span: Span,
     ) -> Option<Place> {
         let (ty, array) = self.expr(array, None);
-        let index = self.check(index, Ty::Prim(Prim::U32));
+        let index = self.check(index, Ty::Prim(Prim::Uint));
         let Ty::Array(id) = ty else {
             self.invalid_operand("[]", ty, span);
             return None;
@@ -3830,11 +3884,12 @@ impl<'c> Body<'c> {
     /// `module.name`, one of `module`'s constants. `module.static` is the
     /// static data section, as an `array(u8)`, which only reads it. `page_size` is the bytes in a
     /// wasm page, and `min` and `max` are the pages memory starts with and
-    /// may grow to, `max` being the largest `u32` if it's unlimited.
+    /// may grow to, `max` being the largest `uint` if it's unlimited. Each
+    /// is a `uint`.
     fn module_property(&mut self, name: &Ident) -> (Ty, Value) {
         let page_count = |pages: u32| {
             let value = scalar(ValType::I32, Expr::Const(Const::I32(pages as i32)));
-            (Ty::Prim(Prim::U32), value)
+            (Ty::Prim(Prim::Uint), value)
         };
         match name.name.as_str() {
             "static" => {
@@ -3863,8 +3918,9 @@ impl<'c> Body<'c> {
 
     /// `module.name(args)`, one of `module`'s functions, lowered to the
     /// memory instruction it stands for. `memory()` is all of memory as a
-    /// `varray(u8)`, `size()` its size in pages, and `grow(pages)` adds pages,
-    /// giving the old size or -1 if it can't. `fill(dst, value, len)` and
+    /// `varray(u8)`, `size()` its size in pages as a `uint`, and `grow(pages)`
+    /// adds pages, giving the old size as an `int`, or -1 if it can't.
+    /// `fill(dst, value, len)` and
     /// `copy(dst, src, len)` set and copy bytes. `unreachable()` traps.
     /// `count_leading_zeros(value)` and `count_trailing_zeros(value)` are
     /// [`Self::count_zeros`].
@@ -3873,7 +3929,7 @@ impl<'c> Body<'c> {
             return self.count_zeros(name, args, span);
         }
         let byte = Ty::Prim(Prim::U8);
-        let count = Ty::Prim(Prim::U32);
+        let count = Ty::Prim(Prim::Uint);
         let src = self.ck.ptr_to(byte, false);
         let dst = self.ck.ptr_to(byte, true);
         let params: &[(&str, Ty)] = match name.name.as_str() {
@@ -3918,7 +3974,7 @@ impl<'c> Body<'c> {
             "size" => (count, vec![(ValType::I32, Expr::MemorySize)]),
             "grow" => {
                 let grow = Expr::MemoryGrow(Box::new(operand()));
-                (Ty::Prim(Prim::I32), vec![(ValType::I32, grow)])
+                (Ty::Prim(Prim::Int), vec![(ValType::I32, grow)])
             }
             "fill" => {
                 let (dst, value, len) = (operand(), operand(), operand());
@@ -3960,7 +4016,7 @@ impl<'c> Body<'c> {
         }
         let value = self.bound_args(&params, &[], args, binding, checked);
         let prim = match ty {
-            Ty::Prim(prim) if prim.is_int() => prim,
+            Ty::Prim(prim) if prim.is_int() => self.ck.fixed(prim),
             _ => {
                 let op = match leading {
                     true => "module.count_leading_zeros",
@@ -4074,7 +4130,7 @@ impl<'c> Body<'c> {
         let elem = want.unwrap_or(ty);
         self.expect(ty, elem, value.span);
         let consts = self.ck.fold_value(&lowered, value.span);
-        let lowered = self.check(len, Ty::Prim(Prim::U32));
+        let lowered = self.check(len, Ty::Prim(Prim::Uint));
         let count = self.ck.fold_value(&lowered, len.span);
         if !self.ck.fits(ty, elem) || !self.placeable(elem, errors, span) {
             return (Ty::Error, Value::default());
@@ -4092,7 +4148,7 @@ impl<'c> Body<'c> {
     /// a pointer is expected, it is an address.
     fn int_literal(&mut self, n: i128, expected: Option<Ty>, span: Span) -> (Ty, Value) {
         if let Some(ptr @ Ty::Ptr(_)) = expected {
-            let (min, max) = Prim::U32.range();
+            let (min, max) = self.ck.fixed(Prim::Uint).range();
             if n < min || n > max {
                 self.error(TypeErrorKind::IntOutOfRange(self.ck.ty_name(ptr)), span);
             }
@@ -4105,15 +4161,16 @@ impl<'c> Body<'c> {
         if prim.is_float() {
             return float_literal(n as f64, expected);
         }
-        let (min, max) = prim.range();
+        let fixed = self.ck.fixed(prim);
+        let (min, max) = fixed.range();
         if n < min || n > max {
             self.error(TypeErrorKind::IntOutOfRange(prim.name().to_string()), span);
         }
-        let value = match prim.val_type() {
+        let value = match fixed.val_type() {
             ValType::I64 => Const::I64(n as i64),
             _ => Const::I32(n as i32),
         };
-        (Ty::Prim(prim), scalar(prim.val_type(), Expr::Const(value)))
+        (Ty::Prim(prim), scalar(fixed.val_type(), Expr::Const(value)))
     }
 
     /// The value of the variable or item `name`. `expected` picks the
@@ -4265,7 +4322,7 @@ impl<'c> Body<'c> {
             UnaryOp::Neg | UnaryOp::BitNot => self.expr(operand, expected),
         };
         let prim = match ty {
-            Ty::Prim(prim) => prim,
+            Ty::Prim(prim) => self.ck.fixed(prim),
             // A number, for some type arguments.
             Ty::Param(_) => {
                 self.ck.deferred = true;
@@ -4364,7 +4421,7 @@ impl<'c> Body<'c> {
     ) -> (Ty, Value) {
         let bool = Ty::Prim(Prim::Bool);
         let prim = match ty {
-            Ty::Prim(prim) => prim,
+            Ty::Prim(prim) => self.ck.fixed(prim),
             // Whatever `op` takes, for some type arguments.
             Ty::Param(_) => {
                 self.ck.deferred = true;
@@ -4374,7 +4431,7 @@ impl<'c> Body<'c> {
                 };
             }
             // Pointers compare as unsigned addresses.
-            Ty::Ptr(_) if is_comparison(op) => Prim::U32,
+            Ty::Ptr(_) if is_comparison(op) => self.ck.fixed(Prim::Uint),
             _ if matches!(op, BinOp::Eq | BinOp::NotEq) => {
                 return self.eq_values(op, ty, lhs, rhs, span);
             }
@@ -4468,7 +4525,7 @@ impl<'c> Body<'c> {
         let expected = match to {
             // An integer literal cast to a pointer is an address, and to a
             // function pointer an index in the table.
-            Ty::Ptr(_) | Ty::Fn(_) => Some(Ty::Prim(Prim::U32)),
+            Ty::Ptr(_) | Ty::Fn(_) => Some(Ty::Prim(Prim::Uint)),
             _ => None,
         };
         let (from, value) = self.expr(operand, expected);
@@ -4482,9 +4539,11 @@ impl<'c> Body<'c> {
                 (to, self.blank(to))
             }
             None => {
-                let kind = TypeErrorKind::InvalidCast {
-                    from: self.ck.ty_name(from),
-                    to: self.ck.ty_name(to),
+                let address = self.ck.casts_address(from, to);
+                let (from, to) = (self.ck.ty_name(from), self.ck.ty_name(to));
+                let kind = match address {
+                    true => TypeErrorKind::AddressCast { from, to },
+                    false => TypeErrorKind::InvalidCast { from, to },
                 };
                 self.error(kind, span);
                 (Ty::Error, Value::default())
@@ -6095,7 +6154,7 @@ fn take(u: tuple(), n: i32) -> i32:
     return n
 fn double(x: i32) -> i32:
     return x * 2
-fn size(t: type) -> u32:
+fn size(t: type) -> uint:
     return t.size
 fn sum() -> i32:
     return make() |> _.x + _.y
@@ -6105,7 +6164,7 @@ fn callee() -> i32:
     return double |> _(3)
 fn field(p: &P) -> &i32:
     return p |> &_.y
-fn ty() -> u32:
+fn ty() -> uint:
     return P |> size(_)
 ";
         let module = lower(src);
@@ -6811,7 +6870,7 @@ let origin = P(x: 1, y: 2.0)
 let name = \"duck\"
 var count = limit
 pub let top = limit + origin.x
-fn f() -> u32:
+fn f() -> uint:
     count += limit
     let p = origin
     let y = origin.y
@@ -6850,10 +6909,10 @@ pub struct P:
     x: f64
 var null = 0 as &u32
 pub let top = 4294967295 as &&P
-pub fn f(p: &P, a: u32, n: i32) -> &u32:
+pub fn f(p: &P, a: uint, n: int) -> &u32:
     let q = a as &P
-    let b = p as u32
-    let s = p as i32
+    let b = p as uint
+    let s = p as int
     let c = p as &u32
     let d = p == q
     let e = p != q
@@ -6890,15 +6949,20 @@ pub fn f(p: &P, a: u32, n: i32) -> &u32:
              (set g (I32.LtU p q)) (set h (I32.GeU p q)) (set r n) (return c)"
         );
         let src = "\
-fn f(p: &u8, q: &i8, a: i64):
+fn f(p: &u8, q: &i8, a: i64, n: u32, g: fn()):
     let b = p as &i8 == q
     let c = p == q
     let d = p < q
     let e = p + 1
-    let g = a as &u8
+    let h = a as &u8
     let i = p as u64
+    let j = n as &u8
+    let k = p as i32
+    let l = g as u32
+    let m = p as f32
 ";
-        let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
+        // Only `int` and `uint` are as wide as an address.
+        let address = |from: &str, to: &str| TypeErrorKind::AddressCast {
             from: from.into(),
             to: to.into(),
         };
@@ -6908,8 +6972,89 @@ fn f(p: &u8, q: &i8, a: i64):
                 mismatch("&u8", "&i8"),
                 mismatch("&u8", "&i8"),
                 invalid_operand("+", "&u8"),
-                cast("i64", "&u8"),
-                cast("&u8", "u64"),
+                address("i64", "&u8"),
+                address("&u8", "u64"),
+                address("u32", "&u8"),
+                address("&u8", "i32"),
+                address("fn()", "u32"),
+                TypeErrorKind::InvalidCast {
+                    from: "&u8".into(),
+                    to: "f32".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn int_and_uint_are_as_wide_as_an_address() {
+        let src = "\
+enum(uint) Slot:
+    first
+    second
+struct S:
+    a: u8
+    n: uint
+    i: int
+pub let BIG: uint = 4294967295
+pub let LOW: int = -2147483648
+fn f(n: uint, i: int, s: &S, a: array(u8)) -> uint:
+    let narrow = n as u32
+    let wide = narrow as uint
+    let signed = n as int
+    let long = i as i64
+    let back = long as int
+    let half = n / 2 + a.len
+    let neg = -i >> 1
+    let zeros = module.count_leading_zeros(n)
+    let slot = Slot.second as uint
+    match n:
+        4294967295:
+            pass
+        else:
+            pass
+    return s.n + s.i as uint + S.size
+";
+        let module = lower(src);
+        let globals: Vec<_> = module.globals.iter().map(|g| (g.ty, g.init)).collect();
+        assert_eq!(
+            globals,
+            [
+                (ValType::I32, Const::I32(-1)),
+                (ValType::I32, Const::I32(i32::MIN))
+            ]
+        );
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.params, [ValType::I32; 5]);
+        assert_eq!(f.results, [ValType::I32]);
+        assert_eq!(
+            body(&module, "f"),
+            "(set narrow n) (set wide narrow) (set signed n) (set long (I32.ExtendS i)) \
+             (set back (I64.Wrap long)) (set half (I32.Add (I32.DivU n 2) a.len)) \
+             (set neg (I32.ShrS (I32.Sub 0 i) 1)) (set zeros (I32.Clz n)) (set slot 1) \
+             (set tmp14 n) (block (if (I32.Eq tmp14 -1) (then (br 1)) (else ))) \
+             (return (I32.Add (I32.Add (I32.Load offset=4 s) (I32.Load offset=8 s)) 12))"
+        );
+        // Neither mixes with a type of a fixed size, or with the other.
+        let src = "\
+fn f(n: uint, i: int, w: u32):
+    let a = n + w
+    let b = n + i
+    let c: uint = -1
+    let d: uint = 4294967296
+    let e: int = 2147483648
+    let g: u32 = n
+    let h: i32 = i
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                mismatch("uint", "u32"),
+                mismatch("uint", "int"),
+                invalid_operand("-", "uint"),
+                TypeErrorKind::IntOutOfRange("uint".into()),
+                TypeErrorKind::IntOutOfRange("int".into()),
+                mismatch("u32", "uint"),
+                mismatch("i32", "int"),
             ]
         );
     }
@@ -7688,7 +7833,7 @@ struct(T) Box:
 enum(i8) Code:
     ok
     bad
-fn(T) sized(x: T) -> u32:
+fn(T) sized(x: T) -> uint:
     let y: T = x
     let b = Box(T)(value: y)
     return T.size + (&T).size
@@ -7866,9 +8011,9 @@ fn f():
 enum(u16) Unit:
     size
     align = 7
-fn(T) bytes() -> u32:
+fn(T) bytes() -> uint:
     return T.size + T.align
-fn f() -> u32:
+fn f() -> uint:
     let member = Unit.size
     return bytes(Unit)()
 ";
@@ -8216,9 +8361,9 @@ struct(T) W:
     x: T
 struct(T) S:
     w: W(S(T))
-fn f(r: &R(i32)) -> u32:
+fn f(r: &R(i32)) -> uint:
     return R(i32).size + S(u8).size + S(u8).align
-fn(T) g(s: S(T)) -> u32:
+fn(T) g(s: S(T)) -> uint:
     return 1
 ";
         assert_eq!(
@@ -8242,7 +8387,7 @@ fn(T) g(s: S(T)) -> u32:
                 let below = level - 1;
                 src += &format!("struct(T) L{level}:\n    x: L{below}(L{below}(T))\n");
             }
-            src + &format!("fn f() -> u32:\n    return L{levels}(u8).size\n")
+            src + &format!("fn f() -> uint:\n    return L{levels}(u8).size\n")
         };
         assert_eq!(body(&lower(&doubling(6)), "f"), "(return 1)");
         // The declaration nests too deep whatever it is given, so it is
@@ -8256,7 +8401,7 @@ fn(T) g(s: S(T)) -> u32:
         let written = |depth: usize| -> String {
             let ty = format!("{}u8{}", "Opt(".repeat(depth), ")".repeat(depth));
             format!(
-                "union(T) Opt:\n    some: T\n    none\nfn f(o: &{ty}) -> u32:\n    return {ty}.size\n"
+                "union(T) Opt:\n    some: T\n    none\nfn f(o: &{ty}) -> uint:\n    return {ty}.size\n"
             )
         };
         assert_eq!(body(&lower(&written(64)), "f"), "(return 65)");
@@ -8333,13 +8478,13 @@ struct Point:
 struct(T) Box:
     value: T
 pub let INT = i32
-var heap: u32 = 1024
+var heap: uint = 1024
 fn malloc(t: type) -> &u8:
     heap = (heap + t.align - 1) / t.align * t.align
     let p = heap as &u8
     heap += t.size
     return p
-fn f() -> u32:
+fn f() -> uint:
     let p = malloc(Point)
     let t: type = type(size: 3, align: 1)
     let u = tuple().size + (&tuple()).size
@@ -8424,7 +8569,7 @@ fn f(a: array(u8)) -> array(u8):
 struct S:
     tag: u8
     name: array(u16)
-fn f(a: array(u8), s: &var S) -> u32:
+fn f(a: array(u8), s: &var S) -> uint:
     var b = a
     b.len = 2
     s.name.ptr = b.ptr as &u16
@@ -8444,7 +8589,7 @@ fn g(t: &tuple(u8, array(i32))) -> &i32:
     #[test]
     fn arrays_are_constructed_from_a_pointer_and_length() {
         let src = "\
-fn f(n: u32, p: &u8) -> array(u8):
+fn f(n: uint, p: &u8) -> array(u8):
     let b = array(u8)(len: n, ptr: p)
     let c = array(u8)(ptr: p, len: 3)
     return array(u8)(len: 0, ptr: 0)
@@ -8454,11 +8599,11 @@ fn f(n: u32, p: &u8) -> array(u8):
             "(set b.ptr p) (set b.len n) (set c.ptr p) (set c.len 3) (return 0 0)"
         );
         let src = "\
-fn f(n: u32, p: &u8, q: &i8, a: array(u8)):
+fn f(n: uint, p: &u8, q: &i8, a: array(u8)):
     let b = array(u8)(len: n, ptr: q)
     let c = array(u8)(len: -1, ptr: 4294967296)
     let d = (n, p) as array(u8)
-    let e = a as tuple(u32, &u8)
+    let e = a as tuple(uint, &u8)
 ";
         let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
             from: from.into(),
@@ -8470,11 +8615,11 @@ fn f(n: u32, p: &u8, q: &i8, a: array(u8)):
                 mismatch("&u8", "&i8"),
                 TypeErrorKind::InvalidOperand {
                     op: "-",
-                    ty: "u32".into()
+                    ty: "uint".into()
                 },
                 TypeErrorKind::IntOutOfRange("&u8".into()),
-                cast("tuple(u32, &u8)", "array(u8)"),
-                cast("array(u8)", "tuple(u32, &u8)"),
+                cast("tuple(uint, &u8)", "array(u8)"),
+                cast("array(u8)", "tuple(uint, &u8)"),
             ]
         );
     }
@@ -8500,8 +8645,8 @@ fn f(p: &u8) -> bool:
     fn indexing_checks_bounds_then_loads() {
         let src = "\
 extern:
-    fn tick() -> u32
-fn f(a: array(u16), i: u32) -> u16:
+    fn tick() -> uint
+fn f(a: array(u16), i: uint) -> u16:
     return a[i]
 fn g(a: array(u8)) -> u8:
     return a[3]
@@ -8546,7 +8691,7 @@ fn f(a: array(u8), i: i32, n: i32):
 ";
         assert_eq!(
             errors(src),
-            vec![mismatch("u32", "i32"), invalid_operand("[]", "i32"),]
+            vec![mismatch("uint", "i32"), invalid_operand("[]", "i32"),]
         );
     }
 
@@ -8556,7 +8701,7 @@ fn f(a: array(u8), i: i32, n: i32):
 struct P:
     x: i32
     y: f64
-fn f(a: varray(P), i: u32) -> &P:
+fn f(a: varray(P), i: uint) -> &P:
     a[i].x += 1
     a[0] = P(x: 1, y: 2.0)
     return &a[i]
@@ -8592,7 +8737,7 @@ let views: array(array(u8)) = [text]
 var kept: &Node = 0
 fn read(n: &Node) -> i32:
     return n.val
-fn len(a: array(u8)) -> u32:
+fn len(a: array(u8)) -> uint:
     return a.len
 fn(T) first(a: array(T)) -> T:
     return a[0]
@@ -8853,7 +8998,7 @@ pub let nested: array(array(i8)) = [[], [-1]]
 pub struct P:
     a: u8
     b: i32
-let n: u32 = 2
+let n: uint = 2
 pub let bytes: array(u8) = [7; 3]
 pub let points = [P(a: 1, b: -2); n + 1]
 pub let zeros: array(u64) = [0; 1000]
@@ -8899,7 +9044,7 @@ pub let last: array(u8) = [1; 1]
         let src = "\
 fn get() -> u8:
     return 1
-var n: u32 = 2
+var n: uint = 2
 let i = 3
 let a = [get(); 2]
 let b = [0; n]
@@ -8917,9 +9062,9 @@ fn f():
             vec![
                 NotConstant,
                 NotConstant,
-                mismatch("u32", "i32"),
-                mismatch("u32", "f64"),
-                invalid_operand("-", "u32"),
+                mismatch("uint", "i32"),
+                mismatch("uint", "f64"),
+                invalid_operand("-", "uint"),
                 IntOutOfRange("u8".into()),
                 mismatch("u8", "bool"),
                 ConstTrap,
@@ -8972,7 +9117,7 @@ fn f():
 pub let s = \"abc\"
 pub let t: array(i32) = [1]
 pub let all = module.static
-fn f() -> u32:
+fn f() -> uint:
     return module.static.len
 ";
         let module = check_with(src, &settings).unwrap();
@@ -9039,11 +9184,11 @@ pub let max = module.max
         let src = "\
 fn all() -> varray(u8):
     return module.memory()
-fn size() -> u32:
+fn size() -> uint:
     return module.size()
-fn grow(n: u32) -> i32:
+fn grow(n: uint) -> int:
     return module.grow(n)
-fn fill(p: &var u8, n: u32):
+fn fill(p: &var u8, n: uint):
     module.fill(p, 7, n)
 fn copy(a: varray(u8), b: array(u8)):
     module.copy(src: b.ptr, dst: a.ptr, len: a.len)
@@ -9190,7 +9335,7 @@ fn f(p: &var u8):
                 },
                 Mismatch {
                     expected: "u32".into(),
-                    found: "i32".into()
+                    found: "int".into()
                 },
             ]
         );
@@ -9286,7 +9431,7 @@ pub let all = module.static
 pub let pages = module.min
 pub let s = \"abc\"
 pub let t: array(i32) = [1]
-fn f() -> u32:
+fn f() -> uint:
     return module.static.len + module.min
 ";
         let module = lower(src);
@@ -9673,7 +9818,7 @@ union Loop:
 union(T) Opt:
     some: T
     none
-fn f(s: Shape) -> u32:
+fn f(s: Shape) -> uint:
     let a = Shape(circle: 1.0)
     let b = s.circle
     let c = Shape.square
@@ -9732,7 +9877,7 @@ struct S:
     flag: bool
     shape: Shape
 let shapes: array(Shape) = [.circle(1.0), .rect((2, 3)), .empty]
-fn sizes() -> tuple(u32, u32, u32):
+fn sizes() -> tuple(uint, uint, uint):
     return (Shape.size, Shape.align, S.size)
 fn get(p: &Shape) -> Shape:
     return p.*
@@ -9995,7 +10140,7 @@ fn parse(x: i32) -> result(u8, bool):
     if x < 0:
         return result(u8, bool).err(false)
     return .ok(x as u8)
-fn sizes() -> tuple(u32, u32, u32):
+fn sizes() -> tuple(uint, uint, uint):
     return (option(i64).size, result(u8, f64).size, Node.size)
 fn nothing(o: option(result(i32, f32))) -> bool:
     return o == .none
@@ -10080,7 +10225,7 @@ fn(T) wrap(x: T) -> Option(T):
     return .some(x)
 fn(T) nothing() -> Option(T):
     return Option(T).none
-fn size() -> u32:
+fn size() -> uint:
     return Node(i64).size
 fn f(n: &Node(i64)) -> Result(i64, Option(u8)):
     let a = wrap(1 as u8)
@@ -11224,7 +11369,7 @@ fn global() -> i32:
     return handler(5)
 fn param(inc: fn(i32) -> i32) -> i32:
     return inc(6)
-fn cast(i: u32) -> i32:
+fn cast(i: uint) -> i32:
     return (i as fn(i32) -> i32)(7)
 ";
         let module = lower(src);
@@ -11395,7 +11540,7 @@ fn inc(x: i32) -> i32:
     return x + 1
 fn f(p: &var S, g: fn(i32) -> i32) -> bool:
     p.f = g
-    let i = g as u32
+    let i = g as uint
     let h = i as fn(i32)
     let k = h as fn() -> f32
     let z = 0 as fn()
@@ -11710,7 +11855,7 @@ fn f() -> Bad(u8, u8):
     #[test]
     fn writable_literals_in_defaults_are_empty() {
         let src = "\
-let N: u32 = 0
+let N: uint = 0
 let SHARED: varray(u8) = [0; 4]
 struct S:
     a: array(u8) = \"ro\"

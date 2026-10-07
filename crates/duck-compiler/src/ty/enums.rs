@@ -186,7 +186,7 @@ impl Checker {
             };
             // Counting from a member whose value is unknown.
             let n = next?;
-            if n > prim.range().1 {
+            if n > self.fixed(prim).range().1 {
                 let kind = TypeErrorKind::MemberOutOfRange {
                     member: name.name.clone(),
                     ty: prim.name().to_string(),
@@ -194,7 +194,7 @@ impl Checker {
                 self.error(kind, name.span);
                 return None;
             }
-            return Some(vec![int_const(prim, n)]);
+            return Some(vec![int_const(self.fixed(prim), n)]);
         };
         let errors = self.errors.len();
         let mut body = Body::new(self, Ty::Unit);

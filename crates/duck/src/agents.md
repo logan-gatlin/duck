@@ -62,16 +62,19 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 
 - `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`. Integer arithmetic wraps.
   Numeric types never mix (`u8 + i32` is an error): convert with `as`.
+- `int` and `uint`: integers as wide as an address, which is 32 bits. They
+  count bytes and elements, and are types of their own: `uint + u32` is an
+  error too.
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
-  `u32` addresses. There is no null: `0` is an address like any other.
+  addresses. There is no null: `0` is an address like any other.
 - `option(T)`: the union of `none` and `some: T`. `result(T, E)`: the union
   of `ok: T` and `err: E`. Both are built in, and are unions in every way.
-- `array(T)`: a view of `ptr: &T` and `len: u32` that owns nothing.
+- `array(T)`: a view of `ptr: &T` and `len: uint` that owns nothing.
   `varray(T)` has a `ptr: &var T`, so its elements are assignable. Strings
   are `array(u8)` of UTF-8.
 - `fn(A, B) -> R`: a function pointer. `fn(A)` returns nothing.
-- `type`: a type as a value, with `size: u32` and `align: u32`, as in
+- `type`: a type as a value, with `size: uint` and `align: uint`, as in
   `Point.size`, `(&Point).size` and `i64.align`.
 - `externref`: an opaque host reference. It is never stored in memory or
   compared.
@@ -208,12 +211,12 @@ written in one.
 let greeting = "hello"             # array(u8)
 let primes: array(u16) = [2, 3, 5]
 let empty: array(i32) = []         # [] needs an annotation
-let SIZE: u32 = 1024
+let SIZE: uint = 1024
 let buf: varray(u8) = [0; SIZE]    # writable; zeros add nothing to the wasm
 let count = &var 0                 # &var i32: one writable value in memory
 
-fn f(i: u32) -> u8:
-	buf[i] = greeting[i]           # a u32 index, bounds checked
+fn f(i: uint) -> u8:
+	buf[i] = greeting[i]           # a uint index, bounds checked
 	count.* += 1
 	return buf[0]
 ```
@@ -235,7 +238,7 @@ fn f(i: u32) -> u8:
 - Only a constructor applies field defaults. Memory that is cast to a struct
   holds whatever was there.
 - A parameter default is constant, with the same `varray` and `&var` rule. It
-  never uses another parameter: `end: u32 = a.len` is an error.
+  never uses another parameter: `end: uint = a.len` is an error.
 
 ## Operators
 
@@ -249,9 +252,11 @@ prefix `- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
   elements. `< <= > >=` compare numbers and pointers.
 - `as` converts number to number (float to integer saturates, NaN gives 0),
   `bool` to integer, pointer to pointer (how a `&T` becomes a `&var T`),
-  `array(T)` to `varray(T)` and back, `i32` or `u32` to and from pointers and
-  function pointers, function pointer to function pointer, and an enum to its
-  value type. Nothing converts to `bool`: write `x != 0`.
+  `array(T)` to `varray(T)` and back, `int` or `uint` to and from pointers
+  and function pointers, function pointer to function pointer, and an enum to
+  its value type. No other integer converts to or from a pointer: go through
+  `uint`, as in `p as uint as u32`. Nothing converts to `bool`: write
+  `x != 0`.
 
 ## Pointers and memory
 
@@ -260,7 +265,7 @@ struct Node:
 	val: i32
 	next: &Node
 
-var heap: u32 = 65536
+var heap: uint = 65536
 
 fn alloc(t: type) -> &var u8:          # bump from an address you pick
 	heap = (heap + t.align - 1) / t.align * t.align
@@ -275,7 +280,7 @@ fn push(head: &Node, v: i32) -> &Node:
 	r.* = 0
 	return n
 
-fn view(p: &i32, len: u32) -> array(i32):
+fn view(p: &i32, len: uint) -> array(i32):
 	return array(i32)(ptr: p, len: len) # slice by building a new view
 ```
 
@@ -286,7 +291,7 @@ fn view(p: &i32, len: u32) -> array(i32):
   pointer or array on the way to the place decides: with `next: &var Node`,
   `p.next.val = 1` works through a `p: &Node`. `let` and `var` govern the
   binding, not the pointee.
-- Pointer arithmetic is `((p as u32) + 4) as &T`.
+- Pointer arithmetic is `((p as uint) + 4) as &T`.
 - Layout follows C, and `bool` is 1 byte.
 - The only runtime checks are array bounds and division by zero, which trap.
 - Literals fill the static section from address 0. Memory starts as the
@@ -297,14 +302,14 @@ fn view(p: &i32, len: u32) -> array(i32):
 `module` is built in. Its functions are single wasm instructions and have no
 pointers.
 
-- `module.page_size`, `module.min`, `module.max`: `u32` constants for the
+- `module.page_size`, `module.min`, `module.max`: `uint` constants for the
   bytes in a page and the pages memory starts with and may grow to.
-- `module.size() -> u32` and `module.grow(pages: u32) -> i32` count pages.
+- `module.size() -> uint` and `module.grow(pages: uint) -> int` count pages.
   `grow` gives the old size, or -1.
 - `module.memory() -> varray(u8)` is all of memory from address 0, and
   `module.static` is an `array(u8)` of the static section.
-- `module.fill(dst: &var u8, value: u8, len: u32)` and
-  `module.copy(dst: &var u8, src: &u8, len: u32)`. `copy` handles overlap.
+- `module.fill(dst: &var u8, value: u8, len: uint)` and
+  `module.copy(dst: &var u8, src: &u8, len: uint)`. `copy` handles overlap.
 - `module.unreachable()` traps, and ends a function as `return` does.
 - `module.count_leading_zeros(x)` and `module.count_trailing_zeros(x)` take
   any integer type and give that type.
@@ -429,10 +434,10 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
 - The host gives every argument. A default is passed by the Duck call that
   leaves it out, so an `extern` function may have them, an exported one has
   them for Duck callers only, and `start` names a function with no parameters.
-- Integers of 32 bits or fewer, `bool`, pointers and function pointers are
-  wasm `i32`. `i64`, `f32`, `f64` and `externref` are themselves, and an enum
-  is its value type. Structs, tuples, arrays and `type` are one wasm value
-  per scalar, in field order: `fn f(s: array(u8)) -> Point` is
+- Integers of 32 bits or fewer, `bool`, `int`, `uint`, pointers and function
+  pointers are wasm `i32`. `i64`, `f32`, `f64` and `externref` are themselves,
+  and an enum is its value type. Structs, tuples, arrays and `type` are one
+  wasm value per scalar, in field order: `fn f(s: array(u8)) -> Point` is
   `(i32 ptr, i32 len) -> (f32, f32)`.
 - An exported aggregate global is one wasm global per scalar, named with
   dots: `origin.x`, `name.ptr`, `name.len`.

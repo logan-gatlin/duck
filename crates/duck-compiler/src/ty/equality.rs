@@ -59,7 +59,7 @@ impl Checker {
             when: when.to_vec(),
         };
         match ty {
-            Ty::Prim(prim) => out.push(part(scalar(prim.val_type()), leaves)),
+            Ty::Prim(prim) => out.push(part(scalar(self.fixed(prim).val_type()), leaves)),
             Ty::Ptr(_) | Ty::Fn(_) => out.push(part(scalar(ValType::I32), leaves)),
             Ty::Enum(id) => self.push_parts(self.enum_ty(id), true, leaves, when, out),
             Ty::Array(_) if !bits => out.push(part(Compare::Array(ty), leaves)),

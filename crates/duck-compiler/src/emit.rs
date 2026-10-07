@@ -1006,7 +1006,7 @@ fn f(p: &var P) -> f64:
     #[test]
     fn module_functions_are_memory_instructions() {
         let src = "\
-pub fn f(p: &var u8, q: &u8, n: u32) -> i32:
+pub fn f(p: &var u8, q: &u8, n: uint) -> int:
     module.fill(p, 0, n)
     module.copy(p, q, n)
     let all = module.memory()
@@ -1141,7 +1141,7 @@ let table: array(u16) = [1, 2]
     #[test]
     fn indexing_traps_out_of_bounds() {
         let src = "\
-fn f(a: array(u8), i: u32) -> u8:
+fn f(a: array(u8), i: uint) -> u8:
     return a[i]
 ";
         let func = func_wat(&emit_src(src), "f");
