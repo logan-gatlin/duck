@@ -108,7 +108,16 @@ pub struct StructDecl {
     pub name: Ident,
     /// `struct(A, B) Name`'s type parameters, if it has any.
     pub params: Vec<TypeParam>,
-    pub fields: Vec<Field>,
+    pub entries: Vec<Entry<Field>>,
+}
+
+/// A line of the body of a struct, a union or an enum.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry<T> {
+    /// A field, variant or member of the declaration's own.
+    Own(T),
+    /// `use Type`: those of another struct, union or enum, in its place.
+    Use(Type),
 }
 
 /// A `name: Type` or `name: Type = default` struct field, optionally marked
@@ -128,7 +137,7 @@ pub struct Field {
 pub struct EnumDecl {
     pub name: Ident,
     pub ty: Type,
-    pub members: Vec<Member>,
+    pub entries: Vec<Entry<Member>>,
 }
 
 /// A `name` or `name = value` member of an enum.
@@ -145,7 +154,7 @@ pub struct UnionDecl {
     pub name: Ident,
     /// `union(A, B) Name`'s type parameters, if it has any.
     pub params: Vec<TypeParam>,
-    pub variants: Vec<Variant>,
+    pub entries: Vec<Entry<Variant>>,
 }
 
 /// A `name` or `name: Type` variant of a union.
@@ -308,8 +317,8 @@ pub enum ExprKind {
     Deref(Box<Expr>),
     /// `&place`, or `&var place`, which can be written through.
     AddrOf(Mutability, Box<Expr>),
-    /// `value as Type`
-    Cast(Box<Expr>, Type),
+    /// `value as Type`, or `value as! Type` if unchecked.
+    Cast(Box<Expr>, Type, bool),
     /// `fn(A) -> R`, a function type written where a value belongs.
     FnType(Type),
     /// `value |> body`, which evaluates `value` once and then `body`, where
@@ -426,6 +435,16 @@ enum Parens<T> {
 /// Precedence of `not`, which sits between `and` and the comparisons.
 const NOT_PREC: u8 = 3;
 const CMP_PREC: u8 = 4;
+
+impl<T> Entry<T> {
+    /// The field, variant or member it is, unless it's a `use`.
+    pub fn own(&self) -> Option<&T> {
+        match self {
+            Self::Own(own) => Some(own),
+            Self::Use(_) => None,
+        }
+    }
+}
 
 impl FnSig {
     /// Whether it has a type parameter: one a call infers, or a parameter of
@@ -678,20 +697,29 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Struct)?;
         let params = self.type_params()?;
         let name = self.ident()?;
-        let fields = self.indented(|p| {
+        let entries = self.indented(|p| {
             if p.eat(TokenKind::Pass) {
                 p.expect(TokenKind::Newline)?;
                 return Ok(None);
             }
-            let field = p.field()?;
-            p.expect(TokenKind::Newline)?;
-            Ok(Some(field))
+            p.entry(Self::field).map(Some)
         })?;
         Ok(StructDecl {
             name,
             params,
-            fields: fields.into_iter().flatten().collect(),
+            entries: entries.into_iter().flatten().collect(),
         })
+    }
+
+    /// A line of a struct's, a union's or an enum's body: `use Type`, or
+    /// what `own` parses.
+    fn entry<T>(&mut self, own: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<Entry<T>> {
+        let entry = match self.eat(TokenKind::Use) {
+            true => Entry::Use(self.ty()?),
+            false => Entry::Own(own(self)?),
+        };
+        self.expect(TokenKind::Newline)?;
+        Ok(entry)
     }
 
     /// The `(A, B: Bound)` after `struct`, `union` or `fn` that makes a
@@ -719,40 +747,42 @@ impl<'a> Parser<'a> {
         let ty = self.ty()?;
         self.expect(TokenKind::RParen)?;
         let name = self.ident()?;
-        let members = self.indented(|p| {
-            let start = p.peek().span;
-            let name = p.ident()?;
-            let value = match p.eat(TokenKind::Eq) {
-                true => Some(p.expr()?),
-                false => None,
-            };
-            let span = p.span_from(start);
-            p.expect(TokenKind::Newline)?;
-            Ok(Member { name, value, span })
-        })?;
-        Ok(EnumDecl { name, ty, members })
+        let entries = self.indented(|p| p.entry(Self::member))?;
+        Ok(EnumDecl { name, ty, entries })
+    }
+
+    fn member(&mut self) -> PResult<Member> {
+        let start = self.peek().span;
+        let name = self.ident()?;
+        let value = match self.eat(TokenKind::Eq) {
+            true => Some(self.expr()?),
+            false => None,
+        };
+        let span = self.span_from(start);
+        Ok(Member { name, value, span })
     }
 
     fn union_decl(&mut self) -> PResult<UnionDecl> {
         self.expect(TokenKind::Union)?;
         let params = self.type_params()?;
         let name = self.ident()?;
-        let variants = self.indented(|p| {
-            let start = p.peek().span;
-            let name = p.ident()?;
-            let ty = match p.eat(TokenKind::Colon) {
-                true => Some(p.ty()?),
-                false => None,
-            };
-            let span = p.span_from(start);
-            p.expect(TokenKind::Newline)?;
-            Ok(Variant { name, ty, span })
-        })?;
+        let entries = self.indented(|p| p.entry(Self::variant))?;
         Ok(UnionDecl {
             name,
             params,
-            variants,
+            entries,
         })
+    }
+
+    fn variant(&mut self) -> PResult<Variant> {
+        let start = self.peek().span;
+        let name = self.ident()?;
+        let ty = match self.eat(TokenKind::Colon) {
+            true => Some(self.ty()?),
+            false => None,
+        };
+        let span = self.span_from(start);
+        Ok(Variant { name, ty, span })
     }
 
     fn param(&mut self) -> PResult<Param> {
@@ -1171,19 +1201,22 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// A unary expression followed by any `as Type` casts, which bind tighter
-    /// than binary operators but looser than unary ones.
+    /// A unary expression followed by any `as Type` and `as! Type` casts,
+    /// which bind tighter than binary operators but looser than unary ones.
     fn cast(&mut self) -> PResult<Expr> {
         let mut expr = self.unary()?;
-        while self.eat(TokenKind::As) {
+        loop {
+            let unchecked = self.eat(TokenKind::AsUnchecked);
+            if !unchecked && !self.eat(TokenKind::As) {
+                return Ok(expr);
+            }
             let ty = self.ty()?;
             let span = self.span_from(expr.span);
             expr = Expr {
-                kind: ExprKind::Cast(Box::new(expr), ty),
+                kind: ExprKind::Cast(Box::new(expr), ty, unchecked),
                 span,
             };
         }
-        Ok(expr)
     }
 
     fn unary(&mut self) -> PResult<Expr> {
@@ -1661,7 +1694,8 @@ mod tests {
             ExprKind::Deref(e) => format!("(.* {})", sexpr(e)),
             ExprKind::AddrOf(Mutability::Let, e) => format!("(& {})", sexpr(e)),
             ExprKind::AddrOf(Mutability::Var, e) => format!("(&var {})", sexpr(e)),
-            ExprKind::Cast(e, ty) => format!("(as {} {})", sexpr(e), render_ty(ty)),
+            ExprKind::Cast(e, ty, false) => format!("(as {} {})", sexpr(e), render_ty(ty)),
+            ExprKind::Cast(e, ty, true) => format!("(as! {} {})", sexpr(e), render_ty(ty)),
             ExprKind::FnType(ty) => render_ty(ty),
             ExprKind::Pipe(value, body) => format!("(|> {} {})", sexpr(value), sexpr(body)),
             ExprKind::Placeholder => "_".to_string(),
@@ -1799,8 +1833,9 @@ mod tests {
         };
         assert_eq!(point.name.name, "Point");
         let fields: Vec<_> = point
-            .fields
+            .entries
             .iter()
+            .filter_map(Entry::own)
             .map(|f| (f.name.name.as_str(), f.ty.kind.clone()))
             .collect();
         assert_eq!(fields, vec![("x", named("f32")), ("y", named("f32"))]);
@@ -1870,6 +1905,8 @@ mod tests {
         assert_eq!(expr("a + b as i64"), "(Add a (as b i64))");
         assert_eq!(expr("a * b as i64"), "(Mul a (as b i64))");
         assert_eq!(expr("x as i64 as f32"), "(as (as x i64) f32)");
+        assert_eq!(expr("-x as! &u8 as uint"), "(as (as! (Neg x) &u8) uint)");
+        assert_eq!(expr("a + b as! fn(i32)"), "(Add a (as! b fn(i32)))");
         assert_eq!(expr("not x as bool"), "(Not (as x bool))");
         assert_eq!(expr("f(x).y as u8"), "(as (. (call f x) y) u8)");
     }
@@ -2428,13 +2465,13 @@ fn f():
         let ItemKind::Struct(p) = &module.items[0].kind else {
             panic!()
         };
-        let fields: Vec<_> = p
-            .fields
+        let fields: Vec<_> = p.entries.iter().filter_map(Entry::own).collect();
+        let names: Vec<_> = fields
             .iter()
             .map(|f| (f.is_pub, f.name.name.as_str()))
             .collect();
-        assert_eq!(fields, vec![(true, "x"), (false, "y")]);
-        let span = p.fields[0].span;
+        assert_eq!(names, vec![(true, "x"), (false, "y")]);
+        let span = fields[0].span;
         assert_eq!(&src[span.start..span.end], "pub x: f32");
 
         assert_eq!(
@@ -2450,14 +2487,14 @@ fn f():
         let ItemKind::Struct(p) = &module.items[0].kind else {
             panic!()
         };
-        let defaults: Vec<_> = p
-            .fields
+        let fields: Vec<_> = p.entries.iter().filter_map(Entry::own).collect();
+        let defaults: Vec<_> = fields
             .iter()
             .map(|f| f.default.as_ref().map(sexpr))
             .collect();
         let want = [Some("(Mul 1.5 2)"), Some("0"), None].map(|d| d.map(str::to_string));
         assert_eq!(defaults, want);
-        let span = p.fields[0].span;
+        let span = fields[0].span;
         assert_eq!(&src[span.start..span.end], "pub x: f32 = 1.5 * 2.0");
 
         assert_eq!(
@@ -2513,7 +2550,65 @@ fn f():
         let ItemKind::Struct(unit) = &module.items[0].kind else {
             panic!()
         };
-        assert!(unit.fields.is_empty());
+        assert!(unit.entries.is_empty());
+    }
+
+    #[test]
+    fn uses_in_bodies() {
+        let src = "\
+struct Named:
+    use Head
+    pub name: array(u8)
+    use geo.Box(&T)
+union Wide:
+    use option(i32)
+    other
+enum(u8) Color:
+    red
+    use Warm
+";
+        let module = parse_src(src).unwrap();
+        let entries = |item: &Item| -> Vec<String> {
+            fn render<T>(entry: &Entry<T>, own: impl Fn(&T) -> &Ident) -> String {
+                match entry {
+                    Entry::Own(entry) => own(entry).name.clone(),
+                    Entry::Use(ty) => format!("use {}", render_ty(ty)),
+                }
+            }
+            match &item.kind {
+                ItemKind::Struct(s) => s.entries.iter().map(|e| render(e, |f| &f.name)).collect(),
+                ItemKind::Union(u) => u.entries.iter().map(|e| render(e, |v| &v.name)).collect(),
+                ItemKind::Enum(e) => e.entries.iter().map(|e| render(e, |m| &m.name)).collect(),
+                _ => panic!(),
+            }
+        };
+        assert_eq!(
+            entries(&module.items[0]),
+            ["use Head", "name", "use geo.Box(&T)"]
+        );
+        assert_eq!(entries(&module.items[1]), ["use option(i32)", "other"]);
+        assert_eq!(entries(&module.items[2]), ["red", "use Warm"]);
+        let ItemKind::Struct(named) = &module.items[0].kind else {
+            panic!()
+        };
+        let Entry::Use(ty) = &named.entries[2] else {
+            panic!()
+        };
+        assert_eq!(&src[ty.span.start..ty.span.end], "geo.Box(&T)");
+
+        // `pub` is each field's own, and a `use` names one type.
+        assert_eq!(
+            errors("struct S:\n    pub use Head\n"),
+            vec![expected("identifier", TokenKind::Use)]
+        );
+        assert_eq!(
+            errors("struct S:\n    use A, B\n"),
+            vec![expected("newline", TokenKind::Comma)]
+        );
+        assert_eq!(
+            errors("union U:\n    use\n"),
+            vec![expected("type", TokenKind::Newline)]
+        );
     }
 
     #[test]
@@ -2620,16 +2715,16 @@ enum(tuple(u8, u8)) Pair:
             .collect();
         assert_eq!(decls[0].name.name, "ReturnCode");
         assert_eq!(render_ty(&decls[0].ty), "i8");
-        let members: Vec<_> = decls[0]
-            .members
+        let members: Vec<_> = decls[0].entries.iter().filter_map(Entry::own).collect();
+        let values: Vec<_> = members
             .iter()
             .map(|m| (m.name.name.as_str(), m.value.as_ref().map(sexpr)))
             .collect();
         assert_eq!(
-            members,
+            values,
             [("ok", None), ("error", Some("(Add 5 1)".to_string()))]
         );
-        let error = &decls[0].members[1];
+        let error = members[1];
         assert_eq!(&src[error.span.start..error.span.end], "error = 5 + 1");
         assert_eq!(render_ty(&decls[1].ty), "tuple(u8, u8)");
 
@@ -2668,7 +2763,7 @@ union(T, E,) Result:
             })
             .collect();
         let variants = |decl: &UnionDecl| -> Vec<_> {
-            let variants = decl.variants.iter();
+            let variants = decl.entries.iter().filter_map(Entry::own);
             variants
                 .map(|v| (v.name.name.clone(), v.ty.as_ref().map(render_ty)))
                 .collect()
@@ -2683,7 +2778,9 @@ union(T, E,) Result:
                 ("empty".to_string(), None),
             ]
         );
-        let rect = &decls[0].variants[1];
+        let Entry::Own(rect) = &decls[0].entries[1] else {
+            panic!()
+        };
         assert_eq!(
             &src[rect.span.start..rect.span.end],
             "rect: tuple(f32, f32)"

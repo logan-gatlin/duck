@@ -139,7 +139,7 @@ module.exports = grammar({
       ':',
       $._newline,
       $._indent,
-      repeat1(choice($.field_declaration, $.pass_statement)),
+      repeat1(choice($.field_declaration, $.type_use, $.pass_statement)),
       $._dedent,
     ),
 
@@ -162,7 +162,7 @@ module.exports = grammar({
       ':',
       $._newline,
       $._indent,
-      repeat1($.enum_member),
+      repeat1(choice($.enum_member, $.type_use)),
       $._dedent,
     ),
 
@@ -180,13 +180,21 @@ module.exports = grammar({
       ':',
       $._newline,
       $._indent,
-      repeat1($.union_variant),
+      repeat1(choice($.union_variant, $.type_use)),
       $._dedent,
     ),
 
     union_variant: $ => seq(
       field('name', $.identifier),
       optional(seq(':', field('type', $._type))),
+      $._newline,
+    ),
+
+    // `use Type` in a struct, a union or an enum: the fields, variants or
+    // members of another, in its place.
+    type_use: $ => seq(
+      'use',
+      field('type', $._type),
       $._newline,
     ),
 
@@ -504,9 +512,11 @@ module.exports = grammar({
       ));
     },
 
+    // `as` makes a value one of another type that it is, and `as!` an
+    // address one of any type, unchecked.
     cast_expression: $ => prec.left(PREC.cast, seq(
       field('value', $._expression),
-      'as',
+      choice('as', 'as!'),
       field('type', $._type),
     )),
 

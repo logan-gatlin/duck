@@ -292,6 +292,69 @@ union(T, E) Result:
         (identifier)))))
 
 ====================
+Use in a struct, a union and an enum
+====================
+
+struct(T) Named:
+    use Head
+    pub name: array(u8)
+    use geo.Box(&T)
+
+union Wide:
+    use option(i32)
+    other
+
+enum(u8) Color:
+    red
+    use Warm
+
+---
+
+(source_file
+  (struct_declaration
+    (type_parameters
+      (identifier))
+    (identifier)
+    (type_use
+      (named_type
+        (identifier)))
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier)
+        (type_arguments
+          (named_type
+            (identifier)))))
+    (type_use
+      (qualified_type
+        (identifier)
+        (named_type
+          (identifier)
+          (type_arguments
+            (pointer_type
+              (named_type
+                (identifier))))))))
+  (union_declaration
+    (identifier)
+    (type_use
+      (named_type
+        (identifier)
+        (type_arguments
+          (named_type
+            (identifier)))))
+    (union_variant
+      (identifier)))
+  (enum_declaration
+    (named_type
+      (identifier))
+    (identifier)
+    (enum_member
+      (identifier))
+    (type_use
+      (named_type
+        (identifier)))))
+
+====================
 Function
 ====================
 

@@ -443,6 +443,19 @@ pub enum TypeErrorKind {
         from: String,
         to: String,
     },
+    /// A cast with `as` that only `as!` makes, as nothing says that a
+    /// `from` is a `to`.
+    UncheckedCast {
+        from: String,
+        to: String,
+    },
+    /// A cast with `as!` that is neither between addresses nor between an
+    /// integer and a float of one width: only `as` makes a value one of
+    /// another type.
+    UncheckedValue {
+        from: String,
+        to: String,
+    },
     IntOutOfRange(String),
     NoField {
         ty: String,
@@ -513,8 +526,28 @@ pub enum TypeErrorKind {
     /// An item that a `use` path goes on past, as only a module's can.
     NotAModule(String),
     /// A `use` path through a name that another `use` gives what this one
-    /// names.
+    /// names, or a `use` in a struct, a union or an enum of a type that
+    /// uses it.
     RecursiveUse(String),
+    /// A `use` in `within`, which is a struct, a union or an enum, of a
+    /// `ty`, which is no such type.
+    UseOfOther {
+        within: &'static str,
+        ty: String,
+    },
+    /// A `use` in an enum of `expected` values of the enum `name`, whose
+    /// values are `found`.
+    UseOfValues {
+        name: String,
+        expected: String,
+        found: String,
+    },
+    /// A `use` of a field or variant `name` whose type holds a `ty` that
+    /// another module declares and isn't `pub`.
+    UseOfPrivate {
+        name: String,
+        ty: String,
+    },
     /// A field that isn't `pub`, used outside the module of its struct.
     PrivateField {
         ty: String,
@@ -769,6 +802,10 @@ struct FieldDef {
     /// The type of its default, if that has one of its own rather than the
     /// field's as declared. Only a declaration's is set.
     default_ty: Option<Ty>,
+    /// The field of another struct or union that a `use` makes it one of,
+    /// if any, whose default is its own.
+    used: Option<(StructId, usize)>,
+    /// Where it is written: the `use`, for one that a `use` makes a field.
     span: Span,
 }
 
@@ -1207,6 +1244,14 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "can't cast `{from}` as `{to}`; pointers cast to and from `uint` and `int`"
             ),
+            Self::UncheckedCast { from, to } => {
+                write!(f, "casting `{from}` as `{to}` is unchecked: write `as!`")
+            }
+            Self::UncheckedValue { from, to } => write!(
+                f,
+                "`as!` casts an address as another, or an integer and a float of one width \
+                 as each other, and `{from}` as `{to}` is neither"
+            ),
             Self::IntOutOfRange(ty) => write!(f, "literal out of range for `{ty}`"),
             Self::NoField { ty, field } => write!(f, "`{ty}` has no field `{field}`"),
             Self::NotAssignable => write!(f, "invalid assignment target"),
@@ -1273,6 +1318,20 @@ impl fmt::Display for TypeErrorKind {
             Self::NoItem { module, item } => write!(f, "`{module}` has no item `{item}`"),
             Self::NotAModule(name) => write!(f, "`{name}` is not a module"),
             Self::RecursiveUse(path) => write!(f, "`use` of `{path}` leads back to itself"),
+            Self::UseOfOther { within, ty } => {
+                write!(f, "`use` in {within} takes {within}, which `{ty}` isn't")
+            }
+            Self::UseOfValues {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "`use` in an enum of `{expected}` takes one, and `{name}` is an enum of `{found}`"
+            ),
+            Self::UseOfPrivate { name, ty } => {
+                write!(f, "`use` of `{name}`, whose type holds the private `{ty}`")
+            }
             Self::PrivateField { ty, field } => write!(f, "field `{field}` of `{ty}` is private"),
             Self::PrivateInPublic { ty, item } => {
                 write!(f, "private type `{ty}` in the type of `pub` item `{item}`")
@@ -1650,26 +1709,12 @@ impl Checker {
     /// instance used so far its fields.
     fn define_structs(&mut self, program: &Program) {
         self.resolve_enums(program);
-        let mut decl_count = 0;
-        for item in &program.items {
-            let (ItemKind::Struct(StructDecl { name, params, .. })
-            | ItemKind::Union(UnionDecl { name, params, .. })) = &item.kind
-            else {
-                continue;
-            };
-            let id = decl_count;
-            decl_count += 1;
-            self.module = name.span.file;
-            let tys = self.structs[id].params.clone();
-            self.declare_type_params(&param_names(params), &tys);
-            self.resolve_bounds(params, &tys);
-            let fields = match &item.kind {
-                ItemKind::Union(decl) => self.union_variants(id, decl),
-                ItemKind::Struct(decl) => self.struct_fields(id, decl),
-                _ => Vec::new(),
-            };
-            self.type_params.clear();
-            self.structs[id].fields = fields;
+        let is_decl =
+            |item: &&parse::Item| matches!(item.kind, ItemKind::Struct(_) | ItemKind::Union(_));
+        let decl_count = program.items.iter().filter(is_decl).count();
+        let mut visits = vec![Visit::New; decl_count];
+        for id in 0..decl_count {
+            self.define_fields(program, id, &mut visits);
         }
         self.break_expansions(decl_count);
         // Whether a declaration contains another by value doesn't depend on
@@ -1753,11 +1798,65 @@ impl Checker {
         deepest + 1
     }
 
+    /// Resolves the fields of struct or union declaration `id`, unless it
+    /// has them, or is being given them, as one that a `use` leads back to
+    /// is. `visits` is how far each declaration is. Those it uses are given
+    /// theirs first.
+    fn define_fields(&mut self, program: &Program, id: usize, visits: &mut [Visit]) {
+        if visits[id] != Visit::New {
+            return;
+        }
+        visits[id] = Visit::Active;
+        let item = &program.items[self.structs[id].item];
+        let (ItemKind::Struct(StructDecl { params, .. })
+        | ItemKind::Union(UnionDecl { params, .. })) = &item.kind
+        else {
+            unreachable!("a struct or a union declares it")
+        };
+        // It may be a declaration that another, being resolved, uses.
+        let module = mem::replace(&mut self.module, item.span.file);
+        let outer = mem::take(&mut self.type_params);
+        let tys = self.structs[id].params.clone();
+        self.declare_type_params(&param_names(params), &tys);
+        self.resolve_bounds(params, &tys);
+        let fields = match &item.kind {
+            ItemKind::Union(decl) => self.union_variants(program, id, decl, visits),
+            ItemKind::Struct(decl) => self.struct_fields(program, id, decl, visits),
+            _ => Vec::new(),
+        };
+        self.type_params = outer;
+        self.module = module;
+        self.structs[id].fields = fields;
+        visits[id] = Visit::Done;
+    }
+
     /// Resolves the fields of struct `id`, which `decl` declares, with its
     /// type parameters in scope.
-    fn struct_fields(&mut self, id: usize, decl: &StructDecl) -> Vec<FieldDef> {
+    fn struct_fields(
+        &mut self,
+        program: &Program,
+        id: usize,
+        decl: &StructDecl,
+        visits: &mut [Visit],
+    ) -> Vec<FieldDef> {
         let mut fields: Vec<FieldDef> = Vec::new();
-        for field in &decl.fields {
+        for entry in &decl.entries {
+            let field = match entry {
+                parse::Entry::Own(field) => field,
+                parse::Entry::Use(used) => {
+                    for field in self.used_fields(program, id, used, visits) {
+                        if self.structs[id].is_pub && field.is_pub {
+                            self.check_public(field.ty, used.span, &field.name);
+                        }
+                        if fields.iter().any(|f| f.name == field.name) {
+                            self.error(TypeErrorKind::DuplicateField(field.name), used.span);
+                            continue;
+                        }
+                        fields.push(field);
+                    }
+                    continue;
+                }
+            };
             let ty = self.resolve_ty(&field.ty);
             if self.structs[id].is_pub && field.is_pub {
                 self.check_public(ty, field.ty.span, &field.name.name);
@@ -1774,8 +1873,67 @@ impl Checker {
                 bare: false,
                 default: field.default.as_ref().map(|_| DefaultValue::Pending),
                 default_ty: None,
+                used: None,
                 span: field.span,
             });
+        }
+        fields
+    }
+
+    /// The fields that `use written` gives struct or union declaration
+    /// `id`: those of the struct or union that `written` names, as its type
+    /// arguments make them, each written where the `use` is. None after
+    /// reporting an error.
+    pub(super) fn used_fields(
+        &mut self,
+        program: &Program,
+        id: usize,
+        written: &parse::Type,
+        visits: &mut [Visit],
+    ) -> Vec<FieldDef> {
+        let ty = self.resolve_ty(written);
+        let union = self.structs[id].union;
+        let used = match ty {
+            Ty::Struct(used) if self.structs[used.0 as usize].union == union => used,
+            Ty::Error => return Vec::new(),
+            _ => {
+                let within = match union {
+                    true => "a union",
+                    false => "a struct",
+                };
+                let ty = self.ty_name(ty);
+                self.error(TypeErrorKind::UseOfOther { within, ty }, written.span);
+                return Vec::new();
+            }
+        };
+        let (decl, args) = match &self.structs[used.0 as usize].instance {
+            Some(instance) => (instance.generic, instance.args.clone()),
+            None => (used, Vec::new()),
+        };
+        // A built-in union is no declaration, and uses nothing.
+        if let Some(visit) = visits.get(decl.0 as usize) {
+            if *visit == Visit::Active {
+                let kind = TypeErrorKind::RecursiveUse(self.ty_name(ty));
+                self.error(kind, written.span);
+                return Vec::new();
+            }
+            self.define_fields(program, decl.0 as usize, visits);
+        }
+        let mut fields = self.structs[decl.0 as usize].fields.clone();
+        for (index, field) in fields.iter_mut().enumerate() {
+            if !args.is_empty() {
+                field.ty = self.substitute(field.ty, &args, written.span);
+            }
+            if let Some(private) = self.private_part(field.ty, Some(self.module)) {
+                let (name, ty) = (field.name.clone(), self.ty_name(private));
+                self.error(TypeErrorKind::UseOfPrivate { name, ty }, written.span);
+                field.ty = Ty::Error;
+            }
+            // Folded with the defaults of the declaration that uses it.
+            field.default = field.default.as_ref().map(|_| DefaultValue::Pending);
+            field.default_ty = None;
+            field.used = Some((used, index));
+            field.span = written.span;
         }
         fields
     }
@@ -1790,13 +1948,29 @@ impl Checker {
                 continue;
             }
             for i in 0..self.structs[id].fields.len() {
-                if let Some(ty) = self.unstorable_pointee(self.structs[id].fields[i].ty) {
-                    let kind = TypeErrorKind::NotStorable(self.ty_name(ty));
-                    self.error(kind, self.field_site(id, i));
+                let field = &self.structs[id].fields[i];
+                if let Some(ty) = self.unstorable_pointee(field.ty) {
+                    if !self.reports_pointee(field) {
+                        let kind = TypeErrorKind::NotStorable(self.ty_name(ty));
+                        self.error(kind, self.field_site(id, i));
+                    }
                     self.structs[id].fields[i].ty = Ty::Error;
                 }
             }
         }
+    }
+
+    /// Whether a pointer in `field` that can't be stored is reported in the
+    /// field that a `use` makes it one of: the struct that the `use` names
+    /// has its own fields checked, unless it waits on type arguments.
+    fn reports_pointee(&self, field: &FieldDef) -> bool {
+        let Some((used, at)) = field.used else {
+            return false;
+        };
+        let def = &self.structs[used.0 as usize];
+        let ty = def.fields[at].ty;
+        let waits = def.instance.is_some() && self.is_open(used);
+        !waits && (ty == Ty::Error || self.unstorable_pointee(ty).is_some())
     }
 
     /// Where to report an error in field `i` of struct `id`: the field
@@ -1902,7 +2076,7 @@ impl Checker {
     /// Reports a type in `ty`, written at `span` in the type of `pub` item
     /// `item`, that isn't `pub`.
     fn check_public(&mut self, ty: Ty, span: Span, item: &str) {
-        if let Some(private) = self.private_part(ty) {
+        if let Some(private) = self.private_part(ty, None) {
             let kind = TypeErrorKind::PrivateInPublic {
                 ty: self.ty_name(private),
                 item: item.to_string(),
@@ -1911,22 +2085,27 @@ impl Checker {
         }
     }
 
-    /// The first struct or enum in `ty` that isn't `pub`.
-    fn private_part(&self, ty: Ty) -> Option<Ty> {
+    /// The first struct or enum in `ty` that isn't `pub`. With `within`,
+    /// only one that the module `within` doesn't declare, so can't name.
+    fn private_part(&self, ty: Ty, within: Option<FileId>) -> Option<Ty> {
         match ty {
             Ty::Struct(id) => {
                 let def = &self.structs[id.0 as usize];
-                if !def.is_pub {
+                if !def.is_pub && within != Some(def.module) {
                     return Some(ty);
                 }
                 let args = def.instance.iter().flat_map(|instance| &instance.args);
-                args.into_iter().find_map(|arg| self.private_part(*arg))
+                args.into_iter()
+                    .find_map(|arg| self.private_part(*arg, within))
             }
-            Ty::Enum(id) => (!self.enums[id.0 as usize].is_pub).then_some(ty),
+            Ty::Enum(id) => {
+                let def = &self.enums[id.0 as usize];
+                (!def.is_pub && within != Some(def.module)).then_some(ty)
+            }
             _ => self
                 .components(ty)
                 .into_iter()
-                .find_map(|component| self.private_part(component)),
+                .find_map(|component| self.private_part(component, within)),
         }
     }
 
@@ -1978,6 +2157,22 @@ impl Checker {
         self.module = module;
         self.constant_depth -= 1;
         self.constants[index].state = Visit::Done;
+    }
+
+    /// Whether the constants of item `index` of `program` are folded, which
+    /// they are here if they weren't, where there is a `program` to fold.
+    /// Otherwise reports why `name`, used at `span`, has none.
+    fn folded(&mut self, program: Option<&Program>, index: usize, name: &str, span: Span) -> bool {
+        if let Some(program) = program {
+            self.fold_item(program, index);
+        }
+        let kind = match self.constants[index].state {
+            Visit::Done => return true,
+            Visit::Active => TypeErrorKind::RecursiveConstant(name.to_string()),
+            Visit::New => TypeErrorKind::ConstantTooDeep(name.to_string()),
+        };
+        self.error(kind, span);
+        false
     }
 
     /// Checks and folds the initializer of `decl`, the binding that `item`
@@ -2750,18 +2945,18 @@ impl Checker {
                 let value = map1(value, as_.val_type(), |e| convert(from, as_, e));
                 Some((to, value))
             }
-            // A pointer converts to and from its address.
-            (Ty::Ptr(_) | Ty::Prim(Prim::Uint | Prim::Int), Ty::Ptr(_))
-            | (Ty::Ptr(_), Ty::Prim(Prim::Uint | Prim::Int)) => Some((to, value)),
-            // An array and a `varray` of the same elements convert to each
-            // other.
-            (Ty::Array(from), Ty::Array(as_)) if self.element(from) == self.element(as_) => {
+            // A pointer is one that reads what it writes, and one to what
+            // its pointee starts as.
+            (Ty::Ptr(have), Ty::Ptr(want))
+                if self.fits(from, to) || self.points_to_start(have, want) =>
+            {
                 Some((to, value))
             }
-            // Function pointers convert as pointers do: to each other, and
-            // to and from their index in the table.
-            (Ty::Fn(_) | Ty::Prim(Prim::Uint | Prim::Int), Ty::Fn(_))
-            | (Ty::Fn(_), Ty::Prim(Prim::Uint | Prim::Int)) => Some((to, value)),
+            // A `varray` is an array of the same elements.
+            (Ty::Array(_), Ty::Array(_)) if self.fits(from, to) => Some((to, value)),
+            // A pointer converts to its address, and a function pointer to
+            // its index in the table.
+            (Ty::Ptr(_) | Ty::Fn(_), Ty::Prim(Prim::Uint | Prim::Int)) => Some((to, value)),
             // An enum is one that starts as it does, as its values are.
             (Ty::Enum(_), Ty::Enum(_)) if self.meets(from, to) => Some((to, value)),
             // A union is one that starts as it does, and holds the same
@@ -2775,6 +2970,54 @@ impl Checker {
             (Ty::Enum(id), to) => self.cast_value(self.enum_ty(id), to, value),
             _ => None,
         }
+    }
+
+    /// Whether a pointer `from` is one to what `to` points to, with no more
+    /// than that known of either: its pointee is a struct that starts as
+    /// that of `to` does, which `to` writes only if `from` does. A union
+    /// that starts as another is laid out otherwise.
+    fn points_to_start(&self, from: PtrId, to: PtrId) -> bool {
+        let (have, writes) = self.pointees[from.0 as usize];
+        let (want, written) = self.pointees[to.0 as usize];
+        let is_struct = matches!(want, Ty::Struct(_)) && !self.is_sum(want);
+        (writes || !written) && is_struct && self.meets(have, want)
+    }
+
+    /// How many of the scalars of a `from` are a `to`, if `from as to` is a
+    /// struct as one that it starts as, which its first fields are.
+    fn starting_scalars(&self, from: Ty, to: Ty) -> Option<usize> {
+        let is_struct = |ty| matches!(ty, Ty::Struct(_)) && !self.is_sum(ty);
+        let starts = from != to && is_struct(from) && is_struct(to) && self.meets(from, to);
+        starts.then(|| self.val_types(to).len())
+    }
+
+    /// Whether `from as! to` is a cast, which leaves the value as it is: to
+    /// a pointer or a function pointer from another or from an address, or
+    /// between an array and a `varray` of the same elements. Nothing says
+    /// that the value is a `to`.
+    fn reinterprets(&self, from: Ty, to: Ty) -> bool {
+        match (from, to) {
+            (Ty::Ptr(_) | Ty::Prim(Prim::Uint | Prim::Int), Ty::Ptr(_))
+            | (Ty::Fn(_) | Ty::Prim(Prim::Uint | Prim::Int), Ty::Fn(_)) => true,
+            (Ty::Array(from), Ty::Array(to)) => self.element(from) == self.element(to),
+            // An enum casts as the type of its values does.
+            (Ty::Enum(id), to) => self.reinterprets(self.enum_ty(id), to),
+            _ => false,
+        }
+    }
+
+    /// Whether `from as! to` is a number as the one with its bits: an
+    /// integer and a float of one width, which an `int` or a `uint` has
+    /// none of, being as wide as an address.
+    fn shares_bits(&self, from: Ty, to: Ty) -> bool {
+        let (Ty::Prim(from), Ty::Prim(to)) = (from, to) else {
+            return false;
+        };
+        let sized = |prim: Prim| !matches!(prim, Prim::Int | Prim::Uint);
+        let pair = |int: Prim, float: Prim| {
+            int.is_int() && float.is_float() && sized(int) && int.size() == float.size()
+        };
+        pair(from, to) || pair(to, from)
     }
 
     /// Whether `from as to` casts between a pointer or function pointer and
@@ -3089,16 +3332,7 @@ impl<'c> Body<'c> {
     /// which a global initializer that is first to use them has done here.
     /// Otherwise reports why `name`, used at `span`, has none.
     fn folded(&mut self, index: usize, name: &str, span: Span) -> bool {
-        if let Some(program) = self.global {
-            self.ck.fold_item(program, index);
-        }
-        let kind = match self.ck.constants[index].state {
-            Visit::Done => return true,
-            Visit::Active => TypeErrorKind::RecursiveConstant(name.to_string()),
-            Visit::New => TypeErrorKind::ConstantTooDeep(name.to_string()),
-        };
-        self.error(kind, span);
-        false
+        self.ck.folded(self.global, index, name, span)
     }
 
     /// Reports a mismatch unless `found` fits where `want` is expected or
@@ -3759,7 +3993,7 @@ impl<'c> Body<'c> {
                     _ => self.invalid_operand(".*", ty, expr.span),
                 }
             }
-            ExprKind::Cast(inner, ty) => self.cast(inner, ty, expr.span),
+            ExprKind::Cast(inner, ty, unchecked) => self.cast(inner, ty, *unchecked, expr.span),
             ExprKind::AddrOf(mutability, inner) => {
                 self.addr_of(*mutability, inner, expected, expr.span)
             }
@@ -4482,22 +4716,40 @@ impl<'c> Body<'c> {
         }
     }
 
-    fn cast(&mut self, operand: &parse::Expr, ty: &parse::Type, span: Span) -> (Ty, Value) {
+    /// `operand as ty`, or `operand as! ty` if `unchecked`.
+    ///
+    /// `as` makes a value of one type a value of another that it is, or is
+    /// near enough: a number of another, a struct of one that it starts as,
+    /// a union or an enum of a wider one. `as!` makes an address one of any
+    /// type, which it is only if what is there is, and an integer or a float
+    /// the other, of its width, that has its bits.
+    fn cast(
+        &mut self,
+        operand: &parse::Expr,
+        ty: &parse::Type,
+        unchecked: bool,
+        span: Span,
+    ) -> (Ty, Value) {
         let to = self.ck.resolve_ty(ty);
         let expected = match to {
             // An integer literal cast to a pointer is an address, and to a
             // function pointer an index in the table.
             Ty::Ptr(_) | Ty::Fn(_) => Some(Ty::Prim(Prim::Uint)),
+            // An integer literal cast to the float with its bits is as wide
+            // as the float.
+            Ty::Prim(Prim::F32) if unchecked => Some(Ty::Prim(Prim::U32)),
+            Ty::Prim(Prim::F64) if unchecked => Some(Ty::Prim(Prim::U64)),
             _ => None,
         };
         let (from, value) = self.expr(operand, expected);
         if from == Ty::Error || to == Ty::Error {
             return (Ty::Error, Value::default());
         }
-        // A type parameter bounded by a union or an enum casts as its bound
-        // does, which every type argument casts to.
+        // A bounded type parameter casts as its bound does, which every
+        // type argument casts to.
+        let written = from;
         let from = match self.ck.known(from) {
-            bound if self.ck.is_sum(bound) => bound,
+            bound if !matches!(to, Ty::Param(_)) => bound,
             _ => from,
         };
         // Two enums are compared by the values of their members.
@@ -4507,19 +4759,41 @@ impl<'c> Body<'c> {
         {
             return (Ty::Error, Value::default());
         }
-        match self.ck.cast_value(from, to, value) {
-            Some(cast) => cast,
-            None => {
-                let address = self.ck.casts_address(from, to);
-                let (from, to) = (self.ck.ty_name(from), self.ck.ty_name(to));
-                let kind = match address {
-                    true => TypeErrorKind::AddressCast { from, to },
-                    false => TypeErrorKind::InvalidCast { from, to },
-                };
-                self.error(kind, span);
-                (Ty::Error, Value::default())
+        let reinterprets = self.ck.reinterprets(from, to);
+        if unchecked && reinterprets {
+            return (to, value);
+        }
+        if let (true, Ty::Prim(have), Ty::Prim(want)) =
+            (unchecked && self.ck.shares_bits(from, to), from, to)
+        {
+            let bits = |e| Expr::Unary(have.val_type(), IrUnOp::Reinterpret, Box::new(e));
+            return (to, map1(value, want.val_type(), bits));
+        }
+        if !unchecked {
+            // An enum casts as the type of its values does.
+            let mut held = from;
+            while let (Ty::Enum(id), false) = (held, matches!(to, Ty::Enum(_))) {
+                held = self.ck.enum_ty(id);
+            }
+            if let Some(len) = self.ck.starting_scalars(held, to) {
+                let len = len.min(value.scalars.len());
+                return (to, self.project(value, 0..len));
+            }
+            if let Some(cast) = self.ck.cast_value(from, to, value) {
+                return cast;
             }
         }
+        let address = self.ck.casts_address(from, to);
+        let is_address = matches!(to, Ty::Ptr(_) | Ty::Fn(_) | Ty::Array(_));
+        let (from, to) = (self.ck.ty_name(written), self.ck.ty_name(to));
+        let kind = match (unchecked, reinterprets, address) {
+            (true, _, _) if !is_address => TypeErrorKind::UncheckedValue { from, to },
+            (false, true, _) => TypeErrorKind::UncheckedCast { from, to },
+            (_, _, true) => TypeErrorKind::AddressCast { from, to },
+            _ => TypeErrorKind::InvalidCast { from, to },
+        };
+        self.error(kind, span);
+        (Ty::Error, Value::default())
     }
 
     /// `&place` or `&var place`, the address of memory reached through a
@@ -6832,18 +7106,18 @@ fn f() -> uint:
         let src = "\
 pub struct P:
     x: f64
-var null = 0 as &u32
-pub let top = 4294967295 as &&P
+var null = 0 as! &u32
+pub let top = 4294967295 as! &&P
 pub fn f(p: &P, a: uint, n: int) -> &u32:
-    let q = a as &P
+    let q = a as! &P
     let b = p as uint
     let s = p as int
-    let c = p as &u32
+    let c = p as! &u32
     let d = p == q
     let e = p != q
     let g = p < q
     let h = p >= q
-    let r = n as &P
+    let r = n as! &P
     return c
 ";
         let module = lower(src);
@@ -6876,7 +7150,7 @@ pub fn f(p: &P, a: uint, n: int) -> &u32:
         );
         let src = "\
 fn f(p: &u8, q: &i8, a: i64, n: u32, g: fn()):
-    let b = p as &i8 == q
+    let b = p as! &i8 == q
     let c = p == q
     let d = p < q
     let e = p + 1
@@ -7005,7 +7279,7 @@ pub struct S:
     p: &u8
     n: uint
 pub let BIG: uint = 5000000000
-pub let top = 18446744073709551615 as &u8
+pub let top = 18446744073709551615 as! &u8
 pub fn f(n: uint, i: int, w: u32, p: &var S) -> uint:
     let narrow = n as u32
     let wide = w as uint
@@ -7013,7 +7287,7 @@ pub fn f(n: uint, i: int, w: u32, p: &var S) -> uint:
     let short = i as i32
     let addr = p as uint
     p.n = addr + 8
-    let q = p.p < (addr + 8) as &u8
+    let q = p.p < (addr + 8) as! &u8
     let r = &var p.n
     let t = (fn()).size
     return S.size + (&u8).align + array(u8).size + t + module.count_leading_zeros(n)
@@ -7201,7 +7475,7 @@ fn inc(x: i32) -> i32:
     return x + 1
 fn f(p: &var S, g: fn(i32) -> i32, i: uint) -> i32:
     p.f = g
-    let h = i as fn(i32) -> i32
+    let h = i as! fn(i32) -> i32
     let n = inc as uint
     return p.f(1) + h(2) + S.size as i32
 ";
@@ -7344,7 +7618,7 @@ struct P:
     x: i32
     y: u8
     z: i64
-var q = 0 as &var P
+var q = 0 as! &var P
 fn make() -> P:
     return P(x: 1, y: 2, z: 3)
 fn tick() -> i32:
@@ -7935,7 +8209,7 @@ fn f(xs: array(u16), p: &tuple(u8, bool)) -> tuple(bool, u8):
 var heap: uint = 1024
 fn malloc(T: type, count: uint = 1) -> &var T:
     heap += T.size * count
-    return (heap - T.size * count) as &var T
+    return (heap - T.size * count) as! &var T
 fn(T) boxed(val: T) -> &var T:
     let p = malloc(T)
     p.* = val
@@ -7972,7 +8246,7 @@ fn g(x: i32):
 fn zero(T: type = u8) -> uint:
     return T.size
 fn(T) lost() -> &T:
-    return 0 as &T
+    return 0 as! &T
 fn(T) twice(T: type, x: T):
     pass
 fn f():
@@ -8237,8 +8511,8 @@ fn(T) swap(a: &var T, b: &var Box(T)) -> uint:
     let held = a.*
     a.* = b.v
     b.v = held
-    let p = a as &u8
-    let q = p as &T
+    let p = a as! &u8
+    let q = p as! &T
     match held:
         other:
             return T.size + T.align
@@ -9278,7 +9552,7 @@ struct S:
 fn f(a: array(u8), s: &var S) -> uint:
     var b = a
     b.len = 2
-    s.name.ptr = b.ptr as &u16
+    s.name.ptr = b.ptr as! &u16
     return s.name.len
 fn g(t: &tuple(u8, array(i32))) -> &i32:
     return t.1.ptr
@@ -9467,9 +9741,9 @@ fn f(p: &var Node, q: &Node, b: varray(u8)) -> &Node:
     let x = &var p.val
     x.* = 2
     let y: &i32 = &var p.val
-    let c = q as &var Node
+    let c = q as! &var Node
     c.val = 3
-    let d = s as varray(u8)
+    let d = s as! varray(u8)
     d[0] = 1
     let e = (&var Node).size + varray(u8).size
     let z: &var u8 = 16
@@ -9520,7 +9794,7 @@ fn f(p: &Node, a: array(u8), v: &var Node, pp: &var &Node):
     k(p)
     same(v, p)
     let t: tuple(&var Node, i32) = (p, 1)
-    let m: &&Node = 0 as &&var Node
+    let m: &&Node = 0 as! &&var Node
     let fp: fn(&var Node) = r
     let w = a as varray(u16)
     let s: &var u8 = \"duck\"
@@ -9578,7 +9852,7 @@ fn f(p: &Node, a: array(u8), v: &var Node, pp: &var &Node):
         );
         let src = "\
 let s: &var u8 = \"duck\"
-let a: varray(&var u8) = [0 as &u8]
+let a: varray(&var u8) = [0 as! &u8]
 fn varray():
     pass
 ";
@@ -12061,7 +12335,7 @@ fn global() -> i32:
 fn param(inc: fn(i32) -> i32) -> i32:
     return inc(6)
 fn cast(i: uint) -> i32:
-    return (i as fn(i32) -> i32)(7)
+    return (i as! fn(i32) -> i32)(7)
 ";
         let module = lower(src);
         assert_eq!(
@@ -12234,9 +12508,9 @@ fn inc(x: i32) -> i32:
 fn f(p: &var S, g: fn(i32) -> i32) -> bool:
     p.f = g
     let i = g as uint
-    let h = i as fn(i32)
-    let k = h as fn() -> f32
-    let z = 0 as fn()
+    let h = i as! fn(i32)
+    let k = h as! fn() -> f32
+    let z = 0 as! fn()
     let t = (fn(i32) -> i32).size
     let s = tuple(u8, fn(externref) -> externref).size
     return p.f == inc and g != inc
@@ -12638,7 +12912,7 @@ struct S:
     d: varray(i32) = [0; N]
     e: varray(varray(u8)) = []
     f: varray(u8) = SHARED
-    g: varray(u8) = \"abc\" as varray(u8)
+    g: varray(u8) = \"abc\" as! varray(u8)
     h: array(array(u8)) = [\"x\", \"y\"]
 fn f() -> S:
     return S()
@@ -12951,6 +13225,815 @@ fn f():
         assert_eq!(
             default_mismatch.to_string(),
             "the default of `b` is a `i32`, where a `bool` is needed here: give `b` a value"
+        );
+    }
+
+    #[test]
+    fn a_use_gives_a_struct_the_fields_of_another() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct Head:
+    id: i32
+    tag: u8 = 7
+struct Named:
+    use Head
+    len: u8
+struct Last:
+    len: u8
+    use Head
+fn(T: Head) id(x: &T) -> i32:
+    return x.id
+";
+        let src = format!(
+            "{decls}\
+fn f(n: &Named) -> i32:
+    let m = Named(id: 1, len: 2)
+    let h = n as &Head
+    return n.id + m.tag as i32 + id(n) + h.id
+fn size() -> uint:
+    return Named.size + Last.size
+"
+        );
+        let module = lower(&src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set m.id 1) (set m.tag 7) (set m.len 2) (set h n) \
+             (return (I32.Add (I32.Add (I32.Add (I32.Load offset=0 n) m.tag) \
+             (call id(Named) n)) (I32.Load offset=0 h)))"
+        );
+        // The fields are its own, laid out where the `use` is: no `Head` is
+        // within either.
+        assert_eq!(body(&module, "size"), "(return (I32.Add 8 12))");
+
+        // Only a struct that starts with them starts as `Head` does, and
+        // neither is a `Head`.
+        let src = format!(
+            "{decls}\
+fn g(l: &Last, n: Named) -> i32:
+    let h: Head = n
+    return id(l)
+"
+        );
+        assert_eq!(
+            errors(&src),
+            vec![
+                mismatch("Head", "Named"),
+                BoundNotMet {
+                    ty: "Last".into(),
+                    bound: "Head".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn used_fields_take_the_type_arguments_of_the_use() {
+        let decls = "\
+struct(T) Box:
+    value: T
+struct(T) Pair:
+    use Box(T)
+    other: T
+struct Ints:
+    first: u8
+    use Pair(i64)
+struct(N) Link:
+    next: &N
+struct Node:
+    val: i32
+    next: &Node
+struct DNode:
+    use Node
+    prev: &DNode
+struct Chain:
+    use Link(Chain)
+";
+        let src = format!(
+            "{decls}\
+fn f(p: Pair(u8), i: Ints, d: &DNode, c: &Chain) -> i64:
+    let n: &Node = d.next
+    let m: &Chain = c.next
+    return p.value as i64 + i.value + i.other
+fn size() -> uint:
+    return Ints.size + Pair(u8).size
+"
+        );
+        let module = lower(&src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set n (I32.Load offset=4 d)) (set m (I32.Load offset=0 c)) \
+             (return (I64.Add (I64.Add (I32.ExtendU p.value) i.value) i.other))"
+        );
+        assert_eq!(body(&module, "size"), "(return (I32.Add 24 2))");
+
+        // A used field has the type it was declared with, which names the
+        // struct it was declared in.
+        let src = format!("{decls}fn g(d: &DNode):\n    let n: &DNode = d.next\n");
+        assert_eq!(errors(&src), vec![mismatch("&DNode", "&Node")]);
+    }
+
+    #[test]
+    fn used_fields_keep_their_defaults() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct(T) Slot:
+    value: T = SEVEN
+    p: &T = 0
+let SEVEN = 7
+struct A:
+    use Slot(i32)
+struct(T) W:
+    use Slot(T)
+    last: u8 = 1
+struct B:
+    use Slot(u8)
+";
+        let src = format!(
+            "{decls}\
+fn f() -> i32:
+    let a = A()
+    let w = W(i32)()
+    let v = W(u8)(value: 2)
+    let b = B(value: 3)
+    return a.value + w.value
+"
+        );
+        assert_eq!(
+            body(&lower(&src), "f"),
+            "(set a.value 7) (set a.p 0) (set w.value 7) (set w.p 0) (set w.last 1) \
+             (set v.value 2) (set v.p 0) (set v.last 1) (set b.value 3) (set b.p 0) \
+             (return (I32.Add a.value w.value))"
+        );
+
+        // A default is one value, of one type, wherever its field is used.
+        let src = format!("{decls}fn g():\n    let b = B()\n    let w = W(u8)()\n");
+        let default_mismatch = DefaultMismatch {
+            param: "value".into(),
+            expected: "u8".into(),
+            found: "i32".into(),
+        };
+        assert_eq!(
+            errors_at(&src),
+            vec![
+                (default_mismatch.clone(), "B()"),
+                (default_mismatch, "W(u8)()"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_use_gives_a_union_the_variants_of_another() {
+        let src = "\
+union ReadError:
+    closed
+    timeout: u32
+union IoError:
+    use ReadError
+    denied
+union(T) Maybe:
+    unknown
+    use option(T)
+fn f(r: ReadError) -> i32:
+    match r as IoError:
+        .closed:
+            return 1
+        .timeout(ms):
+            return ms as i32
+        .denied:
+            return 3
+fn g(m: Maybe(i32)) -> i32:
+    match m:
+        .unknown:
+            return -1
+        .none:
+            return 0
+        .some(x):
+            return x
+fn h() -> Maybe(u8):
+    return .some(4)
+";
+        let module = lower(src);
+        // `none` is the second variant of `Maybe`, and `some` the third.
+        assert_eq!(body(&module, "h"), "(return 2 4)");
+        assert_eq!(
+            body(&module, "g"),
+            "(set tmp2 m) (set x m.0) (block \
+             (if (I32.Eq tmp2 0) (then (return -1)) (else )) \
+             (if (I32.Eq tmp2 1) (then (return 0)) (else )) \
+             (if (I32.Eq tmp2 2) (then (return x)) (else )) unreachable) unreachable"
+        );
+        // A `ReadError` is the variant of `IoError` that it is of its own.
+        assert_eq!(
+            body(&module, "f"),
+            "(set tmp2 r) (set ms r.0) (block \
+             (if (I32.Eq tmp2 0) (then (return 1)) (else )) \
+             (if (I32.Eq tmp2 1) (then (return ms)) (else )) \
+             (if (I32.Eq tmp2 2) (then (return 3)) (else )) unreachable) unreachable"
+        );
+    }
+
+    #[test]
+    fn used_members_count_up_where_they_are_used() {
+        let src = "\
+enum(u8) A:
+    x
+    y = FIVE
+    z
+let FIVE: u8 = 5
+enum(u8) B:
+    p
+    q
+    use A
+    r
+enum(u8) Wide:
+    use A
+    w
+enum(u8) Wider:
+    use Wide
+enum(tuple(u8, bool)) Pairs:
+    one = (1, true)
+enum(tuple(u8, bool)) More:
+    zero = (0, false)
+    use Pairs
+fn b() -> tuple(u8, u8, u8, u8, u8, u8):
+    return (B.p as u8, B.q as u8, B.x as u8, B.y as u8, B.z as u8, B.r as u8)
+fn wide(a: A) -> tuple(Wider, u8):
+    return (a as Wide as Wider, Wider.w as u8)
+fn more() -> tuple(u8, bool):
+    return More.one as tuple(u8, bool)
+fn count() -> i32:
+    var n = 0
+    for m in More:
+        n += 1
+    return n
+";
+        let module = lower(src);
+        // A member given a value keeps it, and one given none counts up from
+        // the member before it where the `use` is.
+        assert_eq!(body(&module, "b"), "(return 0 1 2 5 6 7)");
+        // An enum that starts with a `use` is wider than what it uses.
+        assert_eq!(body(&module, "wide"), "(return a 7)");
+        assert_eq!(body(&module, "more"), "(return 1 1)");
+        assert_eq!(body(&module, "count").matches("(set n ").count(), 3);
+
+        let src = format!("{src}fn narrow(b: B) -> A:\n    return b as A\n");
+        assert_eq!(
+            errors(&src),
+            vec![TypeErrorKind::InvalidCast {
+                from: "B".into(),
+                to: "A".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_use_names_a_type_of_the_kind_it_is_in() {
+        use TypeErrorKind::*;
+        let src = "\
+struct S:
+    x: i32
+union U:
+    a
+enum(u8) E:
+    m
+enum(u16) F:
+    n
+struct(T) G:
+    use T
+    use U
+    use E
+    use array(u8)
+    use tuple(i32, i32)
+    use &S
+    use Missing
+    use G
+union V:
+    use S
+    use E
+    use option
+enum(u8) H:
+    use S
+    use F
+    use i32
+";
+        let other = |within: &'static str, ty: &str| UseOfOther {
+            within,
+            ty: ty.into(),
+        };
+        let values = UseOfValues {
+            name: "F".into(),
+            expected: "u8".into(),
+            found: "u16".into(),
+        };
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (other("an enum", "S"), "S"),
+                (values.clone(), "F"),
+                (other("an enum", "i32"), "i32"),
+                (other("a struct", "T"), "T"),
+                (other("a struct", "U"), "U"),
+                (other("a struct", "E"), "E"),
+                (other("a struct", "array(u8)"), "array(u8)"),
+                (other("a struct", "tuple(i32, i32)"), "tuple(i32, i32)"),
+                (other("a struct", "&S"), "&S"),
+                (UnknownType("Missing".into()), "Missing"),
+                (MissingTypeArgs("G".into()), "G"),
+                (other("a union", "S"), "S"),
+                (other("a union", "E"), "E"),
+                (MissingTypeArgs("option".into()), "option"),
+            ]
+        );
+        assert_eq!(
+            other("a union", "S").to_string(),
+            "`use` in a union takes a union, which `S` isn't"
+        );
+        assert_eq!(
+            values.to_string(),
+            "`use` in an enum of `u8` takes one, and `F` is an enum of `u16`"
+        );
+    }
+
+    #[test]
+    fn used_names_are_not_repeated() {
+        use TypeErrorKind::*;
+        let src = "\
+struct A:
+    x: i32
+    y: i32
+struct B:
+    y: u8
+    use A
+    x: u8
+    use A
+struct L:
+    use A
+struct R:
+    use A
+struct D:
+    use L
+    use R
+union P:
+    a
+    b: i32
+union Q:
+    use P
+    a: u8
+    use P
+enum(u8) M:
+    a
+    b
+enum(u8) N:
+    b
+    use M
+    a
+fn f(b: B, n: N) -> tuple(u8, i32, u8):
+    return (b.y, b.x, n as u8)
+";
+        let field = |name: &str| DuplicateField(name.into());
+        let variant = |name: &str| DuplicateVariant(name.into());
+        let member = |name: &str| DuplicateMember(name.into());
+        // Whichever is written later is the one repeated, and is no field,
+        // variant or member.
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (member("b"), "M"),
+                (field("y"), "A"),
+                (field("x"), "x"),
+                (field("x"), "A"),
+                (field("y"), "A"),
+                (field("x"), "R"),
+                (field("y"), "R"),
+                (variant("a"), "a"),
+                (variant("a"), "P"),
+                (variant("b"), "P"),
+                (member("a"), "a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_use_never_leads_back_to_itself() {
+        use TypeErrorKind::*;
+        let src = "\
+struct A:
+    use B
+    a: i32
+struct B:
+    use C
+    b: i32
+struct C:
+    use A
+    c: i32
+struct S:
+    use S
+struct(T) G:
+    use G(&T)
+union U:
+    use V
+union V:
+    use U
+    v
+enum(u8) E:
+    use F
+    e
+enum(u8) F:
+    use E
+    f
+fn f(a: A, b: B, c: C, u: U) -> i32:
+    match u:
+        .v:
+            return a.a + a.b + a.c + b.b + b.c + c.c + E.f as i32 + E.e as i32
+";
+        let recursive = |ty: &str| RecursiveUse(ty.into());
+        // Each is reported once, at the `use` that leads back, which gives
+        // no fields: the others give what is left.
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (recursive("E"), "E"),
+                (recursive("A"), "A"),
+                (recursive("S"), "S"),
+                (recursive("G(&T)"), "G(&T)"),
+                (recursive("U"), "U"),
+            ]
+        );
+        assert_eq!(
+            recursive("A").to_string(),
+            "`use` of `A` leads back to itself"
+        );
+    }
+
+    #[test]
+    fn errors_in_used_fields_are_reported_at_the_use() {
+        use TypeErrorKind::*;
+        let src = "\
+struct(T) Box:
+    value: T
+struct A:
+    use Box(A)
+struct Ext:
+    p: &externref
+struct Copy:
+    use Ext
+struct(T) Ptr:
+    p: &T
+struct E:
+    use Ptr(externref)
+struct(T) Open:
+    use Ptr(tuple(T, externref))
+struct Hidden:
+    x: i32
+struct Inner:
+    pub h: Hidden
+    i: Hidden
+pub struct Outer:
+    use Inner
+pub union Sum:
+    use option(Hidden)
+struct(T: Hidden) Bounded:
+    x: T
+struct Unmet:
+    use Bounded(Inner)
+enum(u8) Top:
+    a = 254
+    b
+enum(u8) Tail:
+    t
+    u
+enum(u8) Over:
+    use Top
+    use Tail
+enum(u8) Same:
+    z = 254
+    use Top
+";
+        let private = |item: &str| PrivateInPublic {
+            ty: "Hidden".into(),
+            item: item.into(),
+        };
+        let unstorable = || NotStorable("externref".into());
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (private("h"), "Inner"),
+                (private("some"), "option(Hidden)"),
+                (RecursiveStruct("A".into()), "Box(A)"),
+                // Reported once: where it is declared, or where the type
+                // arguments that make it so are given.
+                (unstorable(), "p: &externref"),
+                (
+                    NotStorable("tuple(T, externref)".into()),
+                    "Ptr(tuple(T, externref))"
+                ),
+                (unstorable(), "Ptr(externref)"),
+                (
+                    BoundNotMet {
+                        ty: "Inner".into(),
+                        bound: "Hidden".into()
+                    },
+                    "Bounded(Inner)"
+                ),
+                (
+                    MemberOutOfRange {
+                        member: "t".into(),
+                        ty: "u8".into()
+                    },
+                    "Tail"
+                ),
+                (
+                    DuplicateValue {
+                        member: "a".into(),
+                        same_as: "z".into()
+                    },
+                    "Top"
+                ),
+            ]
+        );
+
+        let variants = |name: &str, count: usize| -> String {
+            let variants = (0..count).map(|i| format!("    {name}{i}\n"));
+            variants.collect()
+        };
+        let src = format!(
+            "union Half:\n{}union Rest:\n{}union Both:\n    use Half\n    use Rest\n",
+            variants("a", 128),
+            variants("b", 129)
+        );
+        assert_eq!(
+            errors_at(&src),
+            vec![(TooManyVariants("Both".into()), "Rest")]
+        );
+    }
+
+    #[test]
+    fn used_constants_are_not_used_in_their_own_definition() {
+        use TypeErrorKind::*;
+        let src = "\
+struct A:
+    x: i32 = B().x
+struct B:
+    use A
+enum(u8) E:
+    a = F.b as u8
+enum(u8) F:
+    use E
+    b
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (RecursiveConstant("A".into()), "A"),
+                (RecursiveConstant("E".into()), "E"),
+            ]
+        );
+    }
+
+    #[test]
+    fn as_casts_a_value_to_what_it_is() {
+        let src = "\
+struct Head:
+    id: i32
+    tag: u8
+struct Named:
+    use Head
+    len: u8
+    wide: i64
+enum(Named) Names:
+    one = Named(id: 1, tag: 2, len: 3, wide: 4)
+extern:
+    fn make() -> Named
+let first = Named(id: 5, tag: 6, len: 7, wide: 8) as Head
+fn up(n: Named) -> Head:
+    return n as Head
+fn made() -> Head:
+    return make() as Head
+fn name() -> Head:
+    return Names.one as Head
+fn ptrs(n: &var Named, m: &Named) -> tuple(&var Head, &Head, &Head, uint):
+    return (n as &var Head, n as &Head, m as &Head, m as uint)
+fn(T: Head) bound(x: T, p: &T) -> i32:
+    return (x as Head).id + (p as &Head).id + first.id
+fn call(n: Named, p: &Named) -> i32:
+    return bound(n, p)
+";
+        let module = lower(src);
+        // A struct is one that it starts as: its first fields.
+        assert_eq!(body(&module, "up"), "(return n.id n.tag)");
+        assert_eq!(body(&module, "name"), "(return 1 2)");
+        // What it leaves out is still evaluated.
+        assert_eq!(
+            body(&module, "made"),
+            "(call make [] -> [tmp0 tmp1 tmp2 tmp3]) (return tmp0 (I32.And tmp1 255))"
+        );
+        // A pointer to it is one to what it starts as, and writes it if it
+        // wrote the whole.
+        assert_eq!(body(&module, "ptrs"), "(return n n m m)");
+        // A type parameter is what bounds it.
+        assert_eq!(
+            body(&module, "bound(Named)"),
+            "(return (I32.Add (I32.Add x.id (I32.Load offset=0 p)) 5))"
+        );
+    }
+
+    #[test]
+    fn as_unchecked_casts_an_address_to_any_other() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    len: u8
+struct Last:
+    len: u8
+    use Head
+union Narrow:
+    a
+union Wide:
+    use Narrow
+    b
+enum(u8) Warm:
+    red
+enum(u8) Color:
+    use Warm
+    blue
+";
+        let params = "h: Head, p: &Head, n: &Named, l: &Last, a: uint, g: fn(), s: array(u8), u: &Narrow, w: &Warm";
+        let src = format!(
+            "{decls}\
+fn f({params}):
+    let a1 = p as! &Named
+    let a2 = n as! &var Head
+    let a3 = l as! &Head
+    let a4 = a as! &Head
+    let a5 = a as! fn()
+    let a6 = g as! fn(i32)
+    let a7 = s as! varray(u8)
+    let a8 = 0 as! &Head
+    let a9 = u as! &Wide
+    let b1 = w as! &Color
+    let b2 = n as! &Head
+"
+        );
+        // The value is as it was: nothing is checked, or done.
+        assert_eq!(
+            body(&lower(&src), "f"),
+            "(set a1 p) (set a2 n) (set a3 l) (set a4 a) (set a5 a) (set a6 g) \
+             (set a7.ptr s.ptr) (set a7.len s.len) (set a8 0) (set a9 u) (set b1 w) (set b2 n)"
+        );
+
+        let src = format!(
+            "{decls}\
+fn f({params}):
+    let a0 = h as Named
+    let a1 = p as &Named
+    let a2 = n as &var Head
+    let a3 = l as &Head
+    let a4 = a as &Head
+    let a5 = a as fn()
+    let a6 = g as fn(i32)
+    let a7 = s as varray(u8)
+    let a8 = 0 as &Head
+    let a9 = u as &Wide
+    let b1 = w as &Color
+    let c1 = n as! Head
+    let c2 = a as! u8
+    let c3 = h as! Named
+    let c4 = p as! uint
+    let c5 = 1.5 as! &Head
+    let c6 = a as u32 as! &Head
+    let c7 = s as! array(u16)
+"
+        );
+        let cast = |from: &str, to: &str| InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        let unchecked = |from: &str, to: &str| UncheckedCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        let value = |from: &str, to: &str| UncheckedValue {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(
+            errors_at(&src),
+            vec![
+                // No value is one of a type that has more than it does.
+                (cast("Head", "Named"), "h as Named"),
+                // Nothing says what is at an address, or that it is written.
+                (unchecked("&Head", "&Named"), "p as &Named"),
+                (unchecked("&Named", "&var Head"), "n as &var Head"),
+                (unchecked("&Last", "&Head"), "l as &Head"),
+                (unchecked("uint", "&Head"), "a as &Head"),
+                (unchecked("uint", "fn()"), "a as fn()"),
+                (unchecked("fn()", "fn(i32)"), "g as fn(i32)"),
+                (unchecked("array(u8)", "varray(u8)"), "s as varray(u8)"),
+                (unchecked("uint", "&Head"), "0 as &Head"),
+                // A wider union or enum is another value, not the same one.
+                (unchecked("&Narrow", "&Wide"), "u as &Wide"),
+                (unchecked("&Warm", "&Color"), "w as &Color"),
+                // Only an address is cast without a check.
+                (value("&Named", "Head"), "n as! Head"),
+                (value("uint", "u8"), "a as! u8"),
+                (value("Head", "Named"), "h as! Named"),
+                (value("&Head", "uint"), "p as! uint"),
+                (cast("f64", "&Head"), "1.5 as! &Head"),
+                (
+                    AddressCast {
+                        from: "u32".into(),
+                        to: "&Head".into()
+                    },
+                    "a as u32 as! &Head"
+                ),
+                (cast("array(u8)", "array(u16)"), "s as! array(u16)"),
+            ]
+        );
+        assert_eq!(
+            unchecked("uint", "&Head").to_string(),
+            "casting `uint` as `&Head` is unchecked: write `as!`"
+        );
+        assert_eq!(
+            value("uint", "u8").to_string(),
+            "`as!` casts an address as another, or an integer and a float of one width \
+             as each other, and `uint` as `u8` is neither"
+        );
+    }
+
+    #[test]
+    fn as_unchecked_gives_a_number_the_bits_of_another() {
+        use TypeErrorKind::*;
+        let src = "\
+let one = 0x3f800000 as! f32
+let nan = 0xfff8000000000000 as! f64
+let bits = 1.0 as! u64
+fn f(a: i32, b: u32, c: i64, d: u64, x: f32, y: f64) -> tuple(f32, f32, f64, f64):
+    return (a as! f32, b as! f32, c as! f64, d as! f64)
+fn g(x: f32, y: f64) -> tuple(i32, u32, i64, u64):
+    return (x as! i32, x as! u32, y as! i64, y as! u64)
+fn consts() -> tuple(f32, u64, f64, i32):
+    return (one, bits, 1 as! f64, (2.5 as f32) as! i32)
+fn round(x: f32) -> f32:
+    return x as! u32 as! f32
+";
+        let module = lower(src);
+        // The bits are as they were, where `as` gives the nearest value.
+        assert_eq!(
+            body(&module, "f"),
+            "(return (I32.Reinterpret a) (I32.Reinterpret b) \
+             (I64.Reinterpret c) (I64.Reinterpret d))"
+        );
+        assert_eq!(
+            body(&module, "g"),
+            "(return (F32.Reinterpret x) (F32.Reinterpret x) \
+             (F64.Reinterpret y) (F64.Reinterpret y))"
+        );
+        assert_eq!(
+            body(&module, "round"),
+            "(return (I32.Reinterpret (F32.Reinterpret x)))"
+        );
+        // A literal is as wide as the float it is cast to, and a constant
+        // is cast when it is folded.
+        assert_eq!(
+            body(&module, "consts"),
+            "(return 1f32 4607182418800017408i64 (I64.Reinterpret 1i64) \
+             (F32.Reinterpret (F64.Demote 2.5f64)))"
+        );
+
+        let src = "\
+fn f(a: u8, b: uint, c: i32, x: f32, y: f64, t: bool):
+    let a1 = a as! f32
+    let a2 = b as! f32
+    let a3 = c as! f64
+    let a4 = x as! u64
+    let a5 = x as! f64
+    let a6 = y as! int
+    let a7 = t as! f32
+    let a8 = 1.5 as! f32
+    let a9 = c as! u32
+";
+        let value = |from: &str, to: &str| UncheckedValue {
+            from: from.into(),
+            to: to.into(),
+        };
+        // Only an integer and a float of one width share their bits: any
+        // other number is converted, by `as`.
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (value("u8", "f32"), "a as! f32"),
+                (value("uint", "f32"), "b as! f32"),
+                (value("i32", "f64"), "c as! f64"),
+                (value("f32", "u64"), "x as! u64"),
+                (value("f32", "f64"), "x as! f64"),
+                (value("f64", "int"), "y as! int"),
+                (value("bool", "f32"), "t as! f32"),
+                (value("f64", "f32"), "1.5 as! f32"),
+                (value("i32", "u32"), "c as! u32"),
+            ]
         );
     }
 }

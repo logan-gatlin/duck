@@ -51,6 +51,8 @@ pub enum TokenKind {
     True,
     False,
     As,
+    /// `as!`
+    AsUnchecked,
 
     // Delimiters
     LParen,
@@ -169,6 +171,7 @@ impl fmt::Display for TokenKind {
             Self::True => "true",
             Self::False => "false",
             Self::As => "as",
+            Self::AsUnchecked => "as!",
             Self::LParen => "(",
             Self::RParen => ")",
             Self::LBracket => "[",
@@ -469,6 +472,7 @@ impl<'a> Lexer<'a> {
             "not" => TokenKind::Not,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "as" if self.eat('!') => TokenKind::AsUnchecked,
             "as" => TokenKind::As,
             name => TokenKind::Ident(name.to_string()),
         }
@@ -962,6 +966,20 @@ mod tests {
             kinds("[0; n]"),
             vec![LBracket, Int(0), Semi, ident("n"), RBracket, Newline, Eof]
         );
+        assert_eq!(
+            kinds("p as! &u8 as uint"),
+            vec![
+                ident("p"),
+                AsUnchecked,
+                Amp,
+                ident("u8"),
+                As,
+                ident("uint"),
+                Newline,
+                Eof
+            ]
+        );
+        assert_eq!(error("as !"), LexErrorKind::UnexpectedChar('!'));
         assert_eq!(error("!"), LexErrorKind::UnexpectedChar('!'));
     }
 

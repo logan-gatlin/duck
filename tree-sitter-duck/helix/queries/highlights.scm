@@ -102,6 +102,7 @@
   "or"
   "not"
   "as"
+  "as!"
 ] @keyword.operator
 
 ; Punctuation

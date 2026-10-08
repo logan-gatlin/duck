@@ -55,7 +55,7 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - A parameter anywhere in the list may have a default. Label a later argument
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
-  match struct enum union extern use module and or not true false as`. No
+  match struct enum union extern use module and or not true false as as!`. No
   item is named `array`, `varray`, `tuple`, `type`, `option` or `result`.
 
 ## Types
@@ -67,7 +67,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   types of their own: `uint + u32` is an error too.
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
-  addresses. There is no null: `0` is an address like any other.
+  addresses, which `as!` makes of any address. There is no null: `0` is an
+  address like any other.
 - `option(T)`: the union of `none` and `some: T`. `result(T, E)`: the union
   of `ok: T` and `err: E`. Both are built in, and are unions in every way.
 - `array(T)`: a view of `ptr: &T` and `len: uint` that owns nothing.
@@ -244,21 +245,35 @@ fn f(i: uint) -> u8:
 ## Operators
 
 Loosest to tightest, the binary ones left associative: `|>`, `or`, `and`,
-`not`, `== != < <= > >=`, `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, `as`,
+`not`, `== != < <= > >=`, `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, `as as!`,
 prefix `- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
 
 - `%` and `~` take integers, and unary `-` takes signed integers and floats.
   Integer division by zero traps.
 - `==` and `!=` compare any one type structurally, arrays by length and
   elements. `< <= > >=` compare numbers and pointers.
-- `as` converts number to number (float to integer saturates, NaN gives 0),
-  `bool` to integer, pointer to pointer (how a `&T` becomes a `&var T`),
-  `array(T)` to `varray(T)` and back, `int` or `uint` to and from pointers
-  and function pointers, function pointer to function pointer, an enum to
-  its value type, and a union or an enum to a wider one, which starts as it
-  does. No other integer converts to or from a pointer: go through
-  `uint`, as in `p as uint as u32`. Nothing converts to `bool`: write
-  `x != 0`.
+- `as` makes a value one of another type that it is, or is near enough:
+  number to number (float to integer saturates, NaN gives 0, and a narrower
+  one may lose precision), `bool` to integer, an enum to its value type, a
+  union or an enum to a wider one, which starts as it does, and a struct to
+  one that it starts as, which is its first fields. Nothing converts to
+  `bool`: write `x != 0`.
+- Of addresses, `as` makes a pointer or a function pointer an `int` or a
+  `uint`, a `&var T` a `&T`, a `varray(T)` an `array(T)`, and a pointer to a
+  struct one to a struct that it starts as: a `&Named` a `&Head`, and a
+  `&var Named` a `&var Head`.
+- `as!` makes an address one of any type, and checks nothing: pointer to
+  pointer (how a `&T` becomes a `&var T`, and a `&Head` a `&Named`), `int`
+  or `uint` to a pointer or a function pointer, function pointer to function
+  pointer, and `array(T)` to `varray(T)`. What is at the address is read as
+  the type says, whatever is there.
+- `as!` also makes an integer the float that has its bits, and a float the
+  integer: an `i32` or a `u32` and an `f32`, an `i64` or a `u64` and an
+  `f64`. `1 as f32` is `1.0`, and `0x3f800000 as! f32` is too. It casts no
+  other value: `x as! u8` and `p as! uint` are errors, as is `as` where
+  only `as!` casts.
+- No other integer converts to or from a pointer: go through `uint`, as in
+  `p as uint as u32`.
 
 ## Pointers and memory
 
@@ -272,7 +287,7 @@ var heap: uint = 65536
 fn alloc(T: type) -> &var T:           # bump from an address you pick
 	heap = (heap + T.align - 1) / T.align * T.align
 	heap += T.size
-	return (heap - T.size) as &var T
+	return (heap - T.size) as! &var T
 
 fn push(head: &Node, v: i32) -> &Node:
 	let n = alloc(Node)                # a `&var Node`
@@ -293,7 +308,7 @@ fn view(p: &i32, len: uint) -> array(i32):
   pointer or array on the way to the place decides: with `next: &var Node`,
   `p.next.val = 1` works through a `p: &Node`. `let` and `var` govern the
   binding, not the pointee.
-- Pointer arithmetic is `((p as uint) + 4) as &T`.
+- Pointer arithmetic is `((p as uint) + 4) as! &T`.
 - Layout follows C, and `bool` is 1 byte. A pointer, a function pointer, an
   `int` and a `uint` are each 4 bytes, or 8 with `memory64`.
 - The only runtime checks are array bounds and division by zero, which trap.
@@ -336,7 +351,7 @@ var heap: uint = 65536
 
 fn new(T: type) -> &var T:           # a call gives `T` a type: new(Named)
 	heap += T.size
-	return (heap - T.size) as &var T
+	return (heap - T.size) as! &var T
 
 fn(T) boxed(value: T) -> &var Box(T):  # a call infers `T` from `value`
 	let b = new(Box(T))
@@ -359,7 +374,8 @@ fn demo(n: &Named) -> i32:
 - A type parameter is a type of which only the size and alignment are known.
   A `T` is bound, passed and returned, read and written through a `&var T`,
   and held by other types: `&T`, `array(T)`, `Box(T)`. A pointer to one is
-  cast as any pointer is. `T.size` and `T.align` are those of the type.
+  cast as any pointer is, with `as!`. `T.size` and `T.align` are those of
+  the type.
 - A `T` has no operators, literals, fields, constructor or members: `a > b`,
   `a == b`, `0 as T`, `T(x: 1)` and `T.ok` are errors where they are written,
   whatever the function is called with. So a generic body is checked once,
@@ -383,7 +399,8 @@ fn demo(n: &Named) -> i32:
 - `pub` plays no part in a bound. The body sees the fields that it sees in
   `Head`, and reads them of a type argument whose own are private.
 - Only a type parameter is bounded. A function that takes a `Head` doesn't
-  take a `Named`, and a `&Named` is not a `&Head`: cast it, `n as &Head`.
+  take a `Named`, and a `&Named` is not a `&Head`: cast it, `n as &Head`, or
+  `n.* as Head` for the value. A `T` bounded by `Head` casts as `Head` does.
 - A type argument is storable: nothing is generic over `externref`.
 - A default, of a parameter or a field, is one value for every call and
   constructor, so it never names `T`, and is no value laid out by one:
@@ -440,13 +457,82 @@ fn demo(r: ReadError, w: Warm) -> i32:
   values. Each is as wide as itself.
 - `x as Wider` is the same variant or member of the wider type. Nothing
   converts the other way: `match` the wider one. The two unions aren't laid
-  out alike, so a `&ReadError` is no `&IoError`.
+  out alike, so a `&ReadError` is no `&IoError`, and only `as!` makes it or
+  a `&Warm` the pointer to the wider type.
 - A type parameter bounded by a union or an enum takes the types it is wider
   than, the reverse of a struct, which bounds those with more fields. In the
   body a `T` is matched as the bound, with an arm for each of the bound's
   variants or members, and `x as IoError` is the bound's own value. It
   builds no `T`: `T.closed` and `.closed` for a `T` are errors, as a type
   argument may have no such variant.
+
+## Use in a struct, union or enum
+
+```duck
+struct Head:
+	pub id: i32
+	tag: u8 = 7
+
+struct Named:
+	use Head                         # `pub id: i32` and `tag: u8 = 7`
+	name: array(u8)
+
+union ReadError:
+	closed
+	timeout: u32
+
+union IoError:
+	use ReadError                    # `closed` and `timeout: u32`
+	denied
+
+enum(u8) Warm:
+	red
+	green = 5
+
+enum(u8) Color:
+	black                            # 0
+	use Warm                         # `red` is 1 here, and `green` is 5
+	blue                             # 6
+
+struct(T) Box:
+	value: T
+
+struct(T) Pair:
+	use Box(T)                       # `value: T`
+	other: T
+
+let nobody = Named(id: 0, name: "")  # `tag` is 7
+
+fn demo(n: &Named, r: ReadError) -> i32:
+	let h = n as &Head               # `Named` starts as `Head` does
+	let head = nobody as Head        # its first fields, by value
+	let io = r as IoError            # `IoError` is wider than `ReadError`
+	return h.id + head.tag as i32 + Color.red as u8 as i32
+```
+
+- A `use Type` line of a struct, a union or an enum stands for the fields,
+  variants or members of `Type`, in order, as if they were written there.
+  A struct uses a struct, a union a union, and an enum an enum whose values
+  have the type its own do. Any lines may be a `use`, among the others.
+- The type is `Name`, `mod.Name` or a generic one with its type arguments,
+  which may be the declaration's own type parameters. A union may use an
+  `option(T)` or a `result(T, E)`. Nothing uses a type parameter: `use T` is
+  an error.
+- Nothing else relates the two types: a `Named` holds no `Head`, and is
+  laid out as its fields are. A struct that starts with `use Head` starts as
+  `Head` does, so `as` makes it one, and a pointer to it a `&Head`. A union
+  or an enum that starts with a `use` is wider than what it uses, which `as`
+  makes it. A `use` further down gives neither.
+- A used field keeps its type, `pub` and default as declared. A `next: &Node`
+  of `Node` is a `&Node` wherever it is used, and a default is a constant of
+  the module that wrote it. A field that isn't `pub` is private to the
+  module that uses it, and its type holds no private type of another.
+- A used member keeps a value that it was given. One given none counts up
+  from the member before it, where the `use` is.
+- No name is given twice, by a `use` or a line of its own: it's an error at
+  whichever comes later.
+- A `use` never leads back to itself, as `use B` in `A` does when `B` has
+  `use A`.
 
 ## Function pointers
 
@@ -505,7 +591,7 @@ pub use geo.Color                # also reachable as `this.Color`
 - The module is the file furthest along the path. What follows names its
   `pub` items, or goes on through a module it makes `pub`.
 - `use` binds the last name of the path, or the one `as` gives. `{}` groups
-  nest, and `use` lines come before every other item.
+  nest, and a module's `use` lines come before every other item.
 - A dependency's library is its only module in reach: `json.Value`, or
   `json.value.Value` once it has `pub use value`.
 - A used module's `pub` items are reached as `mod.item`:

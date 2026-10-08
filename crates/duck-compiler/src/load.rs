@@ -909,6 +909,50 @@ fn f() -> i32:
     }
 
     #[test]
+    fn used_fields_are_private_to_the_module_that_uses_them() {
+        let a = "let BASE = 3\nstruct Hidden:\n    x: i32\npub struct Point:\n    pub x: f32\n    secret: i32 = BASE\npub struct Sealed:\n    pub open: i32\n    key: &Hidden\npub enum(u8) Level:\n    low = BASE as u8\n    high\n";
+        let b = "use a\nlet BASE = 9\npub struct P3:\n    use a.Point\n    pub z: f32\npub enum(u8) More:\n    none\n    use a.Level\npub fn secrets() -> tuple(i32, i32):\n    return (P3(x: 1.0, z: 2.0).secret, P3(x: 1.0, secret: BASE, z: 2.0).secret)\n";
+        let main = "use b\npub fn f() -> tuple(u8, u8, f32):\n    return (b.More.low as u8, b.More.high as u8, b.P3(x: 1.0, z: 2.0).z)\n";
+        let mut files = Memory(vec![("main", main), ("a", a), ("b", b)]);
+        let module = lower(&mut files);
+        let returned = |name: &str| {
+            let func = module.funcs.iter().find(|f| f.name == name).unwrap();
+            match &func.body[..] {
+                [ir::Stmt::Return(values)] => values.clone(),
+                body => panic!("{body:?}"),
+            }
+        };
+        let consts = |xs: [i32; 2]| xs.map(|x| ir::Expr::Const(Const::I32(x))).to_vec();
+        // A default and a member's value are folded where they are declared,
+        // with the private `BASE` of that module.
+        assert_eq!(returned("secrets"), consts([3, 9]));
+        assert_eq!(returned("f")[..2], consts([3, 4]));
+
+        // A field that was private where it was declared is private to the
+        // module that uses it, and to no other.
+        let main = "use b\nfn f() -> i32:\n    let p = b.P3(x: 1.0, secret: 1, z: 2.0)\n    return p.secret\n";
+        let mut files = Memory(vec![("main", main), ("a", a), ("b", b)]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"secret\": field `secret` of `P3` is private",
+                "main \"secret\": field `secret` of `P3` is private",
+            ]
+        );
+
+        // A module can name the type of every field it has.
+        let main = "use a\nstruct S:\n    use a.Sealed\nstruct T:\n    use a.Hidden\n";
+        let mut files = Memory(vec![("main", main), ("a", a)]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"a.Sealed\": `use` of `key`, whose type holds the private `Hidden`",
+                "main \"Hidden\": `Hidden` is private",
+            ]
+        );
+    }
+
+    #[test]
     fn parameter_defaults_are_folded_where_they_are_declared() {
         let lib = "let STEP = 4\nfn twice(x: i32) -> i32:\n    return x * 2\npub fn step(n: i32, by: i32 = STEP, with: fn(i32) -> i32 = twice) -> i32:\n    return with(n) + by\n";
         let main = "use a\nuse a.{step as advance}\nlet STEP = 9\npub fn f() -> i32:\n    return advance(1) + a.step(2, by: STEP)\n";

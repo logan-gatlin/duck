@@ -11,11 +11,12 @@ use std::iter;
 
 use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
+use crate::load::Program;
 use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
     Body, Checker, FieldDef, Item, Leaf, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS,
-    Ty, TypeErrorKind, Value, binary, fold_unary, is_stable, zero,
+    Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_stable, zero,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -120,6 +121,7 @@ impl Checker {
                 bare: holds.is_none(),
                 default: None,
                 default_ty: None,
+                used: None,
                 span,
             };
             self.builtin_unions
@@ -146,9 +148,37 @@ impl Checker {
 
     /// Resolves the variants of union `id`, which `decl` declares, with its
     /// type parameters in scope.
-    pub(super) fn union_variants(&mut self, id: usize, decl: &UnionDecl) -> Vec<FieldDef> {
+    pub(super) fn union_variants(
+        &mut self,
+        program: &Program,
+        id: usize,
+        decl: &UnionDecl,
+        visits: &mut [Visit],
+    ) -> Vec<FieldDef> {
         let mut variants: Vec<FieldDef> = Vec::new();
-        for variant in &decl.variants {
+        // Where the first variant past the most there can be is written.
+        let mut extra = None;
+        for entry in &decl.entries {
+            let variant = match entry {
+                parse::Entry::Own(variant) => variant,
+                parse::Entry::Use(used) => {
+                    for variant in self.used_fields(program, id, used, visits) {
+                        if self.structs[id].is_pub {
+                            self.check_public(variant.ty, used.span, &variant.name);
+                        }
+                        if variants.iter().any(|v| v.name == variant.name) {
+                            let kind = TypeErrorKind::DuplicateVariant(variant.name);
+                            self.error(kind, used.span);
+                            continue;
+                        }
+                        variants.push(variant);
+                        if variants.len() > MAX_VARIANTS {
+                            extra.get_or_insert(used.span);
+                        }
+                    }
+                    continue;
+                }
+            };
             let name = &variant.name;
             let ty = match &variant.ty {
                 Some(ty) => {
@@ -174,12 +204,16 @@ impl Checker {
                 bare: variant.ty.is_none(),
                 default: None,
                 default_ty: None,
+                used: None,
                 span: variant.span,
             });
+            if variants.len() > MAX_VARIANTS {
+                extra.get_or_insert(variant.span);
+            }
         }
-        if let Some(extra) = decl.variants.get(MAX_VARIANTS) {
+        if let Some(extra) = extra {
             let kind = TypeErrorKind::TooManyVariants(decl.name.name.clone());
-            self.error(kind, extra.span);
+            self.error(kind, extra);
         }
         variants
     }

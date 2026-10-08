@@ -735,6 +735,10 @@
         {
           "type": "enum_member",
           "named": true
+        },
+        {
+          "type": "type_use",
+          "named": true
         }
       ]
     }
@@ -1571,6 +1575,10 @@
         {
           "type": "pass_statement",
           "named": true
+        },
+        {
+          "type": "type_use",
+          "named": true
         }
       ]
     }
@@ -1640,6 +1648,22 @@
     }
   },
   {
+    "type": "type_use",
+    "named": true,
+    "fields": {
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "unary_expression",
     "named": true,
     "fields": {
@@ -1702,6 +1726,10 @@
       "multiple": true,
       "required": true,
       "types": [
+        {
+          "type": "type_use",
+          "named": true
+        },
         {
           "type": "union_variant",
           "named": true
@@ -2059,6 +2087,10 @@
   },
   {
     "type": "as",
+    "named": false
+  },
+  {
+    "type": "as!",
     "named": false
   },
   {

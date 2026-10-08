@@ -774,6 +774,38 @@ pub fn f(a: N, b: N, s: array(u8)) -> bool:
     }
 
     #[test]
+    fn used_fields_are_laid_out_as_a_structs_own() {
+        let src = "\
+struct Head:
+    id: i32
+    tag: u8
+pub struct Named:
+    use Head
+    pub len: u8
+    pub wide: i64
+pub fn get(n: &Named) -> Named:
+    return n.*
+pub fn set(n: &var Named, len: u8):
+    n.len = len
+";
+        let bytes = emit_src(src);
+        // `len` follows `tag` in the padding a nested `Head` would end with.
+        let get = func_wat(&bytes, "get");
+        let loads: Vec<_> = get.lines().filter(|l| l.contains("load")).collect();
+        assert_eq!(
+            loads,
+            [
+                "    i32.load",
+                "    i32.load8_u offset=4",
+                "    i32.load8_u offset=5",
+                "    i64.load offset=8",
+            ]
+        );
+        assert!(get.contains("(param $n i32) (result i32 i32 i32 i64)"));
+        assert!(func_wat(&bytes, "set").contains("i32.store8 offset=5"));
+    }
+
+    #[test]
     fn imports_precede_defined_functions() {
         let src = "\
 struct P:
@@ -787,7 +819,7 @@ extern:
     fn put(p: &P, v: P) -> P
     fn flag() -> bool
 pub fn g() -> i32:
-    let p = put(0 as &P, P(x: 1.0, y: 2))
+    let p = put(0 as! &P, P(x: 1.0, y: 2))
     if flag():
         return f(now(1))
     return 0

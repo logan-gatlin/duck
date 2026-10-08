@@ -507,6 +507,10 @@
               },
               {
                 "type": "SYMBOL",
+                "name": "type_use"
+              },
+              {
+                "type": "SYMBOL",
                 "name": "pass_statement"
               }
             ]
@@ -642,8 +646,17 @@
         {
           "type": "REPEAT1",
           "content": {
-            "type": "SYMBOL",
-            "name": "enum_member"
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "enum_member"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "type_use"
+              }
+            ]
           }
         },
         {
@@ -752,8 +765,17 @@
         {
           "type": "REPEAT1",
           "content": {
-            "type": "SYMBOL",
-            "name": "union_variant"
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "union_variant"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "type_use"
+              }
+            ]
           }
         },
         {
@@ -797,6 +819,27 @@
               "type": "BLANK"
             }
           ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_newline"
+        }
+      ]
+    },
+    "type_use": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "use"
+        },
+        {
+          "type": "FIELD",
+          "name": "type",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_type"
+          }
         },
         {
           "type": "SYMBOL",
@@ -2869,8 +2912,17 @@
             }
           },
           {
-            "type": "STRING",
-            "value": "as"
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "STRING",
+                "value": "as"
+              },
+              {
+                "type": "STRING",
+                "value": "as!"
+              }
+            ]
           },
           {
             "type": "FIELD",

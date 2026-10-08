@@ -25,9 +25,28 @@ pub(super) enum DefaultValue {
 }
 
 impl Checker {
-    /// Checks and folds the defaults of struct `id`'s fields.
+    /// Checks and folds the defaults of struct `id`'s fields. A field that
+    /// a `use` makes one of them has the default of the field it is, which
+    /// is folded first.
     pub(super) fn define_defaults(&mut self, program: &Program, id: StructId, decl: &StructDecl) {
-        for field in &decl.fields {
+        for index in 0..self.structs[id.0 as usize].fields.len() {
+            let field = &self.structs[id.0 as usize].fields[index];
+            let (Some((used, at)), Some(_), span) = (field.used, &field.default, field.span) else {
+                continue;
+            };
+            let def = &self.structs[used.0 as usize];
+            let (item, name) = (def.item, def.name.clone());
+            let (default, default_ty) = match self.folded(Some(program), item, &name, span) {
+                true => (
+                    self.field_default(used, at).cloned(),
+                    self.field_default_ty(used, at),
+                ),
+                false => (Some(DefaultValue::Failed), None),
+            };
+            let field = &mut self.structs[id.0 as usize].fields[index];
+            (field.default, field.default_ty) = (default, default_ty);
+        }
+        for field in decl.entries.iter().filter_map(parse::Entry::own) {
             let Some(expr) = &field.default else {
                 continue;
             };
@@ -311,7 +330,7 @@ fn param_in_expr<'a>(
         ExprKind::Call(callee, args) => {
             within(callee).or_else(|| args.iter().find_map(|arg| within(&arg.value)))
         }
-        ExprKind::Cast(value, ty) => within(value).or_else(|| in_type(ty)),
+        ExprKind::Cast(value, ty, _) => within(value).or_else(|| in_type(ty)),
         ExprKind::FnType(ty) => in_type(ty),
     }
 }
