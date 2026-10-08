@@ -1,27 +1,28 @@
 //! Generic functions: resolving their signatures with type parameters,
-//! inferring type arguments at calls, and lowering an instance per list of
+//! finding type arguments at calls, and lowering an instance per list of
 //! type arguments.
 //!
+//! A type parameter in the `(T)` after `fn` is inferred from the arguments
+//! of each call. A parameter of type `type` is a type parameter too, which
+//! each call gives a type as its argument: `fn zero(T: type) -> &T` is
+//! called as `zero(u8)`.
+//!
 //! A generic function's body is checked once as declared, with its type
-//! parameters standing for themselves. An error that no type argument avoids
-//! is reported there. A statement that only some avoid, like `a + b` of a
-//! type parameter, is a need of the function, and each instance is checked
-//! against the needs alone before it is lowered. An error in a need is
-//! reported at the call that led to the instance.
+//! parameters standing for themselves: types of which only the size and
+//! alignment are known. So what is right there is right for every list of
+//! type arguments, and an instance is lowered without being checked again.
 
 use std::collections::HashMap;
 use std::mem;
-use std::rc::Rc;
 
 use crate::ir::{self, FuncId};
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, Arg};
 
-use super::generic::Arity;
 use super::{
     Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
-    generic_fn_decls, is_typed_by_other, path_text, pending_defaults,
+    generic_fn_decls, is_typed_by_other, pending_defaults,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -34,13 +35,19 @@ pub(super) const MAX_INSTANCE_SIZE: u64 = 4096;
 
 /// A generic function's declaration.
 pub(super) struct GenericFn {
-    /// The [`Ty::Param`] of each type parameter.
+    /// The [`Ty::Param`] of each type parameter: those a call infers, then
+    /// those it gives a type.
     params: Vec<Ty>,
-    /// The signature, in terms of the type parameters.
+    /// The signature, in terms of the type parameters. A parameter that is
+    /// one of them is a [`Ty::Type`].
     sig: FuncSig,
-    /// What its body needs of its type arguments. Empty until the body is
-    /// checked as declared.
-    needs: Rc<Needs>,
+    /// Which of `params` each parameter of `sig` is, if it's a type
+    /// parameter.
+    given: Vec<Option<usize>>,
+    /// The type of each parameter's default that has one of its own, which
+    /// settles the type parameters in the parameter's type for a call that
+    /// leaves the argument out. Empty until the defaults are folded.
+    default_tys: Vec<Option<Ty>>,
     /// Whether its declaration has an error, which its instances share.
     failed: bool,
 }
@@ -62,52 +69,20 @@ pub(super) struct InstanceCall {
     pub(super) call: Span,
 }
 
-/// What the statements of a generic function's body need of its type
-/// arguments, by where each starts.
-#[derive(Default)]
-pub(super) struct Needs {
-    stmts: HashMap<usize, Need>,
-}
-
-/// What a statement in the body of a generic function needs of its type
-/// arguments. That of an `if` or `while` is its condition's, that of a `for`
-/// is its array's, and that of a `match` is its value's and its patterns':
-/// the statements within have their own.
-#[derive(Clone, Copy)]
-pub(super) enum Need {
-    /// Something that not every type has, so it's checked for each instance.
-    Check,
-    /// Nothing, but it's a `let`, `var`, `for` or `match` that binds names
-    /// in a value of this type, which may hold type parameters.
-    Bind(Ty),
-    /// Nothing.
-    Skip,
-}
-
-impl Needs {
-    pub(super) fn of(&self, stmt: &parse::Stmt) -> Need {
-        let need = self.stmts.get(&stmt.span.start);
-        need.copied().unwrap_or(Need::Skip)
-    }
-
-    pub(super) fn set(&mut self, stmt: &parse::Stmt, need: Need) {
-        self.stmts.insert(stmt.span.start, need);
-    }
-}
-
 impl Checker {
     /// Declares generic function `decl`.
     pub(super) fn declare_generic_fn(&mut self, decl: &parse::FnDecl) -> GenericFnId {
-        let params = self.new_params(&decl.sig.type_params);
+        let params = self.new_params(&decl.sig.type_param_names());
         self.generic_fns.push(GenericFn {
             params,
+            given: Vec::new(),
+            default_tys: Vec::new(),
             sig: FuncSig {
                 name: decl.sig.name.name.clone(),
                 params: Vec::new(),
                 defaults: Vec::new(),
                 ret: Ty::Unit,
             },
-            needs: Rc::default(),
             failed: false,
         });
         GenericFnId(self.generic_fns.len() as u32 - 1)
@@ -118,14 +93,61 @@ impl Checker {
         for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
             self.module = item.span.file;
             let errors = self.errors.len();
-            let params = self.generic_fns[i].params.clone();
-            self.declare_type_params(&decl.sig.type_params, &params);
+            let tys = self.generic_fns[i].params.clone();
+            self.declare_type_params(&decl.sig.type_param_names(), &tys);
+            self.resolve_bounds(&decl.sig.type_params, &tys);
             let (params, ret) = self.resolve_sig(&decl.sig);
             if item.is_pub {
                 self.check_public_sig(&decl.sig, &params, ret);
             }
+            // One that isn't in scope is already reported.
+            let inferred = decl.sig.type_params.iter().zip(&tys);
+            let inferred: Vec<_> = inferred
+                .filter(|(param, ty)| self.type_param(&param.name.name) == Some(**ty))
+                .collect();
             self.type_params.clear();
+            let mut next = decl.sig.type_params.len();
+            let mut given = Vec::new();
+            for param in &decl.sig.params {
+                given.push(param.ty.is_type().then_some(next));
+                if !param.ty.is_type() {
+                    continue;
+                }
+                next += 1;
+                if param.default.is_some() {
+                    let kind = TypeErrorKind::TypeParamDefault(param.name.name.clone());
+                    self.error(kind, param.span);
+                }
+            }
+            // A call infers the type parameters in the types of its
+            // arguments, and from those the ones their bounds name.
+            let mut settled: Vec<_> = tys
+                .iter()
+                .map(|ty| params.iter().any(|(_, held)| self.holds(*held, *ty)))
+                .collect();
+            for i in (0..tys.len()).rev() {
+                let bound = match tys[i] {
+                    Ty::Param(id) if settled[i] => self.params[id.0 as usize].bound,
+                    _ => None,
+                };
+                for (j, ty) in tys.iter().enumerate() {
+                    settled[j] |= bound.is_some_and(|bound| self.holds(bound, *ty));
+                }
+            }
+            // A signature that failed to resolve is already reported.
+            let resolved = params.iter().all(|(_, ty)| *ty != Ty::Error);
+            for (param, ty) in inferred {
+                let index = tys.iter().position(|other| other == ty);
+                if resolved && !index.is_some_and(|index| settled[index]) {
+                    let kind = TypeErrorKind::NeverInferred {
+                        func: decl.sig.name.name.clone(),
+                        param: param.name.name.clone(),
+                    };
+                    self.error(kind, param.name.span);
+                }
+            }
             let def = &mut self.generic_fns[i];
+            def.given = given;
             def.sig.params = params;
             def.sig.defaults = pending_defaults(&decl.sig);
             def.sig.ret = ret;
@@ -138,38 +160,38 @@ impl Checker {
     pub(super) fn define_generic_fn_defaults(&mut self, program: &Program) {
         for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
             self.module = item.span.file;
-            let params = self.generic_fns[i].sig.params.clone();
-            let defaults = self.fold_param_defaults(program, &decl.sig, &params);
-            self.generic_fns[i].sig.defaults = defaults;
+            let def = &self.generic_fns[i];
+            let (params, tys) = (def.sig.params.clone(), def.params.clone());
+            let (defaults, own) = self.fold_param_defaults(program, &decl.sig, &params, &tys);
+            let def = &mut self.generic_fns[i];
+            def.sig.defaults = defaults;
+            def.default_tys = own;
         }
     }
 
     /// Checks the body of every generic function as declared, with its type
-    /// parameters standing for themselves, and records what each needs of
-    /// its type arguments. What is lowered is of no instance, and is dropped.
+    /// parameters standing for themselves. What is lowered is of no
+    /// instance, and is dropped.
     pub(super) fn check_generic_fns(&mut self, program: &Program) {
         for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
             self.module = item.span.file;
             let def = &self.generic_fns[i];
             let (params, sig) = (def.params.clone(), def.sig.clone());
-            let names = decl.sig.type_params.iter().map(|p| p.name.clone());
+            let names = decl.sig.type_param_names().into_iter().map(|p| p.name);
             self.type_params = names.zip(params).collect();
             let errors = self.errors.len();
             self.open = true;
-            self.deferred = false;
-            let (_, needs) = self.walk_body(sig, &decl.body, item.span, None, None);
+            self.lower_body(sig, &decl.body, item.span, None);
             self.open = false;
             self.type_params.clear();
-            let def = &mut self.generic_fns[i];
-            def.needs = Rc::new(needs);
-            def.failed |= self.errors.len() > errors;
+            self.generic_fns[i].failed |= self.errors.len() > errors;
         }
     }
 
     /// The instance of generic function `generic` with type arguments
     /// `args`, first called at `call`. `None` if an argument is the error
     /// type, or after reporting an instance too deep or large to create, or
-    /// whose signature points to something memory can't hold.
+    /// a type argument that memory can't hold.
     fn instantiate_fn(
         &mut self,
         generic: GenericFnId,
@@ -206,14 +228,24 @@ impl Checker {
 
     /// The signature of the instance of generic function `generic` with type
     /// arguments `args`, named as the instance is written. `None` after
-    /// reporting, at `call`, type arguments too large for an instance, or a
-    /// signature that points to something memory can't hold.
+    /// reporting, at `call`, type arguments too large for an instance, or one
+    /// that memory can't hold.
     fn instance_sig(&mut self, generic: GenericFnId, args: &[Ty], call: Span) -> Option<FuncSig> {
         let sig = self.generic_fns[generic.0 as usize].sig.clone();
         let mut sizes = HashMap::new();
         let size = args.iter().map(|arg| self.written_size(*arg, &mut sizes));
         if size.fold(0, u64::saturating_add) > MAX_INSTANCE_SIZE {
             self.error(TypeErrorKind::InstanceTooLarge(sig.name), call);
+            return None;
+        }
+        // The body may point to a type parameter, whatever its signature
+        // does.
+        if let Some(arg) = args.iter().find(|arg| !self.storable(**arg)) {
+            self.error(TypeErrorKind::NotStorable(self.ty_name(*arg)), call);
+            return None;
+        }
+        let params = self.generic_fns[generic.0 as usize].params.clone();
+        if !self.check_bounds(&params, args, call) {
             return None;
         }
         let names: Vec<_> = args.iter().map(|arg| self.ty_name(*arg)).collect();
@@ -224,11 +256,6 @@ impl Checker {
             .map(|(param, ty)| (param, self.substitute(ty, args, call)))
             .collect();
         let ret = self.substitute(sig.ret, args, call);
-        let tys = params.iter().map(|(_, ty)| *ty).chain([ret]);
-        if let Some(pointee) = tys.into_iter().find_map(|ty| self.unstorable_pointee(ty)) {
-            self.error(TypeErrorKind::NotStorable(self.ty_name(pointee)), call);
-            return None;
-        }
         // A call takes the defaults of the declaration it names.
         Some(FuncSig {
             name,
@@ -241,20 +268,17 @@ impl Checker {
     /// The signature of generic function `generic` with type arguments
     /// `args`, as a call at `call` in a generic function checked as declared
     /// uses it. Each instance of that function has its own instance of this
-    /// one, whose needs its type arguments may not meet, so the call is a
-    /// need. `None` as [`Self::instantiate_fn`] is.
+    /// one. `None` as [`Self::instantiate_fn`] is.
     fn open_instance(&mut self, generic: GenericFnId, args: &[Ty], call: Span) -> Option<FuncSig> {
         if args.contains(&Ty::Error) {
             return None;
         }
-        self.deferred = true;
         self.instance_sig(generic, args, call)
     }
 
-    /// Lowers function `id`, an instance of a generic function, once its
-    /// type arguments are found to meet the needs of its declaration. They
-    /// are all that can be wrong with it, so an error in lowering it is one
-    /// that checking the declaration missed.
+    /// Lowers function `id`, an instance of a generic function. Its
+    /// declaration is right for every list of type arguments, so an error in
+    /// lowering it is one that checking the declaration missed.
     pub(super) fn lower_instance(
         &mut self,
         program: &Program,
@@ -265,19 +289,13 @@ impl Checker {
             .nth(instance.generic.0 as usize)
             .unwrap();
         self.module = item.span.file;
-        let names = decl.sig.type_params.iter().map(|p| p.name.clone());
+        let names = decl.sig.type_param_names().into_iter().map(|p| p.name);
         self.type_params = names.zip(instance.args).collect();
         self.instance_chain = instance.chain;
         let sig = self.funcs[id.0 as usize].clone();
-        let def = &self.generic_fns[instance.generic.0 as usize];
-        // A declaration with an error has it in every instance, where it
-        // isn't a need.
-        let needs = (!def.failed).then(|| def.needs.clone());
         let errors = self.errors.len();
-        if let Some(needs) = needs {
-            self.walk_body(sig.clone(), &decl.body, item.span, None, Some(needs));
-        }
-        let func = if self.errors.len() > errors {
+        // A declaration with an error has it in every instance.
+        let func = if self.generic_fns[instance.generic.0 as usize].failed {
             ir::Func {
                 export: None,
                 name: sig.name,
@@ -289,6 +307,15 @@ impl Checker {
         } else {
             let func = self.lower_body(sig, &decl.body, item.span, None);
             for error in &mut self.errors[errors..] {
+                // Only what an instance is too deep or too large for is its
+                // type arguments' doing, and is reported at the call that led
+                // to it.
+                if let TypeErrorKind::InstanceTooDeep(_)
+                | TypeErrorKind::InstanceTooLarge(_)
+                | TypeErrorKind::NestedTooDeep(_) = error.kind
+                {
+                    continue;
+                }
                 // Where in the body it is, which the last instance holds.
                 let Some(site) = error.instances.pop() else {
                     continue;
@@ -313,7 +340,7 @@ impl Checker {
     /// place. Parameters already in `bound` keep their type. An argument of
     /// the error type binds every parameter in `pattern` to it, since it
     /// already failed to check.
-    fn unify(&self, pattern: Ty, actual: Ty, bound: &mut [Option<Ty>]) {
+    pub(super) fn unify(&self, pattern: Ty, actual: Ty, bound: &mut [Option<Ty>]) {
         match (pattern, actual) {
             (Ty::Param(id), _) => {
                 let slot = &mut bound[self.params[id.0 as usize].index];
@@ -377,6 +404,38 @@ impl Checker {
         }
     }
 
+    /// Settles the type parameters of generic function `generic` that
+    /// `bound` leaves out, where the bound of one that it has names them:
+    /// they are what makes the bound's fields those the type argument
+    /// starts with. A bound names only type parameters before its own, so
+    /// the last is taken first.
+    pub(super) fn settle_by_bounds(&self, generic: GenericFnId, bound: &mut [Option<Ty>]) {
+        let params = &self.generic_fns[generic.0 as usize].params;
+        for (i, param) in params.iter().enumerate().rev() {
+            let Ty::Param(id) = *param else {
+                continue;
+            };
+            let (Some(want), Some(arg)) = (self.params[id.0 as usize].bound, bound[i]) else {
+                continue;
+            };
+            if !self.has_unbound(want, bound) {
+                continue;
+            }
+            let have = self.known(arg);
+            self.unify(want, have, bound);
+            let (Ty::Struct(want), Ty::Struct(have)) = (want, have) else {
+                continue;
+            };
+            let want = &self.structs[want.0 as usize].fields;
+            let have = &self.structs[have.0 as usize].fields;
+            for (want, have) in want.iter().zip(have) {
+                if want.name == have.name {
+                    self.unify(want.ty, have.ty, bound);
+                }
+            }
+        }
+    }
+
     /// Whether `ty` is the type parameter `param`, or holds it anywhere
     /// within it.
     pub(super) fn holds(&self, ty: Ty, param: Ty) -> bool {
@@ -398,22 +457,18 @@ impl Checker {
 }
 
 impl Body<'_> {
-    /// A call of generic function `generic` spanning `span`, given type
-    /// arguments `explicit`, or else inferring them from `args`.
+    /// A call of generic function `generic` spanning `span`, whose type
+    /// arguments are those among `args` and those inferred from the others.
     pub(super) fn generic_fn_call(
         &mut self,
         generic: GenericFnId,
-        explicit: Option<Vec<Ty>>,
         args: &[Arg],
         span: Span,
     ) -> (Ty, Value) {
         let sig = self.ck.generic_fns[generic.0 as usize].sig.clone();
         let binding = self.bind_args(&sig.params, &sig.defaults, args, false, span);
         let mut checked: Vec<_> = args.iter().map(|_| None).collect();
-        let type_args = match explicit {
-            Some(type_args) => type_args,
-            None => self.infer_type_args(generic, args, &binding, &mut checked, span),
-        };
+        let type_args = self.type_args_of(generic, args, &binding, &mut checked, span);
         // A generic function checked as declared calls no instance.
         let id = match self.ck.open {
             true => None,
@@ -433,6 +488,23 @@ impl Body<'_> {
             self.bound_args(&params, &sig.defaults, args, binding, checked);
             return (Ty::Error, Value::default());
         };
+        // A default with a type of its own is taken only as that type.
+        let def = &self.ck.generic_fns[generic.0 as usize];
+        let default_tys = def.default_tys.clone();
+        for (i, own) in default_tys.into_iter().enumerate() {
+            let Some(own) = own.filter(|_| !binding.contains(&Some(i))) else {
+                continue;
+            };
+            let (param, expected) = &instance.params[i];
+            if !self.ck.fits(own, *expected) && *expected != Ty::Error {
+                let kind = TypeErrorKind::DefaultMismatch {
+                    param: param.clone(),
+                    expected: self.ck.ty_name(*expected),
+                    found: self.ck.ty_name(own),
+                };
+                self.error(kind, span);
+            }
+        }
         let value = self.bound_args(&instance.params, &sig.defaults, args, binding, checked);
         match id {
             Some(id) => self.call_func(id, value),
@@ -452,21 +524,18 @@ impl Body<'_> {
         let def = &self.ck.generic_fns[generic.0 as usize];
         let (func, type_params) = (def.sig.name.clone(), def.params.clone());
         let (params, ret) = (def.sig.params.iter().map(|(_, ty)| *ty), def.sig.ret);
-        let params: Vec<_> = params.collect();
+        // A type parameter is no parameter of an instance's pointer.
+        let params: Vec<_> = params.filter(|ty| *ty != Ty::Type).collect();
         // A signature or expected type that failed to resolve is already
         // reported.
         if params.contains(&Ty::Error) || ret == Ty::Error || expected == Some(Ty::Error) {
             return (Ty::Error, Value::default());
         }
-        // A function type, for some type arguments.
-        if let Some(param @ Ty::Param(_)) = expected {
-            self.ck.deferred = true;
-            return (param, Value::default());
-        }
         let mut bound = vec![None; type_params.len()];
         if let Some(expected @ Ty::Fn(_)) = expected {
             let pattern = self.ck.fn_of(params, ret);
             self.ck.unify(pattern, expected, &mut bound);
+            self.ck.settle_by_bounds(generic, &mut bound);
         }
         for (param, ty) in type_params.iter().zip(&bound) {
             if ty.is_none() {
@@ -481,7 +550,8 @@ impl Body<'_> {
             let Some(instance) = self.ck.open_instance(generic, &type_args, span) else {
                 return (Ty::Error, Value::default());
             };
-            let params = instance.params.into_iter().map(|(_, ty)| ty).collect();
+            let params = instance.params.into_iter().map(|(_, ty)| ty);
+            let params = params.filter(|ty| *ty != Ty::Type).collect();
             let ty = self.ck.fn_of(params, instance.ret);
             return (ty, self.blank(ty));
         }
@@ -499,57 +569,27 @@ impl Body<'_> {
         }
     }
 
-    /// Whether `expr(args)` gives a function its type arguments, rather
-    /// than calling one whose result is then called. A generic function
-    /// always takes type arguments; any other is taken to unless it returns
-    /// a function pointer, so that giving it some is reported.
-    pub(super) fn names_fn(&self, expr: &parse::Expr) -> bool {
-        match self.named(expr) {
-            Some(Item::GenericFn(_)) => true,
-            Some(Item::Func(id)) => !matches!(self.ck.funcs[id.0 as usize].ret, Ty::Fn(_)),
-            _ => false,
+    /// The type `expr` writes, as the argument of a type parameter. The
+    /// error type after reporting that it's a value.
+    fn type_arg(&mut self, expr: &parse::Expr) -> Ty {
+        if self.is_type_expr(expr) {
+            return self.expr_type(expr);
         }
+        if self.expr(expr, None).0 != Ty::Error {
+            self.error(TypeErrorKind::NotAType, expr.span);
+        }
+        Ty::Error
     }
 
-    /// `callee(args)`, where `callee` is the function `func` names given
-    /// type arguments, as in `id(u8)`.
-    pub(super) fn explicit_call(
-        &mut self,
-        callee: &parse::Expr,
-        func: &parse::Expr,
-        type_args: &[Arg],
-        args: &[Arg],
-        span: Span,
-    ) -> (Ty, Value) {
-        let name = path_text(func);
-        let type_args = self.ck.type_args(type_args);
-        let generic = match self.named(func) {
-            Some(Item::GenericFn(generic)) => Some(generic),
-            _ => {
-                self.error(TypeErrorKind::NotGeneric(name.clone()), callee.span);
-                None
-            }
-        };
-        if let (Some(generic), Some(type_args)) = (generic, type_args) {
-            let arity = Arity::Exactly(self.ck.generic_fns[generic.0 as usize].params.len());
-            match arity.check(&name, Some(type_args.len())) {
-                Some(kind) => self.error(kind, callee.span),
-                None => return self.generic_fn_call(generic, Some(type_args), args, span),
-            }
-        }
-        for arg in args {
-            self.expr(&arg.value, None);
-        }
-        (Ty::Error, Value::default())
-    }
-
-    /// Infers the type arguments of a call of generic function `generic`
-    /// from the `args` that `binding` matches with its parameters. Arguments
-    /// that aren't literals or `.name`s go first, so that those take the
-    /// types they settle, and those naming generic functions are left for
-    /// last. Those it checks are kept in `checked`. Type parameters that no
-    /// argument settles are reported at `span`, and given the error type.
-    fn infer_type_args(
+    /// The type arguments of a call of generic function `generic`, from the
+    /// `args` that `binding` matches with its parameters: the types given
+    /// to its parameters of type `type`, and those inferred from the other
+    /// arguments. Of those, the ones that aren't literals or `.name`s go
+    /// first, so that those take the types they settle, and those naming
+    /// generic functions are left for last. The arguments it checks are
+    /// kept in `checked`. Type parameters that no argument settles are
+    /// reported at `span`, and given the error type.
+    fn type_args_of(
         &mut self,
         generic: GenericFnId,
         args: &[Arg],
@@ -559,7 +599,24 @@ impl Body<'_> {
     ) -> Vec<Ty> {
         let def = &self.ck.generic_fns[generic.0 as usize];
         let patterns: Vec<_> = def.sig.params.iter().map(|(_, ty)| *ty).collect();
+        let given = def.given.clone();
         let mut bound = vec![None; def.params.len()];
+        for (k, (arg, param)) in args.iter().zip(binding).enumerate() {
+            let Some(index) = param.and_then(|i| given[i]) else {
+                continue;
+            };
+            let ty = self.type_arg(&arg.value);
+            bound[index] = Some(ty);
+            let found = match ty {
+                Ty::Error => Ty::Error,
+                _ => Ty::Type,
+            };
+            checked[k] = Some((found, Value::default()));
+        }
+        // One left without an argument is already reported.
+        for index in given.iter().flatten() {
+            bound[*index].get_or_insert(Ty::Error);
+        }
         for literals in [false, true] {
             for (k, (arg, param)) in args.iter().zip(binding).enumerate() {
                 let Some(i) = *param else {
@@ -567,8 +624,8 @@ impl Body<'_> {
                 };
                 // A generic function's instance is picked by its parameter's
                 // type, so it settles nothing.
-                let generic = matches!(self.named(&arg.value), Some(Item::GenericFn(_)));
-                if generic
+                let named = matches!(self.named(&arg.value), Some(Item::GenericFn(_)));
+                if named
                     || is_typed_by_other(&arg.value) != literals
                     || !self.ck.has_unbound(patterns[i], &bound)
                 {
@@ -576,12 +633,22 @@ impl Body<'_> {
                 }
                 let (ty, value) = self.expr(&arg.value, None);
                 self.ck.unify(patterns[i], ty, &mut bound);
+                // A bound settles a type parameter before a later argument
+                // would, which is then checked against it.
+                self.ck.settle_by_bounds(generic, &mut bound);
                 checked[k] = Some((ty, value));
             }
         }
+        // A default with a type of its own settles what no argument did.
+        let default_tys = self.ck.generic_fns[generic.0 as usize].default_tys.clone();
+        for (i, own) in default_tys.into_iter().enumerate() {
+            if let Some(own) = own.filter(|_| !binding.contains(&Some(i))) {
+                self.ck.unify(patterns[i], own, &mut bound);
+            }
+        }
+        self.ck.settle_by_bounds(generic, &mut bound);
         // Missing arguments, and signatures and defaults that failed to
-        // resolve, are already reported. A default that didn't fail settles
-        // nothing.
+        // resolve, are already reported. Any other default settles nothing.
         let sig = &self.ck.generic_fns[generic.0 as usize].sig;
         if sig.params.iter().any(|(_, ty)| *ty == Ty::Error) || sig.ret == Ty::Error {
             bound.fill(Some(Ty::Error));
@@ -602,13 +669,6 @@ impl Body<'_> {
             .filter(|(_, ty)| ty.is_none())
             .map(|(param, _)| self.ck.param_name(*param))
             .collect();
-        // A type parameter in an argument's type may be given a type that
-        // settles them.
-        let mut tys = checked.iter().flatten().map(|(ty, _)| *ty);
-        if self.ck.open && !unbound.is_empty() && tys.any(|ty| self.ck.has_param(ty)) {
-            self.ck.deferred = true;
-            return vec![Ty::Error; bound.len()];
-        }
         for param in unbound {
             let func = func.clone();
             self.error(TypeErrorKind::CannotInfer { func, param }, span);
@@ -627,7 +687,7 @@ mod tests {
     use crate::lex::tokenize;
 
     #[test]
-    fn errors_that_a_declarations_needs_miss_are_internal() {
+    fn errors_that_checking_a_declaration_misses_are_internal() {
         let src = "\
 fn(T) add(a: T, b: T) -> T:
     return a + b
@@ -638,10 +698,8 @@ fn f():
         let tokens = tokenize(entry, src).unwrap();
         let program = Program::single(entry, parse::parse(&tokens).unwrap());
         let mut ck = Checker::define(&program, &Settings::default(), None);
-        ck.check_generic_fns(&program);
+        // As if checking `add` as declared had found nothing wrong with it.
         assert!(ck.errors.is_empty());
-        // As if checking `add` as declared had found nothing it needs.
-        ck.generic_fns[0].needs = Rc::default();
         ck.lower_funcs(&program);
         ck.lower_synths(&program);
         let [error] = &ck.errors[..] else {

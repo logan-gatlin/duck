@@ -100,7 +100,9 @@ impl Body<'_> {
     /// A pointer to function `id`.
     pub(super) fn func_value(&mut self, id: FuncId) -> (Ty, Value) {
         let sig = &self.ck.funcs[id.0 as usize];
-        let params: Vec<_> = sig.params.iter().map(|(_, ty)| *ty).collect();
+        // A type parameter of an instance is no parameter of its pointer.
+        let params = sig.params.iter().map(|(_, ty)| *ty);
+        let params: Vec<_> = params.filter(|ty| *ty != Ty::Type).collect();
         let ret = sig.ret;
         // A signature that failed to resolve is already reported.
         if params.contains(&Ty::Error) || ret == Ty::Error {
@@ -124,10 +126,7 @@ impl Body<'_> {
     ) -> (Ty, Value) {
         let (ty, callee_value) = self.expr(callee, None);
         let Ty::Fn(id) = ty else {
-            // A function pointer, for some type arguments.
-            if let Ty::Param(_) = ty {
-                self.ck.deferred = true;
-            } else if ty != Ty::Error {
+            if ty != Ty::Error {
                 self.error(TypeErrorKind::NotCallable(path_text(callee)), callee.span);
             }
             for arg in args {

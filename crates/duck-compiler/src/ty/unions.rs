@@ -119,6 +119,7 @@ impl Checker {
                 is_pub: true,
                 bare: holds.is_none(),
                 default: None,
+                default_ty: None,
                 span,
             };
             self.builtin_unions
@@ -172,6 +173,7 @@ impl Checker {
                 is_pub: true,
                 bare: variant.ty.is_none(),
                 default: None,
+                default_ty: None,
                 span: variant.span,
             });
         }

@@ -6,7 +6,7 @@
 use std::mem;
 
 use crate::lex::Span;
-use crate::parse::{self, Arg, ExprKind, Ident, TypeKind};
+use crate::parse::{self, Arg, ExprKind, Ident, TypeKind, TypeParam};
 
 use super::{
     ARRAY, Body, Checker, Item, OPTION, ParamId, RESULT, StructDef, StructId, TUPLE, Ty,
@@ -31,6 +31,9 @@ pub(super) struct ParamDef {
     pub(super) name: String,
     /// Position in its declaration's type parameters.
     pub(super) index: usize,
+    /// The struct whose fields its type arguments start with, once it is
+    /// resolved, if the type parameter is bounded.
+    pub(super) bound: Option<Ty>,
 }
 
 /// A type argument of a generic declaration's field that holds one of the
@@ -107,6 +110,7 @@ impl Checker {
                 self.params.push(ParamDef {
                     name: param.name.clone(),
                     index,
+                    bound: None,
                 });
                 Ty::Param(ParamId(self.params.len() as u32 - 1))
             })
@@ -142,6 +146,130 @@ impl Checker {
                 self.type_params.push((param.name.clone(), tys[i]));
             }
         }
+    }
+
+    /// Resolves the bound of each of a declaration's type parameters
+    /// `params` that has one, whose types are `tys`. A bound is a struct,
+    /// and of `params` it names only those before its own, so that no
+    /// bound leads back to itself. Any other is reported and bounds
+    /// nothing.
+    pub(super) fn resolve_bounds(&mut self, params: &[TypeParam], tys: &[Ty]) {
+        for (i, (param, ty)) in params.iter().zip(tys).enumerate() {
+            let (Some(written), Ty::Param(id)) = (&param.bound, *ty) else {
+                continue;
+            };
+            let bound = self.resolve_ty(written);
+            let is_struct = matches!(bound, Ty::Struct(_)) && self.union_id(bound).is_none();
+            if bound != Ty::Error && !is_struct {
+                self.error(TypeErrorKind::NotABound(self.ty_name(bound)), written.span);
+                continue;
+            }
+            let later = &tys[i..params.len()];
+            if let Some(later) = later.iter().find(|later| self.holds(bound, **later)) {
+                let (bound, param) = (self.ty_name(bound), self.param_name(*later));
+                let kind = TypeErrorKind::BoundNamesLater { bound, param };
+                self.error(kind, written.span);
+                continue;
+            }
+            self.params[id.0 as usize].bound = Some(bound);
+        }
+    }
+
+    /// What is known of `ty` where it is declared: the bound of a bounded
+    /// type parameter, which its type arguments start with the fields of.
+    /// Any other type is itself.
+    pub(super) fn known(&self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Param(id) => self.params[id.0 as usize].bound.unwrap_or(ty),
+            _ => ty,
+        }
+    }
+
+    /// Whether `ty` starts as the struct `bound` does, so that a field of
+    /// `bound` is where it would be in a `ty`, in memory and among its
+    /// leaves. It does if it is a struct with as many fields or more, of
+    /// which those that `bound` has are named and typed as its are, in
+    /// order. A type parameter starts as its own bound does.
+    fn starts_with(&self, ty: Ty, bound: Ty) -> bool {
+        let ty = self.known(ty);
+        if ty == bound || ty == Ty::Error || bound == Ty::Error {
+            return true;
+        }
+        let (Ty::Struct(have), Ty::Struct(want)) = (ty, bound) else {
+            return false;
+        };
+        let (have, want) = (
+            &self.structs[have.0 as usize],
+            &self.structs[want.0 as usize],
+        );
+        if have.union {
+            return false;
+        }
+        let mut fields = have.fields.iter().zip(&want.fields);
+        have.fields.len() >= want.fields.len()
+            && fields.all(|(have, want)| {
+                let failed = have.ty == Ty::Error || want.ty == Ty::Error;
+                have.name == want.name && (have.ty == want.ty || failed)
+            })
+    }
+
+    /// The type that a field named `field` is looked up in, as a field of a
+    /// `ty`: the bound of a bounded type parameter, and otherwise `ty`
+    /// itself. An instance of a generic function looks it up in the bound
+    /// too, as its declaration did, with its type arguments in place of the
+    /// type parameters the bound names: its type argument starts as the
+    /// bound does, so the field is where the bound has it, and what sees
+    /// the field in the bound reads it whether or not the type argument's
+    /// own is `pub`.
+    pub(super) fn read_as(&mut self, ty: Ty, field: &Ident) -> Ty {
+        let key = (field.span.file, field.span.start);
+        let bound = self.known(ty);
+        if bound != ty {
+            self.bound_fields.insert(key, bound);
+            return bound;
+        }
+        match self.bound_fields.get(&key) {
+            Some(bound) if !self.instance_chain.is_empty() => {
+                let args: Vec<_> = self.type_params.iter().map(|(_, arg)| *arg).collect();
+                self.substitute(*bound, &args, field.span)
+            }
+            _ => ty,
+        }
+    }
+
+    /// Reports, at `site`, each of the type arguments `args` that doesn't
+    /// start as the bound of its type parameter does, one of `params`, once
+    /// the bound has `args` in place of the type parameters it names.
+    /// Whether none was.
+    pub(super) fn check_bounds(&mut self, params: &[Ty], args: &[Ty], site: Span) -> bool {
+        let mut met = true;
+        for (param, arg) in params.iter().zip(args) {
+            let Ty::Param(id) = *param else {
+                continue;
+            };
+            let Some(bound) = self.params[id.0 as usize].bound else {
+                continue;
+            };
+            let bound = self.substitute(bound, args, site);
+            if !self.starts_with(*arg, bound) {
+                let (ty, bound) = (self.ty_name(*arg), self.ty_name(bound));
+                self.error(TypeErrorKind::BoundNotMet { ty, bound }, site);
+                met = false;
+            }
+        }
+        met
+    }
+
+    /// Checks the type arguments of struct `id`, if it's an instance,
+    /// against the bounds of its declaration's type parameters, which is
+    /// done once every struct has its fields.
+    pub(super) fn check_instance_bounds(&mut self, id: StructId) {
+        let Some(instance) = &self.structs[id.0 as usize].instance else {
+            return;
+        };
+        let (args, site) = (instance.args.clone(), instance.site);
+        let params = self.structs[instance.generic.0 as usize].params.clone();
+        self.check_bounds(&params, &args, site);
     }
 
     /// Whether struct `id` is a generic declaration, or an instance whose type
@@ -317,13 +445,6 @@ impl Checker {
         types.into_iter().collect()
     }
 
-    /// Resolves `args`, written as expressions, as a list of type
-    /// arguments. `None` after reporting an error.
-    pub(super) fn type_args(&mut self, args: &[Arg]) -> Option<Vec<Ty>> {
-        let types = self.type_args_syntax(args)?;
-        Some(types.iter().map(|ty| self.resolve_ty(ty)).collect())
-    }
-
     /// Which lists of type arguments the type `name` takes. `None` for names
     /// that aren't types.
     pub(super) fn type_arity(&self, name: &str) -> Option<Arity> {
@@ -368,7 +489,6 @@ impl Checker {
         if args.contains(&Ty::Error) {
             return Ty::Error;
         }
-        self.deferred |= self.open && args.iter().any(|arg| self.has_param(*arg));
         let id = match self.instances.get(&(generic, args.clone())) {
             Some(id) => *id,
             None => {
@@ -400,6 +520,7 @@ impl Checker {
                 self.fill_instance(id);
                 if self.structs_defined {
                     self.check_instances(id.0 as usize);
+                    self.check_instance_bounds(id);
                 }
                 // Measured as soon as it has its fields, so that instances
                 // which hold ever more of each other stop at the limit.
@@ -551,6 +672,11 @@ impl Body<'_> {
                 && !args.is_empty()
                 && args.iter().all(|arg| arg.label.is_none())
     }
+}
+
+/// The names of the type parameters `params`.
+pub(super) fn param_names(params: &[TypeParam]) -> Vec<Ident> {
+    params.iter().map(|param| param.name.clone()).collect()
 }
 
 /// Whether type parameters flow from declaration `from` to `to` along

@@ -321,6 +321,55 @@ pub fn add(a: i32, b: i32,) -> i32:
           (identifier))))))
 
 ====================
+Bounded type parameters
+====================
+
+struct(T: Head, U) Pair:
+    pass
+
+fn(T: mod.Head) id(T: type, x: &T) -> i32:
+    return x.id
+
+---
+
+(source_file
+  (struct_declaration
+    (type_parameters
+      (bounded_type_parameter
+        (identifier)
+        (named_type
+          (identifier)))
+      (identifier))
+    (identifier)
+    (pass_statement))
+  (function_declaration
+    (type_parameters
+      (bounded_type_parameter
+        (identifier)
+        (qualified_type
+          (identifier)
+          (named_type
+            (identifier)))))
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier)))
+      (parameter
+        (identifier)
+        (pointer_type
+          (named_type
+            (identifier)))))
+    (named_type
+      (identifier))
+    (block
+      (return_statement
+        (field_expression
+          (identifier)
+          (identifier))))))
+
+====================
 Generic function
 ====================
 

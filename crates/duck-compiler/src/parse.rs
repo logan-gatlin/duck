@@ -56,10 +56,22 @@ pub struct FnDecl {
 /// type parameters are optional.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnSig {
-    pub type_params: Vec<Ident>,
+    /// The type parameters that a call infers from its arguments.
+    pub type_params: Vec<TypeParam>,
     pub name: Ident,
+    /// A parameter of type `type` is a type parameter that a call gives a
+    /// type.
     pub params: Vec<Param>,
     pub ret: Option<Type>,
+}
+
+/// A type parameter in the `(A, B: Bound)` after `struct`, `union` or `fn`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: Ident,
+    /// The struct whose fields its type arguments start with, if it's
+    /// bounded.
+    pub bound: Option<Type>,
 }
 
 /// `extern "module":` and the host functions it imports. The module name is
@@ -94,8 +106,8 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     pub name: Ident,
-    /// The names of `struct(A, B) Name`'s type parameters, if it has any.
-    pub params: Vec<Ident>,
+    /// `struct(A, B) Name`'s type parameters, if it has any.
+    pub params: Vec<TypeParam>,
     pub fields: Vec<Field>,
 }
 
@@ -131,8 +143,8 @@ pub struct Member {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnionDecl {
     pub name: Ident,
-    /// The names of `union(A, B) Name`'s type parameters, if it has any.
-    pub params: Vec<Ident>,
+    /// `union(A, B) Name`'s type parameters, if it has any.
+    pub params: Vec<TypeParam>,
     pub variants: Vec<Variant>,
 }
 
@@ -415,6 +427,32 @@ enum Parens<T> {
 const NOT_PREC: u8 = 3;
 const CMP_PREC: u8 = 4;
 
+impl FnSig {
+    /// Whether it has a type parameter: one a call infers, or a parameter of
+    /// type `type`.
+    pub fn is_generic(&self) -> bool {
+        !self.type_params.is_empty() || self.params.iter().any(|param| param.ty.is_type())
+    }
+
+    /// The names of its type parameters: those a call infers, then its
+    /// parameters of type `type`.
+    pub fn type_param_names(&self) -> Vec<Ident> {
+        let inferred = self.type_params.iter().map(|param| &param.name);
+        let given = self.params.iter().filter(|param| param.ty.is_type());
+        inferred
+            .chain(given.map(|param| &param.name))
+            .cloned()
+            .collect()
+    }
+}
+
+impl Type {
+    /// Whether it is `type`, which makes a parameter a type parameter.
+    pub fn is_type(&self) -> bool {
+        matches!(&self.kind, TypeKind::Named(name, None) if name == "type")
+    }
+}
+
 impl fmt::Display for ParseErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -610,10 +648,13 @@ impl<'a> Parser<'a> {
         let sig = self.fn_sig()?;
         if let (Some(first), Some(last)) = (sig.type_params.first(), sig.type_params.last()) {
             let span = Span {
-                end: last.span.end,
-                ..first.span
+                end: last.name.span.end,
+                ..first.name.span
             };
             self.error(ParseErrorKind::GenericExtern, span);
+        }
+        for param in sig.params.iter().filter(|param| param.ty.is_type()) {
+            self.error(ParseErrorKind::GenericExtern, param.span);
         }
         let import_name = if self.eat(TokenKind::Eq) {
             Some(self.string()?)
@@ -653,16 +694,23 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// The `(A, B)` after `struct`, `union` or `fn` that makes a declaration
-    /// generic, if there is one.
-    fn type_params(&mut self) -> PResult<Vec<Ident>> {
+    /// The `(A, B: Bound)` after `struct`, `union` or `fn` that makes a
+    /// declaration generic, if there is one.
+    fn type_params(&mut self) -> PResult<Vec<TypeParam>> {
         if !self.eat(TokenKind::LParen) {
             return Ok(Vec::new());
         }
         if self.at(TokenKind::RParen) {
             return Err(self.unexpected("type parameter"));
         }
-        self.comma_list(TokenKind::RParen, Self::ident)
+        self.comma_list(TokenKind::RParen, |p| {
+            let name = p.ident()?;
+            let bound = match p.eat(TokenKind::Colon) {
+                true => Some(p.ty()?),
+                false => None,
+            };
+            Ok(TypeParam { name, bound })
+        })
     }
 
     fn enum_decl(&mut self) -> PResult<EnumDecl> {
@@ -2475,7 +2523,7 @@ fn f():
         let ItemKind::Struct(pair) = &module.items[0].kind else {
             panic!()
         };
-        let params: Vec<_> = pair.params.iter().map(|p| p.name.as_str()).collect();
+        let params: Vec<_> = pair.params.iter().map(|p| p.name.name.as_str()).collect();
         assert_eq!(params, vec!["A", "B"]);
         let ItemKind::Struct(p) = &module.items[1].kind else {
             panic!()
@@ -2485,6 +2533,32 @@ fn f():
         assert_eq!(
             errors("struct() Box:\n    pass\n"),
             vec![expected("type parameter", TokenKind::RParen)]
+        );
+
+        let module = parse_src(
+            "struct(A: mod.Head(u8), B) Pair:\n    pass\nfn(T: Head) f(T: type, x: &T):\n    pass\n",
+        )
+        .unwrap();
+        let ItemKind::Struct(pair) = &module.items[0].kind else {
+            panic!()
+        };
+        let bounds = pair.params.iter().map(|p| p.bound.as_ref().map(render_ty));
+        let bounds: Vec<_> = bounds.collect();
+        assert_eq!(bounds, vec![Some("mod.Head(u8)".to_string()), None]);
+        let ItemKind::Fn(f) = &module.items[1].kind else {
+            panic!()
+        };
+        assert!(f.sig.is_generic());
+        let names: Vec<_> = f
+            .sig
+            .type_param_names()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["T", "T"]);
+        assert_eq!(
+            f.sig.type_params[0].bound.as_ref().map(render_ty),
+            Some("Head".to_string())
         );
     }
 
@@ -2501,7 +2575,7 @@ fn f():
             .sig
             .type_params
             .iter()
-            .map(|p| p.name.as_str())
+            .map(|p| p.name.name.as_str())
             .collect();
         assert_eq!(params, vec!["T", "U"]);
         assert_eq!(pair.sig.name.name, "pair");
@@ -2517,6 +2591,10 @@ fn f():
         );
         assert_eq!(
             errors("extern:\n    fn(T) f(x: T)\n"),
+            vec![ParseErrorKind::GenericExtern]
+        );
+        assert_eq!(
+            errors("extern:\n    fn f(T: type, x: &type)\n"),
             vec![ParseErrorKind::GenericExtern]
         );
     }
@@ -2610,7 +2688,11 @@ union(T, E,) Result:
             &src[rect.span.start..rect.span.end],
             "rect: tuple(f32, f32)"
         );
-        let params: Vec<_> = decls[1].params.iter().map(|p| p.name.as_str()).collect();
+        let params: Vec<_> = decls[1]
+            .params
+            .iter()
+            .map(|p| p.name.name.as_str())
+            .collect();
         assert_eq!(params, vec!["T", "E"]);
         assert_eq!(
             variants(decls[1]),

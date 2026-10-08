@@ -28,6 +28,7 @@
 
 (named_type name: (identifier) @type)
 (type_parameters (identifier) @type)
+(bounded_type_parameter name: (identifier) @type)
 (struct_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
 (union_declaration name: (identifier) @type)

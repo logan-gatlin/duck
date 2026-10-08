@@ -10,8 +10,8 @@ use crate::load::Program;
 use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, PatternKind, StmtKind};
 
 use super::{
-    ARRAY, Body, Checker, Label, Need, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary,
-    scalar, single, unions::narrow,
+    ARRAY, Body, Checker, Label, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary, scalar,
+    single, unions::narrow,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -216,18 +216,8 @@ impl Body<'_> {
     /// value matches, with the names the pattern binds. The value is
     /// evaluated once, and traps if no arm matches it, as only one that was
     /// never built here can.
-    pub(super) fn match_stmt(
-        &mut self,
-        stmt: &parse::Stmt,
-        value: &parse::Expr,
-        arms: &[Arm],
-        out: &mut Vec<Stmt>,
-    ) {
-        let (ty, mut subject) = match self.need(stmt) {
-            Need::Check => self.expr(value, None),
-            Need::Bind(ty) => self.unchecked(ty, stmt.span),
-            Need::Skip => (Ty::Error, Value::default()),
-        };
+    pub(super) fn match_stmt(&mut self, value: &parse::Expr, arms: &[Arm], out: &mut Vec<Stmt>) {
+        let (ty, mut subject) = self.expr(value, None);
         // Held in temporaries that the arms test and their names read, so
         // nothing an arm does changes what its names are.
         self.spill(&mut subject, |_| false);
@@ -257,7 +247,6 @@ impl Body<'_> {
             )]);
             cases.push(case);
         }
-        self.record(stmt, Some(ty));
         if matched != Ty::Error && cases.iter().all(|case| !case.failed) {
             self.check_arms(arms, &rows, matched, value.span);
         }
