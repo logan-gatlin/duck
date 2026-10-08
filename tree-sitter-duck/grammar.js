@@ -95,7 +95,15 @@ module.exports = grammar({
       optional(seq('->', field('return_type', $._type))),
     ),
 
-    type_parameters: $ => seq('(', commaSep1($.identifier), ')'),
+    type_parameters: $ => seq('(', commaSep1($._type_parameter), ')'),
+
+    _type_parameter: $ => choice($.identifier, $.bounded_type_parameter),
+
+    bounded_type_parameter: $ => seq(
+      field('name', $.identifier),
+      ':',
+      field('bound', $._type),
+    ),
 
     parameters: $ => seq('(', commaSep($.parameter), ')'),
 

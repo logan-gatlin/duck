@@ -74,8 +74,9 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   `varray(T)` has a `ptr: &var T`, so its elements are assignable. Strings
   are `array(u8)` of UTF-8.
 - `fn(A, B) -> R`: a function pointer. `fn(A)` returns nothing.
-- `type`: a type as a value, with `size: uint` and `align: uint`, as in
-  `Point.size`, `(&Point).size` and `i64.align`.
+- A type has a `size: uint` and an `align: uint`, as in `Point.size`,
+  `(&Point).size` and `i64.align`. It is no value: `type` is only the type of
+  a function's parameter, which makes it a type parameter.
 - `externref`: an opaque host reference. It is never stored in memory or
   compared.
 - `Name`, `Name(T)`, `mod.Name`: structs, unions and enums, passed by value
@@ -123,7 +124,7 @@ fn area(s: Shape) -> result(f32, Fault):  # built in, as `option(T)` is
   expected there: by a `return`, an annotated binding, an assignment, an
   argument, the value of a field or variant, or the other side of an
   operator. `let x = .empty` is an error. So is `.name` where a type
-  parameter `T` is expected: write `T.name`.
+  parameter `T` is expected, as a `T` has no variants or members.
 - `==` and `!=` compare which variant each holds and then its value. Only
   `match` reads that value: a union has no fields.
 - A union has 1 to 256 variants, which are as `pub` as it is. A variant
@@ -253,8 +254,9 @@ prefix `- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
 - `as` converts number to number (float to integer saturates, NaN gives 0),
   `bool` to integer, pointer to pointer (how a `&T` becomes a `&var T`),
   `array(T)` to `varray(T)` and back, `int` or `uint` to and from pointers
-  and function pointers, function pointer to function pointer, and an enum to
-  its value type. No other integer converts to or from a pointer: go through
+  and function pointers, function pointer to function pointer, an enum to
+  its value type, and a union or an enum to a wider one, which starts as it
+  does. No other integer converts to or from a pointer: go through
   `uint`, as in `p as uint as u32`. Nothing converts to `bool`: write
   `x != 0`.
 
@@ -267,13 +269,13 @@ struct Node:
 
 var heap: uint = 65536
 
-fn alloc(t: type) -> &var u8:          # bump from an address you pick
-	heap = (heap + t.align - 1) / t.align * t.align
-	heap += t.size
-	return (heap - t.size) as &var u8
+fn alloc(T: type) -> &var T:           # bump from an address you pick
+	heap = (heap + T.align - 1) / T.align * T.align
+	heap += T.size
+	return (heap - T.size) as &var T
 
 fn push(head: &Node, v: i32) -> &Node:
-	let n = alloc(Node) as &var Node
+	let n = alloc(Node)                # a `&var Node`
 	n.* = Node(val: v, next: head)     # `p.*` is the whole pointee
 	n.val += 1                         # fields auto-dereference
 	let r: &var i32 = &var n.val       # `&place` gives a `&T`
@@ -321,31 +323,130 @@ pointers.
 struct(T) Box:
 	value: T
 
-fn(T) larger(a: T, b: T) -> T:     # no bounds: each call's types must suit the body
-	if a > b:
-		return a
+struct Head:                         # used as a bound below
+	id: i32
+
+struct Named:                        # starts with the field of `Head`
+	id: i32
+	name: array(u8)
+
+let nobody = &Named(id: 0, name: "")
+
+var heap: uint = 65536
+
+fn new(T: type) -> &var T:           # a call gives `T` a type: new(Named)
+	heap += T.size
+	return (heap - T.size) as &var T
+
+fn(T) boxed(value: T) -> &var Box(T):  # a call infers `T` from `value`
+	let b = new(Box(T))
+	b.value = value
 	return b
 
-fn(T) zero() -> T:
-	return 0 as T
+fn(T: Head) id(x: &T = nobody) -> i32:   # `T` is a struct that starts as `Head` does
+	return x.id
 
-fn demo() -> u8:
-	let b = Box(u8)(value: 1)      # generic structs always take type arguments
-	let z = zero(u8)()             # f(Types)(args) when arguments can't infer them
-	return larger(z, b.value)
+fn(T, B: Box(T)) unbox(b: &B) -> T:  # a bound names the type parameters before it
+	return b.value
+
+fn demo(n: &Named) -> i32:
+	let b = boxed(n.id)              # `T` is `i32`
+	let c = Box(u8)(value: 1)        # generic structs always take type arguments
+	let v = unbox(b)                 # `B` is `Box(i32)`, so `T` is `i32`
+	return id(n) + id() + v          # `id()` is of the default, so `T` is `Named`
 ```
 
-- A generic body is checked as declared, where `T` is only itself. What no
-  type could make right is an error there, like a `T` returned as a `Box(T)`.
-  What some types make right, like `a > b`, is checked for each call's type
-  arguments, and an error is reported at the call.
-- In a generic body `T` is also a value (`T.size`), a constructor (`T(x: 1)`)
-  and an enum (`T.ok`). `T.size` and `T.align` are always those of the type.
-- A default never names `T`, and a field or parameter holding a `T` by value
-  has none. A `&var T` or a `varray(T)` may: `items: varray(T) = []`. An
-  argument left to its default infers nothing: `f(u8)()` if no other does.
+- A type parameter is a type of which only the size and alignment are known.
+  A `T` is bound, passed and returned, read and written through a `&var T`,
+  and held by other types: `&T`, `array(T)`, `Box(T)`. A pointer to one is
+  cast as any pointer is. `T.size` and `T.align` are those of the type.
+- A `T` has no operators, literals, fields, constructor or members: `a > b`,
+  `a == b`, `0 as T`, `T(x: 1)` and `T.ok` are errors where they are written,
+  whatever the function is called with. So a generic body is checked once,
+  as declared, and is right for every type argument.
+- `fn(T) f(x: T)`: each call infers `T` from its arguments, so `T` is in the
+  type of a parameter, or in the bound of a type parameter that is.
+- `fn f(T: type)`: each call gives `T` a type as that argument, `f(u8)` or
+  `f(T: u8)`. `T` is a type throughout the signature and the body. It has no
+  default, and is nothing at run time. A function may have both kinds.
+- `fn(T: Head)`, `struct(T: Head)`: `T` is bounded by the struct `Head`, so a
+  type argument is a struct that starts as `Head` does: it has as many fields
+  or more, and those `Head` has are named and typed as its are, in order.
+  `Head` itself is one. A struct that holds a `Head` as its first field is
+  not.
+- A bound may name the type parameters before its own in
+  the list, and any that are parameters: `fn(T, B: Box(T))`. A type argument
+  for `B` then starts as a `Box(T)` does, and a call that settles `B` takes
+  `T` from it: with a `B` whose first field is `value: f64`, `T` is `f64`.
+- In the body a `T` has the fields of `Head`, read and written as a struct's
+  are, and is otherwise as any `T` is.
+- `pub` plays no part in a bound. The body sees the fields that it sees in
+  `Head`, and reads them of a type argument whose own are private.
+- Only a type parameter is bounded. A function that takes a `Head` doesn't
+  take a `Named`, and a `&Named` is not a `&Head`: cast it, `n as &Head`.
+- A type argument is storable: nothing is generic over `externref`.
+- A default, of a parameter or a field, is one value for every call and
+  constructor, so it never names `T`, and is no value laid out by one:
+  `none: option(T) = .none` is an error. It may fit the type as declared,
+  like `p: &T = 0` and `items: varray(T) = []`, and then it infers nothing.
+  Or it has a type of its own that the declared type stands for, like the
+  `&Named` of `nobody` for a `&T`, which meets the bound of `T`.
+- A call that leaves such an argument out takes `T` from the default's type,
+  where no argument gives `T` another. A call or constructor that gives `T`
+  another type has no default there: `Slot(u8)()` is an error where
+  `struct(T) Slot` has `value: T = 7`, an `i32`, and `Slot(i32)()` is not.
 - `p: &T` takes a `&var i32` with `T` as `i32`, and `array(T)` a `varray(i32)`.
   Nothing is generic over writability: write both, or cast.
+
+### Wider unions and enums
+
+```duck
+union IoError:
+	closed
+	timeout: u32
+	denied
+
+union ReadError:                     # starts as `IoError` does, and stops sooner
+	closed
+	timeout: u32
+
+enum(u8) Color:
+	red
+	green = 5
+	blue
+
+enum(u8) Warm:                       # the first members of `Color`, as valued
+	red
+	green = 5
+
+fn(E: IoError) code(e: E) -> i32:    # `E` is a union that `IoError` is wider than
+	match e:                         # as an `IoError`
+		.closed:
+			return 1
+		.timeout(ms):
+			return ms as i32
+		.denied:
+			return 3
+
+fn demo(r: ReadError, w: Warm) -> i32:
+	let io = r as IoError            # the same variant, of the wider union
+	let c = w as Color
+	return code(r) + code(io) + c as u8 as i32
+```
+
+- A union is wider than one whose variants are its own first ones: named the
+  same, holding the same types or nothing, in order. An enum is wider than
+  one over the same type whose members are its own first ones, with the same
+  values. Each is as wide as itself.
+- `x as Wider` is the same variant or member of the wider type. Nothing
+  converts the other way: `match` the wider one. The two unions aren't laid
+  out alike, so a `&ReadError` is no `&IoError`.
+- A type parameter bounded by a union or an enum takes the types it is wider
+  than, the reverse of a struct, which bounds those with more fields. In the
+  body a `T` is matched as the bound, with an arm for each of the bound's
+  variants or members, and `x as IoError` is the bound's own value. It
+  builds no `T`: `T.closed` and `.closed` for a `T` are errors, as a type
+  argument may have no such variant.
 
 ## Function pointers
 
@@ -368,8 +469,6 @@ fn demo(f: fn(i32) -> i32) -> i32:
   belong to the function's name: `double` with one would still be only a
   `fn(i32) -> i32`.
 - `extern` functions have pointers too. Calling a zeroed pointer traps.
-- With a generic `f`, `f(x)(y)` reads `x` as type arguments, so bind `f(x)`
-  to a name before calling what it returns.
 
 ## Pipes
 
@@ -439,7 +538,7 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   `uint`, pointers and function pointers, which are `i64` with `memory64`: a
   JS host then passes each as a `BigInt`, as in `table.get(1n)`. `i64`,
   `f32`, `f64` and `externref` are themselves, and an enum is its value type.
-  Structs, tuples, arrays and `type` are one wasm value per scalar, in field
+  Structs, tuples and arrays are one wasm value per scalar, in field
   order: `fn f(s: array(u8)) -> Point` is `(i32 ptr, i32 len) -> (f32, f32)`.
 - An exported aggregate global is one wasm global per scalar, named with
   dots: `origin.x`, `name.ptr`, `name.len`.

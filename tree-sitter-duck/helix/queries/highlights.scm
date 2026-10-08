@@ -30,6 +30,7 @@
 
 (named_type name: (identifier) @type)
 (type_parameters (identifier) @type.parameter)
+(bounded_type_parameter name: (identifier) @type.parameter)
 (struct_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
 (union_declaration name: (identifier) @type)

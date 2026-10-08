@@ -15,7 +15,7 @@ use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
     Body, Checker, FieldDef, Item, Leaf, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS,
-    Ty, TypeErrorKind, Value, binary, fold_unary, is_stable,
+    Ty, TypeErrorKind, Value, binary, fold_unary, is_stable, zero,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -119,6 +119,7 @@ impl Checker {
                 is_pub: true,
                 bare: holds.is_none(),
                 default: None,
+                default_ty: None,
                 span,
             };
             self.builtin_unions
@@ -172,6 +173,7 @@ impl Checker {
                 is_pub: true,
                 bare: variant.ty.is_none(),
                 default: None,
+                default_ty: None,
                 span: variant.span,
             });
         }
@@ -249,6 +251,44 @@ impl Checker {
         };
         let leaves = held.iter().map(leaves).collect();
         (shared, leaves)
+    }
+}
+
+impl Checker {
+    /// `value`, of union `from`, as a value of union `to`, which starts as
+    /// `from` does: it holds the same variant. A scalar of a variant is in
+    /// the same leaf of its kind in both, which in `to` may be wider for
+    /// the variants that `from` hasn't, and the leaves that only those use
+    /// are zero.
+    pub(super) fn widen_union(&self, from: StructId, to: StructId, value: Value) -> Value {
+        let is_number = |vt: &&ValType| **vt != ValType::ExternRef;
+        let (from_leaves, to_leaves) = (self.union_leaves(from).0, self.union_leaves(to).0);
+        let from_numbers = from_leaves.iter().filter(is_number).count();
+        let to_numbers = to_leaves.iter().filter(is_number).count();
+        let types = iter::once(ValType::I32).chain(to_leaves);
+        let mut scalars: Vec<_> = types.map(|vt| (vt, Expr::Const(zero(vt)))).collect();
+        // Only a mistyped value has other scalars than the union's.
+        if value.scalars.len() != 1 + from_leaves.len() {
+            return Value {
+                pre: Vec::new(),
+                scalars,
+            };
+        }
+        for (i, (vt, scalar)) in value.scalars.into_iter().enumerate() {
+            // The tag, a number, or an `externref`, which follow the
+            // numbers.
+            let leaf = match i {
+                0 => 0,
+                i if i <= from_numbers => i,
+                i => i - from_numbers + to_numbers,
+            };
+            let (shared, zeroed) = &mut scalars[leaf];
+            *zeroed = widen(vt, *shared, scalar);
+        }
+        Value {
+            pre: value.pre,
+            scalars,
+        }
     }
 }
 

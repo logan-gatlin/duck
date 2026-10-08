@@ -72,13 +72,13 @@ impl Checker {
                     self.push_parts(variant, bits, &held, &when, out);
                 }
             }
-            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Type => {
+            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_) => {
                 for (member, held) in self.member_leaves(ty, leaves) {
                     self.push_parts(member, bits, &held, when, out);
                 }
             }
             Ty::ExternRef => unreachable!("`externref` can't be compared"),
-            Ty::Param(_) | Ty::Unit | Ty::Error => {}
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Error => {}
         }
     }
 
@@ -145,7 +145,7 @@ impl Body<'_> {
         span: Span,
     ) -> (Ty, Value) {
         let bool = Ty::Prim(Prim::Bool);
-        if ty == Ty::Error || !self.ck.stores(ty) {
+        if ty == Ty::Error || !self.ck.storable(ty) {
             return self.invalid_operand(binop_symbol(op), ty, span);
         }
         // Checked up front, as folding skips calls in branches it doesn't

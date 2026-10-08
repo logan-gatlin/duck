@@ -714,7 +714,7 @@ fn f(q: &Point) -> f32:
         let mut files = Memory(vec![
             (
                 "main",
-                "use lib\nfn f() -> i32:\n    let b: lib.Box(lib.Color) = lib.Box(lib.Color)(v: lib.Color.Red)\n    let size = lib.Box(i64).size\n    var n = lib.id(b.v) as i32\n    for c in lib.Color:\n        n += c as i32\n    return n + lib.id(i32)(size as i32)\n",
+                "use lib\nfn f() -> i32:\n    let b: lib.Box(lib.Color) = lib.Box(lib.Color)(v: lib.Color.Red)\n    let size = lib.Box(i64).size\n    var n = lib.id(b.v) as i32\n    for c in lib.Color:\n        n += c as i32\n    return n + lib.id(size as i32)\n",
             ),
             ("lib", lib),
         ]);
@@ -723,11 +723,47 @@ fn f(q: &Point) -> f32:
         let mut files = Memory(vec![
             (
                 "main",
-                "use lib.{Box, Color, id}\nfn f() -> i32:\n    let b: Box(Color) = Box(Color)(v: Color.Red)\n    let size = Box(i64).size\n    var n = id(b.v) as i32\n    for c in Color:\n        n += c as i32\n    return n + id(i32)(size as i32)\n",
+                "use lib.{Box, Color, id}\nfn f() -> i32:\n    let b: Box(Color) = Box(Color)(v: Color.Red)\n    let size = Box(i64).size\n    var n = id(b.v) as i32\n    for c in Color:\n        n += c as i32\n    return n + id(size as i32)\n",
             ),
             ("lib", lib),
         ]);
         lower(&mut files);
+    }
+
+    #[test]
+    fn bounds_match_fields_whether_or_not_they_are_pub() {
+        let lib = "\
+pub struct Head:
+    pub id: i32
+    tag: u8
+pub fn(T: Head) id(x: &T) -> i32:
+    return x.id + x.tag as i32
+";
+        let main = "\
+use lib
+struct Mine:
+    id: i32
+    tag: u8
+    rest: i64
+fn(T: lib.Head) peek(x: &T) -> i32:
+    return x.id
+fn f(m: &Mine) -> i32:
+    return lib.id(m) + peek(m)
+";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        lower(&mut files);
+
+        // What reads a field of the bound must see it in the bound.
+        let main = "\
+use lib
+fn(T: lib.Head) peek(x: &T) -> u8:
+    return x.tag
+";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        assert_eq!(
+            errors(&mut files),
+            ["main \"tag\": field `tag` of `Head` is private"]
+        );
     }
 
     #[test]

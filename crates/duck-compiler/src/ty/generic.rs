@@ -6,10 +6,10 @@
 use std::mem;
 
 use crate::lex::Span;
-use crate::parse::{self, Arg, ExprKind, Ident, TypeKind};
+use crate::parse::{self, Arg, ExprKind, Ident, TypeKind, TypeParam};
 
 use super::{
-    ARRAY, Body, Checker, Item, OPTION, ParamId, RESULT, StructDef, StructId, TUPLE, Ty,
+    ARRAY, Body, Checker, FieldDef, Item, OPTION, ParamId, RESULT, StructDef, StructId, TUPLE, Ty,
     TypeErrorKind, VARRAY, Value, Visit, is_builtin_type, module_path, path_text,
 };
 
@@ -31,6 +31,9 @@ pub(super) struct ParamDef {
     pub(super) name: String,
     /// Position in its declaration's type parameters.
     pub(super) index: usize,
+    /// The struct whose fields its type arguments start with, once it is
+    /// resolved, if the type parameter is bounded.
+    pub(super) bound: Option<Ty>,
 }
 
 /// A type argument of a generic declaration's field that holds one of the
@@ -107,6 +110,7 @@ impl Checker {
                 self.params.push(ParamDef {
                     name: param.name.clone(),
                     index,
+                    bound: None,
                 });
                 Ty::Param(ParamId(self.params.len() as u32 - 1))
             })
@@ -142,6 +146,176 @@ impl Checker {
                 self.type_params.push((param.name.clone(), tys[i]));
             }
         }
+    }
+
+    /// Resolves the bound of each of a declaration's type parameters
+    /// `params` that has one, whose types are `tys`. A bound is a struct, a
+    /// union or an enum, and of `params` it names only those before its
+    /// own, so that no bound leads back to itself. Any other is reported
+    /// and bounds nothing.
+    pub(super) fn resolve_bounds(&mut self, params: &[TypeParam], tys: &[Ty]) {
+        for (i, (param, ty)) in params.iter().zip(tys).enumerate() {
+            let (Some(written), Ty::Param(id)) = (&param.bound, *ty) else {
+                continue;
+            };
+            let bound = self.resolve_ty(written);
+            if !matches!(bound, Ty::Struct(_) | Ty::Enum(_) | Ty::Error) {
+                self.error(TypeErrorKind::NotABound(self.ty_name(bound)), written.span);
+                continue;
+            }
+            let later = &tys[i..params.len()];
+            if let Some(later) = later.iter().find(|later| self.holds(bound, **later)) {
+                let (bound, param) = (self.ty_name(bound), self.param_name(*later));
+                let kind = TypeErrorKind::BoundNamesLater { bound, param };
+                self.error(kind, written.span);
+                continue;
+            }
+            self.params[id.0 as usize].bound = Some(bound);
+        }
+    }
+
+    /// What is known of `ty` where it is declared: the bound of a bounded
+    /// type parameter, which its type arguments are laid out as where the
+    /// body of a generic function is checked as declared. Any other type
+    /// is itself.
+    pub(super) fn known(&self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Param(id) => self.params[id.0 as usize].bound.unwrap_or(ty),
+            _ => ty,
+        }
+    }
+
+    /// Whether a `ty` is a type that `bound` bounds.
+    ///
+    /// A struct is bounded by one that it starts as: it has as many fields
+    /// or more, of which those that `bound` has are named and typed as its
+    /// are, in order. So a field of `bound` is where it would be in a `ty`,
+    /// in memory and among its leaves.
+    ///
+    /// A union is bounded by one that starts as it does, and so is an
+    /// enum: `ty` has as many variants or members or fewer, which are
+    /// named, and hold or are what the first of `bound` do, in order. So
+    /// every value of a `ty` is the same variant or member of `bound`.
+    ///
+    /// A type parameter is bounded by what its own bound is.
+    pub(super) fn meets(&self, ty: Ty, bound: Ty) -> bool {
+        let ty = self.known(ty);
+        if ty == bound || ty == Ty::Error || bound == Ty::Error {
+            return true;
+        }
+        match (ty, bound) {
+            (Ty::Struct(have), Ty::Struct(want)) => {
+                let (have, want) = (
+                    &self.structs[have.0 as usize],
+                    &self.structs[want.0 as usize],
+                );
+                match (have.union, want.union) {
+                    (false, false) => starts_as(&have.fields, &want.fields),
+                    (true, true) => starts_as(&want.fields, &have.fields),
+                    _ => false,
+                }
+            }
+            (Ty::Enum(have), Ty::Enum(want)) => self.enum_starts_as(want, have),
+            _ => false,
+        }
+    }
+
+    /// Whether `ty` is a union or an enum.
+    pub(super) fn is_sum(&self, ty: Ty) -> bool {
+        matches!(ty, Ty::Enum(_)) || self.union_id(ty).is_some()
+    }
+
+    /// Whether whether `ty` is bounded by another type isn't known yet: it
+    /// is an enum whose members' values aren't folded.
+    fn unfolded(&self, ty: Ty) -> bool {
+        matches!(self.known(ty), Ty::Enum(id) if !self.enum_folded(id))
+    }
+
+    /// The type that a field named `field` is looked up in, as a field of a
+    /// `ty`: the bound of a bounded type parameter, and otherwise `ty`
+    /// itself. An instance of a generic function looks it up in the bound
+    /// too, as its declaration did, with its type arguments in place of the
+    /// type parameters the bound names: its type argument starts as the
+    /// bound does, so the field is where the bound has it, and what sees
+    /// the field in the bound reads it whether or not the type argument's
+    /// own is `pub`.
+    pub(super) fn read_as(&mut self, ty: Ty, field: &Ident) -> Ty {
+        let key = (field.span.file, field.span.start);
+        let bound = self.known(ty);
+        if bound != ty {
+            self.bound_uses.insert(key, bound);
+            return bound;
+        }
+        match self.bound_uses.get(&key) {
+            Some(bound) if !self.instance_chain.is_empty() => {
+                let args: Vec<_> = self.type_params.iter().map(|(_, arg)| *arg).collect();
+                self.substitute(*bound, &args, field.span)
+            }
+            _ => ty,
+        }
+    }
+
+    /// Reports, at `site`, each of the type arguments `args` that doesn't
+    /// start as the bound of its type parameter does, one of `params`, once
+    /// the bound has `args` in place of the type parameters it names.
+    /// Whether none was.
+    pub(super) fn check_bounds(&mut self, params: &[Ty], args: &[Ty], site: Span) -> bool {
+        let mut met = true;
+        for (param, arg) in params.iter().zip(args) {
+            let Ty::Param(id) = *param else {
+                continue;
+            };
+            let Some(bound) = self.params[id.0 as usize].bound else {
+                continue;
+            };
+            let bound = self.substitute(bound, args, site);
+            // An enum is compared once its members' values are folded.
+            if self.unfolded(*arg) || self.unfolded(bound) {
+                self.pending_bounds.push((*arg, bound, site));
+            } else if !self.meets(*arg, bound) {
+                self.bound_error(*arg, bound, site);
+                met = false;
+            }
+        }
+        met
+    }
+
+    /// Reports, at `site`, that a `ty` isn't a type that `bound` bounds.
+    fn bound_error(&mut self, ty: Ty, bound: Ty, site: Span) {
+        let what = match bound {
+            Ty::Enum(_) => Some("members"),
+            _ if self.union_id(bound).is_some() => Some("variants"),
+            _ => None,
+        };
+        let (ty, bound) = (self.ty_name(ty), self.ty_name(bound));
+        let kind = match what {
+            Some(what) => TypeErrorKind::NotWithin { ty, bound, what },
+            None => TypeErrorKind::BoundNotMet { ty, bound },
+        };
+        self.error(kind, site);
+    }
+
+    /// Checks the type arguments that were given a type parameter bounded
+    /// by an enum, or were an enum, before every enum's members were
+    /// folded.
+    pub(super) fn check_pending_bounds(&mut self) {
+        for (ty, bound, site) in mem::take(&mut self.pending_bounds) {
+            if !self.meets(ty, bound) {
+                self.bound_error(ty, bound, site);
+            }
+        }
+    }
+
+    /// Checks the type arguments of struct `id`, if it's an instance,
+    /// against the bounds of its declaration's type parameters, which is
+    /// done once every struct has its fields.
+    pub(super) fn check_instance_bounds(&mut self, id: StructId) {
+        let Some(instance) = &self.structs[id.0 as usize].instance else {
+            return;
+        };
+        let (args, site) = (instance.args.clone(), instance.site);
+        let params = self.structs[instance.generic.0 as usize].params.clone();
+        self.check_bounds(&params, &args, site);
     }
 
     /// Whether struct `id` is a generic declaration, or an instance whose type
@@ -317,13 +491,6 @@ impl Checker {
         types.into_iter().collect()
     }
 
-    /// Resolves `args`, written as expressions, as a list of type
-    /// arguments. `None` after reporting an error.
-    pub(super) fn type_args(&mut self, args: &[Arg]) -> Option<Vec<Ty>> {
-        let types = self.type_args_syntax(args)?;
-        Some(types.iter().map(|ty| self.resolve_ty(ty)).collect())
-    }
-
     /// Which lists of type arguments the type `name` takes. `None` for names
     /// that aren't types.
     pub(super) fn type_arity(&self, name: &str) -> Option<Arity> {
@@ -368,7 +535,6 @@ impl Checker {
         if args.contains(&Ty::Error) {
             return Ty::Error;
         }
-        self.deferred |= self.open && args.iter().any(|arg| self.has_param(*arg));
         let id = match self.instances.get(&(generic, args.clone())) {
             Some(id) => *id,
             None => {
@@ -400,6 +566,7 @@ impl Checker {
                 self.fill_instance(id);
                 if self.structs_defined {
                     self.check_instances(id.0 as usize);
+                    self.check_instance_bounds(id);
                 }
                 // Measured as soon as it has its fields, so that instances
                 // which hold ever more of each other stop at the limit.
@@ -551,6 +718,24 @@ impl Body<'_> {
                 && !args.is_empty()
                 && args.iter().all(|arg| arg.label.is_none())
     }
+}
+
+/// Whether `fields` start as `first` do: there are as many or more, and
+/// those that `first` has are named and typed as its are, in order. Of
+/// variants, they also hold a value or none as those of `first` do.
+fn starts_as(fields: &[FieldDef], first: &[FieldDef]) -> bool {
+    let mut pairs = fields.iter().zip(first);
+    fields.len() >= first.len()
+        && pairs.all(|(field, first)| {
+            let failed = field.ty == Ty::Error || first.ty == Ty::Error;
+            let typed = field.ty == first.ty || failed;
+            field.name == first.name && field.bare == first.bare && typed
+        })
+}
+
+/// The names of the type parameters `params`.
+pub(super) fn param_names(params: &[TypeParam]) -> Vec<Ident> {
+    params.iter().map(|param| param.name.clone()).collect()
 }
 
 /// Whether type parameters flow from declaration `from` to `to` along

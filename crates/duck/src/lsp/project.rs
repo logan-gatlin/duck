@@ -402,24 +402,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn errors_in_type_arguments_note_the_instances_that_need_them() {
+    fn errors_in_instances_note_the_instances_that_led_to_them() {
         let dir = TempDir::new("instances");
         dir.write(&[
             ("app/Duck.toml", MODULE),
             (
                 "app/main.duck",
-                "fn(T) neg(x: T) -> T:\n    return -x\nfn f() -> bool:\n    return neg(true)\n",
+                "fn(T) nest(x: T):\n    nest((x, x))\nfn f():\n    nest(true)\n",
             ),
         ]);
+        // Each instance of `nest` needs another, without end.
         let problems = check(&dir, &[]);
-        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.len() > 2, "{problems:?}");
         assert!(
-            problems[0].starts_with("app/main.duck:3:11-3:20: "),
+            problems[0].starts_with("app/main.duck:3:4-3:14: "),
             "{problems:?}"
         );
         assert_eq!(
             problems[1],
-            "app/main.duck:1:11-1:13: required by `neg(bool)` here"
+            "app/main.duck:1:4-1:16: required by `nest(bool)` here"
         );
     }
 

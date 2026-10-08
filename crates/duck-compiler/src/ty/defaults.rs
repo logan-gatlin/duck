@@ -10,7 +10,7 @@ use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, Arg, ExprKind, FnSig, Ident, StructDecl, TypeKind};
 
-use super::{Body, Checker, StructId, Ty, TypeErrorKind, Value, fn_sigs};
+use super::{Body, Checker, StructId, Ty, TypeErrorKind, Value, fn_sigs, param_names};
 
 /// The default of a struct field or function parameter that has one.
 #[derive(Clone)]
@@ -37,11 +37,15 @@ impl Checker {
                 continue;
             };
             let ty = fields[index].ty;
-            let default = match self.fold_default(program, ty, expr, &decl.params) {
+            let names = param_names(&decl.params);
+            let tys = self.structs[id.0 as usize].params.clone();
+            let (consts, own) = self.fold_default(program, ty, expr, &names, &tys);
+            let field = &mut self.structs[id.0 as usize].fields[index];
+            field.default_ty = own;
+            field.default = Some(match consts {
                 Some(consts) => DefaultValue::Folded(consts),
                 None => DefaultValue::Failed,
-            };
-            self.structs[id.0 as usize].fields[index].default = Some(default);
+            });
         }
     }
 
@@ -50,26 +54,37 @@ impl Checker {
         for (id, (_, sig)) in fn_sigs(program).enumerate() {
             self.module = sig.name.span.file;
             let params = self.funcs[id].params.clone();
-            self.funcs[id].defaults = self.fold_param_defaults(program, sig, &params);
+            self.funcs[id].defaults = self.fold_param_defaults(program, sig, &params, &[]).0;
         }
         self.define_generic_fn_defaults(program);
     }
 
     /// The default of each parameter of `sig` that has one, checked and
-    /// folded. `params` are its parameters as resolved.
+    /// folded. `params` are its parameters as resolved, and `tys` its type
+    /// parameters. With them is the type of each default that has one of
+    /// its own, as [`Self::fold_default`] finds.
     pub(super) fn fold_param_defaults(
         &mut self,
         program: &Program,
         sig: &FnSig,
         params: &[(String, Ty)],
-    ) -> Vec<Option<DefaultValue>> {
+        tys: &[Ty],
+    ) -> (Vec<Option<DefaultValue>>, Vec<Option<Ty>>) {
         let names: Vec<_> = sig.params.iter().map(|param| param.name.clone()).collect();
-        let mut defaults = Vec::new();
+        let type_names = sig.type_param_names();
+        let (mut defaults, mut own) = (Vec::new(), Vec::new());
         for (param, (_, ty)) in sig.params.iter().zip(params) {
+            own.push(None);
             let Some(expr) = &param.default else {
                 defaults.push(None);
                 continue;
             };
+            // A type parameter has none, which is reported where it's
+            // declared.
+            if param.ty.is_type() {
+                defaults.push(Some(DefaultValue::Failed));
+                continue;
+            }
             // The default is folded once for every call, none of whose
             // arguments it can read. A global of the name isn't meant.
             let named = param_in_expr(expr, &names, false);
@@ -78,43 +93,79 @@ impl Checker {
                     self.error(TypeErrorKind::DefaultReadsParam(name), span);
                     None
                 }
-                None => self.fold_default(program, *ty, expr, &sig.type_params),
+                None => {
+                    let (consts, found) = self.fold_default(program, *ty, expr, &type_names, tys);
+                    own.pop();
+                    own.push(found);
+                    consts
+                }
             };
             defaults.push(Some(match consts {
                 Some(consts) => DefaultValue::Folded(consts),
                 None => DefaultValue::Failed,
             }));
         }
-        defaults
+        (defaults, own)
     }
 
     /// The folded value of `expr`, the default of a field or parameter of
-    /// type `ty` in a struct or function with type parameters `params`.
-    /// `None` after reporting an error, or if `ty` is the error type.
+    /// type `ty` in a struct or function whose type parameters are `tys`,
+    /// named `names`. `None` after reporting an error, or if `ty` is the
+    /// error type.
+    ///
+    /// A default needn't have the type `ty` as declared: it may have one of
+    /// the types that `ty` stands for, as a `&Heap` is one of those a `&A`
+    /// stands for. That type is given with the value. A call that leaves
+    /// the argument out takes its type parameters from it, where no
+    /// argument settles them, and it is the default only where the
+    /// parameter or field then has that type.
     fn fold_default(
         &mut self,
         program: &Program,
         ty: Ty,
         expr: &parse::Expr,
-        params: &[Ident],
-    ) -> Option<Vec<Const>> {
-        // The default is folded once for every instance, so it can neither
-        // name a type parameter nor be a value laid out by one.
-        let named = param_in_expr(expr, params, true);
-        let named = named.map(|(name, span)| (name.to_string(), span));
-        let held = self.held_param(ty, true);
-        let held = held.map(|param| (self.param_name(param), expr.span));
-        if let Some((param, span)) = named.or(held) {
-            self.error(TypeErrorKind::DefaultUsesParam(param), span);
-            return None;
+        names: &[Ident],
+        tys: &[Ty],
+    ) -> (Option<Vec<Const>>, Option<Ty>) {
+        if let Some((name, span)) = param_in_expr(expr, names, true) {
+            self.error(TypeErrorKind::DefaultUsesParam(name.to_string()), span);
+            return (None, None);
         }
         let errors = self.errors.len();
         let mut body = Body::new(self, Ty::Unit);
         body.global = Some(program);
         body.default = true;
-        let value = body.check(expr, ty);
+        let (found, value) = body.expr(expr, Some(ty));
+        let mut own = None;
+        if self.fits(found, ty) || found == Ty::Error || ty == Ty::Error {
+            // It is folded once for every instance, so it isn't a value
+            // laid out by a type parameter.
+            if let Some(param) = self.held_param(ty, true) {
+                let kind = TypeErrorKind::DefaultUsesParam(self.param_name(param));
+                self.error(kind, expr.span);
+            }
+        } else {
+            let mut bound = vec![None; tys.len()];
+            self.unify(ty, found, &mut bound);
+            let args = tys
+                .iter()
+                .zip(bound)
+                .map(|(param, arg)| arg.unwrap_or(*param));
+            let args: Vec<_> = args.collect();
+            let stood = self.substitute(ty, &args, expr.span);
+            if self.has_param(found) || !self.fits(found, stood) {
+                let kind = TypeErrorKind::Mismatch {
+                    expected: self.ty_name(ty),
+                    found: self.ty_name(found),
+                };
+                self.error(kind, expr.span);
+            } else if self.check_bounds(tys, &args, expr.span) {
+                own = Some(found);
+            }
+        }
         let consts = self.fold_value(&value, expr.span);
-        (self.errors.len() == errors && ty != Ty::Error).then_some(consts)
+        let folded = self.errors.len() == errors && ty != Ty::Error;
+        (folded.then_some(consts), own.filter(|_| folded))
     }
 
     /// The default of field `index` of struct `id`. An instance of a generic
@@ -127,6 +178,17 @@ impl Checker {
             .as_ref()
             .map_or(id, |instance| instance.generic);
         self.structs[decl.0 as usize].fields[index].default.as_ref()
+    }
+
+    /// The type of the default of field `index` of struct `id`, if it has
+    /// one of its own, read from its declaration as the default is.
+    fn field_default_ty(&self, id: StructId, index: usize) -> Option<Ty> {
+        let def = &self.structs[id.0 as usize];
+        let decl = def
+            .instance
+            .as_ref()
+            .map_or(id, |instance| instance.generic);
+        self.structs[decl.0 as usize].fields[index].default_ty
     }
 
     /// A type parameter that `ty` holds, if any. With `by_value`, only one
@@ -189,6 +251,21 @@ impl Body<'_> {
         let pending = used.any(|(_, default)| matches!(default, Some(DefaultValue::Pending)));
         if pending && self.folded(item, &ty, span) {
             defaults = field_defaults(self);
+        }
+        // A default with a type of its own is taken only as that type.
+        for (i, (name, expected)) in params.iter().enumerate() {
+            let own = self.ck.field_default_ty(id, i);
+            let Some(own) = own.filter(|_| !binding.contains(&Some(i))) else {
+                continue;
+            };
+            if !self.ck.fits(own, *expected) && *expected != Ty::Error {
+                let kind = TypeErrorKind::DefaultMismatch {
+                    param: name.clone(),
+                    expected: self.ck.ty_name(*expected),
+                    found: self.ck.ty_name(own),
+                };
+                self.error(kind, span);
+            }
         }
         let checked = args.iter().map(|_| None).collect();
         self.bound_args(&params, &defaults, args, binding, checked)

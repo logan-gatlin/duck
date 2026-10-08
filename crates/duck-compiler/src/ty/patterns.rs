@@ -10,8 +10,8 @@ use crate::load::Program;
 use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, PatternKind, StmtKind};
 
 use super::{
-    ARRAY, Body, Checker, Label, Need, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary,
-    scalar, single, unions::narrow,
+    ARRAY, Body, Checker, Label, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary, scalar,
+    single, unions::narrow,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -212,22 +212,37 @@ impl Checker {
 }
 
 impl Body<'_> {
+    /// `value`, of type `ty`, which a `match` at `span` takes apart: as its
+    /// bound, if `ty` is a type parameter bounded by a union or an enum,
+    /// whose variants or members the patterns are then of. An instance of a
+    /// generic function matches it as that bound too, which its type
+    /// argument casts to.
+    fn as_bound(&mut self, ty: Ty, value: Value, span: Span) -> (Ty, Value) {
+        let key = (span.file, span.start);
+        let bound = self.ck.known(ty);
+        if bound != ty && self.ck.is_sum(bound) {
+            self.ck.bound_uses.insert(key, bound);
+            return (bound, value);
+        }
+        let bound = match self.ck.bound_uses.get(&key) {
+            Some(bound) if !self.ck.instance_chain.is_empty() => *bound,
+            _ => return (ty, value),
+        };
+        let args: Vec<_> = self.ck.type_params.iter().map(|(_, arg)| *arg).collect();
+        let bound = self.ck.substitute(bound, &args, span);
+        match self.ck.is_sum(ty) && self.ck.meets(ty, bound) {
+            true => self.ck.cast_value(ty, bound, value).unwrap(),
+            false => (ty, value),
+        }
+    }
+
     /// `match value:`, which runs the first of `arms` whose pattern the
     /// value matches, with the names the pattern binds. The value is
     /// evaluated once, and traps if no arm matches it, as only one that was
     /// never built here can.
-    pub(super) fn match_stmt(
-        &mut self,
-        stmt: &parse::Stmt,
-        value: &parse::Expr,
-        arms: &[Arm],
-        out: &mut Vec<Stmt>,
-    ) {
-        let (ty, mut subject) = match self.need(stmt) {
-            Need::Check => self.expr(value, None),
-            Need::Bind(ty) => self.unchecked(ty, stmt.span),
-            Need::Skip => (Ty::Error, Value::default()),
-        };
+    pub(super) fn match_stmt(&mut self, value: &parse::Expr, arms: &[Arm], out: &mut Vec<Stmt>) {
+        let (ty, subject) = self.expr(value, None);
+        let (ty, mut subject) = self.as_bound(ty, subject, value.span);
         // Held in temporaries that the arms test and their names read, so
         // nothing an arm does changes what its names are.
         self.spill(&mut subject, |_| false);
@@ -257,7 +272,6 @@ impl Body<'_> {
             )]);
             cases.push(case);
         }
-        self.record(stmt, Some(ty));
         if matched != Ty::Error && cases.iter().all(|case| !case.failed) {
             self.check_arms(arms, &rows, matched, value.span);
         }
