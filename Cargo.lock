@@ -148,8 +148,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "duck-compiler",
+ "lsp-server",
+ "lsp-types",
  "serde",
+ "serde_json",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -159,18 +163,6 @@ dependencies = [
  "wasm-encoder",
  "wasmparser",
  "wasmprinter",
-]
-
-[[package]]
-name = "duck-lsp"
-version = "0.1.0"
-dependencies = [
- "duck",
- "duck-compiler",
- "lsp-server",
- "lsp-types",
- "serde_json",
- "url",
 ]
 
 [[package]]

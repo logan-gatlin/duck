@@ -24,7 +24,7 @@ use lsp_types::{
 };
 use url::Url;
 
-use crate::project::{self, Place, Problem, Project};
+use super::project::{self, Place, Problem, Project};
 
 type Fallible = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -340,7 +340,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::project::tests::{MODULE, TempDir};
+    use crate::lsp::project::tests::{MODULE, TempDir};
 
     /// An editor at the other end of a server's connection.
     struct Editor {
@@ -363,7 +363,7 @@ mod tests {
             let folder = json!({ "uri": uri(&dir.0), "name": "dir" });
             let params = json!({ "capabilities": capabilities, "workspaceFolders": [folder] });
             let result = editor.request(Initialize::METHOD, params);
-            assert_eq!(result["serverInfo"]["name"], "duck-lsp");
+            assert_eq!(result["serverInfo"]["name"], "duck");
             assert_eq!(result["capabilities"]["textDocumentSync"]["change"], 1);
             editor.notify(Initialized::METHOD, json!({}));
             editor

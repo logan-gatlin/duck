@@ -1,4 +1,5 @@
 mod agents;
+mod lsp;
 mod new;
 
 use std::fmt::Display;
@@ -35,6 +36,9 @@ enum Command {
     },
     /// Print an overview of the duck language for coding agents
     Agents,
+    /// Report the errors of duck packages to an editor, speaking the Language
+    /// Server Protocol over stdio
+    Lsp,
 }
 
 fn main() -> ExitCode {
@@ -58,6 +62,7 @@ fn main() -> ExitCode {
             print!("{}", agents::OVERVIEW);
             ExitCode::SUCCESS
         }
+        Command::Lsp => lsp::serve(),
     }
 }
 

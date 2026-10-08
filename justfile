@@ -1,16 +1,12 @@
 grammar := "tree-sitter-duck"
 helix_runtime := env("HELIX_RUNTIME", env("XDG_CONFIG_HOME", home_directory() / ".config") / "helix" / "runtime")
 
-# Install duck, duck-lsp, and the Helix grammar
-install: install-duck install-lsp install-grammar
+# Install duck and the Helix grammar
+install: install-duck install-grammar
 
-# Install the duck CLI
+# Install the duck CLI, which is also the language server
 install-duck:
     cargo install --locked --path crates/duck
-
-# Install the language server
-install-lsp:
-    cargo install --locked --path crates/duck-lsp
 
 # Compile the tree-sitter grammar into Helix's runtime, alongside its queries
 install-grammar:
