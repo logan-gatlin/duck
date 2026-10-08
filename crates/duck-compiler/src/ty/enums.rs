@@ -208,6 +208,26 @@ impl Checker {
     pub(super) fn enum_ty(&self, id: EnumId) -> Ty {
         self.enums[id.0 as usize].ty
     }
+
+    /// Whether the values of enum `id`'s members are folded.
+    pub(super) fn enum_folded(&self, id: EnumId) -> bool {
+        let item = self.enums[id.0 as usize].item;
+        self.constants[item].state == Visit::Done
+    }
+
+    /// Whether enum `id` starts as enum `first` does: its values have the
+    /// same type, and it has as many members or more, of which those that
+    /// `first` has are named as its are and have their values, in order.
+    pub(super) fn enum_starts_as(&self, id: EnumId, first: EnumId) -> bool {
+        let (def, first) = (&self.enums[id.0 as usize], &self.enums[first.0 as usize]);
+        let bits = |member: &MemberDef| -> Vec<_> {
+            member.value.iter().map(|c| const_bits(*c)).collect()
+        };
+        let mut pairs = def.members.iter().zip(&first.members);
+        def.ty == first.ty
+            && def.members.len() >= first.members.len()
+            && pairs.all(|(member, first)| member.name == first.name && bits(member) == bits(first))
+    }
 }
 
 impl Body<'_> {
@@ -248,6 +268,15 @@ impl Body<'_> {
         let member = &self.ck.enums[id.0 as usize].members[index];
         let consts = member.value.iter().map(|c| Expr::Const(*c)).collect();
         Some((Ty::Enum(id), self.scalars(Ty::Enum(id), consts)))
+    }
+
+    /// Whether the values of enum `id`'s members are folded, which a global
+    /// initializer that is first to use them does here. Otherwise reports,
+    /// at `span`, why they aren't.
+    pub(super) fn fold_enum(&mut self, id: EnumId, span: Span) -> bool {
+        let def = &self.ck.enums[id.0 as usize];
+        let (name, item) = (def.name.clone(), def.item);
+        self.folded(item, &name, span)
     }
 
     /// `for var in E`, where `E` names enum `id`: a copy of `body` per

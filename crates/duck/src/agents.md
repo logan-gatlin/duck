@@ -254,8 +254,9 @@ prefix `- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
 - `as` converts number to number (float to integer saturates, NaN gives 0),
   `bool` to integer, pointer to pointer (how a `&T` becomes a `&var T`),
   `array(T)` to `varray(T)` and back, `int` or `uint` to and from pointers
-  and function pointers, function pointer to function pointer, and an enum to
-  its value type. No other integer converts to or from a pointer: go through
+  and function pointers, function pointer to function pointer, an enum to
+  its value type, and a union or an enum to a wider one, which starts as it
+  does. No other integer converts to or from a pointer: go through
   `uint`, as in `p as uint as u32`. Nothing converts to `bool`: write
   `x != 0`.
 
@@ -373,7 +374,7 @@ fn demo(n: &Named) -> i32:
   or more, and those `Head` has are named and typed as its are, in order.
   `Head` itself is one. A struct that holds a `Head` as its first field is
   not.
-- A bound is a struct, and may name the type parameters before its own in
+- A bound may name the type parameters before its own in
   the list, and any that are parameters: `fn(T, B: Box(T))`. A type argument
   for `B` then starts as a `Box(T)` does, and a call that settles `B` takes
   `T` from it: with a `B` whose first field is `value: f64`, `T` is `f64`.
@@ -396,6 +397,56 @@ fn demo(n: &Named) -> i32:
   `struct(T) Slot` has `value: T = 7`, an `i32`, and `Slot(i32)()` is not.
 - `p: &T` takes a `&var i32` with `T` as `i32`, and `array(T)` a `varray(i32)`.
   Nothing is generic over writability: write both, or cast.
+
+### Wider unions and enums
+
+```duck
+union IoError:
+	closed
+	timeout: u32
+	denied
+
+union ReadError:                     # starts as `IoError` does, and stops sooner
+	closed
+	timeout: u32
+
+enum(u8) Color:
+	red
+	green = 5
+	blue
+
+enum(u8) Warm:                       # the first members of `Color`, as valued
+	red
+	green = 5
+
+fn(E: IoError) code(e: E) -> i32:    # `E` is a union that `IoError` is wider than
+	match e:                         # as an `IoError`
+		.closed:
+			return 1
+		.timeout(ms):
+			return ms as i32
+		.denied:
+			return 3
+
+fn demo(r: ReadError, w: Warm) -> i32:
+	let io = r as IoError            # the same variant, of the wider union
+	let c = w as Color
+	return code(r) + code(io) + c as u8 as i32
+```
+
+- A union is wider than one whose variants are its own first ones: named the
+  same, holding the same types or nothing, in order. An enum is wider than
+  one over the same type whose members are its own first ones, with the same
+  values. Each is as wide as itself.
+- `x as Wider` is the same variant or member of the wider type. Nothing
+  converts the other way: `match` the wider one. The two unions aren't laid
+  out alike, so a `&ReadError` is no `&IoError`.
+- A type parameter bounded by a union or an enum takes the types it is wider
+  than, the reverse of a struct, which bounds those with more fields. In the
+  body a `T` is matched as the bound, with an arm for each of the bound's
+  variants or members, and `x as IoError` is the bound's own value. It
+  builds no `T`: `T.closed` and `.closed` for a `T` are errors, as a type
+  argument may have no such variant.
 
 ## Function pointers
 

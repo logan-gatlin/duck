@@ -369,8 +369,17 @@ pub enum TypeErrorKind {
     /// A generic function instantiated within its instances, or those of
     /// others, too many times over, as recursion with ever larger type
     /// arguments would be.
-    /// A type parameter bounded by a type that isn't a struct.
+    /// A type parameter bounded by a type that isn't a struct, a union or an
+    /// enum.
     NotABound(String),
+    /// A type argument that isn't a union of the first variants of its type
+    /// parameter's bound, or an enum of its first members, which `what`
+    /// says.
+    NotWithin {
+        ty: String,
+        bound: String,
+        what: &'static str,
+    },
     /// A bound that names its own type parameter, or one declared after it
     /// in the list.
     BoundNamesLater {
@@ -643,10 +652,15 @@ struct Checker {
     /// Each instance of a generic function by its declaration and type
     /// arguments.
     fn_instances: HashMap<(GenericFnId, Vec<Ty>), FuncId>,
-    /// Where the body of a generic function reads a field of a bounded type
-    /// parameter, by the file and start of the field's name: the bound
-    /// whose field it is, which is where each instance reads it.
-    bound_fields: HashMap<(FileId, usize), Ty>,
+    /// Where the body of a generic function uses a value of a bounded type
+    /// parameter as its bound, by the file and start of what does: the name
+    /// of a field it reads, or the value a `match` takes apart. Each
+    /// instance uses it as that bound too.
+    bound_uses: HashMap<(FileId, usize), Ty>,
+    /// The type arguments still to be compared with the bounds they were
+    /// given, and where: those that are enums whose members' values weren't
+    /// folded.
+    pending_bounds: Vec<(Ty, Ty, Span)>,
     /// While checking or lowering an instance of a generic function, it and
     /// the instances whose calls led to it, innermost first. Given to errors.
     instance_chain: Vec<InstanceCall>,
@@ -1111,9 +1125,14 @@ impl fmt::Display for TypeErrorKind {
                 "`{name}` holds structs and unions nested more than {MAX_VALUE_DEPTH} deep"
             ),
             Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
-            Self::NotABound(ty) => {
-                write!(f, "`{ty}` can't bound a type parameter; only a struct can")
-            }
+            Self::NotABound(ty) => write!(
+                f,
+                "`{ty}` can't bound a type parameter; only a struct, a union or an enum can"
+            ),
+            Self::NotWithin { ty, bound, what } => write!(
+                f,
+                "`{ty}` doesn't have only the first {what} of `{bound}`, in order"
+            ),
             Self::BoundNamesLater { bound, param } => write!(
                 f,
                 "the bound `{bound}` names `{param}`, which isn't declared before the type \
@@ -2033,6 +2052,7 @@ impl Checker {
         ck.define_funcs(program);
         ck.define_globals(program);
         ck.define_param_defaults(program);
+        ck.check_pending_bounds();
         ck.place_pattern_strings(program);
         ck
     }
@@ -2742,6 +2762,15 @@ impl Checker {
             // to and from their index in the table.
             (Ty::Fn(_) | Ty::Prim(Prim::Uint | Prim::Int), Ty::Fn(_))
             | (Ty::Fn(_), Ty::Prim(Prim::Uint | Prim::Int)) => Some((to, value)),
+            // An enum is one that starts as it does, as its values are.
+            (Ty::Enum(_), Ty::Enum(_)) if self.meets(from, to) => Some((to, value)),
+            // A union is one that starts as it does, and holds the same
+            // variant of it.
+            (Ty::Struct(have), Ty::Struct(want))
+                if self.union_id(from).is_some() && self.meets(from, to) =>
+            {
+                Some((to, self.widen_union(have, want, value)))
+            }
             // An enum casts to whatever the type of its values does.
             (Ty::Enum(id), to) => self.cast_value(self.enum_ty(id), to, value),
             _ => None,
@@ -4463,6 +4492,19 @@ impl<'c> Body<'c> {
         };
         let (from, value) = self.expr(operand, expected);
         if from == Ty::Error || to == Ty::Error {
+            return (Ty::Error, Value::default());
+        }
+        // A type parameter bounded by a union or an enum casts as its bound
+        // does, which every type argument casts to.
+        let from = match self.ck.known(from) {
+            bound if self.ck.is_sum(bound) => bound,
+            _ => from,
+        };
+        // Two enums are compared by the values of their members.
+        if let (Ty::Enum(a), Ty::Enum(b)) = (from, to)
+            && a != b
+            && !(self.fold_enum(a, span) && self.fold_enum(b, span))
+        {
             return (Ty::Error, Value::default());
         }
         match self.ck.cast_value(from, to, value) {
@@ -8499,6 +8541,199 @@ fn f(c: &var Counted, e: &Empty, p: Pair(i32, Counted)):
     }
 
     #[test]
+    fn unions_and_enums_are_bounded_by_those_that_start_as_they_do() {
+        let src = "\
+union IoError:
+    closed
+    timeout: u32
+    denied
+    big: tuple(i64, f32)
+union ReadError:
+    closed
+    timeout: u32
+pub enum(u8) Color:
+    red
+    green = 5
+    blue
+enum(u8) Warm:
+    red
+    green = 5
+struct(C: Color) Paint:
+    c: C
+    under: &Paint(Warm)
+pub let widened = Warm.green as Color
+fn(E: IoError) code(e: E) -> i32:
+    match e:
+        .closed:
+            return 1
+        .timeout(ms):
+            return ms as i32
+        .denied:
+            return 3
+        .big((n, x)):
+            return 4
+fn(E: IoError) again(p: &E) -> bool:
+    return p.* as IoError == .denied or code(p.*) == 1
+fn(C: Color) shade(c: C) -> u8:
+    match c:
+        .red:
+            return 1
+        else:
+            return c as Color as u8
+fn f(r: ReadError, p: &ReadError, w: Warm) -> i32:
+    let io = r as IoError
+    let c = w as Color
+    return code(r) + code(io) + shade(w) as i32 + shade(c) as i32
+fn g(p: &ReadError) -> bool:
+    return again(p)
+";
+        let module = lower(src);
+        let globals: Vec<_> = module.globals.iter().map(|g| g.init).collect();
+        assert_eq!(globals, [Const::I32(5)]);
+        assert_eq!(
+            body(&module, "f"),
+            "(set io r) (set io.0 (I32.ExtendU r.0)) (set io.1 0f32) (set c w) (return \
+             (I32.Add (I32.Add (I32.Add (call code(ReadError) r r.0) (call \
+             code(IoError) io io.0 io.1)) (call shade(Warm) w)) (call shade(Color) c)))"
+        );
+        assert_eq!(
+            body(&module, "code(ReadError)"),
+            "(set tmp2 e) (set n (I32.ExtendU e.0)) (set x 0f32) (block (if (I32.Eq \
+             tmp2 0) (then (return 1)) (else )) (if (if (I32.Eq tmp2 1) (seq (set ms \
+             (I64.Wrap n)) 1) 0) (then (return ms)) (else )) (if (I32.Eq tmp2 2) (then \
+             (return 3)) (else )) (if (I32.Eq tmp2 3) (then (return 4)) (else )) \
+             unreachable) unreachable"
+        );
+        assert_eq!(
+            body(&module, "shade(Warm)"),
+            "(set tmp1 c) (block (if (I32.Eq tmp1 0) (then (return 1)) (else )) (return \
+             c)) unreachable"
+        );
+        assert_eq!(
+            body(&module, "again(ReadError)"),
+            "(set tmp1 (I32.Load8U offset=0 p)) (set tmp2 (I32.ExtendU (if (I32.Eq tmp1 \
+             1) (I32.Load offset=4 p) 0))) (return (if (I32.Eq tmp1 2) 1 (seq (set tmp3 \
+             (I32.Load8U offset=0 p)) (I32.Eq (call code(ReadError) tmp3 (if (I32.Eq \
+             tmp3 1) (I32.Load offset=4 p) 0)) 1))))"
+        );
+    }
+
+    #[test]
+    fn union_and_enum_bound_errors() {
+        use TypeErrorKind::*;
+        let src = "\
+union IoError:
+    closed
+    timeout: u32
+    denied
+union ReadError:
+    closed
+    timeout: u32
+union Swapped:
+    timeout: u32
+    closed
+union Retyped:
+    closed
+    timeout: i32
+union Held:
+    closed: tuple()
+union More:
+    closed
+    timeout: u32
+    denied
+    other
+struct Closed:
+    closed: tuple()
+enum(u8) Color:
+    red
+    green = 5
+    blue
+enum(u8) Warm:
+    red
+    green = 5
+enum(u8) Cool:
+    red
+    green
+enum(i8) Signed:
+    red
+struct(C: Color) Paint:
+    c: C
+    under: &Paint(Cool)
+fn(E: IoError) code(e: E) -> E:
+    match e:
+        .closed:
+            pass
+    let a = E.closed
+    let b: E = .closed
+    let c = e == e
+    return IoError.denied
+fn(C: Color) shade(c: C) -> u8:
+    return c as u8
+fn(S: Closed) field(s: S):
+    pass
+fn f(io: IoError, r: ReadError, s: Swapped, t: Retyped, h: Held, m: More, k: Closed):
+    code(s)
+    code(t)
+    code(h)
+    code(m)
+    code(k)
+    field(h)
+    shade(Cool.red)
+    shade(Signed.red)
+    shade(io)
+    let a = io as ReadError
+    let b = Color.red as Warm
+    let c = Cool.red as Color
+    let d = r as More
+    let e = r as Swapped
+";
+        let not_within = |ty: &str, bound: &str, what| NotWithin {
+            ty: ty.into(),
+            bound: bound.into(),
+            what,
+        };
+        let cast = |from: &str, to: &str| InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                not_within("Cool", "Color", "members"),
+                NonExhaustive(".timeout(_)".into()),
+                NotAValue("E".into()),
+                UntypedDot("closed".into()),
+                invalid_operand("==", "E"),
+                mismatch("E", "IoError"),
+                not_within("Swapped", "IoError", "variants"),
+                not_within("Retyped", "IoError", "variants"),
+                not_within("Held", "IoError", "variants"),
+                not_within("More", "IoError", "variants"),
+                not_within("Closed", "IoError", "variants"),
+                BoundNotMet {
+                    ty: "Held".into(),
+                    bound: "Closed".into()
+                },
+                not_within("Cool", "Color", "members"),
+                not_within("Signed", "Color", "members"),
+                not_within("IoError", "Color", "members"),
+                cast("IoError", "ReadError"),
+                cast("Color", "Warm"),
+                cast("Cool", "Color"),
+                cast("ReadError", "Swapped"),
+            ]
+        );
+        assert_eq!(
+            not_within("Cool", "Color", "members").to_string(),
+            "`Cool` doesn't have only the first members of `Color`, in order"
+        );
+        assert_eq!(
+            NotABound("i32".into()).to_string(),
+            "`i32` can't bound a type parameter; only a struct, a union or an enum can"
+        );
+    }
+
+    #[test]
     fn bound_errors() {
         use TypeErrorKind::*;
         let src = "\
@@ -8567,7 +8802,6 @@ fn f(b: B, s: Swapped, r: Renamed, t: Retyped, u: U, h: Held(A), e: Embeds):
             vec![
                 not_met("A", "B"),
                 NotABound("i32".into()),
-                NotABound("U".into()),
                 names_later.clone(),
                 names_later.clone(),
                 ImmutableAssign("x".into()),
@@ -8593,10 +8827,7 @@ fn f(b: B, s: Swapped, r: Renamed, t: Retyped, u: U, h: Held(A), e: Embeds):
             not_met("Swapped", "A").to_string(),
             "`Swapped` doesn't start as `A` does"
         );
-        assert_eq!(
-            NotABound("i32".into()).to_string(),
-            "`i32` can't bound a type parameter; only a struct can"
-        );
+
         assert_eq!(
             names_later.to_string(),
             "the bound `Box(T)` names `T`, which isn't declared before the type parameter it bounds"
