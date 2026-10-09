@@ -1,16 +1,18 @@
 mod agents;
 mod lsp;
 mod new;
+mod run;
 
 use std::fmt::Display;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use duck::files::Files;
 use duck::manifest::{MANIFEST, Manifest};
+use duck::package::Packages;
 use duck::{git, package};
 use duck_compiler::file::FileManager;
 
@@ -26,6 +28,14 @@ enum Command {
     /// Compile the package described by the nearest Duck.toml: build its
     /// module, or check its library if it has no module
     Build,
+    /// Compile the module of the package described by the nearest Duck.toml
+    /// and run its `start` function in Wasmtime, which gives it WASI 0.2 and
+    /// with it the files and the network of this machine
+    Run {
+        /// The arguments the program is given
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Create a new package in a new directory: a module, or a library with --lib
     New {
         /// The directory to create
@@ -44,6 +54,7 @@ enum Command {
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Build => build(),
+        Command::Run { args } => run(args),
         Command::New { path, lib } => {
             let kind = if lib {
                 new::Kind::Library
@@ -67,19 +78,9 @@ fn main() -> ExitCode {
 }
 
 fn build() -> ExitCode {
-    let root = match Manifest::find() {
-        Ok(Some(root)) => root,
-        Ok(None) => {
-            return fail(format_args!(
-                "cannot find {MANIFEST} in this directory or any parent"
-            ));
-        }
-        Err(e) => return fail(format_args!("cannot find {MANIFEST}: {e}")),
-    };
-    let manifest_path = root.join(MANIFEST);
-    let packages = match package::resolve(&root, &git::Cache::from_env()) {
-        Ok(packages) => packages,
-        Err(e) => return fail(e),
+    let (root, packages) = match resolve() {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
     };
     let manifest = &packages.root().manifest;
 
@@ -100,29 +101,7 @@ fn build() -> ExitCode {
     };
     let bytes = match compiled {
         Ok(bytes) => bytes,
-        Err(errors) => {
-            for error in &errors {
-                let Some(span) = error.span() else {
-                    eprintln!("{}: error: {error}", manifest_path.display());
-                    continue;
-                };
-                let (line, col) = line_col(&files.contents(span.file), span.start);
-                eprintln!(
-                    "{}:{line}:{col}: error: {error}",
-                    files.display_name(span.file)
-                );
-                for site in error.instances() {
-                    let span = site.span;
-                    let (line, col) = line_col(&files.contents(span.file), span.start);
-                    eprintln!(
-                        "{}:{line}:{col}: note: required by `{}` here",
-                        files.display_name(span.file),
-                        site.name
-                    );
-                }
-            }
-            return ExitCode::FAILURE;
-        }
+        Err(errors) => return report(&errors, &mut files, &root.join(MANIFEST)),
     };
 
     let (Some(module), Some(bytes)) = (&manifest.module, bytes) else {
@@ -138,6 +117,76 @@ fn build() -> ExitCode {
         return fail(format_args!("cannot write {}: {e}", output.display()));
     }
     ExitCode::SUCCESS
+}
+
+/// Compiles the module of the nearest package and runs it, writing nothing.
+/// The program is named as the module's output is, before `args`.
+fn run(args: Vec<String>) -> ExitCode {
+    let (root, packages) = match resolve() {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+    let Some(module) = &packages.root().manifest.module else {
+        return fail(format_args!("nothing to run: {MANIFEST} has no [module]"));
+    };
+    let entry = root.join(&module.entry);
+    let mut files = match Files::new(&packages, &entry, module.settings()) {
+        Ok(files) => files,
+        Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
+    };
+    let lowered = match duck_compiler::lower(&mut files) {
+        Ok(lowered) => lowered,
+        Err(errors) => return report(&errors, &mut files, &root.join(MANIFEST)),
+    };
+    let name = module.output.file_name().unwrap_or_default();
+    let name = name.to_string_lossy().into_owned();
+    let args: Vec<_> = [name].into_iter().chain(args).collect();
+    match run::run(lowered, &args) {
+        Ok(status) => ExitCode::from(status),
+        Err(e) => fail(e),
+    }
+}
+
+/// The root of the nearest package, and it with every package it depends
+/// on. Reports why there are none.
+fn resolve() -> Result<(PathBuf, Packages), ExitCode> {
+    let root = match Manifest::find() {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            return Err(fail(format_args!(
+                "cannot find {MANIFEST} in this directory or any parent"
+            )));
+        }
+        Err(e) => return Err(fail(format_args!("cannot find {MANIFEST}: {e}"))),
+    };
+    let packages = package::resolve(&root, &git::Cache::from_env()).map_err(fail)?;
+    Ok((root, packages))
+}
+
+/// Prints each of `errors` with where in `files` it is, or with the manifest
+/// if it's in no file.
+fn report(errors: &[duck_compiler::Error], files: &mut Files, manifest: &Path) -> ExitCode {
+    for error in errors {
+        let Some(span) = error.span() else {
+            eprintln!("{}: error: {error}", manifest.display());
+            continue;
+        };
+        let (line, col) = line_col(&files.contents(span.file), span.start);
+        eprintln!(
+            "{}:{line}:{col}: error: {error}",
+            files.display_name(span.file)
+        );
+        for site in error.instances() {
+            let span = site.span;
+            let (line, col) = line_col(&files.contents(span.file), span.start);
+            eprintln!(
+                "{}:{line}:{col}: note: required by `{}` here",
+                files.display_name(span.file),
+                site.name
+            );
+        }
+    }
+    ExitCode::FAILURE
 }
 
 fn fail(message: impl Display) -> ExitCode {

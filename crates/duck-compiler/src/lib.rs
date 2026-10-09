@@ -67,10 +67,14 @@ impl std::error::Error for Error {}
 /// Stops at the first stage that fails, returning all of its errors. Loading
 /// every file counts as one stage.
 pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
+    Ok(emit::emit(&lower(files)?))
+}
+
+/// Lowers the entry point of `files`, and every file it uses, to the module
+/// that [`compile`] encodes, for a caller that changes it first.
+pub fn lower(files: &mut impl FileManager) -> Result<ir::Module, Vec<Error>> {
     let module = load::load(files)?;
-    let module = ty::check(&module, &files.settings())
-        .map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
-    Ok(emit::emit(&module))
+    ty::check(&module, &files.settings()).map_err(|e| e.into_iter().map(Error::Type).collect())
 }
 
 /// Finds the errors [`compile`] does in the entry point of `files`, and

@@ -3,7 +3,7 @@
 Indentation-blocked, statically typed, compiled to one WebAssembly module.
 Values live in wasm locals and globals, memory is raw pointers into linear
 memory, and the host supplies all I/O through `extern`. `duck build` compiles
-the package of the nearest `Duck.toml`.
+the package of the nearest `Duck.toml`, and `duck run` runs it with WASI.
 
 Absent: allocator, GC, standard library, closures, anonymous functions,
 methods, traits, overloading, varargs, ternary, ranges, exceptions, char type,
@@ -702,6 +702,100 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   Canonical ABI returns one.
 - An exported `shape` is the globals `shape`, `shape.0` and `shape.1`.
 
+## WASI
+
+`duck run` compiles the module of the nearest `Duck.toml` and runs its `start`
+function in Wasmtime, which gives it WASI 0.2: the interfaces of
+`wasi:cli/imports@0.2.12`. It writes no file.
+
+```duck
+union StreamError:                       # `variant stream-error`
+	last_operation_failed: i32           # holds an `own<error>`, a handle
+	closed
+
+extern "wasi:cli/stdout@0.2.12":         # an interface, with its version
+	fn get_stdout() -> i32 = "get-stdout"  # an `own<output-stream>`
+
+extern "wasi:io/streams@0.2.12":
+	fn write(
+		stream: i32,                     # the `borrow<output-stream>` of a method
+		contents: array(u8),             # a `list<u8>`
+		ret: &var result(tuple(), StreamError),  # its `result<_, stream-error>`
+	) = "[method]output-stream.blocking-write-and-flush"
+
+extern "wasi:cli/environment@0.2.12":
+	fn get_arguments(ret: &var array(array(u8))) = "get-arguments"  # `list<string>`
+
+extern "wasi:cli/exit@0.2.12":
+	fn exit(status: u8) = "exit-with-code"
+
+let greeting = "Hello,"
+let newline = "\n"
+let written = &var result(tuple(), StreamError).ok(())
+let arguments: &var array(array(u8)) = &var []
+var heap: uint = 0
+
+pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+	if heap == 0:
+		heap = module.size() * module.page_size  # past what memory starts with
+	let at = (heap + align - 1) / align * align
+	heap = at + new_size
+	let pages = (heap + module.page_size - 1) / module.page_size
+	if pages > module.size() and module.grow(pages - module.size()) < 0:
+		module.unreachable()
+	module.copy(at as! &var u8, old, old_size)
+	return at as! &var u8
+
+fn main():                               # `start = "main"` in Duck.toml
+	let out = get_stdout()
+	write(out, greeting, written)
+	get_arguments(arguments)             # allocates with `cabi_realloc`
+	for argument in arguments.*:
+		write(out, argument, written)
+	write(out, newline, written)
+	match written.*:
+		.ok(_):
+			pass
+		.err(_):
+			exit(1)
+```
+
+- `duck run a -b` gives the program the arguments `a` and `-b`, after its own
+  name. It reaches all that `duck` does: its standard streams, its
+  environment variables, the network, and every file.
+- `wasi:filesystem/preopens` gives two directories to open paths in, each to
+  read and write: `.`, the directory `duck run` is in, and then `/`.
+- The `start` function is the program. It runs once the module is
+  instantiated, so that it may call every import, and `duck run` exits with 0
+  when it returns, or with the status it gives `wasi:cli/exit`. A trap is an
+  error that names the functions that were running. A module without a
+  `start` doesn't run, nor does one with `memory64`.
+- An `extern` block names an interface of `wasi:cli`, `wasi:io`,
+  `wasi:clocks`, `wasi:filesystem`, `wasi:random` or `wasi:sockets` with the
+  version `0.2.12`, or an earlier `0.2` one that it stands for. Nothing else
+  is there to import: an `extern` function of `env` is an error.
+- A function has the name its WIT does: `get-stdout`, a resource's method as
+  `[method]output-stream.write`, and `[resource-drop]output-stream` to drop a
+  handle, which takes it.
+- It is declared as the Canonical ABI lowers it, which is how Duck passes
+  values. A handle, `own` or `borrow`, is an `i32`, and a `char` a `u32`. A
+  `list<T>` is an `array(T)` and a `string` an `array(u8)`. A `record` is a
+  struct, a `variant` a union, an `enum` an `enum(u8)`, and `tuple`, `option`
+  and `result` are Duck's own, each with its fields, variants or members in
+  order. `flags` are the narrowest of `u8`, `u16` and `u32` with a bit for
+  each, from the lowest. A `_` is `tuple()`.
+- A function that returns more than one wasm value takes a `&var` to its
+  result as a last parameter instead, and returns nothing: Duck lays a type
+  out in memory as the Canonical ABI does. `-> i32` stays for a handle, and
+  `ret: &var array(u8)` is for a `string`. Parameters that come to more than
+  16 wasm values are one pointer to a tuple of them.
+- The host returns a `list` or a `string` in memory that it has the module
+  allocate. A module that imports such a function has `pub fn cabi_realloc` in
+  its entry file, as above: it is called with `old` and `old_size` as 0, and
+  returns `new_size` bytes at a multiple of `align`.
+- `duck build` writes the module as it does any other, with these imports
+  for its host to give it.
+
 ## Duck.toml
 
 `duck new <dir>` creates a module package, and `duck new --lib <dir>` a
@@ -711,7 +805,7 @@ library.
 [module]                 # the wasm module this package builds
 entry = "src/main.duck"  # relative to Duck.toml
 output = "build/out.wasm"
-start = "main"           # optional: run on instantiation
+start = "main"           # optional: run on instantiation, and by `duck run`
 
 [memory]                 # optional, as is each key; needs [module]
 memory64 = true          # 64-bit addresses, which are 32-bit without it

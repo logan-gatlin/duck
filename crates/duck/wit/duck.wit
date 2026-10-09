@@ -1,0 +1,11 @@
+package duck:run;
+
+/// What `duck run` gives the module it runs, and what it calls of it.
+world program {
+  include wasi:cli/imports@0.2.12;
+
+  /// The module's start function, which is exported under this name rather
+  /// than run when the module is instantiated: no import that reads or
+  /// writes memory can be called until then.
+  export start-function: func();
+}
