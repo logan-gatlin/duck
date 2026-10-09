@@ -123,6 +123,48 @@ fn g() -> i32:
         (integer)))))
 
 ====================
+Defer
+====================
+
+fn f():
+    defer close(h)
+    defer heap = mark
+    defer:
+        x = 1
+        defer pass_through()
+        pass
+    pass
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (defer_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier))))
+      (defer_statement
+        (assignment_expression
+          (identifier)
+          (identifier)))
+      (defer_statement
+        (block
+          (expression_statement
+            (assignment_expression
+              (identifier)
+              (integer)))
+          (defer_statement
+            (call_expression
+              (identifier)
+              (arguments)))
+          (pass_statement)))
+      (pass_statement))))
+
+====================
 Nested blocks dedent together
 ====================
 

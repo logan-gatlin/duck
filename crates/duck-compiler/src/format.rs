@@ -966,6 +966,14 @@ mod tests {
     }
 
     #[test]
+    fn a_defer_is_laid_out_as_the_statement_or_block_it_holds() {
+        let src = "fn f():\n  defer  close( h )\n  defer(a,b).0=1\n  defer  :\n      x=1\n  pass\n";
+        let expected =
+            "fn f():\n\tdefer close(h)\n\tdefer (a, b).0 = 1\n\tdefer:\n\t\tx = 1\n\tpass\n";
+        assert_eq!(formatted(src), expected);
+    }
+
+    #[test]
     fn a_statement_that_fits_is_on_one_line() {
         let src =
             "fn f(\na: i32,\n      b: i32\n  ) -> i32:\n    return g(a,\n  [\n1, 2],\n\n  b)\n";

@@ -202,6 +202,10 @@
         "named": true
       },
       {
+        "type": "defer_statement",
+        "named": true
+      },
+      {
         "type": "expression_statement",
         "named": true
       },
@@ -649,6 +653,32 @@
     "type": "continue_statement",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "defer_statement",
+    "named": true,
+    "fields": {
+      "body": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "block",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "_expression",
+            "named": true
+          }
+        ]
+      }
+    }
   },
   {
     "type": "dereference_expression",
@@ -2123,6 +2153,10 @@
   },
   {
     "type": "continue",
+    "named": false
+  },
+  {
+    "type": "defer",
     "named": false
   },
   {

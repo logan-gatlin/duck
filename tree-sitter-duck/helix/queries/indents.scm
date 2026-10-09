@@ -10,6 +10,7 @@
   (match_statement)
   (match_arm)
   (else_arm)
+  (defer_statement body: (block))
 
   (parameters)
   (type_parameters)
@@ -35,6 +36,7 @@
   (match_statement)
   (match_arm)
   (else_arm)
+  (defer_statement body: (block))
 ] @extend
 
 [

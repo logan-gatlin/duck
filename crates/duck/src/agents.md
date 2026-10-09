@@ -56,8 +56,9 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - A parameter anywhere in the list may have a default. Label a later argument
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
-  match struct enum union extern use module and or not true false as as!`. No
-  item is named `array`, `varray`, `tuple`, `type`, `option` or `result`.
+  defer match struct enum union extern use module and or not true false as
+  as!`. No item is named `array`, `varray`, `tuple`, `type`, `option` or
+  `result`.
 
 ## Types
 
@@ -410,6 +411,62 @@ pointers.
 - `module.unreachable()` traps, and ends a function as `return` does.
 - `module.count_leading_zeros(x)` and `module.count_trailing_zeros(x)` take
   any integer type and give that type.
+
+## Defer
+
+```duck
+extern:
+	fn open() -> i32
+	fn read(file: i32) -> i32
+	fn close(file: i32)
+	fn log(n: i32)
+
+var heap: uint = 0
+
+fn sum() -> i32:
+	let mark = heap
+	defer heap = mark                # as `sum` is left, by either `return`
+	let file = open()
+	defer close(file)                # before that: the last `defer` runs first
+	var total = 0
+	while true:
+		let n = read(file)
+		defer:                       # a block, run as each iteration ends
+			log(n)
+			log(total)
+		if n < 0:
+			return total             # `total`, and then all three
+		if n == 0:
+			break                    # only that of the loop's body
+		total += n
+	return -1
+```
+
+- `defer` takes one expression on its line, or `defer:` and a block. Nothing
+  runs where it is written. Its body runs when the block that the `defer` is
+  in is left: at its end, or by a `return`, `break` or `continue`.
+- The block is the nearest: the body of a function, an `if`, an `else`, a
+  loop, an arm or another `defer`. One in a loop's body runs as each
+  iteration ends, and one in an `if` as the `if` ends, not the function.
+- The defers of a block run last first, and those of a block before those of
+  the block around it. Only those that were reached run: a `return` above a
+  `defer` doesn't run it.
+- The body names what is in scope where it is written, and reads each
+  variable as it is when it runs: `defer log(n)` logs what `n` is by then.
+- `return value` evaluates `value`, then runs the defers, then returns it.
+  No defer changes what is returned: `return n` with `defer n = 0` returns
+  what `n` was.
+- A body has no `return`, and no `break` or `continue` of a loop that the
+  `defer` is in. A loop within the body has its own. A `defer` within it
+  runs as the body ends.
+- A statement that is no `defer` follows a `defer` in its block. One that
+  only others follow would run where it is written, so it is an error: write
+  its statement alone, or `pass` after it.
+- A `defer` ends no function: one with results still needs its `return`,
+  whatever the body is.
+- **A trap runs no defer.** `module.unreachable()`, an index out of bounds
+  and a division by zero end the program where they are, as does a host
+  function that never returns, like the `exit` of `wasi:cli/exit`.
 
 ## Generics
 

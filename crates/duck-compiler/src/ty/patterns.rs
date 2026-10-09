@@ -747,7 +747,7 @@ fn push_pattern_strings<'p>(block: &'p [parse::Stmt], out: &mut Vec<&'p str>) {
                 push_pattern_strings(then_body, out);
                 push_pattern_strings(else_body.as_deref().unwrap_or_default(), out);
             }
-            StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Defer(body) => {
                 push_pattern_strings(body, out);
             }
             StmtKind::Match { arms, .. } => {

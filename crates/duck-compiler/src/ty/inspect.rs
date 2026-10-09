@@ -1755,6 +1755,7 @@ impl<'p> Walk<'p> {
                 }
                 false
             }
+            StmtKind::Defer(body) => self.block(body),
             StmtKind::Break | StmtKind::Continue | StmtKind::Pass => false,
         }
     }
@@ -2432,6 +2433,33 @@ fn bytes(T: type, count: uint) -> uint:
         let given = names(&mut files, "T\n    return T.size");
         assert_eq!(given[..2], ["count: uint", "Box"]);
         assert!(given.contains(&"T".to_string()), "{given:?}");
+    }
+
+    #[test]
+    fn the_body_of_a_defer_is_a_block_of_its_own() {
+        let src = "\
+extern:
+    fn log(n: i32)
+fn f(h: i32):
+    defer log(h)
+    defer:
+        let held = h
+        log(held)
+    pass
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let (file, offset) = files.at("main", "h)\n");
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(&src[hover.span.start..hover.span.end], "h");
+        assert_eq!(hover.text, "h: i32");
+        let mut names = |text: &str| {
+            let (file, offset) = files.at("main", text);
+            shown(analysis.names(&mut files, file, offset))
+        };
+        assert_eq!(names("log(held)")[..2], ["held: i32", "h: i32"]);
+        // What the body binds is out of scope after it.
+        assert_eq!(names("pass")[..2], ["h: i32", "f: fn f(h: i32)"]);
     }
 
     #[test]

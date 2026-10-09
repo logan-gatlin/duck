@@ -82,6 +82,7 @@
 "fn" @keyword.function
 "use" @keyword.control.import
 "return" @keyword.control.return
+"defer" @keyword.control
 
 [
   "if"

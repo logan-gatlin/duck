@@ -71,6 +71,7 @@
   "union"
   "extern"
   "pass"
+  "defer"
 ] @keyword
 
 "fn" @keyword.function

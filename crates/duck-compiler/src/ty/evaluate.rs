@@ -681,6 +681,63 @@ pub var v = make(tenth).x
     }
 
     #[test]
+    fn defers_run_in_order_as_each_block_is_left() {
+        let src = "\
+var trace = 0
+fn note(n: i32):
+    trace = trace * 10 + n
+fn run() -> i32:
+    defer note(1)
+    var i = 0
+    while i < 2:
+        defer note(2)
+        i += 1
+        defer note(3)
+        note(4)
+    return trace
+fn early(stop: bool) -> i32:
+    trace = 0
+    defer note(1)
+    while true:
+        defer note(2)
+        if stop:
+            break
+        return 7
+    defer note(3)
+    note(4)
+    return trace
+fn nested() -> i32:
+    trace = 0
+    defer:
+        defer note(1)
+        note(2)
+    for n in Step:
+        defer note(n as i32)
+        if n == .skipped:
+            continue
+        note(5)
+    return 0
+enum(i32) Step:
+    kept = 6
+    skipped
+pub let ran = run()
+pub let after = trace
+pub let broke = early(true)
+pub let then = trace
+pub let quit = early(false)
+pub let last = trace
+pub let _ = nested()
+pub let inner = trace
+";
+        // A `return` is what it was before its defers ran, and a defer that
+        // wasn't reached doesn't run.
+        assert_eq!(
+            consts(src),
+            "ran=432432 after=4324321 broke=24 then=2431 quit=7 last=21 inner=56721"
+        );
+    }
+
+    #[test]
     fn every_kind_of_constant_calls_functions() {
         let src = "\
 fn twice(x: i32) -> i32:

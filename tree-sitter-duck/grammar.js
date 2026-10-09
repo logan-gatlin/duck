@@ -353,6 +353,7 @@ module.exports = grammar({
       $.break_statement,
       $.continue_statement,
       $.pass_statement,
+      $.defer_statement,
     ),
 
     expression_statement: $ => seq($._expression, $._newline),
@@ -412,6 +413,15 @@ module.exports = grammar({
     continue_statement: $ => seq('continue', $._newline),
 
     pass_statement: $ => seq('pass', $._newline),
+
+    // What runs when the block it is in is left: an expression, or a block.
+    defer_statement: $ => seq(
+      'defer',
+      choice(
+        seq(field('value', $._expression), $._newline),
+        field('body', $.block),
+      ),
+    ),
 
     // Expressions
 

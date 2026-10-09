@@ -271,6 +271,9 @@ pub enum StmtKind {
     Break,
     Continue,
     Pass,
+    /// `defer expr`, whose block is that one expression, or `defer:` and a
+    /// block. It runs when the block that the `defer` is in is left.
+    Defer(Block),
 }
 
 /// `pattern:` and the block a `match` runs for a value that matches it.
@@ -1059,6 +1062,19 @@ impl<'a> Parser<'a> {
             TokenKind::Break => self.keyword_stmt(StmtKind::Break)?,
             TokenKind::Continue => self.keyword_stmt(StmtKind::Continue)?,
             TokenKind::Pass => self.keyword_stmt(StmtKind::Pass)?,
+            TokenKind::Defer => {
+                self.bump();
+                if self.at(TokenKind::Colon) {
+                    StmtKind::Defer(self.block()?)
+                } else {
+                    let line = self.peek().span;
+                    let expr = self.expr()?;
+                    self.expect(TokenKind::Newline)?;
+                    let span = self.span_from(line);
+                    let kind = StmtKind::Expr(expr);
+                    StmtKind::Defer(vec![Stmt { kind, span }])
+                }
+            }
             _ => {
                 let expr = self.expr()?;
                 self.expect(TokenKind::Newline)?;
@@ -1832,6 +1848,7 @@ mod tests {
                 StmtKind::Break => "break",
                 StmtKind::Continue => "continue",
                 StmtKind::Pass => "pass",
+                StmtKind::Defer(_) => "defer",
             })
             .collect()
     }
@@ -2428,6 +2445,43 @@ fn f():
         };
         assert_eq!(sexpr(cond), "b");
         assert_eq!(stmt_kinds(last), vec!["pass"]);
+    }
+
+    #[test]
+    fn defers() {
+        let src = "\
+fn f():
+    defer close(h)
+    defer heap = mark
+    defer:
+        x = 1
+        return
+    pass
+";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(stmt_kinds(&f.body), vec!["defer", "defer", "defer", "pass"]);
+        let bodies: Vec<_> = f.body[..3]
+            .iter()
+            .map(|s| match &s.kind {
+                StmtKind::Defer(body) => stmt_kinds(body),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![vec!["expr"], vec!["assign"], vec!["assign", "return"]]
+        );
+        // The line of a `defer` is one expression, and no other statement.
+        assert_eq!(
+            errors("fn f():\n    defer return\n    defer\n"),
+            vec![
+                expected("expression", TokenKind::Return),
+                expected("expression", TokenKind::Newline),
+            ]
+        );
     }
 
     #[test]

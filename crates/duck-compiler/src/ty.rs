@@ -9,6 +9,7 @@ use std::fmt;
 use std::iter;
 use std::mem;
 use std::ops::Range;
+use std::slice;
 
 use crate::eval::Evaluator;
 use crate::file::{FileId, Settings};
@@ -179,6 +180,9 @@ const MAX_VALUE_DEPTH: usize = 64;
 
 /// The name of a local the compiler makes, which holds no variable.
 const TEMP: &str = "tmp";
+
+/// The keyword that a `defer` starts with.
+const DEFER: &str = "defer";
 
 /// The most constants that can be nested, each folded where the last is
 /// first to use it.
@@ -530,6 +534,12 @@ pub enum TypeErrorKind {
     MissingReturn(String),
     BreakOutsideLoop,
     ContinueOutsideLoop,
+    /// A `return`, or a `break` or `continue` of a loop that the `defer` is
+    /// in, in the body of a `defer`, which runs while its block is left.
+    LeavesDefer(&'static str),
+    /// A `defer` that no statement but a `defer` follows in its block, so
+    /// that it would run where it is written.
+    TrailingDefer,
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
     /// Code that traps while it's run to evaluate a constant.
@@ -947,6 +957,11 @@ struct Body<'c> {
     scopes: Vec<HashMap<String, Var>>,
     /// Enclosing wasm labels, innermost last.
     labels: Vec<Label>,
+    /// The `defer`s of each enclosing block, innermost last.
+    defers: Vec<Deferred>,
+    /// How many of `labels` the innermost `defer` is in, if this is the body
+    /// of one: nothing in it branches to those.
+    deferring: Option<usize>,
     /// The program, if this is a global initializer: the only place
     /// literals that need memory can be, and where a constant that isn't
     /// folded yet is folded to be read.
@@ -971,6 +986,15 @@ struct Var {
     mutable: bool,
     /// One local per scalar leaf of `ty`.
     slots: Vec<LocalId>,
+}
+
+/// The `defer`s of a block that are before the statement being lowered: those
+/// that have been reached wherever it is.
+struct Deferred {
+    /// How many wasm labels the block is in.
+    nesting: usize,
+    /// The body of each, lowered where its `defer` is, in order.
+    bodies: Vec<Vec<Stmt>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1403,6 +1427,13 @@ impl fmt::Display for TypeErrorKind {
             Self::MissingReturn(name) => write!(f, "`{name}` can finish without returning"),
             Self::BreakOutsideLoop => write!(f, "`break` outside of a loop"),
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
+            Self::LeavesDefer(keyword) => {
+                write!(f, "`{keyword}` leaves the body of a `defer`")
+            }
+            Self::TrailingDefer => write!(
+                f,
+                "this `defer` defers nothing: no statement but a `defer` follows it in its block"
+            ),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ConstTraps { trap, stack } => {
                 write!(f, "constant evaluation traps: {trap}{}", Stack(stack))
@@ -3644,6 +3675,8 @@ impl<'c> Body<'c> {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
+            defers: Vec::new(),
+            deferring: None,
             global: None,
             program: None,
             default: false,
@@ -3736,12 +3769,61 @@ impl<'c> Body<'c> {
 
     fn block(&mut self, block: &parse::Block) -> Vec<Stmt> {
         self.scopes.push(HashMap::new());
+        self.defers.push(Deferred {
+            nesting: self.labels.len(),
+            bodies: Vec::new(),
+        });
         let mut out = Vec::new();
-        for stmt in block {
+        let last = block.iter().rposition(|stmt| !is_defer(stmt));
+        for (i, stmt) in block.iter().enumerate() {
+            // Only others follow it, so it would run where it is written.
+            if is_defer(stmt) && last.is_none_or(|last| i > last) {
+                let end = stmt.span.start + DEFER.len();
+                let keyword = Span { end, ..stmt.span };
+                self.error(TypeErrorKind::TrailingDefer, keyword);
+            }
             self.stmt(stmt, &mut out);
+        }
+        // Those of the block run as it ends, the last of them first, unless
+        // nothing reaches its end: what left it has run them.
+        let ended = self.defers.pop().unwrap();
+        if !leaves(block) {
+            out.extend(ended.bodies.into_iter().rev().flatten());
         }
         self.scopes.pop();
         out
+    }
+
+    /// What the `defer`s run of every enclosing block that is in `nesting`
+    /// wasm labels or more, the innermost block's first, and the last of
+    /// each block's first.
+    fn deferred(&self, nesting: usize) -> Vec<Stmt> {
+        let blocks = self.defers.iter().rev();
+        let left = blocks.take_while(|block| block.nesting >= nesting);
+        let bodies = left.flat_map(|block| block.bodies.iter().rev());
+        bodies.flatten().cloned().collect()
+    }
+
+    /// `break` or `continue`, as `keyword` is, which branches to the
+    /// innermost `label` once the `defer`s of the blocks within it have run.
+    /// `outside` is the error if there is none.
+    fn branch(
+        &mut self,
+        keyword: &'static str,
+        label: Label,
+        outside: TypeErrorKind,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) {
+        let Some(depth) = self.depth(label) else {
+            return self.error(outside, span);
+        };
+        let nesting = self.labels.len() - depth as usize;
+        if self.deferring.is_some_and(|outer| nesting <= outer) {
+            return self.error(TypeErrorKind::LeavesDefer(keyword), span);
+        }
+        out.extend(self.deferred(nesting));
+        out.push(Stmt::Br(depth));
     }
 
     /// A block nested in a wasm label.
@@ -3802,14 +3884,23 @@ impl<'c> Body<'c> {
                 }
             }
             StmtKind::Return(value) => {
-                let value = match value {
+                if self.deferring.is_some() {
+                    self.error(TypeErrorKind::LeavesDefer("return"), stmt.span);
+                }
+                let mut value = match value {
                     Some(value) => self.check(value, self.ret),
                     None => {
                         self.expect(Ty::Unit, self.ret, stmt.span);
                         Value::default()
                     }
                 };
+                let deferred = self.deferred(0);
+                if !deferred.is_empty() {
+                    // Held, as they may change what it is read from.
+                    self.spill(&mut value, |scalar| matches!(scalar, Expr::Const(_)));
+                }
                 out.extend(value.pre);
+                out.extend(deferred);
                 out.push(Stmt::Return(exprs(value.scalars)));
             }
             StmtKind::If {
@@ -3841,15 +3932,23 @@ impl<'c> Body<'c> {
             }
             StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
             StmtKind::Match { value, arms } => self.match_stmt(value, arms, out),
-            StmtKind::Break => match self.depth(Label::Break) {
-                Some(depth) => out.push(Stmt::Br(depth)),
-                None => self.error(TypeErrorKind::BreakOutsideLoop, stmt.span),
-            },
-            StmtKind::Continue => match self.depth(Label::Continue) {
-                Some(depth) => out.push(Stmt::Br(depth)),
-                None => self.error(TypeErrorKind::ContinueOutsideLoop, stmt.span),
-            },
+            StmtKind::Break => {
+                let outside = TypeErrorKind::BreakOutsideLoop;
+                self.branch("break", Label::Break, outside, stmt.span, out);
+            }
+            StmtKind::Continue => {
+                let outside = TypeErrorKind::ContinueOutsideLoop;
+                self.branch("continue", Label::Continue, outside, stmt.span, out);
+            }
             StmtKind::Pass => {}
+            // Nothing runs here: the body is lowered as what it names is
+            // now, and is run wherever the block is left.
+            StmtKind::Defer(body) => {
+                let outer = self.deferring.replace(self.labels.len());
+                let body = self.block(body);
+                self.deferring = outer;
+                self.defers.last_mut().unwrap().bodies.push(body);
+            }
         }
         self.assigned = outer;
     }
@@ -6191,7 +6290,11 @@ fn assigned_within(stmt: &parse::Stmt) -> Vec<String> {
         | StmtKind::While { cond: expr, .. }
         | StmtKind::For { iter: expr, .. }
         | StmtKind::Match { value: expr, .. } => push_assigned(expr, &mut names),
-        StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue | StmtKind::Pass => {}
+        StmtKind::Return(None)
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass
+        | StmtKind::Defer(_) => {}
     }
     names
 }
@@ -6363,6 +6466,26 @@ fn diverges(block: &[parse::Stmt]) -> bool {
         StmtKind::Match { arms, .. } => arms.iter().all(|arm| diverges(&arm.body)),
         _ => false,
     })
+}
+
+/// Whether control can never reach the end of `block`, or leaves it first for
+/// the loop that it's in, by a `break` or a `continue`.
+fn leaves(block: &[parse::Stmt]) -> bool {
+    block.iter().any(|stmt| match &stmt.kind {
+        StmtKind::Break | StmtKind::Continue => true,
+        StmtKind::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => leaves(then_body) && leaves(else_body),
+        StmtKind::Match { arms, .. } => arms.iter().all(|arm| leaves(&arm.body)),
+        _ => diverges(slice::from_ref(stmt)),
+    })
+}
+
+/// Whether `stmt` is a `defer`, which runs nothing where it is.
+fn is_defer(stmt: &parse::Stmt) -> bool {
+    matches!(stmt.kind, StmtKind::Defer(_))
 }
 
 /// Whether `expr` is `module.unreachable()`, which traps.
@@ -6754,6 +6877,199 @@ fn f(a: bool):
              (if a (then (br 2)) (else (br 1))) \
              (block (loop (if a (then (br 1)) (else )) (br 1) (br 0))) \
              (br 0)))"
+        );
+    }
+
+    #[test]
+    fn defers_run_as_their_block_ends_last_first() {
+        let src = "\
+extern:
+    fn log(n: i32)
+fn f(a: bool):
+    var n = 1
+    defer log(n)
+    defer:
+        log(2)
+        log(3)
+    n = 4
+    if a:
+        defer log(5)
+        log(6)
+";
+        // Nothing runs where a `defer` is, and its body reads `n` as it is
+        // when it runs.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set n 1) (set n 4) \
+             (if a (then (call log [6] -> []) (call log [5] -> [])) (else )) \
+             (call log [2] -> []) (call log [3] -> []) (call log [n] -> [])"
+        );
+    }
+
+    #[test]
+    fn a_return_is_evaluated_before_the_defers_it_runs() {
+        let src = "\
+extern:
+    fn log(n: i32)
+    fn read() -> i32
+fn f(a: bool) -> i32:
+    var n = 1
+    defer n = 0
+    defer log(n)
+    if a:
+        defer log(2)
+        return n
+    return read()
+fn g():
+    defer log(1)
+    return
+fn h() -> i32:
+    defer log(1)
+    return 7
+";
+        let module = lower(src);
+        // Every block it leaves runs its own, the innermost first, and what
+        // it returns is held from before they ran.
+        assert_eq!(
+            body(&module, "f"),
+            "(set n 1) \
+             (if a (then (set tmp2 n) (call log [2] -> []) (call log [n] -> []) (set n 0) \
+             (return tmp2)) (else )) \
+             (set tmp3 (call read )) (call log [n] -> []) (set n 0) (return tmp3)"
+        );
+        assert_eq!(body(&module, "g"), "(call log [1] -> []) (return )");
+        assert_eq!(body(&module, "h"), "(call log [1] -> []) (return 7)");
+    }
+
+    #[test]
+    fn break_and_continue_run_the_defers_of_the_blocks_they_leave() {
+        let src = "\
+extern:
+    fn log(n: i32)
+fn f(a: bool, b: bool):
+    defer log(0)
+    while a:
+        defer log(1)
+        if b:
+            defer log(2)
+            break
+        if a:
+            continue
+        log(3)
+fn g(a: bool):
+    while true:
+        defer log(1)
+        if a:
+            break
+        else:
+            continue
+";
+        let module = lower(src);
+        // Each leaves the body of the loop, and not the block the loop is in.
+        assert_eq!(
+            body(&module, "f"),
+            "(block (loop (br_if 1 (I32.Eqz a)) \
+             (if b (then (call log [2] -> []) (call log [1] -> []) (br 2)) (else )) \
+             (if a (then (call log [1] -> []) (br 1)) (else )) \
+             (call log [3] -> []) (call log [1] -> []) (br 0))) \
+             (call log [0] -> [])"
+        );
+        // Nothing reaches the end of a block that every path leaves.
+        assert_eq!(
+            body(&module, "g"),
+            "(block (loop (if a (then (call log [1] -> []) (br 2)) \
+             (else (call log [1] -> []) (br 1))) (br 0)))"
+        );
+    }
+
+    #[test]
+    fn nothing_leaves_the_body_of_a_defer() {
+        let src = "\
+fn f(a: bool) -> i32:
+    while a:
+        defer:
+            break
+            continue
+            return 1
+            while a:
+                break
+                continue
+        pass
+    defer:
+        break
+    return 0
+";
+        // A loop within the body is left as any other is.
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (TypeErrorKind::LeavesDefer("break"), "break"),
+                (TypeErrorKind::LeavesDefer("continue"), "continue"),
+                (TypeErrorKind::LeavesDefer("return"), "return 1"),
+                (TypeErrorKind::BreakOutsideLoop, "break"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_defer_is_followed_by_a_statement_of_its_block() {
+        let src = "\
+extern:
+    fn log(n: i32)
+fn f(a: bool):
+    if a:
+        defer log(1)
+        defer:
+            log(2)
+    defer log(3)
+    pass
+fn g():
+    defer log(4)
+";
+        // One that only others follow would run where it is, as they would.
+        // Each is reported at its keyword.
+        let errors = check_src(src).unwrap_err();
+        let lines: Vec<_> = errors
+            .iter()
+            .map(|e| src[e.span.unwrap().start..].lines().next().unwrap())
+            .collect();
+        assert_eq!(lines, ["defer log(1)", "defer:", "defer log(4)"]);
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (TypeErrorKind::TrailingDefer, "defer"),
+                (TypeErrorKind::TrailingDefer, "defer"),
+                (TypeErrorKind::TrailingDefer, "defer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_defer_ends_no_function() {
+        // It runs once the function has been left, so one that traps still
+        // leaves the function without a `return`.
+        let src = "fn f() -> i32:\n    defer module.unreachable()\n    pass\n";
+        assert_eq!(errors(src), [TypeErrorKind::MissingReturn("f".into())]);
+        let src = "\
+extern:
+    fn read() -> i32
+fn f(a: bool) -> i32:
+    defer read()
+    match a:
+        true:
+            defer:
+                defer read()
+                pass
+            return 1
+        false:
+            return 2
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp1 a) (block \
+             (if tmp1 (then (drop (call read )) (drop (call read )) (return 1)) (else )) \
+             (if (I32.Eqz tmp1) (then (drop (call read )) (return 2)) (else )) \
+             unreachable) unreachable"
         );
     }
 

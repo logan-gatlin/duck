@@ -78,6 +78,7 @@ fn block<'p>(block: &'p [parse::Stmt], visit: &mut dyn FnMut(Node<'p>)) {
                     self::block(&arm.body, visit);
                 }
             }
+            StmtKind::Defer(body) => self::block(body, visit),
             StmtKind::Break | StmtKind::Continue | StmtKind::Pass => {}
         }
     }
