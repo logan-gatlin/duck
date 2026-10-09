@@ -10,7 +10,7 @@ use std::mem;
 use std::ops::Range;
 
 use crate::eval::Evaluator;
-use crate::file::{FileId, MemoryLimits, Settings, StaticSection};
+use crate::file::{FileId, Settings};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
     UnOp as IrUnOp, ValType,
@@ -138,7 +138,7 @@ const COUNT_LEADING_ZEROS: &str = "count_leading_zeros";
 const COUNT_TRAILING_ZEROS: &str = "count_trailing_zeros";
 
 /// The constants of `module`.
-const MODULE_CONSTS: [&str; 4] = ["static", "page_size", "min", "max"];
+const MODULE_CONSTS: [&str; 2] = ["page_size", "max"];
 
 /// The name of the built-in array type.
 const ARRAY: &str = "array";
@@ -593,25 +593,15 @@ pub enum TypeErrorKind {
     UnknownStart(String),
     /// A start function that takes arguments or returns something.
     InvalidStart(String),
-    /// Literal data that doesn't fit in the static data section.
+    /// Literal data that ends past every address.
     DataTooLarge {
-        bytes: u128,
-        capacity: u64,
+        end: u128,
     },
-    /// A static data section that ends past the memory's initial pages.
-    StaticOutsideMemory {
-        end: u64,
-        min_pages: u64,
-    },
-    /// A static data section that ends past the pages the memory may grow
-    /// to, where it starts with as many as hold the section.
-    StaticOutsideMax {
-        end: u64,
+    /// Literal data that ends past the pages the memory may grow to.
+    DataPastMax {
+        end: u128,
         max_pages: u64,
     },
-    /// A static data section fitted to literals that it is too small for
-    /// once they are given its size.
-    SelfSizedStatic,
     /// `module.name` naming nothing.
     UnknownModuleProperty(String),
     /// A string or array literal outside a global initializer or default.
@@ -741,27 +731,20 @@ struct Checker {
     /// How many constants are being folded, each within the one before.
     constant_depth: usize,
     ir_globals: Vec<ir::Global>,
-    /// The memory's size limits, which `module.min` and `module.max` are.
-    memory: MemoryLimits,
+    /// The most pages memory may grow to, which `module.max` is, unless it
+    /// may grow without limit.
+    max_pages: Option<u64>,
     /// Whether an address is 64 bits wide rather than 32.
     memory64: bool,
-    /// Where literals are placed, which `module.static` is. While
-    /// `unfitted`, it is empty.
-    static_section: StaticSection,
-    /// Whether the static data section is yet to be fitted to the literals,
-    /// which it is once every global is defined.
-    unfitted: bool,
-    /// Whether anything was given the size of the static data section, or
-    /// the pages that hold it, while it was `unfitted`.
-    read_unfitted: bool,
     /// The address literals must end by.
     data_limit: u64,
     /// The contents of literals, placed in memory in the order they are
     /// lowered.
     data: Vec<ir::Data>,
-    /// The first address after `data`, or the start of the static data
-    /// section if there is none. Data that doesn't fit may end past every
-    /// address.
+    /// The first address after the last literal, or the address the settings
+    /// place them from if there is none. The pages up to it are the
+    /// literals', and those that code run for a constant grows memory by are
+    /// not. Data that doesn't fit may end past every address.
     data_end: u128,
     /// The address of each string that a pattern is, which is placed once.
     pattern_strings: HashMap<String, u64>,
@@ -1436,21 +1419,12 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "start function `{name}` must take no arguments and return nothing"
             ),
-            Self::DataTooLarge { bytes, capacity } => write!(
+            Self::DataTooLarge { end } => {
+                write!(f, "literals end at address {end}, past every address")
+            }
+            Self::DataPastMax { end, max_pages } => write!(
                 f,
-                "literals take {bytes} bytes, more than the {capacity} bytes of the static data section"
-            ),
-            Self::StaticOutsideMemory { end, min_pages } => write!(
-                f,
-                "the static data section ends at address {end}, past the {min_pages} pages memory starts with"
-            ),
-            Self::StaticOutsideMax { end, max_pages } => write!(
-                f,
-                "the static data section ends at address {end}, past the {max_pages} pages memory may grow to"
-            ),
-            Self::SelfSizedStatic => write!(
-                f,
-                "the static data section is fitted to literals whose size depends on its own"
+                "literals end at address {end}, past the {max_pages} pages memory may grow to"
             ),
             Self::UnknownModuleProperty(name) => write!(f, "`module` has no property `{name}`"),
             Self::LiteralOutsideGlobal => write!(
@@ -1529,9 +1503,8 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
     if !ck.errors.is_empty() {
         return Err(ck.errors);
     }
-    let mut min_pages = ck.min_pages();
+    let min_pages = ck.pages();
     if let Some(eval) = &mut ck.eval {
-        min_pages = min_pages.max(eval.pages());
         ck.data = eval.data();
         let globals = ck.ir_globals.iter_mut().enumerate();
         for (index, global) in globals.filter(|(_, global)| global.mutable) {
@@ -1541,7 +1514,7 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
     Ok(ir::Module {
         memory: ir::Memory {
             min_pages,
-            max_pages: settings.memory.max_pages,
+            max_pages: settings.max_pages,
             memory64: settings.memory64,
             export: MEMORY_EXPORT.to_string(),
         },
@@ -1572,29 +1545,9 @@ fn lower_program(
     settings: &Settings,
     records: bool,
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
-    let mut ck = Checker::define(program, settings, None, records);
-    if ck.unfitted {
-        // Literals are only in globals, so every one has been placed.
-        let fitted = StaticSection {
-            start: 0,
-            end: ck.data_end.min(ck.data_limit.into()) as u64,
-        };
-        if ck.read_unfitted {
-            // A global was given a size the section doesn't have.
-            ck = Checker::define(program, settings, Some(fitted), records);
-            if ck.data_fits() && ck.data_end != u128::from(fitted.end) {
-                ck.errors.push(TypeError {
-                    kind: TypeErrorKind::SelfSizedStatic,
-                    span: None,
-                    instances: Vec::new(),
-                });
-            }
-        } else {
-            ck.static_section = fitted;
-            ck.unfitted = false;
-        }
-    }
-    ck.check_static_section();
+    let mut ck = Checker::define(program, settings, records);
+    // Literals are only in globals, so every one has been placed.
+    ck.check_data_fits();
     let start = settings
         .start
         .as_ref()
@@ -2444,31 +2397,21 @@ impl Checker {
     }
 
     /// Declares and defines every item of `program`, which places its
-    /// literals. `fitted` is the static data section, if the settings leave
-    /// it to be fitted to the literals and it has been. If it `records`, the
-    /// type of what is written is kept.
-    fn define(
-        program: &Program,
-        settings: &Settings,
-        fitted: Option<StaticSection>,
-        records: bool,
-    ) -> Self {
-        let static_section = settings.static_section.or(fitted).unwrap_or_default();
+    /// literals. If it `records`, the type of what is written is kept.
+    fn define(program: &Program, settings: &Settings, records: bool) -> Self {
         let mut ck = Self {
             types: records.then(HashMap::new),
             entry: program.entry,
-            memory: settings.memory,
+            max_pages: settings.max_pages,
             memory64: settings.memory64,
-            static_section,
-            unfitted: settings.static_section.is_none() && fitted.is_none(),
-            data_end: static_section.start.into(),
+            data_end: settings.static_start.into(),
             fuel_limit: settings.fuel.unwrap_or(DEFAULT_FUEL),
             ..Self::default()
         };
-        ck.data_limit = match settings.static_section {
-            Some(section) => section.end,
-            None => ck.max_addr(),
-        };
+        let max_bytes = settings
+            .max_pages
+            .map(|pages| pages.saturating_mul(PAGE_SIZE));
+        ck.data_limit = max_bytes.map_or(ck.max_addr(), |bytes| bytes.min(ck.max_addr()));
         ck.declare(program);
         ck.define_structs(program);
         ck.define_funcs(program);
@@ -2478,38 +2421,30 @@ impl Checker {
         ck
     }
 
-    /// The pages memory starts with, which `module.min` is: those of the
-    /// settings, or else the fewest that hold the static data section.
-    fn min_pages(&self) -> u64 {
-        let fewest = self.static_section.end.div_ceil(PAGE_SIZE);
-        self.memory.min_pages.unwrap_or(fewest)
+    /// The pages memory has: the fewest that hold the literals, or as many
+    /// as the code constants ran grew it to, if those are more.
+    fn pages(&self) -> u64 {
+        let literals = self.data_end.div_ceil(PAGE_SIZE.into());
+        let grown = self.eval.as_ref().map_or(0, Evaluator::pages);
+        u64::try_from(literals).unwrap_or(u64::MAX).max(grown)
     }
 
-    /// Checks that the static data section is in the memory's initial
-    /// pages, and that literal data fits in it.
-    fn check_static_section(&mut self) {
-        let StaticSection { start, end } = self.static_section;
-        let mut errors = Vec::new();
-        match (self.memory.min_pages, self.memory.max_pages) {
-            (Some(min_pages), _) if end.div_ceil(PAGE_SIZE) > min_pages => {
-                errors.push(TypeErrorKind::StaticOutsideMemory { end, min_pages });
-            }
-            (None, Some(max_pages)) if self.min_pages() > max_pages => {
-                errors.push(TypeErrorKind::StaticOutsideMax { end, max_pages });
-            }
-            _ => {}
+    /// Checks that the literals end within the pages memory may grow to.
+    fn check_data_fits(&mut self) {
+        if self.data_fits() {
+            return;
         }
-        if !self.data_fits() {
-            errors.push(TypeErrorKind::DataTooLarge {
-                bytes: self.data_end - u128::from(start),
-                capacity: self.data_limit - start,
-            });
-        }
-        self.errors.extend(errors.into_iter().map(|kind| TypeError {
+        let end = self.data_end;
+        let within = |max_pages: &u64| end <= u128::from(*max_pages) * u128::from(PAGE_SIZE);
+        let kind = match self.max_pages.filter(|max_pages| !within(max_pages)) {
+            Some(max_pages) => TypeErrorKind::DataPastMax { end, max_pages },
+            None => TypeErrorKind::DataTooLarge { end },
+        };
+        self.errors.push(TypeError {
             kind,
             span: None,
             instances: Vec::new(),
-        }));
+        });
     }
 
     /// The function `name`, which must take and return nothing. `None` after
@@ -3488,10 +3423,22 @@ impl Checker {
     /// Makes room in memory for `size` bytes at the next multiple of `align`,
     /// or right at the end if there are none. Returns their address, which
     /// is only meaningful while the data fits.
+    ///
+    /// Bytes that the literals' last page has no room for go in the pages
+    /// after it, unless code run for a constant grew memory since: those
+    /// pages are its own, as any are that `module.grow` gives, so the bytes
+    /// go in pages past them.
     fn reserve_data(&mut self, size: u128, align: u32) -> u64 {
         let mut offset = self.data_end;
         if size > 0 {
             offset = offset.next_multiple_of(align.into());
+            let page = u128::from(PAGE_SIZE);
+            let owned = self.data_end.next_multiple_of(page);
+            let grown = self.eval.as_ref().map_or(0, Evaluator::pages);
+            let top = u128::from(grown) * page;
+            if offset + size > owned && top > owned {
+                offset = top;
+            }
             self.data_end = offset + size;
         }
         offset as u64
@@ -3517,8 +3464,8 @@ impl Checker {
         offset
     }
 
-    /// Whether every literal placed so far is within the static data
-    /// section, or within memory if the section is fitted to them.
+    /// Whether every literal placed so far is within the pages memory may
+    /// grow to.
     fn data_fits(&self) -> bool {
         self.data_end <= self.data_limit.into()
     }
@@ -4416,25 +4363,13 @@ impl<'c> Body<'c> {
         )
     }
 
-    /// `module.name`, one of `module`'s constants. `module.static` is the
-    /// static data section, as an `array(u8)`, which only reads it. `page_size` is the bytes in a
-    /// wasm page, and `min` and `max` are the pages memory starts with and
-    /// may grow to, `max` being the largest `uint` if it's unlimited. Each
-    /// is a `uint`.
+    /// `module.name`, one of `module`'s constants. `page_size` is the bytes
+    /// in a wasm page, and `max` is the pages memory may grow to, or the
+    /// largest `uint` if it's unlimited. Each is a `uint`.
     fn module_property(&mut self, name: &Ident) -> (Ty, Value) {
         let count = match name.name.as_str() {
-            "static" => {
-                self.ck.read_unfitted |= self.ck.unfitted;
-                let StaticSection { start, end } = self.ck.static_section;
-                let ty = self.ck.array_of(Ty::Prim(Prim::U8), false);
-                return (ty, self.ck.array_value(start, end - start));
-            }
             "page_size" => PAGE_SIZE,
-            "min" => {
-                self.ck.read_unfitted |= self.ck.unfitted && self.ck.memory.min_pages.is_none();
-                self.ck.min_pages()
-            }
-            "max" => self.ck.memory.max_pages.unwrap_or(self.ck.max_addr()),
+            "max" => self.ck.max_pages.unwrap_or(self.ck.max_addr()),
             other => {
                 let kind = if MODULE_FUNCS.contains(&other) {
                     TypeErrorKind::NotAValue(format!("module.{other}"))
@@ -6407,7 +6342,7 @@ fn wasm_max(a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{DummyManager, FileManager, MemoryLimits, StaticSection};
+    use crate::file::{DummyManager, FileManager};
     use crate::ir::{Const, Expr, Func, Module, Stmt, ValType};
     use crate::lex::tokenize;
 
@@ -8041,7 +7976,7 @@ fn same(a: array(u16), b: array(u16)) -> bool:
     #[test]
     fn memory64_widens_the_functions_and_constants_of_module() {
         let src = "\
-pub let limits = (module.page_size, module.min, module.max)
+pub let limits = (module.page_size, module.max)
 fn all() -> varray(u8):
     return module.memory()
 fn size() -> uint:
@@ -8055,7 +7990,7 @@ fn copy(a: varray(u8), b: array(u8)):
 ";
         let module = lower64(src);
         let globals: Vec<_> = module.globals.iter().map(|g| g.init).collect();
-        assert_eq!(globals, [Const::I64(65536), Const::I64(0), Const::I64(-1)]);
+        assert_eq!(globals, [Const::I64(65536), Const::I64(-1)]);
         assert_eq!(
             body(&module, "all"),
             "(return 0i64 (I64.Mul memory.size 65536i64))"
@@ -8074,21 +8009,14 @@ fn copy(a: varray(u8), b: array(u8)):
     fn memory64_places_literals_past_what_32_bits_address() {
         let far = 1 << 32;
         let settings = Settings {
-            memory: MemoryLimits {
-                min_pages: Some(1 << 17),
-                max_pages: Some(1 << 30),
-            },
+            max_pages: Some(1 << 30),
             memory64: true,
-            static_section: Some(StaticSection {
-                start: far,
-                end: far + 16,
-            }),
+            static_start: far,
             ..Settings::default()
         };
         let src = "\
 pub let s = \"abc\"
 pub let cell = &var 7
-pub let all = module.static
 pub let max = module.max
 ";
         let module = check_with(src, &settings).unwrap();
@@ -8098,12 +8026,13 @@ pub let max = module.max
         );
         let globals: Vec<_> = module.globals.iter().map(|g| g.init).collect();
         let far = far as i64;
-        assert_eq!(globals, [far, 3, far + 4, far, 16, 1 << 30].map(Const::I64));
+        assert_eq!(globals, [far, 3, far + 4, 1 << 30].map(Const::I64));
+        // The pages below the literals, and the one they are in.
         assert_eq!(
             (module.memory.min_pages, module.memory.max_pages),
-            (1 << 17, Some(1 << 30))
+            ((1 << 16) + 1, Some(1 << 30))
         );
-        // More elements than 32 bits count, in the memory fitted to them.
+        // More elements than 32 bits count, in the memory that holds them.
         let module = lower64("pub let zeros: array(u8) = [0; 5000000000]\n");
         assert_eq!(module.memory.min_pages, 76294);
         assert_eq!(module.globals[1].init, Const::I64(5000000000));
@@ -8116,8 +8045,7 @@ pub let max = module.max
         assert_eq!(
             errors.into_iter().map(|e| e.kind).collect::<Vec<_>>(),
             [TypeErrorKind::DataTooLarge {
-                bytes: 8 * u128::from(u64::MAX),
-                capacity: u64::MAX
+                end: 8 * u128::from(u64::MAX)
             }]
         );
     }
@@ -10761,20 +10689,14 @@ fn f():
     }
 
     #[test]
-    fn module_static_is_the_static_data_section() {
+    fn literals_are_placed_from_where_the_settings_say() {
         let settings = Settings {
-            static_section: Some(StaticSection {
-                start: 1025,
-                end: 2048,
-            }),
+            static_start: 1025,
             ..Settings::default()
         };
         let src = "\
 pub let s = \"abc\"
 pub let t: array(i32) = [1]
-pub let all = module.static
-fn f() -> uint:
-    return module.static.len
 ";
         let module = check_with(src, &settings).unwrap();
         assert_eq!(
@@ -10793,46 +10715,37 @@ fn f() -> uint:
                 ("s.len", Const::I32(3)),
                 ("t.ptr", Const::I32(1028)),
                 ("t.len", Const::I32(1)),
-                ("all.ptr", Const::I32(1025)),
-                ("all.len", Const::I32(1023)),
             ]
         );
-        assert_eq!(body(&module, "f"), "(return 1023)");
         // Nothing is exported but what the source makes `pub`.
         assert!(check_src("pub let data_end = 1\n").is_ok());
-        assert_eq!(
-            errors("let x = module.heap\n"),
-            [TypeErrorKind::UnknownModuleProperty("heap".into())]
-        );
+        // Where the literals end, and the pages that hold them, are only
+        // known once every constant has run.
+        for name in ["heap", "static", "min"] {
+            assert_eq!(
+                errors(&format!("let x = module.{name}\n")),
+                [TypeErrorKind::UnknownModuleProperty(name.into())]
+            );
+        }
     }
 
     #[test]
     fn module_constants_describe_memory() {
         let settings = |max_pages| Settings {
-            memory: MemoryLimits {
-                min_pages: Some(2),
-                max_pages,
-            },
+            max_pages,
             ..Settings::default()
         };
         let src = "\
 pub let page = module.page_size
-pub let min = module.min
 pub let max = module.max
 ";
         let inits = |max_pages| -> Vec<_> {
             let module = check_with(src, &settings(max_pages)).unwrap();
             module.globals.iter().map(|g| g.init).collect()
         };
-        assert_eq!(
-            inits(Some(16)),
-            [Const::I32(65536), Const::I32(2), Const::I32(16)]
-        );
+        assert_eq!(inits(Some(16)), [Const::I32(65536), Const::I32(16)]);
         // `u32::MAX` when memory may grow without limit.
-        assert_eq!(
-            inits(None),
-            [Const::I32(65536), Const::I32(2), Const::I32(-1)]
-        );
+        assert_eq!(inits(None), [Const::I32(65536), Const::I32(-1)]);
     }
 
     #[test]
@@ -10998,15 +10911,12 @@ fn f(p: &var u8):
     }
 
     #[test]
-    fn data_must_fit_in_the_static_section() {
-        use TypeErrorKind::{DataTooLarge, StaticOutsideMemory};
-        let errors = |src: &str, start, end, min_pages| -> Vec<TypeError> {
+    fn literals_must_end_within_the_pages_memory_may_grow_to() {
+        use TypeErrorKind::{DataPastMax, DataTooLarge};
+        let errors = |src: &str, static_start, max_pages| -> Vec<TypeError> {
             let settings = Settings {
-                memory: MemoryLimits {
-                    min_pages: Some(min_pages),
-                    max_pages: None,
-                },
-                static_section: Some(StaticSection { start, end }),
+                max_pages,
+                static_start,
                 ..Settings::default()
             };
             check_with(src, &settings).err().unwrap_or_default()
@@ -11016,156 +10926,92 @@ fn f(p: &var u8):
             span: None,
             instances: Vec::new(),
         };
-        assert_eq!(errors("let s = \"\"\n", 0, 0, 0), []);
-        assert_eq!(errors("let s = \"ab\"\n", 4, 6, 1), []);
+        assert_eq!(errors("let s = \"\"\n", 0, Some(0)), []);
+        assert_eq!(errors("let s = \"ab\"\n", 65534, Some(1)), []);
         assert_eq!(
-            errors("let s = \"abc\"\n", 4, 6, 1),
-            [spanless(DataTooLarge {
-                bytes: 3,
-                capacity: 2
+            errors("let s = \"abc\"\n", 65534, Some(1)),
+            [spanless(DataPastMax {
+                end: 65537,
+                max_pages: 1
             })]
         );
         // Padding to align the `u32`s counts.
         assert_eq!(
-            errors("let s = \"a\"\nlet t: array(u32) = [1]\n", 0, 6, 1),
-            [spanless(DataTooLarge {
-                bytes: 8,
-                capacity: 6
+            errors(
+                "let s = \"a\"\nlet t: array(u32) = [1, 2]\n",
+                65530,
+                Some(1)
+            ),
+            [spanless(DataPastMax {
+                end: 65540,
+                max_pages: 1
             })]
         );
         // Nothing so large is built to find that it doesn't fit, zeroed or
         // not.
+        let large = "let a: array(u64) = [0; 4294967295]\nlet b: array(u64) = [1; 4294967295]\n";
         assert_eq!(
-            errors(
-                "let a: array(u64) = [0; 4294967295]\nlet b: array(u64) = [1; 4294967295]\n",
-                8,
-                16,
-                1
-            ),
-            [spanless(DataTooLarge {
-                bytes: 68719476720,
-                capacity: 8
-            })]
+            errors(large, 8, None),
+            [spanless(DataTooLarge { end: 68719476728 })]
         );
         assert_eq!(
-            errors("let s = \"\"\n", 0, 65537, 1),
-            [spanless(StaticOutsideMemory {
-                end: 65537,
-                min_pages: 1
+            errors(large, 8, Some(1)),
+            [spanless(DataPastMax {
+                end: 68719476728,
+                max_pages: 1
             })]
         );
     }
 
     #[test]
-    fn an_unset_static_section_fits_the_literals() {
+    fn memory_starts_with_the_pages_that_hold_the_literals() {
         let spanless = |kind| TypeError {
             kind,
             span: None,
             instances: Vec::new(),
         };
-        let limits = |min_pages, max_pages| Settings {
-            memory: MemoryLimits {
-                min_pages,
-                max_pages,
-            },
-            ..Settings::default()
-        };
-        let globals = |module: &Module| -> Vec<_> {
-            let globals = module.globals.iter();
-            globals.map(|g| (g.name.clone(), g.init)).collect()
-        };
-
-        // Without literals it is empty, and memory starts with nothing.
-        let module = lower("fn f() -> array(u8):\n    return module.static\n");
+        // Without literals, it starts with nothing.
+        let module = lower("fn f():\n    pass\n");
         assert_eq!(module.memory.min_pages, 0);
-        assert_eq!(body(&module, "f"), "(return 0 0)");
 
-        // It starts at address 0 and ends where the literals do, however
-        // early it is read.
-        let src = "\
-pub let all = module.static
-pub let pages = module.min
-pub let s = \"abc\"
-pub let t: array(i32) = [1]
-fn f() -> uint:
-    return module.static.len + module.min
-";
-        let module = lower(src);
+        let module = lower("pub let s = \"abc\"\npub let t: array(i32) = [1]\n");
         assert_eq!(data(&module), [(0, &b"abc"[..]), (4, &[1, 0, 0, 0][..])]);
         assert_eq!(module.memory.min_pages, 1);
-        assert_eq!(
-            globals(&module)[..3],
-            [
-                ("all.ptr".to_string(), Const::I32(0)),
-                ("all.len".to_string(), Const::I32(8)),
-                ("pages".to_string(), Const::I32(1)),
-            ]
-        );
-        assert_eq!(body(&module, "f"), "(return (I32.Add 8 1))");
 
-        // Memory starts with the pages that hold it, unless told otherwise.
-        let src = "pub let a: array(u8) = [0; 65537]\npub let pages = module.min\n";
+        // What one page has no room for goes on into the next.
+        let src = "pub let a: array(u8) = [0; 65537]\npub let b = \"x\"\n";
         let module = lower(src);
+        assert_eq!(data(&module), [(65537, &b"x"[..])]);
         assert_eq!(module.memory.min_pages, 2);
-        assert_eq!(globals(&module)[2].1, Const::I32(2));
-        let module = check_with(src, &limits(Some(3), None)).unwrap();
-        assert_eq!(module.memory.min_pages, 3);
-        assert_eq!(globals(&module)[2].1, Const::I32(3));
+        let max = |max_pages| Settings {
+            max_pages: Some(max_pages),
+            ..Settings::default()
+        };
         assert_eq!(
-            check_with(src, &limits(Some(1), None)).unwrap_err(),
-            [spanless(TypeErrorKind::StaticOutsideMemory {
-                end: 65537,
-                min_pages: 1
-            })]
-        );
-        assert_eq!(
-            check_with(src, &limits(None, Some(1))).unwrap_err(),
-            [spanless(TypeErrorKind::StaticOutsideMax {
-                end: 65537,
+            check_with(src, &max(1)).unwrap_err(),
+            [spanless(TypeErrorKind::DataPastMax {
+                end: 65538,
                 max_pages: 1
             })]
         );
-        assert!(check_with(src, &limits(None, Some(2))).is_ok());
+        assert!(check_with(src, &max(2)).is_ok());
 
-        // A section that is set is not fitted, but still sets where memory
-        // starts.
+        // The pages below the literals are there too, whether or not there
+        // are any literals.
         let settings = Settings {
-            static_section: Some(StaticSection {
-                start: 4,
-                end: 65537,
-            }),
+            static_start: 65537,
             ..Settings::default()
         };
         let module = check_with("pub let s = \"abc\"\n", &settings).unwrap();
-        assert_eq!(data(&module), [(4, &b"abc"[..])]);
+        assert_eq!(data(&module), [(65537, &b"abc"[..])]);
         assert_eq!(module.memory.min_pages, 2);
-
-        // A literal may be sized by the section only if that leaves the
-        // section as large as it was.
-        let module = lower("pub let a: array(u8) = [1; module.static.len]\n");
-        assert_eq!(globals(&module)[0].1, Const::I32(0));
-        assert_eq!(
-            check_src("let a: array(u8) = [1; module.static.len + 1]\n").unwrap_err(),
-            [spanless(TypeErrorKind::SelfSizedStatic)]
-        );
-        assert_eq!(
-            check_src("let a: array(u8) = [1; module.min + 1]\n").unwrap_err(),
-            [spanless(TypeErrorKind::SelfSizedStatic)]
-        );
-        // What the first guess at its size got wrong is not reported.
-        let src = "let s = \"abc\"\nlet a: array(u8) = [1; 6 / module.static.len]\n";
-        assert_eq!(
-            check_src(src).unwrap_err(),
-            [spanless(TypeErrorKind::SelfSizedStatic)]
-        );
+        let module = check_with("fn f():\n    pass\n", &settings).unwrap();
+        assert_eq!(module.memory.min_pages, 2);
 
         // Literals still have to fit in memory.
         assert_eq!(
             check_src("let a: array(u64) = [1; 4294967295]\n").unwrap_err(),
-            [spanless(TypeErrorKind::DataTooLarge {
-                bytes: 34359738360,
-                capacity: u32::MAX.into()
-            })]
+            [spanless(TypeErrorKind::DataTooLarge { end: 34359738360 })]
         );
     }
 
@@ -12317,7 +12163,7 @@ fn f(s: array(u8)) -> i32:
                 return 1
             else:
                 pass
-    return module.static.len as i32
+    return 0
 ";
         let module = lower(src);
         assert_eq!(
@@ -12327,7 +12173,6 @@ fn f(s: array(u8)) -> i32:
         let f = body(&module, "f");
         assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 5 3)"), "{f}");
         assert!(f.contains("(call ==(array(u8)) tmp2 tmp3 2 3)"), "{f}");
-        assert!(f.ends_with("(return 8)"), "{f}");
     }
 
     #[test]

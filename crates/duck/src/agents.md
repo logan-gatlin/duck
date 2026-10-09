@@ -294,8 +294,9 @@ fn area(w: i32, h: i32 = id()) -> i32:  # 3, for every call without an `h`
   once for each call that leaves `h` out.
 - The constants of one item share its fuel, which `[const]` in `Duck.toml`
   sets, and is about a second's worth without it.
-- `module.min` is the pages memory has before any constant grows it, and
-  `module.size()` the pages it has.
+- A constant takes memory as the host's code does, with `module.grow`, and
+  the module starts with what it took. A literal is never placed in a page
+  that `grow` gave.
 
 ## Operators
 
@@ -344,10 +345,14 @@ struct Node:
 	val: i32
 	next: &Node
 
-var heap: uint = 65536
+var heap: uint = 0                     # the next free byte
+var end: uint = 0                      # where the page that holds it ends
 
-fn alloc(T: type) -> &var T:           # bump from an address you pick
+fn alloc(T: type) -> &var T:           # bump through pages that `grow` gives
 	heap = (heap + T.align - 1) / T.align * T.align
+	if heap + T.size > end:
+		heap = module.grow(1) as uint * module.page_size
+		end = heap + module.page_size
 	heap += T.size
 	return (heap - T.size) as! &var T
 
@@ -374,20 +379,23 @@ fn view(p: &i32, len: uint) -> array(i32):
 - Layout follows C, and `bool` is 1 byte. A pointer, a function pointer, an
   `int` and a `uint` are each 4 bytes, or 8 with `memory64`.
 - The only runtime checks are array bounds and division by zero, which trap.
-- Literals fill the static section from address 0. Memory starts as the
-  fewest pages that hold it, which is none without literals, so call
-  `module.grow` before using addresses past it. `[memory]` in `Duck.toml`
-  overrides both, and a constant that grows memory leaves it grown.
+- Literals are placed from address 0, or from `static.start` in `Duck.toml`.
+  Memory starts as the fewest pages that hold them, which is none without
+  literals, and those its constants grew it by.
+- A page is yours only if `module.grow` gave it: its result is the first of
+  the new pages. Never pick an address past the literals, as nothing says
+  where they end. Literals keep to this while the program is compiled: one
+  that the page of the last has no room for goes in the pages after it, or
+  past every page that a constant has grown memory by since.
 
 `module` is built in. Its functions are single wasm instructions and have no
 pointers.
 
-- `module.page_size`, `module.min`, `module.max`: `uint` constants for the
-  bytes in a page and the pages memory starts with and may grow to.
+- `module.page_size` and `module.max`: `uint` constants for the bytes in a
+  page and the pages memory may grow to.
 - `module.size() -> uint` and `module.grow(pages: uint) -> int` count pages.
   `grow` gives the old size, or -1.
-- `module.memory() -> varray(u8)` is all of memory from address 0, and
-  `module.static` is an `array(u8)` of the static section.
+- `module.memory() -> varray(u8)` is all of memory from address 0.
 - `module.fill(dst: &var u8, value: u8, len: uint)` and
   `module.copy(dst: &var u8, src: &u8, len: uint)`. `copy` handles overlap.
 - `module.unreachable()` traps, and ends a function as `return` does.
@@ -409,9 +417,11 @@ struct Named:                        # starts with the field of `Head`
 
 let nobody = &Named(id: 0, name: "")
 
-var heap: uint = 65536
+var heap: uint = 0
 
 fn new(T: type) -> &var T:           # a call gives `T` a type: new(Named)
+	if heap == 0:
+		heap = module.grow(1) as uint * module.page_size  # one page, taken once
 	heap += T.size
 	return (heap - T.size) as! &var T
 
@@ -742,15 +752,18 @@ let newline = "\n"
 let written = &var result(tuple(), StreamError).ok(())
 let arguments: &var array(array(u8)) = &var []
 var heap: uint = 0
+var end: uint = 0
 
 pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
-	if heap == 0:
-		heap = module.size() * module.page_size  # past what memory starts with
-	let at = (heap + align - 1) / align * align
+	var at = (heap + align - 1) / align * align
+	if at + new_size > end:
+		let pages = (new_size + module.page_size - 1) / module.page_size
+		let first = module.grow(pages)   # only the pages it gives are free
+		if first < 0:
+			module.unreachable()
+		at = first as uint * module.page_size
+		end = at + pages * module.page_size
 	heap = at + new_size
-	let pages = (heap + module.page_size - 1) / module.page_size
-	if pages > module.size() and module.grow(pages - module.size()) < 0:
-		module.unreachable()
 	module.copy(at as! &var u8, old, old_size)
 	return at as! &var u8
 
@@ -817,9 +830,8 @@ start = "main"           # optional: run on instantiation, and by `duck run`
 
 [memory]                 # optional, as is each key; needs [module]
 memory64 = true          # 64-bit addresses, which are 32-bit without it
-min = "1pgs"             # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
-max = "16MiB"
-static = { start = "0B", end = "64KiB" }  # where literals go
+max = "16MiB"            # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
+static = { start = "1KiB" }  # where literals go from, which is 0 without it
 
 [const]                  # optional
 fuel = 10000000000       # wasm instructions the constants of one item may run
@@ -832,6 +844,9 @@ json = { path = "../json" }
 xml = { git = "https://example.com/xml.git", tag = "v1.0" }  # or rev; no branches
 ```
 
+- Memory has no `min`: it starts with the pages below `static.start`, those
+  its literals take and those its constants grow it by. For one that starts
+  larger, have a constant take the pages with `module.grow`.
 - `memory64` builds a wasm memory64 module, whose memory and table are
   addressed with 64 bits: sizes may pass 4GiB, and `int`, `uint`, pointers
   and function pointers are 64 bits wide. A `uint` past 4294967295 is an

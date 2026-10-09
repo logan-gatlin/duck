@@ -265,13 +265,12 @@ impl Checker {
         let eval = match &mut self.eval {
             Some(eval) => eval,
             none => {
-                let min = self.memory.min_pages.unwrap_or(0);
                 let most = match self.memory64 {
                     true => MAX_CONSTANT_PAGES,
                     false => MAX_CONSTANT_PAGES.min(u64::from(u32::MAX) / PAGE_SIZE + 1),
                 };
-                let max = self.memory.max_pages.unwrap_or(most.max(min));
-                none.insert(Evaluator::new(self.memory64, min, max)?)
+                let max = self.max_pages.unwrap_or(most);
+                none.insert(Evaluator::new(self.memory64, max)?)
             }
         };
         let end = u64::try_from(self.data_end).unwrap_or(u64::MAX);
@@ -610,14 +609,12 @@ fn far() -> &var u32:
     return p
 let text = \"hi\"
 let p = far()
-pub let floor = module.min as i32
 pub let size = module.size() as i32
 pub fn read() -> i32:
     return (p.* >> 16) as i32
 ";
         let module = lower(src);
-        // The memory the literals need, before any is grown.
-        assert_eq!(exported(&module), "floor=1 size=3");
+        assert_eq!(exported(&module), "size=3");
         assert_eq!(module.memory.min_pages, 3);
         let offsets: Vec<_> = module.data.iter().map(|data| data.offset).collect();
         assert_eq!(offsets, [0, 70000]);
@@ -1041,16 +1038,61 @@ enum(i32) E:
     }
 
     #[test]
-    fn constants_see_the_static_section_fitted_to_the_literals() {
+    fn literals_leave_the_pages_a_constant_grew_to_it() {
         let src = "\
-let text = \"hello\"
-fn end() -> uint:
-    let all = module.static
-    return all.len + module.min
-pub let e = end()
-let more = \"world!\"
+fn claim() -> &var u8:
+    let page = module.grow(1) as uint
+    let p = (page * module.page_size) as! &var u8
+    p.* = 0xaa
+    return p
+let first = \"a\"
+let mine = claim()
+let fits = \"bc\"
+let large: array(u8) = [7; 70000]
+let last = \"d\"
+pub let kept = mine.*
+pub let pages = module.size() as i32
+pub fn read() -> i32:
+    return mine.* as i32
+pub fn grow() -> i32:
+    return module.grow(1) as i32
 ";
-        assert_eq!(consts(src), "e=12");
+        let module = lower(src);
+        assert_eq!(exported(&module), "kept=170 pages=4");
+        // `fits` is in the page `first` is, and `large`, which that page has
+        // no room for, is past the one `claim` grew.
+        let segments = module.data.iter();
+        let segments: Vec<_> = segments
+            .map(|data| (data.offset, data.bytes.len()))
+            .collect();
+        assert_eq!(segments, [(0, 3), (65536, 1), (131072, 70001)]);
+        assert_eq!(module.memory.min_pages, 4);
+        let mut started = Started::of(src);
+        assert_eq!(started.bytes(0, 4), *b"abc\0");
+        assert_eq!(started.bytes(131072 + 69999, 3), [7, b'd', 0]);
+        assert_eq!(started.call("read", &[]), 0xaa);
+        // The module grows from where its constants left off.
+        assert_eq!(started.call("grow", &[]), 4);
+    }
+
+    #[test]
+    fn literals_fill_the_pages_after_theirs_if_no_constant_grew_memory() {
+        let src = "\
+fn count() -> i32:
+    return module.size() as i32
+let first = \"a\"
+pub let before = count()
+let large: array(u8) = [7; 70000]
+pub let after = count()
+";
+        let module = lower(src);
+        assert_eq!(exported(&module), "before=1 after=2");
+        let segments = module.data.iter();
+        let segments: Vec<_> = segments
+            .map(|data| (data.offset, data.bytes.len()))
+            .collect();
+        assert_eq!(segments, [(0, 70001)]);
+        assert_eq!(module.memory.min_pages, 2);
     }
 
     #[test]

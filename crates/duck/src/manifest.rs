@@ -6,7 +6,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use duck_compiler::file::{MemoryLimits, Settings, StaticSection};
+use duck_compiler::file::Settings;
 use duck_compiler::lex;
 use serde::Deserialize;
 
@@ -41,11 +41,13 @@ pub struct Module {
     pub output: PathBuf,
     /// The function run when the module is instantiated.
     pub start: Option<String>,
-    pub memory: MemoryLimits,
+    /// The most pages memory may grow to. `None` lets it grow without
+    /// limit.
+    pub max_pages: Option<u64>,
     /// Whether the memory is addressed with 64 bits rather than 32.
     pub memory64: bool,
-    /// `None` fits it to the literals, from address 0.
-    pub static_section: Option<StaticSection>,
+    /// The address literals are placed from.
+    pub static_start: u64,
     /// The fuel that the code run to evaluate the constants of one item
     /// has. `None` is the compiler's own.
     pub fuel: Option<u64>,
@@ -95,14 +97,10 @@ pub enum ManifestError {
         value: String,
         kind: SizeErrorKind,
     },
-    MinExceedsMax {
-        min: String,
-        max: String,
-    },
-    StaticStartExceedsEnd {
-        start: String,
-        end: String,
-    },
+    /// A `min` for memory, which starts as the constants leave it.
+    Min,
+    /// An `end` for the literals, which end where the last is placed.
+    StaticEnd,
     /// Neither a `[module]` nor a `[library]`.
     Empty,
     /// A `[memory]` without a `[module]` to give it to.
@@ -160,17 +158,19 @@ struct RawModule {
 struct RawMemory {
     #[serde(default)]
     memory64: bool,
+    /// Only read to be refused.
     min: Option<String>,
     max: Option<String>,
     #[serde(rename = "static")]
-    static_section: Option<RawStaticSection>,
+    literals: Option<RawStatic>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawStaticSection {
+struct RawStatic {
     start: String,
-    end: String,
+    /// Only read to be refused.
+    end: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -273,9 +273,9 @@ impl Module {
     /// How the module is compiled.
     pub fn settings(&self) -> Settings {
         Settings {
-            memory: self.memory,
+            max_pages: self.max_pages,
             memory64: self.memory64,
-            static_section: self.static_section,
+            static_start: self.static_start,
             start: self.start.clone(),
             fuel: self.fuel,
         }
@@ -286,43 +286,29 @@ impl Module {
             memory64,
             min,
             max,
-            static_section,
+            literals,
         } = memory;
-        let min_pages = min
-            .as_deref()
-            .map(|min| pages("memory.min", min, memory64))
-            .transpose()?;
+        if min.is_some() {
+            return Err(ManifestError::Min);
+        }
         let max_pages = max
             .as_deref()
             .map(|max| pages("memory.max", max, memory64))
             .transpose()?;
-        if let (Some(min), Some(max)) = (min, max)
-            && min_pages > max_pages
-        {
-            return Err(ManifestError::MinExceedsMax { min, max });
-        }
-        let static_section = static_section
-            .map(|RawStaticSection { start, end }| {
-                let section = StaticSection {
-                    start: address("memory.static.start", &start, memory64)?,
-                    end: address("memory.static.end", &end, memory64)?,
-                };
-                if section.start > section.end {
-                    return Err(ManifestError::StaticStartExceedsEnd { start, end });
-                }
-                Ok(section)
-            })
-            .transpose()?;
+        let static_start = match literals {
+            Some(RawStatic { end: Some(_), .. }) => return Err(ManifestError::StaticEnd),
+            Some(RawStatic { start, end: None }) => {
+                address("memory.static.start", &start, memory64)?
+            }
+            None => 0,
+        };
         Ok(Self {
             entry: module.entry,
             output: module.output,
             start: module.start,
-            memory: MemoryLimits {
-                min_pages,
-                max_pages,
-            },
+            max_pages,
             memory64,
-            static_section,
+            static_start,
             fuel: None,
         })
     }
@@ -334,15 +320,9 @@ impl Library {
     /// 32 bits wide, where an `int` and a `uint` hold the least.
     pub fn settings(&self) -> Settings {
         Settings {
-            memory: MemoryLimits {
-                min_pages: Some(MAX_PAGES),
-                max_pages: None,
-            },
+            max_pages: None,
             memory64: false,
-            static_section: Some(StaticSection {
-                start: 0,
-                end: u32::MAX.into(),
-            }),
+            static_start: 0,
             start: None,
             fuel: self.fuel,
         }
@@ -415,12 +395,14 @@ impl fmt::Display for ManifestError {
         match self {
             Self::Toml(e) => write!(f, "{}", e.to_string().trim_end()),
             Self::Size { key, value, kind } => write!(f, "{key} \"{value}\" {kind}"),
-            Self::MinExceedsMax { min, max } => {
-                write!(f, "memory.min \"{min}\" exceeds memory.max \"{max}\"")
-            }
-            Self::StaticStartExceedsEnd { start, end } => write!(
+            Self::Min => write!(
                 f,
-                "memory.static.start \"{start}\" exceeds memory.static.end \"{end}\""
+                "memory has no `min`: it starts with the pages its constants leave it, \
+                 so call `module.grow` in one for more"
+            ),
+            Self::StaticEnd => write!(
+                f,
+                "memory.static has no `end`: literals end where the last is placed"
             ),
             Self::Empty => write!(f, "needs a [module] or [library] table"),
             Self::MemoryWithoutModule => write!(f, "[memory] needs a [module] table"),
@@ -469,22 +451,15 @@ impl fmt::Display for SizeErrorKind {
 mod tests {
     use super::*;
 
-    const STATIC: &str = "static = { start = \"0B\", end = \"64KiB\" }\n";
-
-    /// A module whose `[memory]` has `memory` and then [`STATIC`].
-    fn with_memory(memory: &str) -> Result<Manifest, ManifestError> {
-        with_static(&format!("{memory}{STATIC}"))
-    }
-
     /// A module whose `[memory]` is `memory`.
-    fn with_static(memory: &str) -> Result<Manifest, ManifestError> {
+    fn with_memory(memory: &str) -> Result<Manifest, ManifestError> {
         Manifest::parse(&format!(
             "[module]\nentry = \"src/main.duck\"\noutput = \"build/out.wasm\"\n\n[memory]\n{memory}"
         ))
     }
 
     fn size(value: &str) -> Result<u64, String> {
-        pages("memory.min", value, false).map_err(|e| e.to_string())
+        pages("memory.max", value, false).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -500,19 +475,20 @@ mod tests {
 
     #[test]
     fn addresses() {
-        let address = |value| address("memory.static.end", value, false).map_err(|e| e.to_string());
+        let address =
+            |value| address("memory.static.start", value, false).map_err(|e| e.to_string());
         assert_eq!(address("0B"), Ok(0));
         assert_eq!(address("1025B"), Ok(1025));
         assert_eq!(address("4KiB"), Ok(4096));
         assert_eq!(address("4294967295B"), Ok(u32::MAX.into()));
         assert_eq!(
             address("4GiB"),
-            Err("memory.static.end \"4GiB\" is not below 4GiB".to_string())
+            Err("memory.static.start \"4GiB\" is not below 4GiB".to_string())
         );
         assert_eq!(
             address("5GiB"),
             Err(
-                "memory.static.end \"5GiB\" exceeds 4GiB; set `memory64` to address more"
+                "memory.static.start \"5GiB\" exceeds 4GiB; set `memory64` to address more"
                     .to_string()
             )
         );
@@ -520,26 +496,12 @@ mod tests {
 
     #[test]
     fn memory64_addresses_more() {
-        let module = |memory: &str| with_static(memory).map(|manifest| manifest.module.unwrap());
-        let wide = module(
-            "memory64 = true\nmin = \"8GiB\"\nmax = \"1TiB\"\nstatic = { start = \"4GiB\", end = \"5GiB\" }\n",
-        )
-        .unwrap();
+        let module = |memory: &str| with_memory(memory).map(|manifest| manifest.module.unwrap());
+        let wide =
+            module("memory64 = true\nmax = \"1TiB\"\nstatic = { start = \"4GiB\" }\n").unwrap();
         assert!(wide.memory64 && wide.settings().memory64);
-        assert_eq!(
-            wide.memory,
-            MemoryLimits {
-                min_pages: Some(1 << 17),
-                max_pages: Some(1 << 24),
-            }
-        );
-        assert_eq!(
-            wide.static_section,
-            Some(StaticSection {
-                start: 1 << 32,
-                end: 5 << 30
-            })
-        );
+        assert_eq!(wide.max_pages, Some(1 << 24));
+        assert_eq!(wide.static_start, 1 << 32);
         // Neither size is within reach of 32 bits.
         for memory in ["", "memory64 = false\n"] {
             let narrow = module(&format!("{memory}max = \"4GiB\"\n")).unwrap();
@@ -562,11 +524,12 @@ mod tests {
                 "{value:?}"
             );
         }
-        let address = |value| address("memory.static.end", value, true).map_err(|e| e.to_string());
+        let address =
+            |value| address("memory.static.start", value, true).map_err(|e| e.to_string());
         assert_eq!(address("18446744073709551615B"), Ok(u64::MAX));
         assert_eq!(
             address("16777216TiB"),
-            Err("memory.static.end \"16777216TiB\" is not below 16777216TiB".to_string())
+            Err("memory.static.start \"16777216TiB\" is not below 16777216TiB".to_string())
         );
         assert!(
             module("memory64 = 64\n")
@@ -587,13 +550,13 @@ mod tests {
         ] {
             assert_eq!(
                 size(value),
-                Err(format!("memory.min \"{value}\" {malformed}")),
+                Err(format!("memory.max \"{value}\" {malformed}")),
                 "{value:?}"
             );
         }
         assert_eq!(
             size("100KiB"),
-            Err("memory.min \"100KiB\" is not a multiple of 64KiB".to_string())
+            Err("memory.max \"100KiB\" is not a multiple of 64KiB".to_string())
         );
         for value in [
             "65537pgs",
@@ -604,7 +567,7 @@ mod tests {
             assert_eq!(
                 size(value),
                 Err(format!(
-                    "memory.min \"{value}\" exceeds 4GiB; set `memory64` to address more"
+                    "memory.max \"{value}\" exceeds 4GiB; set `memory64` to address more"
                 )),
                 "{value:?}"
             );
@@ -613,7 +576,7 @@ mod tests {
 
     #[test]
     fn parses() {
-        let manifest = with_memory("min = \"1pgs\"\nmax = \"16MiB\"\n").unwrap();
+        let manifest = with_memory("max = \"16MiB\"\nstatic = { start = \"1025B\" }\n").unwrap();
         assert_eq!(
             manifest,
             Manifest {
@@ -621,36 +584,21 @@ mod tests {
                     entry: "src/main.duck".into(),
                     output: "build/out.wasm".into(),
                     start: None,
-                    memory: MemoryLimits {
-                        min_pages: Some(1),
-                        max_pages: Some(256),
-                    },
+                    max_pages: Some(256),
                     memory64: false,
-                    static_section: Some(StaticSection {
-                        start: 0,
-                        end: 64 * 1024,
-                    }),
+                    static_start: 1025,
                     fuel: None,
                 }),
                 library: None,
                 dependencies: BTreeMap::new(),
             }
         );
-        let manifest = with_memory("min = \"64KiB\"\n").unwrap();
-        assert_eq!(manifest.module.unwrap().memory.max_pages, None);
-        let manifest =
-            with_static("min = \"1pgs\"\nstatic.start = \"1KiB\"\nstatic.end = \"1025B\"\n")
-                .unwrap();
-        assert_eq!(
-            manifest.module.unwrap().static_section,
-            Some(StaticSection {
-                start: 1024,
-                end: 1025
-            })
-        );
-        let manifest = Manifest::parse(&format!(
-            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\nstart = \"init\"\n\n[memory]\nmin = \"1pgs\"\n{STATIC}",
-        ))
+        let manifest = with_memory("static.start = \"1KiB\"\n").unwrap();
+        let module = manifest.module.unwrap();
+        assert_eq!((module.max_pages, module.static_start), (None, 1024));
+        let manifest = Manifest::parse(
+            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\nstart = \"init\"\n\n[memory]\nmax = \"1pgs\"\n",
+        )
         .unwrap();
         assert_eq!(manifest.module.unwrap().start.as_deref(), Some("init"));
     }
@@ -673,26 +621,19 @@ mod tests {
 
     #[test]
     fn memory_is_optional() {
-        let unset = MemoryLimits {
-            min_pages: None,
-            max_pages: None,
-        };
         let module = |memory: &str| {
             let src = format!("[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n{memory}");
             Manifest::parse(&src).unwrap().module.unwrap()
         };
         for memory in ["", "[memory]\n"] {
             let module = module(memory);
-            assert_eq!(module.memory, unset, "{memory:?}");
-            assert_eq!(module.static_section, None, "{memory:?}");
+            assert_eq!(module.max_pages, None, "{memory:?}");
+            assert_eq!(module.static_start, 0, "{memory:?}");
         }
         let module = module("[memory]\nmax = \"2pgs\"\n");
-        assert_eq!(module.memory.max_pages, Some(2));
-        assert_eq!(module.settings().memory.min_pages, None);
-        assert_eq!(module.settings().static_section, None);
-        let module = with_static(STATIC).unwrap().module.unwrap();
-        assert_eq!(module.memory, unset);
-        assert!(module.static_section.is_some());
+        assert_eq!(module.max_pages, Some(2));
+        assert_eq!(module.settings().max_pages, Some(2));
+        assert_eq!(module.settings().static_start, 0);
     }
 
     #[test]
@@ -715,9 +656,9 @@ mod tests {
                 ]),
             }
         );
-        let both = Manifest::parse(&format!(
-            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n[memory]\nmin = \"1pgs\"\n{STATIC}[library]\nentry = \"lib.duck\"\n",
-        ))
+        let both = Manifest::parse(
+            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n[memory]\nmax = \"1pgs\"\n[library]\nentry = \"lib.duck\"\n",
+        )
         .unwrap();
         assert!(both.module.is_some() && both.library.is_some());
     }
@@ -781,9 +722,7 @@ mod tests {
         let error = |src: &str| Manifest::parse(src).unwrap_err().to_string();
         assert_eq!(error(""), "needs a [module] or [library] table");
         assert_eq!(
-            error(&format!(
-                "[library]\nentry = \"a.duck\"\n[memory]\nmin = \"1pgs\"\n{STATIC}"
-            )),
+            error("[library]\nentry = \"a.duck\"\n[memory]\nmax = \"1pgs\"\n"),
             "[memory] needs a [module] table"
         );
         assert_eq!(
@@ -799,34 +738,31 @@ mod tests {
     #[test]
     fn memory_errors() {
         let error = |memory| with_memory(memory).unwrap_err().to_string();
+        assert!(error("max_pages = \"1pgs\"\n").contains("unknown field `max_pages`"));
+        assert!(error("max = 1\n").contains("invalid type"));
+        // Memory starts with what the constants leave it, and no more.
         assert_eq!(
-            error("min = \"2MiB\"\nmax = \"1MiB\"\n"),
-            "memory.min \"2MiB\" exceeds memory.max \"1MiB\""
+            error("min = \"1pgs\"\nmax = \"1MiB\"\n"),
+            "memory has no `min`: it starts with the pages its constants leave it, \
+             so call `module.grow` in one for more"
         );
-        assert!(
-            error("min = \"1pgs\"\nmax_pages = \"1pgs\"\n").contains("unknown field `max_pages`")
-        );
-        assert!(error("min = 1\n").contains("invalid type"));
     }
 
     #[test]
-    fn static_section_errors() {
-        let error = |memory| with_static(memory).unwrap_err().to_string();
+    fn static_errors() {
+        let error = |memory| with_memory(memory).unwrap_err().to_string();
         assert_eq!(
-            error("min = \"1pgs\"\nstatic = { start = \"2KiB\", end = \"1KiB\" }\n"),
-            "memory.static.start \"2KiB\" exceeds memory.static.end \"1KiB\""
+            error("static = { start = \"1kb\" }\n"),
+            "memory.static.start \"1kb\" is not a number followed by B, KiB, MiB, GiB, TiB, or pgs"
         );
+        assert!(error("static = {}\n").contains("missing field `start`"));
+        assert!(
+            error("static = { start = \"0B\", size = \"1B\" }\n").contains("unknown field `size`")
+        );
+        // Literals end where the last is placed.
         assert_eq!(
-            error("min = \"1pgs\"\nstatic = { start = \"0B\", end = \"1kb\" }\n"),
-            "memory.static.end \"1kb\" is not a number followed by B, KiB, MiB, GiB, TiB, or pgs"
-        );
-        assert!(error("min = \"1pgs\"\nstatic = {}\n").contains("missing field `start`"));
-        assert!(
-            error("min = \"1pgs\"\nstatic = { start = \"0B\" }\n").contains("missing field `end`")
-        );
-        assert!(
-            error("min = \"1pgs\"\nstatic = { start = \"0B\", end = \"1B\", size = \"1B\" }\n")
-                .contains("unknown field `size`")
+            error("static = { start = \"0B\", end = \"64KiB\" }\n"),
+            "memory.static has no `end`: literals end where the last is placed"
         );
     }
 }

@@ -636,7 +636,7 @@ fn val_type(ty: ValType) -> wasm_encoder::ValType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{DummyManager, FileManager, MemoryLimits, Settings, StaticSection};
+    use crate::file::{DummyManager, FileManager, Settings};
     use crate::lex::tokenize;
     use crate::load::Program;
     use crate::{parse, ty};
@@ -955,13 +955,14 @@ pub fn shown():
     #[test]
     fn memory_limits() {
         let settings = Settings {
-            memory: MemoryLimits {
-                min_pages: Some(2),
-                max_pages: Some(16),
-            },
+            max_pages: Some(16),
             ..Settings::default()
         };
-        let wat = wat(&emit_with("pub fn f():\n    pass\n", &settings));
+        let emitted = |src| wat(&emit_with(src, &settings));
+        let wat = emitted("pub fn f():\n    pass\n");
+        assert!(wat.contains("(memory (;0;) 0 16)"), "{wat}");
+        // It starts with the pages a constant grew it by.
+        let wat = emitted("let _ = module.grow(2)\n");
         assert!(wat.contains("(memory (;0;) 2 16)"), "{wat}");
     }
 
@@ -969,15 +970,9 @@ pub fn shown():
     fn memory64_addresses_memory_and_the_table_with_i64() {
         let far = 1 << 32;
         let settings = Settings {
-            memory: MemoryLimits {
-                min_pages: Some(1 << 17),
-                max_pages: Some(1 << 20),
-            },
+            max_pages: Some(1 << 20),
             memory64: true,
-            static_section: Some(StaticSection {
-                start: far,
-                end: far + 64,
-            }),
+            static_start: far,
             ..Settings::default()
         };
         let src = "\
@@ -1003,7 +998,7 @@ pub fn mem(p: &var u8, q: &u8, n: uint) -> int:
         let bytes = emit_with(src, &settings);
         let wat = wat(&bytes);
         for line in [
-            "(memory (;0;) i64 131072 1048576)",
+            "(memory (;0;) i64 65537 1048576)",
             "(table (;0;) i64 2 2 funcref)",
             "(elem (;0;) (i64.const 1) func $inc)",
             r#"(data (;0;) (i64.const 4294967296) "far")"#,

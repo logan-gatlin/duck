@@ -19,12 +19,11 @@ start = "main"
 # Address memory with 64 bits rather than 32, which makes pointers, `int` and
 # `uint` 64 bits wide and lets sizes pass 4GiB.
 # memory64 = true
-# What memory starts with. If not given, it is just enough to hold `static`.
-# min = "1pgs"
+# What memory may grow to. It starts with the pages its literals take, and
+# those its constants grow it by.
 # max = "16MiB"
-# The addresses literals are placed in, which `module.static` is. If not
-# given, it starts at 0 and ends where the literals do.
-# static = { start = "0B", end = "64KiB" }
+# The address literals are placed from. If not given, it is 0.
+# static = { start = "1KiB" }
 
 # [const]
 # How long the code that a constant runs may take, counted in wasm
@@ -89,8 +88,6 @@ pub fn new(path: &Path, kind: Kind) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use duck_compiler::file::MemoryLimits;
-
     use super::*;
     use duck::files::Files;
     use duck::manifest::{Library, Module};
@@ -124,12 +121,9 @@ mod tests {
                 entry: "src/main.duck".into(),
                 output: "build/out.wasm".into(),
                 start: Some("main".to_string()),
-                memory: MemoryLimits {
-                    min_pages: None,
-                    max_pages: None,
-                },
+                max_pages: None,
                 memory64: false,
-                static_section: None,
+                static_start: 0,
                 fuel: None,
             })
         );

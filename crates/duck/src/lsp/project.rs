@@ -955,7 +955,8 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) const MODULE: &str = "[module]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmin = \"1pgs\"\nstatic = { start = \"0B\", end = \"64KiB\" }\n";
+    pub(crate) const MODULE: &str =
+        "[module]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmax = \"16MiB\"\n";
 
     const LIBRARY: &str = "[library]\nentry = \"lib.duck\"\n";
 

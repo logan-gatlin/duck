@@ -261,7 +261,6 @@ pub fn module_members() -> Vec<Completion> {
             kind,
             detail: match module_signature(name) {
                 Some(signature) => signature.label,
-                None if *name == MODULE_CONSTS[0] => format!("{ARRAY}({})", Prim::U8.name()),
                 None => Prim::Uint.name().to_string(),
             },
             import: None,
@@ -2510,6 +2509,14 @@ fn bytes(T: type, count: uint) -> uint:
         let module: Vec<_> = module_members().into_iter().map(|m| m.name).collect();
         assert!(module.contains(&"grow".to_string()), "{module:?}");
         assert!(module.contains(&"page_size".to_string()), "{module:?}");
+        // Each constant is a `uint`.
+        let consts = module_members()
+            .into_iter()
+            .filter(|m| MODULE_CONSTS.contains(&&*m.name));
+        let consts: Vec<_> = consts
+            .map(|m| format!("{}: {}", m.name, m.detail))
+            .collect();
+        assert_eq!(consts, ["page_size: uint", "max: uint"]);
     }
 
     #[test]

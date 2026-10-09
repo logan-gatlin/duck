@@ -80,18 +80,18 @@ impl fmt::Display for Imported {
 impl std::error::Error for Imported {}
 
 impl Evaluator {
-    /// A zeroed memory of `min_pages` pages that may grow to `max_pages`,
-    /// addressed with an `i64` if it's a `memory64` and an `i32` otherwise,
-    /// an empty table and no globals.
-    pub(crate) fn new(memory64: bool, min_pages: u64, max_pages: u64) -> Result<Self, Failure> {
+    /// A memory of no pages that may grow to `max_pages`, addressed with an
+    /// `i64` if it's a `memory64` and an `i32` otherwise, an empty table and
+    /// no globals.
+    pub(crate) fn new(memory64: bool, max_pages: u64) -> Result<Self, Failure> {
         let mut store = Store::new(engine(), ());
         let (memory, table) = match memory64 {
             true => (
-                MemoryType::new64(min_pages, Some(max_pages)),
+                MemoryType::new64(0, Some(max_pages)),
                 TableType::new64(RefType::FUNCREF, 1, None),
             ),
             false => (
-                MemoryType::new(min_pages as u32, Some(max_pages as u32)),
+                MemoryType::new(0, Some(max_pages as u32)),
                 TableType::new(RefType::FUNCREF, 1, None),
             ),
         };
@@ -356,8 +356,11 @@ mod tests {
         Expr::Const(Const::I32(x))
     }
 
+    /// An evaluator whose memory has one page and may grow to four.
     fn evaluator() -> Evaluator {
-        Evaluator::new(false, 1, 4).unwrap()
+        let mut eval = Evaluator::new(false, 4).unwrap();
+        assert!(eval.cover(PAGE_SIZE));
+        eval
     }
 
     fn store(addr: i32, value: Expr) -> Stmt {
@@ -556,7 +559,8 @@ mod tests {
 
     #[test]
     fn memories_and_tables_are_as_wide_as_addresses() {
-        let mut eval = Evaluator::new(true, 1, 4).unwrap();
+        let mut eval = Evaluator::new(true, 4).unwrap();
+        assert!(eval.cover(PAGE_SIZE));
         let addr = Expr::Const(Const::I64(8));
         let write = Stmt::Store {
             ty: ValType::I64,
