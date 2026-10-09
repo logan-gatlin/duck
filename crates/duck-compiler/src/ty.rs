@@ -1507,16 +1507,28 @@ impl std::error::Error for TypeError {}
 /// Resolves names in, type checks, and lowers a loaded program to one wasm
 /// module, giving it the memory and start function `settings` describe.
 ///
+/// The module starts as the code its constants ran left it: with that
+/// memory, of that size, and with each `var` as it was last assigned.
+///
 /// Checking continues past errors, so every error in the program is reported
 /// at once.
 pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
-    let (ck, imports, funcs, start) = lower_program(program, settings);
+    let (mut ck, imports, funcs, start) = lower_program(program, settings);
     if !ck.errors.is_empty() {
         return Err(ck.errors);
     }
+    let mut min_pages = ck.min_pages();
+    if let Some(eval) = &mut ck.eval {
+        min_pages = min_pages.max(eval.pages());
+        ck.data = eval.data();
+        let globals = ck.ir_globals.iter_mut().enumerate();
+        for (index, global) in globals.filter(|(_, global)| global.mutable) {
+            global.init = eval.global(index);
+        }
+    }
     Ok(ir::Module {
         memory: ir::Memory {
-            min_pages: ck.min_pages(),
+            min_pages,
             max_pages: settings.memory.max_pages,
             memory64: settings.memory64,
             export: MEMORY_EXPORT.to_string(),
@@ -1583,6 +1595,7 @@ fn lower_program(
     if !ck.errors.iter().all(unchecked) {
         ck.errors.retain(|e| !unchecked(e));
     }
+    ck.place_late_literals();
     (ck, imports, funcs, start)
 }
 

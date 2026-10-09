@@ -26,6 +26,12 @@ start = "main"
 # given, it starts at 0 and ends where the literals do.
 # static = { start = "0B", end = "64KiB" }
 
+# [const]
+# How long the code that a constant runs may take, counted in wasm
+# instructions: the constants of one item share it. If not given, it is about
+# a second's worth.
+# fuel = 10000000000
+
 # Packages to `use` by name, each with a [library].
 # [dependencies]
 # json = { path = "../json" }
@@ -124,6 +130,7 @@ mod tests {
                 },
                 memory64: false,
                 static_section: None,
+                fuel: None,
             })
         );
         assert_eq!(manifest.library, None);
@@ -157,7 +164,8 @@ mod tests {
         assert_eq!(
             manifest.library,
             Some(Library {
-                entry: "src/lib.duck".into()
+                entry: "src/lib.duck".into(),
+                fuel: None,
             })
         );
         assert!(manifest.dependencies.is_empty());

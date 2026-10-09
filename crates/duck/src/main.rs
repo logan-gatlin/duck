@@ -94,7 +94,11 @@ fn build() -> ExitCode {
         Ok(files) => files,
         Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
     };
-    let bytes = match duck_compiler::compile(&mut files) {
+    let compiled = match &manifest.module {
+        Some(_) => duck_compiler::compile(&mut files).map(Some),
+        None => duck_compiler::check(&mut files).map(|()| None),
+    };
+    let bytes = match compiled {
         Ok(bytes) => bytes,
         Err(errors) => {
             for error in &errors {
@@ -121,7 +125,7 @@ fn build() -> ExitCode {
         }
     };
 
-    let Some(module) = &manifest.module else {
+    let (Some(module), Some(bytes)) = (&manifest.module, bytes) else {
         return ExitCode::SUCCESS;
     };
     let output = root.join(&module.output);

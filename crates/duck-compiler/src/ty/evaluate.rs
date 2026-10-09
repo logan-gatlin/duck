@@ -25,13 +25,13 @@ use crate::lex::Span;
 use crate::load::Program;
 
 use super::{
-    Checker, Fold, MEMORY_EXPORT, PAGE_SIZE, TABLE_EXPORT, TEMP, Ty, TypeErrorKind, Value, exprs,
-    fn_decls,
+    Checker, Fold, MEMORY_EXPORT, PAGE_SIZE, TABLE_EXPORT, TEMP, Ty, TypeError, TypeErrorKind,
+    Value, exprs, fn_decls,
 };
 
 /// The fuel the constants of one item run on, unless the settings say: about
 /// a second's worth.
-pub const DEFAULT_FUEL: u64 = 1_000_000_000;
+pub const DEFAULT_FUEL: u64 = 10_000_000_000;
 
 /// The most pages memory grows to while constants are evaluated, where the
 /// settings leave it unlimited: 1 GiB.
@@ -295,6 +295,25 @@ impl Checker {
         Ok(eval)
     }
 
+    /// Gives the state that the code constants ran left, if any ran, the
+    /// literals placed since the last of it did. Reports memory that can't
+    /// hold them.
+    pub(super) fn place_late_literals(&mut self) {
+        if self.eval.is_none() || !self.errors.is_empty() {
+            return;
+        }
+        if let Err(failure) = self.sync() {
+            let FailureKind::Invalid(why) = failure.kind else {
+                unreachable!("nothing is run");
+            };
+            self.errors.push(TypeError {
+                kind: TypeErrorKind::ConstNotRun(why),
+                span: None,
+                instances: Vec::new(),
+            });
+        }
+    }
+
     /// What an error says of `failure`, which stopped `module`. It has the
     /// bodies of the functions of `reached`.
     fn failure_kind(
@@ -311,7 +330,10 @@ impl Checker {
         // The constant itself is the last of them.
         let thunk = (imports + module.funcs.len() - 1) as u32;
         let frames = failure.stack.iter().filter(|index| **index != thunk);
-        let stack: Vec<_> = frames.take(MAX_STACK).map(name).collect();
+        // A function that calls itself is named once.
+        let mut stack: Vec<_> = frames.map(name).collect();
+        stack.dedup();
+        stack.truncate(MAX_STACK);
         let innermost = failure.stack.first().copied();
         let unnamed = innermost.filter(|index| {
             *index != thunk && *index >= self.import_count && !reached.contains(&FuncId(*index))
@@ -323,7 +345,7 @@ impl Checker {
                 stack: stack[1..].to_vec(),
             },
             FailureKind::Unreachable => TypeErrorKind::ConstTraps {
-                trap: "`module.unreachable()` is reached".to_string(),
+                trap: "unreachable code is reached".to_string(),
                 stack,
             },
             FailureKind::Trap(trap) => TypeErrorKind::ConstTraps { trap, stack },
@@ -427,7 +449,6 @@ mod tests {
     use crate::file::{DummyManager, FileManager, Settings};
     use crate::lex::tokenize;
     use crate::parse;
-    use crate::ty::TypeError;
 
     fn check_with(src: &str, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
         let entry = DummyManager::new().entry_point();
@@ -440,6 +461,51 @@ mod tests {
         match check_with(src, &Settings::default()) {
             Ok(module) => module,
             Err(errors) => panic!("unexpected type errors: {errors:#?}"),
+        }
+    }
+
+    /// The module of `src`, compiled and instantiated, as its host finds it.
+    struct Started {
+        store: wasmtime::Store<()>,
+        instance: wasmtime::Instance,
+    }
+
+    impl Started {
+        fn of(src: &str) -> Self {
+            let bytes = crate::emit::emit(&lower(src));
+            let engine = wasmtime::Engine::default();
+            let module = wasmtime::Module::new(&engine, bytes).unwrap();
+            let mut store = wasmtime::Store::new(&engine, ());
+            let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+            Self { store, instance }
+        }
+
+        /// What the exported `i32` global `name` holds.
+        fn global(&mut self, name: &str) -> i32 {
+            let global = self.instance.get_global(&mut self.store, name).unwrap();
+            global.get(&mut self.store).unwrap_i32()
+        }
+
+        /// The result of the exported function `name`, from `i32`s to an
+        /// `i32`, called with `args`.
+        fn call(&mut self, name: &str, args: &[i32]) -> i32 {
+            let func = self.instance.get_func(&mut self.store, name).unwrap();
+            let args: Vec<_> = args.iter().map(|arg| wasmtime::Val::I32(*arg)).collect();
+            let mut results = [wasmtime::Val::I32(0)];
+            func.call(&mut self.store, &args, &mut results).unwrap();
+            results[0].unwrap_i32()
+        }
+
+        /// The `len` bytes of memory at `addr`.
+        fn bytes(&mut self, addr: usize, len: usize) -> Vec<u8> {
+            let memory = self.instance.get_memory(&mut self.store, "memory").unwrap();
+            memory.data(&self.store)[addr..addr + len].to_vec()
+        }
+
+        /// The size of memory, in pages.
+        fn pages(&mut self) -> u64 {
+            let memory = self.instance.get_memory(&mut self.store, "memory").unwrap();
+            memory.size(&self.store)
         }
     }
 
@@ -471,6 +537,125 @@ mod tests {
             (e.kind.to_string(), &src[span.start..span.end])
         };
         errors.into_iter().map(at).collect()
+    }
+
+    #[test]
+    fn a_module_starts_as_its_constants_left_it() {
+        let src = "\
+let squares: varray(u32) = [0; 4]
+pub var count = 0
+pub var untouched = 5
+fn fill() -> uint:
+    var i: uint = 0
+    while i < squares.len:
+        squares[i] = (i * i) as u32
+        count += 1
+        i += 1
+    return i
+pub let filled = fill()
+pub fn get(i: i32) -> i32:
+    return squares[i as uint] as i32
+pub fn bump() -> i32:
+    count += 1
+    return count
+";
+        let mut started = Started::of(src);
+        assert_eq!(
+            started.bytes(0, 16),
+            [0, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 9, 0, 0, 0]
+        );
+        assert_eq!(started.global("count"), 4);
+        assert_eq!(started.global("untouched"), 5);
+        assert_eq!(started.global("filled"), 4);
+        assert_eq!(started.call("get", &[3]), 9);
+        assert_eq!(started.call("bump", &[]), 5);
+    }
+
+    #[test]
+    fn a_module_starts_with_what_its_constants_built() {
+        // A list that is linked while the program is compiled.
+        let src = "\
+struct Node:
+    value: i32
+    next: &Node
+let end = &Node(value: 0, next: 0)
+let nodes: varray(Node) = [Node(value: 0, next: end); 3]
+fn link() -> &Node:
+    var i: uint = 0
+    var head = end
+    while i < nodes.len:
+        nodes[i] = Node(value: (i + 1) as i32 * 10, next: head)
+        head = &nodes[i]
+        i += 1
+    return head
+let head = link()
+pub fn sum() -> i32:
+    var total = 0
+    var at = head
+    while at.value != 0:
+        total += at.value
+        at = at.next
+    return total
+";
+        assert_eq!(Started::of(src).call("sum", &[]), 60);
+    }
+
+    #[test]
+    fn a_module_starts_with_the_memory_its_constants_grew() {
+        let src = "\
+fn far() -> &var u32:
+    module.grow(2)
+    let p = (70000 as uint) as! &var u32
+    p.* = 0xdeadbeef
+    return p
+let text = \"hi\"
+let p = far()
+pub let floor = module.min as i32
+pub let size = module.size() as i32
+pub fn read() -> i32:
+    return (p.* >> 16) as i32
+";
+        let module = lower(src);
+        // The memory the literals need, before any is grown.
+        assert_eq!(exported(&module), "floor=1 size=3");
+        assert_eq!(module.memory.min_pages, 3);
+        let offsets: Vec<_> = module.data.iter().map(|data| data.offset).collect();
+        assert_eq!(offsets, [0, 70000]);
+        let mut started = Started::of(src);
+        assert_eq!(started.pages(), 3);
+        assert_eq!(started.bytes(0, 2), *b"hi");
+        assert_eq!(started.bytes(70000, 4), [0xef, 0xbe, 0xad, 0xde]);
+        assert_eq!(started.call("read", &[]), 0xdead);
+    }
+
+    #[test]
+    fn literals_placed_after_a_run_are_as_written() {
+        // `scribble` writes where `later` is then placed.
+        let src = "\
+fn scribble() -> i32:
+    module.fill(0 as uint as! &var u8, 0xff, 64)
+    return 1
+let first = \"ab\"
+let ran = scribble()
+let zeros: array(u8) = [0; 4]
+let later: array(u8) = [7, 8]
+let last = sum(zeros) + sum(later)
+fn sum(of: array(u8)) -> i32:
+    var total = 0
+    for x in of:
+        total += x as i32
+    return total
+pub let total = last
+pub fn at(i: i32) -> i32:
+    return module.memory()[i as uint] as i32
+";
+        let mut started = Started::of(src);
+        assert_eq!(started.global("total"), 15);
+        assert_eq!(
+            started.bytes(0, 10),
+            [0xff, 0xff, 0, 0, 0, 0, 7, 8, 0xff, 0xff]
+        );
+        assert_eq!(started.call("at", &[7]), 8);
     }
 
     #[test]
@@ -721,8 +906,22 @@ let a = at(2)
         let (message, _) = &errors_at(&src)[0];
         assert_eq!(
             message,
-            "constant evaluation traps: `module.unreachable()` is reached, in `at`"
+            "constant evaluation traps: unreachable code is reached, in `at`"
         );
+    }
+
+    #[test]
+    fn a_function_that_calls_itself_is_named_once() {
+        let src = "\
+fn down(n: i32) -> i32:
+    return down(n + 1) + 1
+fn start() -> i32:
+    return down(0)
+let depth = start()
+";
+        // Only the innermost of so many are known.
+        let trap = "constant evaluation traps: call stack exhausted, in `down`";
+        assert_eq!(errors_at(src), [(trap.to_string(), "start()")]);
     }
 
     #[test]
@@ -797,6 +996,26 @@ let b = sneak()
         let unnamed = "constant evaluation calls `hidden` through a pointer that nothing \
                        the constant names leads to, in `sneak`";
         assert_eq!(errors_at(src), [(unnamed.to_string(), "sneak()")]);
+    }
+
+    #[test]
+    fn errors_are_found_without_making_the_module() {
+        let src = "\
+fn half(x: i32) -> i32:
+    return x / 2
+let fine = half(4)
+let bad = half(1) / half(1)
+";
+        let entry = DummyManager::new().entry_point();
+        let tokens = tokenize(entry, src).unwrap();
+        let program = Program::single(entry, parse::parse(&tokens).unwrap());
+        let errors = crate::ty::errors(&program, &Settings::default());
+        let kinds: Vec<_> = errors.iter().map(|e| e.kind.to_string()).collect();
+        assert_eq!(kinds, ["constant evaluation traps: integer divide by zero"]);
+        let fixed = src.replace("half(1) / half(1)", "half(8)");
+        let tokens = tokenize(entry, &fixed).unwrap();
+        let program = Program::single(entry, parse::parse(&tokens).unwrap());
+        assert_eq!(crate::ty::errors(&program, &Settings::default()), []);
     }
 
     #[test]

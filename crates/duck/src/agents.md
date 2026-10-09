@@ -224,23 +224,77 @@ fn f(i: uint) -> u8:
 ```
 
 - A literal is a read-only `array` unless its global is annotated `varray`.
-- In an initializer, `&value` and `&var value` place a constant in memory, as
+- In an initializer, `&value` and `&var value` place a value in memory, as
   a literal is, and give its address: `&var State()`, `&Mode.idle`. A name is
   copied, so `&N` twice is two addresses.
 - An integer literal takes the type expected of it, which may be a float or a
   pointer (`let p: &u8 = 16`), and is otherwise `i32`. A float literal is
   `f64` by default and has a digit on each side of the `.`.
-- A global initializer is constant: literals, operators, casts, constructors,
-  function names and `let` globals. Calls and `var` globals are out.
-- A field default is constant too. A `varray` literal in one is empty and it
-  has no `&var value`, as every value would share the memory.
-- Constants are declared in any order, in any file. None is used in its own
-  definition: a global in its initializer, an enum in its members' values, or
-  a struct's defaults in that struct's defaults.
+- A `varray` literal in a field default is empty and it has no `&var value`,
+  as every value would share the memory. A parameter default has the same
+  rule, and never uses another parameter: `end: uint = a.len` is an error.
 - Only a constructor applies field defaults. Memory that is cast to a struct
   holds whatever was there.
-- A parameter default is constant, with the same `varray` and `&var` rule. It
-  never uses another parameter: `end: uint = a.len` is an error.
+
+## Constants
+
+A global initializer, an enum member's value and a default are constants:
+each is any expression, evaluated once, while the program is compiled. One
+that calls a function runs it then.
+
+```duck
+let squares: varray(u32) = [0; 256]
+var ids = 0
+
+fn fill() -> uint:
+	var n: uint = 0
+	while n < squares.len:
+		squares[n] = (n * n) as u32  # in the memory the module starts with
+		n += 1
+	return n
+
+fn id() -> i32:
+	ids += 1                         # the module starts with `ids` as 3
+	return ids
+
+let filled = fill()                  # run while compiling
+let first = id()                     # 1
+let second = id()                    # 2: a file runs top to bottom
+pub let largest = squares[filled - 1]  # 65025, read from memory
+
+enum(u32) Limit:
+	low = squares[4]                 # 16
+	high = squares[8]
+
+fn area(w: i32, h: i32 = id()) -> i32:  # 3, for every call without an `h`
+	return w * h
+```
+
+- The module starts as its constants left it: with every byte they wrote,
+  anywhere in memory, with the pages they grew it to, and with each `var` as
+  they last assigned it. Nothing separates the two: a function runs the same
+  for a constant as for the host. Zero what was only scratch, as every other
+  byte is in the wasm.
+- Constants run in order: those of a module that is used before those of the
+  module that uses it, and each file top to bottom. One that another reads
+  runs first, wherever it is declared, as does one that a function the other
+  may call reads. Each runs once. `let _ = init()` runs `init` for what it
+  does alone.
+- The length of `[value; len]` runs before the rest of its initializer does.
+- No constant is used in its own definition: a global in its initializer, an
+  enum in its members' values, a struct's defaults in that struct's
+  defaults, or a function's in that function's. Nor may the functions it
+  calls or takes pointers to read it, or those they call, whether or not
+  they would when it runs.
+- A constant calls no `extern` function: the host isn't there yet. That, a
+  trap and running out of fuel are each an error where the constant is, which
+  names the functions that were running. Nothing runs after an error.
+- A default is one value, made once: `h: i32 = id()` calls `id` once, not
+  once for each call that leaves `h` out.
+- The constants of one item share its fuel, which `[const]` in `Duck.toml`
+  sets, and is about a second's worth without it.
+- `module.min` is the pages memory has before any constant grows it, and
+  `module.size()` the pages it has.
 
 ## Operators
 
@@ -315,7 +369,7 @@ fn view(p: &i32, len: uint) -> array(i32):
 - Literals fill the static section from address 0. Memory starts as the
   fewest pages that hold it, which is none without literals, so call
   `module.grow` before using addresses past it. `[memory]` in `Duck.toml`
-  overrides both.
+  overrides both, and a constant that grows memory leaves it grown.
 
 `module` is built in. Its functions are single wasm instructions and have no
 pointers.
@@ -664,6 +718,9 @@ memory64 = true          # 64-bit addresses, which are 32-bit without it
 min = "1pgs"             # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
 max = "16MiB"
 static = { start = "0B", end = "64KiB" }  # where literals go
+
+[const]                  # optional
+fuel = 10000000000       # wasm instructions the constants of one item may run
 
 [library]                # what other packages `use` by name
 entry = "src/lib.duck"

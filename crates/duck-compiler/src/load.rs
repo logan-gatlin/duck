@@ -359,6 +359,27 @@ mod tests {
     }
 
     #[test]
+    fn constants_run_in_the_order_modules_are_used() {
+        // Those of `b` run before those of `main`, which uses it, and so
+        // call `next` first.
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use b\nuse a\npub let last = a.next() * 10 + b.first\n",
+            ),
+            (
+                "a",
+                "var count = 0\npub fn next() -> i32:\n    count += 1\n    return count\n",
+            ),
+            ("b", "use a\npub let first = a.next()\n"),
+        ]);
+        let module = lower(&mut files);
+        let inits: Vec<_> = module.globals.iter().map(|g| g.init).collect();
+        // `count`, as the calls left it, and `last`.
+        assert_eq!(inits, [Const::I32(2), Const::I32(21)]);
+    }
+
+    #[test]
     fn modules_use_each_other() {
         let mut files = Memory(vec![
             (

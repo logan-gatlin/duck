@@ -72,3 +72,14 @@ pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
         .map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
     Ok(emit::emit(&module))
 }
+
+/// Finds the errors [`compile`] does in the entry point of `files`, and
+/// every file it uses, without making the module of a program that has none.
+pub fn check(files: &mut impl FileManager) -> Result<(), Vec<Error>> {
+    let module = load::load(files)?;
+    let errors = ty::errors(&module, &files.settings());
+    match errors.is_empty() {
+        true => Ok(()),
+        false => Err(errors.into_iter().map(Error::Type).collect()),
+    }
+}
