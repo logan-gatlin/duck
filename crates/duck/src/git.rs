@@ -79,6 +79,14 @@ impl Cache {
         }
     }
 
+    /// Whether `path` is in the cache: a file of a dependency it fetched.
+    pub fn holds(&self, path: &Path) -> bool {
+        let dir = self.dir.as_ref();
+        dir.is_some_and(|dir| {
+            path.starts_with(dir) || fs::canonicalize(dir).is_ok_and(|dir| path.starts_with(dir))
+        })
+    }
+
     /// The commit `reference` names in the repository at `url`, and the
     /// directory holding it, fetching whatever the cache lacks.
     pub fn checkout(&self, url: &str, reference: &GitRef) -> Result<(String, PathBuf), GitError> {

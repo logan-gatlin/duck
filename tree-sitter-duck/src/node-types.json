@@ -8,6 +8,10 @@
         "named": true
       },
       {
+        "type": "assignment_expression",
+        "named": true
+      },
+      {
         "type": "binary_expression",
         "named": true
       },
@@ -186,10 +190,6 @@
     "named": true,
     "subtypes": [
       {
-        "type": "assignment",
-        "named": true
-      },
-      {
         "type": "binding",
         "named": true
       },
@@ -314,7 +314,7 @@
     }
   },
   {
-    "type": "assignment",
+    "type": "assignment_expression",
     "named": true,
     "fields": {
       "operator": {

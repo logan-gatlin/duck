@@ -15,23 +15,27 @@ fn f():
     (identifier)
     (parameters)
     (block
-      (assignment
-        (identifier)
-        (integer))
-      (assignment
-        (field_expression
+      (expression_statement
+        (assignment_expression
           (identifier)
-          (identifier))
-        (integer))
-      (assignment
-        (index_expression
-          (identifier)
-          (integer))
-        (integer))
-      (assignment
-        (dereference_expression
-          (identifier))
-        (integer)))))
+          (integer)))
+      (expression_statement
+        (assignment_expression
+          (field_expression
+            (identifier)
+            (identifier))
+          (integer)))
+      (expression_statement
+        (assignment_expression
+          (index_expression
+            (identifier)
+            (integer))
+          (integer)))
+      (expression_statement
+        (assignment_expression
+          (dereference_expression
+            (identifier))
+          (integer))))))
 
 ====================
 If

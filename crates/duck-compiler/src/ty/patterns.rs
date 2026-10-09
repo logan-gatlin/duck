@@ -366,6 +366,7 @@ impl Body<'_> {
         subject: &[LocalId],
         case: &mut Case<'p>,
     ) -> Pat {
+        self.ck.record(pattern.span, ty);
         match &pattern.kind {
             PatternKind::Name(name) => {
                 if case.names.iter().any(|(bound, ..)| bound == name) {
@@ -757,7 +758,6 @@ fn push_pattern_strings<'p>(block: &'p [parse::Stmt], out: &mut Vec<&'p str>) {
             }
             // Every statement that holds others is above.
             StmtKind::Binding(_)
-            | StmtKind::Assign { .. }
             | StmtKind::Expr(_)
             | StmtKind::Return(_)
             | StmtKind::Break

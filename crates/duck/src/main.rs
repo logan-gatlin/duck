@@ -58,8 +58,10 @@ enum Command {
     },
     /// Print an overview of the duck language for coding agents
     Agents,
-    /// Report the errors of duck packages to an editor, speaking the Language
-    /// Server Protocol over stdio
+    /// Report the errors of duck packages to an editor, and what they never
+    /// use, and tell it what is written at a place, where it is declared,
+    /// what a call takes, what can be written and what would mend an error,
+    /// speaking the Language Server Protocol over stdio
     Lsp,
 }
 

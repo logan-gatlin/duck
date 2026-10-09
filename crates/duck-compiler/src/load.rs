@@ -9,7 +9,7 @@ use std::fmt;
 
 use crate::Error;
 use crate::file::{FileId, FileManager};
-use crate::lex::{self, Span};
+use crate::lex::{self, Span, Token};
 use crate::parse::{self, Ident, Item, ItemKind, UsePath};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +51,9 @@ pub struct Use {
     pub target: FileId,
     /// `target`, as the path names it.
     pub target_path: String,
+    /// The names of the path that lead to `target`, the last of which names
+    /// it: its file, or the dependency whose library it is.
+    pub path: Vec<Ident>,
     /// The rest of the path, each a member of what the one before names.
     /// Empty when the path names `target` itself.
     pub members: Vec<Ident>,
@@ -60,12 +63,18 @@ pub struct Use {
 
 struct Loader<'f, F> {
     files: &'f mut F,
+    /// Whether what lexes and parses of a file with errors is loaded.
+    partial: bool,
     /// The modules loaded or being loaded, which are not loaded again.
     seen: HashSet<FileId>,
     items: Vec<Item>,
     uses: Vec<Use>,
     errors: Vec<Error>,
 }
+
+/// The most lines with an error that are blanked for the rest of a file to
+/// lex.
+const MAX_BLANKED_LINES: usize = 16;
 
 impl fmt::Display for UseErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,38 +117,56 @@ impl Program {
 /// use one another. Errors in one file don't stop the others from loading,
 /// but the uses of a file that fails to lex or parse are not followed.
 pub fn load(files: &mut impl FileManager) -> Result<Program, Vec<Error>> {
-    let entry = files.entry_point();
-    let mut loader = Loader {
-        files,
-        seen: HashSet::new(),
-        items: Vec::new(),
-        uses: Vec::new(),
-        errors: Vec::new(),
-    };
-    loader.seen.insert(entry);
-    loader.items_of(entry);
-    if loader.errors.is_empty() {
-        Ok(Program {
-            items: loader.items,
-            uses: loader.uses,
-            entry,
-        })
-    } else {
-        Err(loader.errors)
+    match Loader::run(files, false) {
+        (program, errors) if errors.is_empty() => Ok(program),
+        (_, errors) => Err(errors),
     }
 }
 
-impl<F: FileManager> Loader<'_, F> {
+/// Loads as [`load`] does, and gives what loaded of a program with errors
+/// along with them, for a caller that asks about what is there: of a file
+/// with errors, the lines without one, whose uses are followed.
+pub fn load_partial(files: &mut impl FileManager) -> (Program, Vec<Error>) {
+    Loader::run(files, true)
+}
+
+impl<'f, F: FileManager> Loader<'f, F> {
+    fn run(files: &'f mut F, partial: bool) -> (Program, Vec<Error>) {
+        let entry = files.entry_point();
+        let mut loader = Self {
+            files,
+            partial,
+            seen: HashSet::new(),
+            items: Vec::new(),
+            uses: Vec::new(),
+            errors: Vec::new(),
+        };
+        loader.seen.insert(entry);
+        loader.items_of(entry);
+        let program = Program {
+            items: loader.items,
+            uses: loader.uses,
+            entry,
+        };
+        (program, loader.errors)
+    }
+
     fn items_of(&mut self, id: FileId) {
         let src = self.files.contents(id);
-        let tokens = match lex::tokenize(id, &src) {
-            Ok(tokens) => tokens,
-            Err(e) => return self.errors.push(Error::Lex(e)),
+        let lexed = self.errors.len();
+        let Some(tokens) = self.tokens_of(id, src) else {
+            return;
         };
-        let module = match parse::parse(&tokens) {
-            Ok(module) => module,
-            Err(errors) => return self.errors.extend(errors.into_iter().map(Error::Parse)),
-        };
+        let (module, errors) = parse::parse_partial(&tokens);
+        let failed = !errors.is_empty();
+        // What is left of a file that doesn't lex may not parse for what
+        // was taken from it.
+        if self.errors.len() == lexed {
+            self.errors.extend(errors.into_iter().map(Error::Parse));
+        }
+        if failed && !self.partial {
+            return;
+        }
         // Uses come first, so the modules they load precede these items,
         // but for one that is being loaded: it uses this module in turn.
         for item in module.items {
@@ -155,6 +182,27 @@ impl<F: FileManager> Loader<'_, F> {
                 _ => self.items.push(item),
             }
         }
+    }
+
+    /// The tokens of `src`, the contents of file `id`. For one that doesn't
+    /// lex they are those of what is left once each line with an error is
+    /// blanked, if what loads of a file is wanted.
+    fn tokens_of(&mut self, id: FileId, mut src: String) -> Option<Vec<Token>> {
+        let mut error = match lex::tokenize(id, &src) {
+            Ok(tokens) => return Some(tokens),
+            Err(error) => error,
+        };
+        self.errors.push(Error::Lex(error.clone()));
+        for _ in 0..MAX_BLANKED_LINES {
+            if !self.partial || !blank_line(&mut src, error.span.start) {
+                break;
+            }
+            error = match lex::tokenize(id, &src) {
+                Ok(tokens) => return Some(tokens),
+                Err(error) => error,
+            };
+        }
+        None
     }
 
     /// Loads the module `path` leads into, and gives what it names its name
@@ -183,11 +231,25 @@ impl<F: FileManager> Loader<'_, F> {
             name: name.clone(),
             target,
             target_path: names[..len].join("."),
+            path: path.segments[..len].to_vec(),
             members: path.segments[len..].to_vec(),
             is_pub,
         });
         Ok(())
     }
+}
+
+/// Replaces the line of `src` that byte `offset` is in with as many spaces,
+/// so that every other line is where it was. Whether that changed it.
+fn blank_line(src: &mut String, offset: usize) -> bool {
+    let offset = offset.min(src.len());
+    let start = src[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = src[offset..].find('\n').map_or(src.len(), |i| offset + i);
+    if src[start..end].trim().is_empty() {
+        return false;
+    }
+    src.replace_range(start..end, &" ".repeat(end - start));
+    true
 }
 
 /// From the first name of `path` to its last.
@@ -276,6 +338,40 @@ mod tests {
             .iter()
             .map(|item| format!("{} {}", name(item), files.display_name(item.span.file)))
             .collect()
+    }
+
+    #[test]
+    fn what_loads_of_a_program_with_errors_is_what_lexes_and_parses() {
+        let mut files = Memory(vec![
+            ("main", "use a\nlet x =\nlet y = a.one\n"),
+            (
+                "a",
+                "use b\npub let one = 1\nlet s = \"\nlet t = (\nlet u = 2\n",
+            ),
+            ("b", "let v = @\n"),
+        ]);
+        // The uses of a file with an error aren't followed, unless what
+        // loads of it is wanted.
+        let strict = load(&mut files).unwrap_err();
+        assert_eq!(strict.len(), 1, "{strict:?}");
+        let (program, errors) = load_partial(&mut files);
+        assert_eq!(errors[..1], strict);
+        let kinds: Vec<_> = errors[1..].iter().map(|error| error.to_string()).collect();
+        // A file that doesn't lex has the one error, though more than the
+        // one line is left out of it.
+        assert_eq!(
+            kinds,
+            ["unterminated string literal", "unexpected character '@'"]
+        );
+        let names = program.items.iter().map(|item| match &item.kind {
+            ItemKind::Binding(b) => match &b.pattern.kind {
+                PatternKind::Name(name) => name.as_str(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        });
+        assert_eq!(names.collect::<Vec<_>>(), ["one", "u", "y"]);
+        assert_eq!(program.uses.len(), 2);
     }
 
     fn compile(files: &mut Memory) -> Result<ir::Module, Vec<Error>> {

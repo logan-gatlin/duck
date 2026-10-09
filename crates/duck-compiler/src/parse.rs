@@ -244,12 +244,6 @@ pub struct Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Binding(Binding),
-    /// `target = value`, or `target op= value` when `op` is set.
-    Assign {
-        target: Expr,
-        op: Option<BinOp>,
-        value: Expr,
-    },
     Expr(Expr),
     Return(Option<Expr>),
     /// `else if` is represented as an `else` block holding a single `If`.
@@ -328,6 +322,13 @@ pub enum ExprKind {
     Placeholder,
     /// `.name`, a variant of the union or member of the enum expected of it.
     Dot(Ident),
+    /// `target = value`, or `target op= value` when `op` is set. Its value is
+    /// the one assigned.
+    Assign {
+        target: Box<Expr>,
+        op: Option<BinOp>,
+        value: Box<Expr>,
+    },
 }
 
 /// A call argument, optionally labelled as in `f(name: value)`.
@@ -417,6 +418,9 @@ struct Parser<'a> {
     /// don't stretch over trailing newlines and dedents.
     last_end: usize,
     errors: Vec<ParseError>,
+    /// How many errors are in the line being parsed that skipping a line
+    /// within it didn't leave out. A line with any is left out itself.
+    flaws: usize,
     /// Whether each pipe body being parsed has had a placeholder yet,
     /// innermost last.
     placeholder_used: Vec<bool>,
@@ -472,6 +476,38 @@ impl Type {
     }
 }
 
+/// Displays the type as it is written.
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let list = |f: &mut fmt::Formatter<'_>, types: &[Type]| {
+            write!(f, "(")?;
+            for (i, ty) in types.iter().enumerate() {
+                let comma = if i == 0 { "" } else { ", " };
+                write!(f, "{comma}{ty}")?;
+            }
+            write!(f, ")")
+        };
+        match &self.kind {
+            TypeKind::Named(name, None) => write!(f, "{name}"),
+            TypeKind::Named(name, Some(args)) => {
+                write!(f, "{name}")?;
+                list(f, args)
+            }
+            TypeKind::Pointer(Mutability::Let, pointee) => write!(f, "&{pointee}"),
+            TypeKind::Pointer(Mutability::Var, pointee) => write!(f, "&var {pointee}"),
+            TypeKind::Qualified(module, ty) => write!(f, "{}.{ty}", module.name),
+            TypeKind::Fn(params, ret) => {
+                write!(f, "fn")?;
+                list(f, params)?;
+                match ret {
+                    Some(ret) => write!(f, " -> {ret}"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
 impl fmt::Display for ParseErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -522,19 +558,26 @@ impl std::error::Error for ParseError {}
 /// Parsing continues past errors: a malformed line (and any block nested
 /// under it) is skipped, so every error in the file is reported at once.
 pub fn parse(tokens: &[Token]) -> Result<Module, Vec<ParseError>> {
+    match parse_partial(tokens) {
+        (module, errors) if errors.is_empty() => Ok(module),
+        (_, errors) => Err(errors),
+    }
+}
+
+/// Parses as [`parse`] does, and gives what parsed of a source with errors
+/// along with them: every line but those an error is in, and the blocks
+/// nested under those.
+pub fn parse_partial(tokens: &[Token]) -> (Module, Vec<ParseError>) {
     let mut parser = Parser {
         tokens,
         pos: 0,
         last_end: 0,
         errors: Vec::new(),
+        flaws: 0,
         placeholder_used: Vec::new(),
     };
     let module = parser.module();
-    if parser.errors.is_empty() {
-        Ok(module)
-    } else {
-        Err(parser.errors)
-    }
+    (module, parser.errors)
 }
 
 impl<'a> Parser<'a> {
@@ -542,6 +585,7 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         let mut past_uses = false;
         while !self.at(TokenKind::Eof) {
+            let flaws = self.flaws;
             match self.item() {
                 Ok(item) => {
                     let is_use = matches!(item.kind, ItemKind::Use(_));
@@ -549,10 +593,13 @@ impl<'a> Parser<'a> {
                         self.error(ParseErrorKind::UseAfterItem, item.span);
                     }
                     past_uses |= !is_use;
-                    items.push(item);
+                    if self.flaws == flaws {
+                        items.push(item);
+                    }
                 }
                 Err(e) => self.recover(e),
             }
+            self.flaws = flaws;
         }
         Module { items }
     }
@@ -931,15 +978,18 @@ impl<'a> Parser<'a> {
         if !self.eat(TokenKind::Indent) {
             // Leave the next line alone; it likely belongs to the outer block.
             let error = self.unexpected("indented block");
-            self.errors.push(error);
+            self.error(error.kind, error.span);
             return Ok(Vec::new());
         }
         let mut lines = Vec::new();
         while !self.eat(TokenKind::Dedent) && !self.at(TokenKind::Eof) {
+            let flaws = self.flaws;
             match line(self) {
-                Ok(l) => lines.push(l),
+                Ok(l) if self.flaws == flaws => lines.push(l),
+                Ok(_) => {}
                 Err(e) => self.recover(e),
             }
+            self.flaws = flaws;
         }
         Ok(lines)
     }
@@ -982,7 +1032,11 @@ impl<'a> Parser<'a> {
             TokenKind::Break => self.keyword_stmt(StmtKind::Break)?,
             TokenKind::Continue => self.keyword_stmt(StmtKind::Continue)?,
             TokenKind::Pass => self.keyword_stmt(StmtKind::Pass)?,
-            _ => self.expr_stmt()?,
+            _ => {
+                let expr = self.expr()?;
+                self.expect(TokenKind::Newline)?;
+                StmtKind::Expr(expr)
+            }
         };
         Ok(Stmt {
             kind,
@@ -1121,9 +1175,11 @@ impl<'a> Parser<'a> {
         Ok(kind)
     }
 
-    /// An expression statement or assignment.
-    fn expr_stmt(&mut self) -> PResult<StmtKind> {
-        let target = self.expr()?;
+    /// An expression, which is an assignment if an assignment operator
+    /// follows its first chain of pipes. Assignments bind looser than every
+    /// other operator and group to the right.
+    fn expr(&mut self) -> PResult<Expr> {
+        let target = self.pipe()?;
         let op = match self.peek().kind {
             TokenKind::Eq => None,
             TokenKind::PlusEq => Some(BinOp::Add),
@@ -1131,10 +1187,7 @@ impl<'a> Parser<'a> {
             TokenKind::StarEq => Some(BinOp::Mul),
             TokenKind::SlashEq => Some(BinOp::Div),
             TokenKind::PercentEq => Some(BinOp::Rem),
-            _ => {
-                self.expect(TokenKind::Newline)?;
-                return Ok(StmtKind::Expr(target));
-            }
+            _ => return Ok(target),
         };
         self.bump();
         if !matches!(
@@ -1144,13 +1197,20 @@ impl<'a> Parser<'a> {
             self.error(ParseErrorKind::InvalidAssignTarget, target.span);
         }
         let value = self.expr()?;
-        self.expect(TokenKind::Newline)?;
-        Ok(StmtKind::Assign { target, op, value })
+        let span = self.span_from(target.span);
+        Ok(Expr {
+            kind: ExprKind::Assign {
+                target: Box::new(target),
+                op,
+                value: Box::new(value),
+            },
+            span,
+        })
     }
 
-    /// A chain of pipes, which bind looser than every other operator and
-    /// group to the left.
-    fn expr(&mut self) -> PResult<Expr> {
+    /// A chain of pipes, which bind looser than every operator but
+    /// assignment and group to the left.
+    fn pipe(&mut self) -> PResult<Expr> {
         let mut expr = self.binary(0)?;
         while self.eat(TokenKind::PipeArrow) {
             self.placeholder_used.push(false);
@@ -1579,9 +1639,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Records an error that doesn't stop the current line from parsing.
+    /// Records an error that doesn't stop the current line from parsing,
+    /// though the line is left out of what [`parse_partial`] gives.
     fn error(&mut self, kind: ParseErrorKind, span: Span) {
         self.errors.push(ParseError { kind, span });
+        self.flaws += 1;
     }
 
     /// An error spanning from `start` to the end of the last consumed token.
@@ -1700,6 +1762,10 @@ mod tests {
             ExprKind::Pipe(value, body) => format!("(|> {} {})", sexpr(value), sexpr(body)),
             ExprKind::Placeholder => "_".to_string(),
             ExprKind::Dot(name) => format!(".{}", name.name),
+            ExprKind::Assign { target, op, value } => {
+                let op = op.map(|op| format!("{op:?}")).unwrap_or_default();
+                format!("({op}= {} {})", sexpr(target), sexpr(value))
+            }
         }
     }
 
@@ -1725,10 +1791,12 @@ mod tests {
 
     fn stmt_kinds(body: &Block) -> Vec<&'static str> {
         body.iter()
-            .map(|s| match s.kind {
+            .map(|s| match &s.kind {
                 StmtKind::Binding(_) => "binding",
-                StmtKind::Assign { .. } => "assign",
-                StmtKind::Expr(_) => "expr",
+                StmtKind::Expr(expr) => match expr.kind {
+                    ExprKind::Assign { .. } => "assign",
+                    _ => "expr",
+                },
                 StmtKind::Return(_) => "return",
                 StmtKind::If { .. } => "if",
                 StmtKind::While { .. } => "while",
@@ -1890,6 +1958,38 @@ mod tests {
         assert_eq!(expr("a - b - c"), "(Sub (Sub a b) c)");
         assert_eq!(expr("a / b * c"), "(Mul (Div a b) c)");
         assert_eq!(expr("a or b or c"), "(Or (Or a b) c)");
+    }
+
+    #[test]
+    fn assignment_is_an_expression() {
+        assert_eq!(expr("a = b = c"), "(= a (= b c))");
+        assert_eq!(expr("a += b.x *= c"), "(Add= a (Mul= (. b x) c))");
+        assert_eq!(expr("a = b or c |> f(_)"), "(= a (|> (Or b c) (call f _)))");
+        assert_eq!(expr("(a = b) + c"), "(Add (= a b) c)");
+        assert_eq!(
+            expr("f(a = 1, x: p.* = 2)"),
+            "(call f (= a 1) x:(= (.* p) 2))"
+        );
+        assert_eq!(expr("a[i = 0]"), "(index a (= i 0))");
+        assert_eq!(expr("x |> (y = _)"), "(|> x (= y _))");
+        let src = "fn f():\n    while (n = next(p)) != 0:\n        a = b = n\n";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        let StmtKind::While { cond, body } = &f.body[0].kind else {
+            panic!()
+        };
+        assert_eq!(sexpr(cond), "(NotEq (= n (call next p)) 0)");
+        assert_eq!(stmt_kinds(body), vec!["assign"]);
+        // Only the first of a chain is a target the parser has yet to see.
+        assert_eq!(
+            errors("fn f():\n    a = b + 1 = c\n    a = 1 = b\n"),
+            vec![
+                ParseErrorKind::InvalidAssignTarget,
+                ParseErrorKind::InvalidAssignTarget
+            ]
+        );
     }
 
     #[test]
@@ -2273,7 +2373,10 @@ fn f():
         let ops: Vec<_> = f.body[..3]
             .iter()
             .map(|s| match &s.kind {
-                StmtKind::Assign { op, .. } => *op,
+                StmtKind::Expr(Expr {
+                    kind: ExprKind::Assign { op, .. },
+                    ..
+                }) => *op,
                 _ => unreachable!(),
             })
             .collect();
@@ -2947,6 +3050,47 @@ let d = 1
                 expected("`:`", TokenKind::Ident("i32".into())),
             ]
         );
+    }
+
+    #[test]
+    fn what_parses_of_a_source_with_errors_is_every_line_without_one() {
+        let src = "\
+fn a():
+    let = 1
+    b = 1 = 2
+    if c:
+    d |> e()
+    while f:
+        g +
+        h()
+    i()
+fn j(: i32):
+    pass
+struct K:
+    l i32
+    m: f32
+let n = 1
+";
+        let tokens = tokenize(DummyManager::new().entry_point(), src).unwrap();
+        let (module, errors) = parse_partial(&tokens);
+        assert_eq!(errors.len(), 7, "{errors:?}");
+        let [a, k, n] = &module.items[..] else {
+            panic!("{:?}", module.items)
+        };
+        let ItemKind::Fn(a) = &a.kind else { panic!() };
+        // A line with an error is left out with the block under it, and
+        // the block it is in is kept.
+        assert_eq!(stmt_kinds(&a.body), vec!["while", "expr"]);
+        let StmtKind::While { body, .. } = &a.body[0].kind else {
+            panic!()
+        };
+        assert_eq!(stmt_kinds(body), vec!["expr"]);
+        let ItemKind::Struct(k) = &k.kind else {
+            panic!()
+        };
+        assert_eq!(k.entries.len(), 1);
+        assert!(matches!(n.kind, ItemKind::Binding(_)));
+        assert_eq!(parse(&tokens).unwrap_err(), errors);
     }
 
     #[test]

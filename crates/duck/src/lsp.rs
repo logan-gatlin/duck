@@ -1,6 +1,11 @@
 //! `duck lsp`: a language server that reports the errors of duck packages
-//! to an editor, speaking the Language Server Protocol over stdio.
+//! to an editor, and what they declare and never use, and tells it what is
+//! written there, where it is declared, what a call takes, what can be
+//! written and what would mend an error, speaking the Language Server
+//! Protocol over stdio.
 
+mod changes;
+mod cursor;
 mod project;
 mod server;
 

@@ -36,10 +36,15 @@ mod evaluate;
 mod fn_ptr;
 mod generic;
 mod generic_fn;
+mod inspect;
 mod patterns;
 mod unions;
 
 pub use evaluate::DEFAULT_FUEL;
+pub use inspect::{
+    Action, Analysis, Completion, CompletionKind, Hint, HintKind, Hover, Parameter, Signature,
+    Symbol, SymbolKind, Unused, UnusedKind, analyze, module_members,
+};
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
 /// signed type `$s` and unsigned counterpart `$u`. Returns from the enclosing
@@ -794,6 +799,9 @@ struct Checker {
     fuel_limit: u64,
     fuel: u64,
     errors: Vec<TypeError>,
+    /// The type of each expression and of each name a pattern binds, by
+    /// where it is written, if they are kept for an [`Analysis`].
+    types: Option<HashMap<Span, Ty>>,
 }
 
 /// The functions that were running where code run for a constant stopped,
@@ -941,6 +949,10 @@ struct Body<'c> {
     default: bool,
     /// The value piped into each enclosing pipe body, innermost last.
     piped: Vec<(Ty, Vec<(ValType, Expr)>)>,
+    /// The variables that an assignment within the statement being lowered
+    /// changes before the statement ends. What is read of one is held in
+    /// temporaries, so that it is what the variable had when it was read.
+    assigned: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1513,7 +1525,7 @@ impl std::error::Error for TypeError {}
 /// Checking continues past errors, so every error in the program is reported
 /// at once.
 pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
-    let (mut ck, imports, funcs, start) = lower_program(program, settings);
+    let (mut ck, imports, funcs, start) = lower_program(program, settings, false);
     if !ck.errors.is_empty() {
         return Err(ck.errors);
     }
@@ -1549,16 +1561,18 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
 /// The errors that [`check`] finds in `program`, without the module it
 /// makes of one that has none.
 pub fn errors(program: &Program, settings: &Settings) -> Vec<TypeError> {
-    lower_program(program, settings).0.errors
+    lower_program(program, settings, false).0.errors
 }
 
 /// Checks and lowers `program`. Returns the checker, which has its errors,
-/// and its imports, its functions and its start function.
+/// and its imports, its functions and its start function. If it `records`,
+/// the checker keeps the type of what is written, too.
 fn lower_program(
     program: &Program,
     settings: &Settings,
+    records: bool,
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
-    let mut ck = Checker::define(program, settings, None);
+    let mut ck = Checker::define(program, settings, None, records);
     if ck.unfitted {
         // Literals are only in globals, so every one has been placed.
         let fitted = StaticSection {
@@ -1567,7 +1581,7 @@ fn lower_program(
         };
         if ck.read_unfitted {
             // A global was given a size the section doesn't have.
-            ck = Checker::define(program, settings, Some(fitted));
+            ck = Checker::define(program, settings, Some(fitted), records);
             if ck.data_fits() && ck.data_end != u128::from(fitted.end) {
                 ck.errors.push(TypeError {
                     kind: TypeErrorKind::SelfSizedStatic,
@@ -1622,6 +1636,26 @@ impl Checker {
             span: Some(span),
             instances,
         });
+    }
+
+    /// Keeps `ty` as the type of what is written at `span`, if types are
+    /// kept. One written in a generic function has the type it is declared
+    /// with, and none of an instance.
+    fn record(&mut self, span: Span, ty: Ty) {
+        if let Some(types) = &mut self.types
+            && self.instance_chain.is_empty()
+            && ty != Ty::Error
+        {
+            types.insert(span, ty);
+        }
+    }
+
+    /// Keeps the type of each parameter of `sig`, which `decl` declares, as
+    /// [`Self::record`] keeps that of a name a pattern binds.
+    fn record_params(&mut self, decl: &FnSig, sig: &FuncSig) {
+        for (param, (_, ty)) in decl.params.iter().zip(&sig.params) {
+            self.record(param.name.span, *ty);
+        }
     }
 
     /// Registers every item's name, so bodies can refer to later items.
@@ -2411,10 +2445,17 @@ impl Checker {
 
     /// Declares and defines every item of `program`, which places its
     /// literals. `fitted` is the static data section, if the settings leave
-    /// it to be fitted to the literals and it has been.
-    fn define(program: &Program, settings: &Settings, fitted: Option<StaticSection>) -> Self {
+    /// it to be fitted to the literals and it has been. If it `records`, the
+    /// type of what is written is kept.
+    fn define(
+        program: &Program,
+        settings: &Settings,
+        fitted: Option<StaticSection>,
+        records: bool,
+    ) -> Self {
         let static_section = settings.static_section.or(fitted).unwrap_or_default();
         let mut ck = Self {
+            types: records.then(HashMap::new),
             entry: program.entry,
             memory: settings.memory,
             memory64: settings.memory64,
@@ -2543,6 +2584,7 @@ impl Checker {
     ) -> ir::Func {
         self.module = item.span.file;
         let sig = self.funcs[id.0 as usize].clone();
+        self.record_params(&decl.sig, &sig);
         let export = self.exports(item).then(|| sig.name.clone());
         self.lower_body(program, sig, &decl.body, item.span, export)
     }
@@ -3263,12 +3305,15 @@ impl Checker {
         out: &mut Vec<Bound<'p>>,
     ) {
         match &pattern.kind {
-            PatternKind::Name(name) => out.push(Bound {
-                name,
-                span: pattern.span,
-                ty,
-                leaves: start..start + self.val_types(ty).len(),
-            }),
+            PatternKind::Name(name) => {
+                self.record(pattern.span, ty);
+                out.push(Bound {
+                    name,
+                    span: pattern.span,
+                    ty,
+                    leaves: start..start + self.val_types(ty).len(),
+                });
+            }
             PatternKind::Discard => {}
             PatternKind::Tuple(elems) => {
                 let members = match ty {
@@ -3529,6 +3574,7 @@ impl<'c> Body<'c> {
             program: None,
             default: false,
             piped: Vec::new(),
+            assigned: Vec::new(),
         }
     }
 
@@ -3633,6 +3679,7 @@ impl<'c> Body<'c> {
     }
 
     fn stmt(&mut self, stmt: &parse::Stmt, out: &mut Vec<Stmt>) {
+        let outer = mem::replace(&mut self.assigned, assigned_within(stmt));
         match &stmt.kind {
             StmtKind::Binding(binding) => {
                 let (ty, value) = self.binding_value(binding);
@@ -3665,11 +3712,14 @@ impl<'c> Body<'c> {
                     self.bind(name, ty, mutable, slots);
                 }
             }
-            StmtKind::Assign { target, op, value } => {
-                self.assign_stmt(target, *op, value, stmt.span, out);
-            }
             StmtKind::Expr(expr) => {
-                let value = self.expr(expr, None).1;
+                let value = match &expr.kind {
+                    // Nothing reads what a statement assigns.
+                    ExprKind::Assign { target, op, value } => {
+                        self.assignment(target, *op, value, expr.span, false).1
+                    }
+                    _ => self.expr(expr, None).1,
+                };
                 out.extend(value.pre);
                 for (_, scalar) in value.scalars {
                     if !is_pure(&scalar) {
@@ -3727,22 +3777,26 @@ impl<'c> Body<'c> {
             },
             StmtKind::Pass => {}
         }
+        self.assigned = outer;
     }
 
-    /// `target = value`, or `target op= value` if `op` is given.
-    fn assign_stmt(
+    /// `target = value`, or `target op= value` if `op` is given. The target
+    /// is found, then the value is evaluated, and then it is stored. If it's
+    /// `used`, the value of the assignment is the one stored. Otherwise it
+    /// has none.
+    fn assignment(
         &mut self,
         target: &parse::Expr,
         op: Option<BinOp>,
         value: &parse::Expr,
         span: Span,
-        out: &mut Vec<Stmt>,
-    ) {
+        used: bool,
+    ) -> (Ty, Value) {
         let Some(mut place) = self.place(target) else {
             self.expr(value, None);
-            return;
+            return (Ty::Error, Value::default());
         };
-        out.append(&mut place.pre);
+        let mut pre = mem::take(&mut place.pre);
         if !place.mutable {
             let kind = match place.behind {
                 Some(ty) => {
@@ -3753,7 +3807,7 @@ impl<'c> Body<'c> {
             };
             self.error(kind, target.span);
         }
-        let value = match op {
+        let mut value = match op {
             None => self.check(value, place.ty),
             Some(op) => {
                 let current = self.read_place(&place);
@@ -3761,7 +3815,25 @@ impl<'c> Body<'c> {
                 self.binary_values(op, place.ty, current, rhs, span).1
             }
         };
-        self.assign(&place, value, out);
+        if !used {
+            self.assign(&place, value, &mut pre);
+            let scalars = Vec::new();
+            return (place.ty, Value { pre, scalars });
+        }
+        // Read again as the value of the assignment, so held where storing
+        // it changes nothing: a variable that is assigned here is read into
+        // temporaries, and so none of these locals is the target's.
+        self.spill(&mut value, is_simple);
+        pre.extend(value.pre);
+        let scalars = value.scalars;
+        let cells = self.cells(&place);
+        self.store(&place, &cells, exprs(scalars.clone()), &mut pre);
+        // Only a mistyped value has other scalars than its type's.
+        let ty = match scalars.len() == self.ck.val_types(place.ty).len() {
+            true => place.ty,
+            false => Ty::Error,
+        };
+        (ty, Value { pre, scalars })
     }
 
     /// `for var in iter`, which copies each element of the array `iter`, or
@@ -3783,6 +3855,7 @@ impl<'c> Body<'c> {
             Ty::Array(id) => self.ck.element(id),
             _ => self.invalid_operand("for", ty, iter.span).0,
         };
+        self.ck.record(var.span, elem);
         let vt = self.ck.addr_type();
         let (ptr, len, index) = (self.temp(vt), self.temp(vt), self.temp(vt));
         let [zero, one] = [0, 1].map(|n| Expr::Const(self.ck.addr_const(n)));
@@ -3852,6 +3925,13 @@ impl<'c> Body<'c> {
 
     /// Resolves an assignment target. `None` after reporting an error.
     fn place(&mut self, target: &parse::Expr) -> Option<Place> {
+        let place = self.find_place(target)?;
+        self.ck.record(target.span, place.ty);
+        Some(place)
+    }
+
+    /// [`Self::place`], but for keeping the type.
+    fn find_place(&mut self, target: &parse::Expr) -> Option<Place> {
         match &target.kind {
             ExprKind::Name(name) => {
                 if let Some(var) = self.lookup(name) {
@@ -4029,7 +4109,11 @@ impl<'c> Body<'c> {
     /// Reads a place, not including its `pre`.
     fn read_place(&mut self, place: &Place) -> Value {
         let reads = match &place.slots {
-            Slots::Local(slots) => slots.iter().map(|l| Expr::Local(*l)).collect(),
+            Slots::Local(slots) => {
+                let reads = slots.iter().map(|l| Expr::Local(*l)).collect();
+                let value = self.scalars(place.ty, reads);
+                return self.read_variable(&place.name, value);
+            }
             Slots::Global(slots) => slots.iter().map(|g| Expr::Global(*g)).collect(),
             Slots::Const(consts) => consts.iter().map(|c| Expr::Const(*c)).collect(),
             Slots::Memory { addr, offset } => {
@@ -4040,13 +4124,29 @@ impl<'c> Body<'c> {
         self.scalars(place.ty, reads)
     }
 
+    /// `value`, read from the locals of the variable `name`. If an
+    /// assignment within the statement changes the variable, it is held in
+    /// temporaries, which nothing else sets: only then is a local as it was
+    /// read however much later it is evaluated.
+    fn read_variable(&mut self, name: &str, mut value: Value) -> Value {
+        if self.assigned.iter().any(|assigned| assigned == name) {
+            self.spill(&mut value, |_| false);
+        }
+        value
+    }
+
+    /// Where each scalar of `place` lives in memory, if it's there.
+    fn cells(&self, place: &Place) -> Vec<Cell> {
+        match place.slots {
+            Slots::Memory { .. } => self.ck.cells(place.ty),
+            _ => Vec::new(),
+        }
+    }
+
     fn assign(&mut self, place: &Place, mut value: Value, out: &mut Vec<Stmt>) {
         // Every scalar is read before any slot is written, so `p = Point(x:
         // p.y, y: p.x)` swaps. Stores can't change locals.
-        let cells = match place.slots {
-            Slots::Memory { .. } => self.ck.cells(place.ty),
-            _ => Vec::new(),
-        };
+        let cells = self.cells(place);
         if cells.iter().any(|cell| !cell.when.is_empty()) {
             // A union's tag is read again to store the variant it holds.
             self.spill(&mut value, is_simple);
@@ -4057,7 +4157,12 @@ impl<'c> Body<'c> {
             }
         }
         out.extend(value.pre);
-        let scalars = exprs(value.scalars);
+        self.store(place, &cells, exprs(value.scalars), out);
+    }
+
+    /// Writes `scalars` to `place`, whose `cells` are those of
+    /// [`Self::cells`], in order. Each is read as late as it is written.
+    fn store(&self, place: &Place, cells: &[Cell], scalars: Vec<Expr>, out: &mut Vec<Stmt>) {
         match &place.slots {
             Slots::Local(slots) => {
                 for (slot, scalar) in slots.iter().zip(scalars) {
@@ -4102,6 +4207,23 @@ impl<'c> Body<'c> {
     /// Infers the type of `expr` and lowers it. `expected` only guides the
     /// types of literals; the caller checks the result.
     fn expr(&mut self, expr: &parse::Expr, expected: Option<Ty>) -> (Ty, Value) {
+        // A `.name` that names nothing of the type expected of it is still
+        // known to be expected to be of that type.
+        let dot = match &expr.kind {
+            ExprKind::Dot(_) => true,
+            ExprKind::Call(callee, _) => matches!(callee.kind, ExprKind::Dot(_)),
+            _ => false,
+        };
+        if let (true, Some(expected)) = (dot, expected) {
+            self.ck.record(expr.span, expected);
+        }
+        let (ty, value) = self.infer(expr, expected);
+        self.ck.record(expr.span, ty);
+        (ty, value)
+    }
+
+    /// [`Self::expr`], but for keeping the type.
+    fn infer(&mut self, expr: &parse::Expr, expected: Option<Ty>) -> (Ty, Value) {
         match &expr.kind {
             ExprKind::Int(n) => self.int_literal(*n as i128, expected, expr.span),
             ExprKind::Float(x) => float_literal(*x, expected),
@@ -4221,6 +4343,9 @@ impl<'c> Body<'c> {
                 }
                 None => unreachable!("the parser rejects `_` outside a pipe"),
             },
+            ExprKind::Assign { target, op, value } => {
+                self.assignment(target, *op, value, expr.span, true)
+            }
         }
     }
 
@@ -4609,7 +4734,8 @@ impl<'c> Body<'c> {
         if let Some(var) = self.lookup(name) {
             let ty = var.ty;
             let reads = var.slots.iter().map(|l| Expr::Local(*l)).collect();
-            return (ty, self.scalars(ty, reads));
+            let value = self.scalars(ty, reads);
+            return (ty, self.read_variable(name, value));
         }
         match self.ck.item(name) {
             Some(item) => self.item_value(item, name, expected, span),
@@ -5930,7 +6056,8 @@ fn is_pure(expr: &Expr) -> bool {
 
 /// Whether `expr` is pure and its value can't be changed by side effects, so
 /// it may be evaluated later than written. Calls can change globals and memory
-/// but not the caller's locals.
+/// but not the caller's locals, and a variable that an assignment changes is
+/// read from temporaries, as [`Body::read_variable`] has it.
 fn is_stable(expr: &Expr) -> bool {
     match expr {
         Expr::Const(_) | Expr::Local(_) => true,
@@ -5949,6 +6076,82 @@ fn is_stable(expr: &Expr) -> bool {
         | Expr::MemorySize
         | Expr::MemoryGrow(_)
         | Expr::Seq(..) => false,
+    }
+}
+
+/// The variables that the assignments within the expressions of `stmt`
+/// change. An assignment that is the statement itself is not among them: its
+/// target is written when nothing is left to read.
+fn assigned_within(stmt: &parse::Stmt) -> Vec<String> {
+    let mut names = Vec::new();
+    match &stmt.kind {
+        StmtKind::Expr(parse::Expr {
+            kind: ExprKind::Assign { target, value, .. },
+            ..
+        }) => {
+            push_assigned(target, &mut names);
+            push_assigned(value, &mut names);
+        }
+        StmtKind::Binding(parse::Binding { value: expr, .. })
+        | StmtKind::Expr(expr)
+        | StmtKind::Return(Some(expr))
+        | StmtKind::If { cond: expr, .. }
+        | StmtKind::While { cond: expr, .. }
+        | StmtKind::For { iter: expr, .. }
+        | StmtKind::Match { value: expr, .. } => push_assigned(expr, &mut names),
+        StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue | StmtKind::Pass => {}
+    }
+    names
+}
+
+/// Pushes the name each assignment within `expr` changes a variable by, if
+/// its target is one or a field of one.
+fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Name(_)
+        | ExprKind::Module(_)
+        | ExprKind::FnType(_)
+        | ExprKind::Placeholder
+        | ExprKind::Dot(_) => {}
+        ExprKind::Tuple(items) | ExprKind::List(items) => {
+            for item in items {
+                push_assigned(item, names);
+            }
+        }
+        ExprKind::Unary(_, inner)
+        | ExprKind::Field(inner, _)
+        | ExprKind::Deref(inner)
+        | ExprKind::AddrOf(_, inner)
+        | ExprKind::Cast(inner, ..) => push_assigned(inner, names),
+        ExprKind::Repeat(a, b)
+        | ExprKind::Binary(_, a, b)
+        | ExprKind::Index(a, b)
+        | ExprKind::Pipe(a, b) => {
+            push_assigned(a, names);
+            push_assigned(b, names);
+        }
+        ExprKind::Call(callee, args) => {
+            push_assigned(callee, names);
+            for arg in args {
+                push_assigned(&arg.value, names);
+            }
+        }
+        ExprKind::Assign { target, value, .. } => {
+            let mut root = &**target;
+            while let ExprKind::Field(inner, _) = &root.kind {
+                root = inner;
+            }
+            if let ExprKind::Name(name) = &root.kind {
+                names.push(name.clone());
+            }
+            push_assigned(target, names);
+            push_assigned(value, names);
+        }
     }
 }
 
@@ -6784,6 +6987,95 @@ fn f(q: P) -> P:
             "(set p.x q.x) (set p.y q.y) \
              (set tmp4 p.y) (set tmp5 p.x) (set p.x tmp4) (set p.y tmp5) \
              (set p.x 1) (return p.x p.y)"
+        );
+    }
+
+    #[test]
+    fn assignment_is_its_value() {
+        let src = "\
+var g: i32 = 0
+fn next() -> i32:
+    return 1
+fn f(p: &var i32) -> i32:
+    var a = 0
+    var b = 0
+    a = b = 1
+    a = g = p.* = next()
+    let c = (a += 2) * b
+    while (a = next()) != 0:
+        pass
+    return c
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set a 0) (set b 0) \
+             (set b 1) (set a 1) \
+             (set tmp3 (call next )) (I32.Store offset=0 p tmp3) (set @g tmp3) (set a tmp3) \
+             (set tmp4 a) (set tmp5 (I32.Add tmp4 2)) (set a tmp5) (set c (I32.Mul tmp5 b)) \
+             (block (loop (set tmp7 (call next )) (set a tmp7) \
+             (br_if 1 (I32.Eqz (I32.Ne tmp7 0))) (br 0))) \
+             (return c)"
+        );
+    }
+
+    #[test]
+    fn assigned_variables_are_read_as_they_were() {
+        let src = "\
+struct P:
+    x: i32
+    y: i32
+fn g(a: i32, b: i32) -> i32:
+    return a
+fn f(n: i32) -> i32:
+    var x = n
+    let a = x + (x = 5) + x
+    let b = g(b: x = 6, a: x)
+    x += x = n
+    var p = P(x: 1, y: 2)
+    let q = p = P(x: p.y, y: p.x)
+    return x |> (x = 7) + _
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set x n) \
+             (set tmp2 x) (set x 5) (set tmp3 x) (set a (I32.Add (I32.Add tmp2 5) tmp3)) \
+             (set x 6) (set tmp5 x) (set b (call g tmp5 6)) \
+             (set tmp7 x) (set x n) (set x (I32.Add tmp7 n)) \
+             (set p.x 1) (set p.y 2) \
+             (set tmp10 p.x) (set tmp11 p.y) (set tmp12 p.x) (set tmp13 p.y) \
+             (set p.x tmp11) (set p.y tmp12) (set q.x tmp11) (set q.y tmp12) \
+             (set tmp16 x) (set x 7) (return (I32.Add 7 tmp16))"
+        );
+    }
+
+    #[test]
+    fn assignment_checks_its_target_and_value() {
+        let src = "\
+fn f(n: i32) -> i64:
+    var a = 0
+    var b: i64 = 0
+    let c = 0
+    b = a = 1
+    a = c = 2
+    a = n = 3
+    if a = 4:
+        pass
+    return b = 5
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::Mismatch {
+                    expected: "i64".into(),
+                    found: "i32".into()
+                },
+                TypeErrorKind::ImmutableAssign("c".into()),
+                TypeErrorKind::ImmutableAssign("n".into()),
+                TypeErrorKind::Mismatch {
+                    expected: "bool".into(),
+                    found: "i32".into()
+                },
+            ]
         );
     }
 
@@ -9367,6 +9659,31 @@ fn f(io: IoError, r: ReadError, s: Swapped, t: Retyped, h: Held, m: More, k: Clo
             NotABound("i32".into()).to_string(),
             "`i32` can't bound a type parameter; only a struct, a union or an enum can"
         );
+    }
+
+    #[test]
+    fn a_union_with_a_variant_that_failed_to_resolve_is_widened_to() {
+        // The variant holds nothing, so the wider union lacks the leaf that
+        // the narrower one has for it.
+        let src = "\
+union IoError:
+    closed
+    timeout: Nope
+    denied
+union ReadError:
+    closed
+    timeout: u32
+fn(E: IoError) code(e: E) -> i32:
+    match e:
+        .timeout(ms):
+            return 1
+        else:
+            return 2
+fn f(r: ReadError) -> i32:
+    let io = r as IoError
+    return code(r) + code(io)
+";
+        assert_eq!(errors(src), vec![TypeErrorKind::UnknownType("Nope".into())]);
     }
 
     #[test]

@@ -181,6 +181,7 @@ impl Checker {
             let (params, sig) = (def.params.clone(), def.sig.clone());
             let names = decl.sig.type_param_names().into_iter().map(|p| p.name);
             self.type_params = names.zip(params).collect();
+            self.record_params(&decl.sig, &sig);
             let errors = self.errors.len();
             self.open = true;
             self.lower_body(program, sig, &decl.body, item.span, None);
@@ -703,7 +704,7 @@ fn f():
         let entry = DummyManager::new().entry_point();
         let tokens = tokenize(entry, src).unwrap();
         let program = Program::single(entry, parse::parse(&tokens).unwrap());
-        let mut ck = Checker::define(&program, &Settings::default(), None);
+        let mut ck = Checker::define(&program, &Settings::default(), None, false);
         // As if checking `add` as declared had found nothing wrong with it.
         assert!(ck.errors.is_empty());
         ck.lower_funcs(&program);

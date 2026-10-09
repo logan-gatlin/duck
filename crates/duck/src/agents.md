@@ -299,10 +299,17 @@ fn area(w: i32, h: i32 = id()) -> i32:  # 3, for every call without an `h`
 
 ## Operators
 
-Loosest to tightest, the binary ones left associative: `|>`, `or`, `and`,
-`not`, `== != < <= > >=`, `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, `as as!`,
-prefix `- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
+Loosest to tightest, the binary ones left associative but for assignment,
+which is right associative: `= += -= *= /= %=`, `|>`, `or`, `and`, `not`,
+`== != < <= > >=`, `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, `as as!`, prefix
+`- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
 
+- An assignment is an expression: its value is the one assigned, as the
+  target's type. So `a = b = 0` assigns both, and `while (n = next()) != 0:`
+  tests what it read. Its target is a variable, a field, `a[i]` or `p.*`.
+- The target is found first, then the value is evaluated, then it is stored.
+  Operands are evaluated left to right, each as its variables were then:
+  `x + (x = 5)` adds what `x` was to 5.
 - `%` and `~` take integers, and unary `-` takes signed integers and floats.
   Integer division by zero traps.
 - `==` and `!=` compare any one type structurally, arrays by length and

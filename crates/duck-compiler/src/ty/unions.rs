@@ -299,10 +299,14 @@ impl Checker {
         let (from_leaves, to_leaves) = (self.union_leaves(from).0, self.union_leaves(to).0);
         let from_numbers = from_leaves.iter().filter(is_number).count();
         let to_numbers = to_leaves.iter().filter(is_number).count();
+        // Only a variant whose type failed to resolve leaves `to` without
+        // a leaf that `from` has, as it then holds nothing.
+        let lacks_leaf = from_numbers > to_numbers
+            || from_leaves.len() - from_numbers > to_leaves.len() - to_numbers;
         let types = iter::once(ValType::I32).chain(to_leaves);
         let mut scalars: Vec<_> = types.map(|vt| (vt, Expr::Const(zero(vt)))).collect();
         // Only a mistyped value has other scalars than the union's.
-        if value.scalars.len() != 1 + from_leaves.len() {
+        if lacks_leaf || value.scalars.len() != 1 + from_leaves.len() {
             return Value {
                 pre: Vec::new(),
                 scalars,

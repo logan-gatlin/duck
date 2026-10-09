@@ -3,7 +3,7 @@ use std::fmt;
 use crate::file::FileId;
 
 /// Byte range `start..end` into the contents of `file`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub file: FileId,
     pub start: usize,

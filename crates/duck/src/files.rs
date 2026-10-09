@@ -9,6 +9,10 @@ use crate::package::Packages;
 /// What the file of a module is named after the module.
 const EXTENSION: &str = "duck";
 
+/// How far down a directory is looked in for the modules that make it one
+/// that a `use` may lead through.
+const MAX_DEPTH: usize = 8;
+
 /// Source files on disk, read as they are opened, each in the package whose
 /// module or dependency led to it.
 #[derive(Debug, Clone)]
@@ -83,6 +87,40 @@ impl Files {
         &self.get(id).canonical
     }
 
+    /// The opened file at the canonical path `path`, if one is.
+    pub fn find(&self, path: &Path) -> Option<FileId> {
+        let file = self.files.iter().find(|f| f.canonical == path)?;
+        Some(file.id)
+    }
+
+    /// The names that the path of a `use` in the file `from` may go on
+    /// with after `path`: the modules and the directories of modules that
+    /// its package has there, and with no path yet, its dependencies too.
+    pub fn children(&self, from: FileId, path: &[String]) -> Vec<String> {
+        let package = &self.packages[self.get(from).package];
+        let mut dir = package.root.clone();
+        dir.extend(path);
+        let mut names = Vec::new();
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let entry = entry.path();
+            let named = match entry.is_dir() {
+                true => holds_modules(&entry, MAX_DEPTH),
+                false => is_module(&entry),
+            };
+            if let Some(name) = entry.file_stem().and_then(|name| name.to_str())
+                && named
+                && !names.iter().any(|known| known == name)
+            {
+                names.push(name.to_string());
+            }
+        }
+        if path.is_empty() {
+            names.extend(package.dependencies.iter().map(|(name, _)| name.clone()));
+        }
+        names.sort();
+        names
+    }
+
     /// Reads the file at `path`, of package `package` unless it has been
     /// read already.
     fn read(&mut self, path: PathBuf, package: usize) -> io::Result<FileId> {
@@ -115,6 +153,23 @@ impl Files {
         let file = self.files.iter().find(|f| f.id == id);
         file.unwrap_or_else(|| panic!("Invalid file id: {id:?}"))
     }
+}
+
+/// Whether the file at `path` is one that a module is named after.
+fn is_module(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == EXTENSION) && path.is_file()
+}
+
+/// Whether the directory `dir` holds a module, in it or in the directories
+/// it holds, down to `depth` of them. A hidden directory holds none.
+fn holds_modules(dir: &Path, depth: usize) -> bool {
+    let hidden = (dir.file_name()).is_some_and(|name| name.as_encoded_bytes().starts_with(b"."));
+    let mut entries = fs::read_dir(dir).into_iter().flatten().flatten();
+    !hidden
+        && entries.any(|entry| {
+            let path = entry.path();
+            is_module(&path) || depth > 0 && path.is_dir() && holds_modules(&path, depth - 1)
+        })
 }
 
 /// Adds the source file at `path` to `sources`, or every source file in the

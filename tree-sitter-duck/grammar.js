@@ -9,9 +9,10 @@
 // @ts-check
 
 // Binary operator precedence, as in `binary_op` in parse.rs; higher binds
-// tighter. `not`, casts, prefix and postfix operators slot in around them, and
-// pipes sit below them all.
+// tighter. `not`, casts, prefix and postfix operators slot in around them,
+// pipes sit below them all, and assignment below pipes.
 const PREC = {
+  assign: -1,
   pipe: 0,
   or: 1,
   and: 2,
@@ -332,7 +333,6 @@ module.exports = grammar({
 
     _statement: $ => choice(
       $.binding,
-      $.assignment,
       $.expression_statement,
       $.return_statement,
       $.if_statement,
@@ -342,13 +342,6 @@ module.exports = grammar({
       $.break_statement,
       $.continue_statement,
       $.pass_statement,
-    ),
-
-    assignment: $ => seq(
-      field('target', $._expression),
-      field('operator', choice('=', '+=', '-=', '*=', '/=', '%=')),
-      field('value', $._expression),
-      $._newline,
     ),
 
     expression_statement: $ => seq($._expression, $._newline),
@@ -426,6 +419,7 @@ module.exports = grammar({
       $.parenthesized_expression,
       $.placeholder,
       $.dot_expression,
+      $.assignment_expression,
       $.pipe_expression,
       $.unary_expression,
       $.binary_expression,
@@ -462,6 +456,13 @@ module.exports = grammar({
 
     // `.name`, a variant of the union or member of the enum expected of it.
     dot_expression: $ => seq('.', field('name', $.identifier)),
+
+    // `target = value`, whose value is the one assigned. Groups to the right.
+    assignment_expression: $ => prec.right(PREC.assign, seq(
+      field('target', $._expression),
+      field('operator', choice('=', '+=', '-=', '*=', '/=', '%=')),
+      field('value', $._expression),
+    )),
 
     // `value |> body`. The scanner lets a deeper line that starts with `|>`
     // continue the line above.

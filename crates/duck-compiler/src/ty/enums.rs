@@ -20,7 +20,7 @@ pub(super) struct EnumDef {
     /// The module that declares it.
     pub(super) module: FileId,
     /// The item of the program that declares it.
-    item: usize,
+    pub(super) item: usize,
     pub(super) is_pub: bool,
     /// The type of every member's value. [`Ty::Error`] until resolved.
     pub(super) ty: Ty,
@@ -440,6 +440,7 @@ impl Body<'_> {
     /// leaves.
     pub(super) fn unrolled_loop(&mut self, id: EnumId, var: &Ident, body: &parse::Block) -> Stmt {
         let ty = Ty::Enum(id);
+        self.ck.record(var.span, ty);
         let slots = self.alloc(&var.name, ty);
         self.scopes.push(HashMap::new());
         self.bind(&var.name, ty, false, slots.clone());
