@@ -169,7 +169,7 @@ impl Checker {
         body.push(Stmt::Return(exprs(value.scalars)));
         let thunk = ir::Func {
             name,
-            export: Some(eval::ENTRY.to_string()),
+            exports: vec![eval::ENTRY.to_string()],
             params: Vec::new(),
             results,
             locals,
@@ -213,7 +213,7 @@ impl Checker {
         let ids = (self.import_count..self.funcs.len() as u32).map(FuncId);
         let funcs = ids.map(|id| match self.lowered.get(&id) {
             Some(func) if reached.contains(&id) => ir::Func {
-                export: None,
+                exports: Vec::new(),
                 ..func.clone()
             },
             _ => self.stub(id),
@@ -250,7 +250,7 @@ impl Checker {
         };
         ir::Func {
             name: sig.name.clone(),
-            export: None,
+            exports: Vec::new(),
             locals: params.iter().map(local).collect(),
             params,
             results: self.val_types(sig.ret),
@@ -518,7 +518,7 @@ mod tests {
             Const::F64(x) => format!("{x:?}f64"),
             Const::Null => "null".to_string(),
         };
-        let globals = module.globals.iter().filter(|g| g.export.is_some());
+        let globals = module.globals.iter().filter(|g| !g.exports.is_empty());
         let globals = globals.map(|g| format!("{}={}", g.name, value(g.init)));
         globals.collect::<Vec<_>>().join(" ")
     }

@@ -3,8 +3,9 @@
 //! The IR is already shaped after wasm, so this is one direct walk: every
 //! statement and expression maps to a fixed instruction sequence. The module
 //! imports its `extern` functions and exports its memory and the `pub fn`s
-//! and `pub` globals of the entry module, names its start function if it has
-//! one, and fills memory with its literals. A module that takes pointers to
+//! and `pub` globals of the entry module, with those it uses as `pub`, names
+//! its start function if it has one, and fills memory with its literals. A
+//! module that takes pointers to
 //! functions also exports the table that holds them. Source names go in a `name` custom section so tools can show them.
 //!
 //! [`emit_hosted`] encodes a module for the compiler itself to run, which
@@ -157,12 +158,12 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
         exports.export(&table.export, ExportKind::Table, 0);
     }
     for (i, func) in module.funcs.iter().enumerate() {
-        if let Some(name) = &func.export {
+        for name in &func.exports {
             exports.export(name, ExportKind::Func, func_index(i));
         }
     }
     for (i, global) in module.globals.iter().enumerate() {
-        if let Some(name) = global.export.as_ref().filter(|_| !hosted) {
+        for name in global.exports.iter().filter(|_| !hosted) {
             exports.export(name, ExportKind::Global, i as u32);
         }
     }

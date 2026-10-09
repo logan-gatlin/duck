@@ -57,8 +57,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
   defer match struct enum union extern use module and or not true false as
-  as!`. No item is named `array`, `varray`, `tuple`, `type`, `option` or
-  `result`.
+  as!`. No item is named `array`, `varray`, `string`, `tuple`, `type`, `option`
+  or `result`.
 
 ## Types
 
@@ -74,8 +74,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - `option(T)`: the union of `none` and `some: T`. `result(T, E)`: the union
   of `ok: T` and `err: E`. Both are built in, and are unions in every way.
 - `array(T)`: a view of `ptr: &T` and `len: uint` that owns nothing.
-  `varray(T)` has a `ptr: &var T`, so its elements are assignable. Strings
-  are `array(u8)` of UTF-8.
+  `varray(T)` has a `ptr: &var T`, so its elements are assignable.
+- `string`: an alias of `array(u8)`, which holds UTF-8.
 - `fn(A, B) -> R`: a function pointer. `fn(A)` returns nothing.
 - A type has a `size: uint` and an `align: uint`, as in `Point.size`,
   `(&Point).size` and `i64.align`. It is no value: `type` is only the type of
@@ -871,6 +871,10 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
   generic functions excepted. Also exported are `memory` and, once any function
   pointer is taken, `table`: the host calls pointer `i` as
   `table.get(i)(...)`. No `pub` item is named either.
+- A `pub use` in the entry file exports the function or global it names, from
+  whichever file, as the name it binds: `pub use alloc.realloc as cabi_realloc`
+  exports `cabi_realloc`. One named twice is exported as both. A generic or
+  `extern` function isn't exported, as a `pub` one of the entry file isn't.
 - The host gives every argument. A default is passed by the Duck call that
   leaves it out, so an `extern` function may have them, an exported one has
   them for Duck callers only, and `start` names a function with no parameters.
@@ -994,8 +998,9 @@ fn main():                               # `start = "main"` in Duck.toml
   16 wasm values are one pointer to a tuple of them.
 - The host returns a `list` or a `string` in memory that it has the module
   allocate. A module that imports such a function has `pub fn cabi_realloc` in
-  its entry file, as above: it is called with `old` and `old_size` as 0, and
-  returns `new_size` bytes at a multiple of `align`.
+  its entry file, as above, or a `pub use` of another file's as that name: it
+  is called with `old` and `old_size` as 0, and returns `new_size` bytes at a
+  multiple of `align`.
 - `duck build` writes the module as it does any other, with these imports
   for its host to give it.
 

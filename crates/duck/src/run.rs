@@ -146,7 +146,7 @@ fn component(mut module: ir::Module) -> Result<Vec<u8>, Error> {
     // be an imported one, which has no export of its own.
     module.funcs.push(ir::Func {
         name: START.to_string(),
-        export: Some(START.to_string()),
+        exports: vec![START.to_string()],
         params: Vec::new(),
         results: Vec::new(),
         locals: Vec::new(),

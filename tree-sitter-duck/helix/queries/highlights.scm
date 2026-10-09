@@ -47,7 +47,7 @@
 ((named_type name: (identifier) @type.builtin)
   (#any-of? @type.builtin
     "i8" "i16" "i32" "i64" "int" "u8" "u16" "u32" "u64" "uint" "f32" "f64" "bool"
-    "array" "varray" "tuple" "option" "result" "externref"))
+    "array" "varray" "string" "tuple" "option" "result" "externref"))
 
 ; Literals
 

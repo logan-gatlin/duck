@@ -336,7 +336,7 @@ mod tests {
     fn func(name: &str, results: Vec<ValType>, body: Vec<Stmt>) -> ir::Func {
         ir::Func {
             name: name.to_string(),
-            export: None,
+            exports: Vec::new(),
             params: Vec::new(),
             results,
             locals: Vec::new(),
@@ -347,7 +347,7 @@ mod tests {
     /// The function a module runs, which returns `results` and runs `body`.
     fn entry(results: Vec<ValType>, body: Vec<Stmt>) -> ir::Func {
         ir::Func {
-            export: Some(ENTRY.to_string()),
+            exports: vec![ENTRY.to_string()],
             ..func("entry", results, body)
         }
     }
@@ -403,7 +403,7 @@ mod tests {
             ty: ValType::I32,
             mutable: true,
             init: Const::I32(40),
-            export: None,
+            exports: Vec::new(),
         });
         eval.write(8, &[1, 0, 0, 0]);
 
@@ -430,7 +430,7 @@ mod tests {
             ty: ValType::I32,
             mutable: true,
             init: Const::I32(0),
-            export: None,
+            exports: Vec::new(),
         }];
         first.table = Some(ir::Table {
             table64: false,

@@ -103,8 +103,9 @@ pub struct Global {
     pub ty: ValType,
     pub mutable: bool,
     pub init: Const,
-    /// Export name, set for `pub let` and `pub var`.
-    pub export: Option<String>,
+    /// Export names: its own for `pub let` and `pub var`, and each that a
+    /// `pub use` gives it.
+    pub exports: Vec<String>,
 }
 
 /// A function supplied by the host, imported as `module`.`field`.
@@ -121,8 +122,9 @@ pub struct Import {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Func {
     pub name: String,
-    /// Export name, set for `pub fn`.
-    pub export: Option<String>,
+    /// Export names: its own for `pub fn`, and each that a `pub use` gives
+    /// it.
+    pub exports: Vec<String>,
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,
     /// Every local, starting with one per parameter.

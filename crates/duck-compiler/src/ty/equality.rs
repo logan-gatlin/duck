@@ -116,7 +116,7 @@ impl Checker {
         let params = body.locals.iter().map(|local| local.ty).collect();
         let stmts = body.array_eq_body(ty, [a[0], a[1]], [b[0], b[1]]);
         ir::Func {
-            export: None,
+            exports: Vec::new(),
             name: sig.name,
             params,
             results: vec![ValType::I32],

@@ -148,6 +148,9 @@ const ARRAY: &str = "array";
 /// The name of the built-in type of arrays whose elements can be written.
 const VARRAY: &str = "varray";
 
+/// The name of the built-in alias of `array(u8)`.
+const STRING: &str = "string";
+
 /// The name of the built-in tuple type.
 const TUPLE: &str = "tuple";
 
@@ -673,6 +676,9 @@ struct Checker {
     module: FileId,
     /// The module whose `pub` items are exported.
     entry: FileId,
+    /// Each function and global that a `pub use` of the entry module names,
+    /// and the name it is exported as for that.
+    reexports: Vec<(Item, String)>,
     /// Struct declarations in declaration order, then the built-in unions
     /// and the struct that lists are instances of, then instances of
     /// generic ones as they are used.
@@ -1812,7 +1818,12 @@ impl Checker {
             path = format!("{path}.{}", member.name);
         }
         match item {
-            Some(item) => self.declare_name(&used.name, item, used.is_pub),
+            Some(item) => {
+                self.declare_name(&used.name, item, used.is_pub);
+                if used.is_pub && used.module == self.entry {
+                    self.reexport(&used.name, item);
+                }
+            }
             None => {
                 let name = used.name.name.clone();
                 self.unresolved.insert((used.module, name));
@@ -1843,7 +1854,29 @@ impl Checker {
     /// Declares a name defined by `item`, which may export it.
     fn declare_item(&mut self, item: &parse::Item, name: &Ident, entry: Item) {
         self.declare_name(name, entry, item.is_pub);
-        if self.exports(item) && [MEMORY_EXPORT, TABLE_EXPORT].contains(&name.name.as_str()) {
+        if self.exports(item) {
+            self.check_export(name);
+        }
+    }
+
+    /// Exports `item` as `name` too, which a `pub use` of the entry module
+    /// gives it, if it's a function the source defines or a global: what a
+    /// `pub` item of the entry module exports.
+    fn reexport(&mut self, name: &Ident, item: Item) {
+        let exported = match item {
+            Item::Func(id) => id.0 >= self.import_count,
+            Item::Global(_) => true,
+            _ => false,
+        };
+        if exported {
+            self.check_export(name);
+            self.reexports.push((item, name.name.clone()));
+        }
+    }
+
+    /// Reports `name`, which is exported, if the module takes it itself.
+    fn check_export(&mut self, name: &Ident) {
+        if [MEMORY_EXPORT, TABLE_EXPORT].contains(&name.name.as_str()) {
             self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
         }
     }
@@ -1852,7 +1885,7 @@ impl Checker {
     fn declare_name(&mut self, name: &Ident, item: Item, is_pub: bool) {
         let scope = self.scopes.entry(self.module).or_default();
         if scope.contains_key(&name.name)
-            || [ARRAY, VARRAY, TUPLE, TYPE, OPTION, RESULT].contains(&name.name.as_str())
+            || [ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT].contains(&name.name.as_str())
         {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
@@ -1863,6 +1896,14 @@ impl Checker {
     /// Whether `item` is exported: it's `pub` and in the entry module.
     fn exports(&self, item: &parse::Item) -> bool {
         item.is_pub && item.span.file == self.entry
+    }
+
+    /// The names `item` is exported as: `own`, if it's a `pub` item of the
+    /// entry module, then each that a `pub use` there gives it.
+    fn export_names(&self, item: Item, own: Option<&str>) -> Vec<String> {
+        let used = self.reexports.iter().filter(|(used, _)| *used == item);
+        let used = used.map(|(_, name)| name.as_str());
+        own.into_iter().chain(used).map(str::to_string).collect()
     }
 
     /// The item `name` names in the current module.
@@ -2481,15 +2522,19 @@ impl Checker {
         // Each name gets its own globals, in the order `declare` gave them.
         for bound in self.destructure(&decl.pattern, ty) {
             let (mut wasm, mut consts) = (Vec::new(), Vec::new());
+            let own = exported.then_some(bound.name);
+            let exports = self.export_names(Item::Global(index), own);
             let leaves = self.leaves(bound.ty, bound.name);
             for ((name, vt), i) in leaves.into_iter().zip(bound.leaves) {
                 let init = inits.get(i).copied().unwrap_or(zero(vt));
                 consts.push(init);
                 // Only a wasm global can be assigned or exported.
-                if mutable || exported {
+                if mutable || !exports.is_empty() {
+                    // Each export names the scalar as the global does.
+                    let scalar = &name[bound.name.len()..];
                     wasm.push(GlobalId(self.ir_globals.len() as u32));
                     self.ir_globals.push(ir::Global {
-                        export: exported.then(|| name.clone()),
+                        exports: exports.iter().map(|e| format!("{e}{scalar}")).collect(),
                         name,
                         ty: vt,
                         mutable,
@@ -2636,20 +2681,21 @@ impl Checker {
         self.module = item.span.file;
         let sig = self.funcs[id.0 as usize].clone();
         self.record_params(&decl.sig, &sig);
-        let export = self.exports(item).then(|| sig.name.clone());
-        self.lower_body(program, sig, &decl.body, item.span, export)
+        let own = self.exports(item).then_some(sig.name.as_str());
+        let exports = self.export_names(Item::Func(id), own);
+        self.lower_body(program, sig, &decl.body, item.span, exports)
     }
 
     /// Lowers a function of `program` with signature `sig` and body `block`,
-    /// declared by the item spanning `span`, and exported as `export` if
-    /// given.
+    /// declared by the item spanning `span`, and exported as each of
+    /// `exports`.
     fn lower_body(
         &mut self,
         program: &Program,
         sig: FuncSig,
         block: &parse::Block,
         span: Span,
-        export: Option<String>,
+        exports: Vec<String>,
     ) -> ir::Func {
         let returns = diverges(block);
         let mut body = Body::new(self, sig.ret);
@@ -2673,7 +2719,7 @@ impl Checker {
             stmts.push(Stmt::Unreachable);
         }
         ir::Func {
-            export,
+            exports,
             name: sig.name,
             params,
             results,
@@ -2822,6 +2868,8 @@ impl Checker {
             Ty::Enum(id)
         } else if let Some(prim) = Prim::from_name(name) {
             Ty::Prim(prim)
+        } else if name == STRING {
+            self.array_of(Ty::Prim(Prim::U8), false)
         } else if name == EXTERNREF {
             Ty::ExternRef
         } else if name == TYPE {
@@ -6379,7 +6427,7 @@ fn module_path(expr: &parse::Expr) -> Option<Vec<Ident>> {
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
-    [ARRAY, VARRAY, TUPLE, EXTERNREF, TYPE, OPTION, RESULT].contains(&name)
+    [ARRAY, VARRAY, STRING, TUPLE, EXTERNREF, TYPE, OPTION, RESULT].contains(&name)
         || Prim::from_name(name).is_some()
 }
 
@@ -6801,8 +6849,8 @@ mod tests {
     #[test]
     fn example_program() {
         let module = lower(include_str!("../example.duck"));
-        let exports: Vec<_> = module.funcs.iter().map(|f| f.export.as_deref()).collect();
-        assert_eq!(exports, vec![Some("add"), Some("main")]);
+        let exports: Vec<_> = module.funcs.iter().map(|f| f.exports.join(" ")).collect();
+        assert_eq!(exports, ["add", "main"]);
         assert_eq!(body(&module, "add"), "(return (I32.Add a b))");
         let imports: Vec<_> = module
             .imports
@@ -7318,7 +7366,7 @@ pub let a = one() |> _ + _
 pub let b = v |> _ + 1
 ";
         let module = lower(src);
-        let exported = module.globals.iter().filter(|g| g.export.is_some());
+        let exported = module.globals.iter().filter(|g| !g.exports.is_empty());
         let inits: Vec<_> = exported.map(|g| konst(g.init)).collect();
         assert_eq!(inits, vec!["2", "2"]);
     }
@@ -8109,16 +8157,16 @@ var hidden = 2
         let exports: Vec<_> = lower(src)
             .globals
             .into_iter()
-            .map(|g| (g.name, g.export))
+            .map(|g| (g.name, g.exports))
             .collect();
-        let named = |name: &str| (name.to_string(), Some(name.to_string()));
+        let named = |name: &str| (name.to_string(), vec![name.to_string()]);
         assert_eq!(
             exports,
             vec![
                 named("a"),
                 named("origin.x"),
                 named("origin.y"),
-                ("hidden".to_string(), None),
+                ("hidden".to_string(), Vec::new()),
             ]
         );
     }
@@ -9117,7 +9165,7 @@ var (_, hidden) = (1, pos.1.1)
         let globals: Vec<_> = lower(src)
             .globals
             .into_iter()
-            .map(|g| (g.name, g.export.is_some(), g.init))
+            .map(|g| (g.name, !g.exports.is_empty(), g.init))
             .collect();
         let global = |name: &str, export, init| (name.to_string(), export, init);
         assert_eq!(
@@ -9386,11 +9434,7 @@ fn f(x: u8, y: i32):
         let module = lower(
             "pub fn(T) id(val: T) -> T:\n    return val\npub fn f() -> i32:\n    return id(1)\n",
         );
-        let exports: Vec<_> = module
-            .funcs
-            .iter()
-            .filter_map(|f| f.export.as_deref())
-            .collect();
+        let exports: Vec<_> = module.funcs.iter().flat_map(|f| &f.exports).collect();
         assert_eq!(exports, ["f"]);
     }
 
@@ -10750,6 +10794,35 @@ fn g(p: &Pair(u8, i64)) -> i64:
     }
 
     #[test]
+    fn string_is_an_alias_of_an_array_of_u8() {
+        use TypeErrorKind::*;
+        lower("fn f(a: string) -> array(u8):\n    return a\n");
+        lower("fn f(a: array(u8)) -> string:\n    return a\n");
+        lower("fn f(a: varray(u8)) -> string:\n    return a\n");
+        lower("let s: string = \"hi\"\n");
+        assert_eq!(
+            errors("fn f(a: string) -> varray(u8):\n    return a\n"),
+            vec![mismatch("varray(u8)", "array(u8)")]
+        );
+        assert_eq!(
+            errors("fn f(a: array(u16)) -> string:\n    return a\n"),
+            vec![mismatch("array(u8)", "array(u16)")]
+        );
+        assert_eq!(
+            errors("fn f(a: string(u8)):\n    pass\n"),
+            vec![NotGeneric("string".into())]
+        );
+        assert_eq!(
+            errors("struct string:\n    pass\n"),
+            vec![DuplicateItem("string".into())]
+        );
+        assert_eq!(
+            errors("struct(string) Box:\n    value: string\n"),
+            vec![DuplicateItem("string".into())]
+        );
+    }
+
+    #[test]
     fn type_arguments_must_match_type_parameters() {
         use TypeErrorKind::*;
         let src = "\
@@ -11767,7 +11840,13 @@ var duck = \"🦆\"
         let globals: Vec<_> = module
             .globals
             .iter()
-            .map(|g| (g.name.as_str(), g.export.as_deref(), g.init))
+            .map(|g| {
+                (
+                    g.name.as_str(),
+                    g.exports.first().map(String::as_str),
+                    g.init,
+                )
+            })
             .collect();
         assert_eq!(
             globals[..4],
@@ -13033,7 +13112,7 @@ pub fn f() -> Shape:
         let globals: Vec<_> = module
             .globals
             .iter()
-            .map(|g| (g.export.as_deref().unwrap(), g.init))
+            .map(|g| (g.exports[0].as_str(), g.init))
             .collect();
         assert_eq!(
             globals,
@@ -13868,7 +13947,13 @@ fn f(s: S) -> i32:
         let globals: Vec<_> = module
             .globals
             .iter()
-            .map(|g| (g.name.as_str(), g.export.as_deref(), g.init))
+            .map(|g| {
+                (
+                    g.name.as_str(),
+                    g.exports.first().map(String::as_str),
+                    g.init,
+                )
+            })
             .collect();
         assert_eq!(globals[0], ("DEFAULT", Some("DEFAULT"), Const::I32(-1)));
         assert_eq!(

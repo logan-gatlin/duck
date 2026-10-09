@@ -184,7 +184,7 @@ impl Checker {
             self.record_params(&decl.sig, &sig);
             let errors = self.errors.len();
             self.open = true;
-            self.lower_body(program, sig, &decl.body, item.span, None);
+            self.lower_body(program, sig, &decl.body, item.span, Vec::new());
             self.open = false;
             self.type_params.clear();
             self.generic_fns[i].failed |= self.errors.len() > errors;
@@ -300,7 +300,7 @@ impl Checker {
         // A declaration with an error has it in every instance.
         let func = if self.generic_fns[instance.generic.0 as usize].failed {
             ir::Func {
-                export: None,
+                exports: Vec::new(),
                 name: sig.name,
                 params: Vec::new(),
                 results: Vec::new(),
@@ -308,7 +308,7 @@ impl Checker {
                 body: Vec::new(),
             }
         } else {
-            let func = self.lower_body(program, sig, &decl.body, item.span, None);
+            let func = self.lower_body(program, sig, &decl.body, item.span, Vec::new());
             for error in &mut self.errors[errors..] {
                 // Only what an instance is too deep or too large for is its
                 // type arguments' doing, and is reported at the call that led

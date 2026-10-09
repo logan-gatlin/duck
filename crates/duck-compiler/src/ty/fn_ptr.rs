@@ -87,7 +87,7 @@ impl Checker {
         stmts.push(Stmt::Return(exprs(value.scalars)));
         let locals = body.locals;
         ir::Func {
-            export: None,
+            exports: Vec::new(),
             name: sig.name,
             params,
             results: self.val_types(sig.ret),

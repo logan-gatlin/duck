@@ -38,7 +38,8 @@ pub struct Program {
     /// Each after every `use` of the module it leads into, unless that
     /// module uses this one in turn.
     pub uses: Vec<Use>,
-    /// The module whose `pub` items the program exports.
+    /// The module whose `pub` items the program exports, with those it uses
+    /// as `pub`.
     pub entry: FileId,
 }
 
@@ -412,9 +413,9 @@ mod tests {
     }
 
     fn exports(module: &ir::Module) -> Vec<&str> {
-        let funcs = module.funcs.iter().filter_map(|f| f.export.as_deref());
-        let globals = module.globals.iter().filter_map(|g| g.export.as_deref());
-        funcs.chain(globals).collect()
+        let funcs = module.funcs.iter().flat_map(|f| &f.exports);
+        let globals = module.globals.iter().flat_map(|g| &g.exports);
+        funcs.chain(globals).map(String::as_str).collect()
     }
 
     #[test]
@@ -984,15 +985,54 @@ fn f() -> i32:
         let mut files = Memory(vec![
             (
                 "main",
-                "use a\npub use a.h\npub fn f():\n    a.g()\npub let x = a.y\nfn hidden():\n    pass\npub fn(T) id(x: T) -> T:\n    return x\n",
+                "use a\nuse a.h\npub fn f():\n    a.g()\npub let x = a.y\nfn hidden():\n    pass\npub fn(T) id(x: T) -> T:\n    return x\n",
             ),
             (
                 "a",
-                "pub fn g():\n    pass\npub fn h():\n    pass\npub let y = 1\npub let memory = 2\n",
+                "pub use b.k\npub fn g():\n    pass\npub fn h():\n    pass\npub let y = 1\npub let memory = 2\n",
             ),
+            ("b", "pub fn k():\n    pass\n"),
         ]);
         let module = lower(&mut files);
         assert_eq!(exports(&module), ["f", "x"]);
+    }
+
+    #[test]
+    fn the_entry_module_exports_what_it_uses_as_pub() {
+        // Each function and global, as each name it is given, whichever
+        // module defines it. No module, type, generic function or import is.
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use a.h\npub use a.{g, g as again, y, v as w, pos, P, id, ext}\npub use a as lib\npub use main.hidden as shown\npub fn f():\n    pass\nfn hidden():\n    pass\n",
+            ),
+            (
+                "a",
+                "extern:\n    pub fn ext()\npub struct P:\n    x: i32\npub fn g():\n    pass\npub fn h():\n    pass\npub let y = 1\npub var v = 2\npub let pos = (0, 1.5)\nlet z = 3\npub fn(T) id(x: T) -> T:\n    return x\n",
+            ),
+        ]);
+        let module = lower(&mut files);
+        assert_eq!(
+            exports(&module),
+            ["g", "again", "f", "shown", "y", "w", "pos.0", "pos.1"]
+        );
+        // A `let` that only another module uses is no wasm global.
+        let globals: Vec<_> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(globals, ["y", "v", "pos.0", "pos.1"]);
+    }
+
+    #[test]
+    fn a_use_exports_as_no_reserved_name() {
+        // A module is no export, so it is named as it likes.
+        let mut files = Memory(vec![
+            ("main", "pub use a.g as memory\npub use a.table\n"),
+            ("a", "pub fn g():\n    pass\n"),
+            ("a.table", "pub let one = 1\n"),
+        ]);
+        assert_eq!(
+            type_errors(&mut files),
+            [TypeErrorKind::ReservedExport("memory".into())]
+        );
     }
 
     #[test]
