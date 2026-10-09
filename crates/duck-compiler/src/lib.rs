@@ -9,6 +9,7 @@ use crate::ty::{InstanceSite, TypeError};
 pub mod emit;
 mod eval;
 pub mod file;
+pub mod format;
 pub mod ir;
 pub mod lex;
 pub mod load;

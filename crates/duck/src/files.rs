@@ -117,6 +117,34 @@ impl Files {
     }
 }
 
+/// Adds the source file at `path` to `sources`, or every source file in the
+/// directory there and in those it holds, in order of their names. A file in
+/// a directory is a source file for being named after a module, and a hidden
+/// directory holds none. No path at all is the working directory.
+pub fn sources(path: &Path, sources: &mut Vec<PathBuf>) -> io::Result<()> {
+    let dir = match path.as_os_str().is_empty() {
+        true => Path::new("."),
+        false => path,
+    };
+    if !fs::metadata(dir)?.is_dir() {
+        sources.push(path.to_path_buf());
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = path.join(entry.file_name());
+        let hidden = entry.file_name().as_encoded_bytes().starts_with(b".");
+        let kind = entry.file_type()?;
+        if kind.is_dir() && !hidden {
+            self::sources(&path, sources)?;
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == EXTENSION) {
+            sources.push(path);
+        }
+    }
+    Ok(())
+}
+
 impl FileManager for Files {
     fn entry_point(&mut self) -> FileId {
         self.files[0].id
@@ -149,5 +177,45 @@ impl FileManager for Files {
 
     fn settings(&mut self) -> Settings {
         self.settings.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sources_are_the_duck_files_of_a_directory() {
+        let dir = std::env::temp_dir().join(format!("duck-sources-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let files = [
+            "src/main.duck",
+            "src/util/geo.duck",
+            "src/notes.md",
+            "lib.duck",
+            ".git/hook.duck",
+        ];
+        for file in files {
+            let path = dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+
+        let mut found = Vec::new();
+        let all = sources(&dir, &mut found);
+        // A file that is named is one whatever its name.
+        let named = sources(&dir.join("src/notes.md"), &mut found);
+        let missing = sources(&dir.join("missing.duck"), &mut found);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(all.is_ok() && named.is_ok());
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+        let expected = [
+            "lib.duck",
+            "src/main.duck",
+            "src/util/geo.duck",
+            "src/notes.md",
+        ];
+        assert_eq!(found, expected.map(|file| dir.join(file)));
     }
 }

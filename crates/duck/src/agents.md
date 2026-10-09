@@ -4,6 +4,7 @@ Indentation-blocked, statically typed, compiled to one WebAssembly module.
 Values live in wasm locals and globals, memory is raw pointers into linear
 memory, and the host supplies all I/O through `extern`. `duck build` compiles
 the package of the nearest `Duck.toml`, and `duck run` runs it with WASI.
+`duck format` lays its files out as the examples here are.
 
 Absent: allocator, GC, standard library, closures, anonymous functions,
 methods, traits, overloading, varargs, ternary, ranges, exceptions, char type,

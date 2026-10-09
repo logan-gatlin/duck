@@ -1,6 +1,7 @@
 //! `duck agents`: an overview of the language for coding agents.
 
-/// The overview, in Markdown. Every ```duck block in it compiles on its own.
+/// The overview, in Markdown. Every ```duck block in it compiles on its own,
+/// and is formatted.
 pub const OVERVIEW: &str = include_str!("agents.md");
 
 #[cfg(test)]
@@ -60,6 +61,13 @@ mod tests {
                 let errors: Vec<_> = errors.iter().map(ToString::to_string).collect();
                 panic!("{block}\n{errors:#?}");
             }
+        }
+    }
+
+    #[test]
+    fn examples_are_formatted() {
+        for block in duck_blocks(OVERVIEW) {
+            assert_eq!(duck_compiler::format::format(block).as_deref(), Ok(block));
         }
     }
 }

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use duck::files::Files;
+use duck::files::{self, Files};
 use duck::manifest::{MANIFEST, Manifest};
 use duck::package::Packages;
 use duck::{git, package};
@@ -36,6 +36,18 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Lay out the source files of the package described by the nearest
+    /// Duck.toml as the language is written, with lines of up to 100 columns.
+    /// A file that doesn't parse is left as it is
+    Format {
+        /// Format these files, and every source file of these directories,
+        /// in place of the package's
+        paths: Vec<PathBuf>,
+        /// Write nothing: name each file that isn't formatted, and fail if
+        /// there are any
+        #[arg(long)]
+        check: bool,
+    },
     /// Create a new package in a new directory: a module, or a library with --lib
     New {
         /// The directory to create
@@ -55,6 +67,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Build => build(),
         Command::Run { args } => run(args),
+        Command::Format { paths, check } => format(paths, check),
         Command::New { path, lib } => {
             let kind = if lib {
                 new::Kind::Library
@@ -145,6 +158,62 @@ fn run(args: Vec<String>) -> ExitCode {
         Ok(status) => ExitCode::from(status),
         Err(e) => fail(e),
     }
+}
+
+/// Formats the source files that `paths` name, or those of the nearest
+/// package if there are none. With `check` it names the files that formatting
+/// would change, and changes none. Fails if a file doesn't parse, or if one
+/// that `check` finds would change.
+fn format(mut paths: Vec<PathBuf>, check: bool) -> ExitCode {
+    if paths.is_empty() {
+        match Manifest::find() {
+            Ok(Some(root)) => paths.push(root),
+            Ok(None) => {
+                return fail(format_args!(
+                    "cannot find {MANIFEST} in this directory or any parent"
+                ));
+            }
+            Err(e) => return fail(format_args!("cannot find {MANIFEST}: {e}")),
+        }
+    }
+    let mut sources = Vec::new();
+    let mut code = ExitCode::SUCCESS;
+    for path in paths {
+        if let Err(e) = files::sources(&path, &mut sources) {
+            code = fail(format_args!("cannot read {}: {e}", path.display()));
+        }
+    }
+    for path in sources {
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(e) => {
+                code = fail(format_args!("cannot read {}: {e}", path.display()));
+                continue;
+            }
+        };
+        let formatted = match duck_compiler::format::format(&source) {
+            Ok(formatted) => formatted,
+            Err(errors) => {
+                for error in errors {
+                    let offset = error.span().map_or(0, |span| span.start);
+                    let (line, col) = line_col(&source, offset);
+                    eprintln!("{}:{line}:{col}: error: {error}", path.display());
+                }
+                code = ExitCode::FAILURE;
+                continue;
+            }
+        };
+        if formatted == source {
+            continue;
+        }
+        if check {
+            println!("{}", path.display());
+            code = ExitCode::FAILURE;
+        } else if let Err(e) = fs::write(&path, formatted) {
+            code = fail(format_args!("cannot write {}: {e}", path.display()));
+        }
+    }
+    code
 }
 
 /// The root of the nearest package, and it with every package it depends
