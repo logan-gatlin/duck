@@ -6,6 +6,10 @@
 //! and `pub` globals of the entry module, names its start function if it has
 //! one, and fills memory with its literals. A module that takes pointers to
 //! functions also exports the table that holds them. Source names go in a `name` custom section so tools can show them.
+//!
+//! [`emit_hosted`] encodes a module for the compiler itself to run, which
+//! imports its memory, table and globals rather than defining them: every
+//! module [`crate::eval`] runs shares the one state.
 
 use std::collections::HashMap;
 
@@ -16,7 +20,12 @@ use wasm_encoder::{
     NameSection, RefType, StartSection, TableSection, TableType, TypeSection,
 };
 
-use crate::ir::{BinOp, Const, Expr, Func, FuncType, LoadOp, Module, Stmt, StoreOp, UnOp, ValType};
+use crate::ir::{
+    BinOp, Const, Expr, Func, FuncType, Global, LoadOp, Module, Stmt, StoreOp, UnOp, ValType,
+};
+
+/// The wasm module that a hosted module imports its state from.
+pub const HOST: &str = "host";
 
 /// The module's function types, each encoded the first time it's asked for.
 #[derive(Default)]
@@ -43,12 +52,59 @@ impl Types {
 
 /// Encodes a lowered module as the contents of a `.wasm` file.
 pub fn emit(module: &Module) -> Vec<u8> {
+    encode(module, false)
+}
+
+/// Encodes a lowered module that its host gives its state: it imports, after
+/// its functions and in this order, its memory, its table and each of its
+/// globals, all from [`HOST`]. It has no data and no start function, and
+/// exports only its functions.
+pub fn emit_hosted(module: &Module) -> Vec<u8> {
+    encode(module, true)
+}
+
+/// Encodes `module`, importing its memory, table and globals if it's
+/// `hosted`, and defining them otherwise.
+fn encode(module: &Module, hosted: bool) -> Vec<u8> {
     let mut types = Types::default();
 
     let mut imports = ImportSection::new();
     for import in &module.imports {
         let id = types.id(&import.params, &import.results);
         imports.import(&import.module, &import.field, EntityType::Function(id));
+    }
+
+    let memory = MemoryType {
+        minimum: module.memory.min_pages,
+        maximum: module.memory.max_pages,
+        memory64: module.memory.memory64,
+        shared: false,
+        page_size_log2: None,
+    };
+    let global_type = |global: &Global| GlobalType {
+        val_type: val_type(global.ty),
+        mutable: global.mutable,
+        shared: false,
+    };
+    if hosted {
+        // The host's are as large as it made them.
+        let unbounded = MemoryType {
+            minimum: 0,
+            maximum: None,
+            ..memory
+        };
+        imports.import(HOST, "memory", EntityType::Memory(unbounded));
+        let table = TableType {
+            element_type: RefType::FUNCREF,
+            table64: module.memory.memory64,
+            minimum: 0,
+            maximum: None,
+            shared: false,
+        };
+        imports.import(HOST, "table", EntityType::Table(table));
+        for global in &module.globals {
+            imports.import(HOST, "global", EntityType::Global(global_type(global)));
+        }
     }
 
     let mut functions = FunctionSection::new();
@@ -68,6 +124,12 @@ pub fn emit(module: &Module) -> Vec<u8> {
             maximum: Some(size),
             shared: false,
         });
+    }
+    if let Some(table) = module
+        .table
+        .as_ref()
+        .filter(|table| !table.funcs.is_empty())
+    {
         let funcs: Vec<_> = table.funcs.iter().map(|func| func.0).collect();
         elements.active(
             None,
@@ -77,30 +139,21 @@ pub fn emit(module: &Module) -> Vec<u8> {
     }
 
     let mut memories = MemorySection::new();
-    memories.memory(MemoryType {
-        minimum: module.memory.min_pages,
-        maximum: module.memory.max_pages,
-        memory64: module.memory.memory64,
-        shared: false,
-        page_size_log2: None,
-    });
+    memories.memory(memory);
 
     let mut globals = GlobalSection::new();
     for global in &module.globals {
-        let ty = GlobalType {
-            val_type: val_type(global.ty),
-            mutable: global.mutable,
-            shared: false,
-        };
-        globals.global(ty, &const_expr(global.init));
+        globals.global(global_type(global), &const_expr(global.init));
     }
 
     // Defined functions are indexed after the imported ones.
     let func_index = |i: usize| (module.imports.len() + i) as u32;
 
     let mut exports = ExportSection::new();
-    exports.export(&module.memory.export, ExportKind::Memory, 0);
-    if let Some(table) = &module.table {
+    if !hosted {
+        exports.export(&module.memory.export, ExportKind::Memory, 0);
+    }
+    if let Some(table) = module.table.as_ref().filter(|_| !hosted) {
         exports.export(&table.export, ExportKind::Table, 0);
     }
     for (i, func) in module.funcs.iter().enumerate() {
@@ -109,12 +162,12 @@ pub fn emit(module: &Module) -> Vec<u8> {
         }
     }
     for (i, global) in module.globals.iter().enumerate() {
-        if let Some(name) = &global.export {
+        if let Some(name) = global.export.as_ref().filter(|_| !hosted) {
             exports.export(name, ExportKind::Global, i as u32);
         }
     }
 
-    let start = module.start.map(|func| StartSection {
+    let start = module.start.filter(|_| !hosted).map(|func| StartSection {
         function_index: func.0,
     });
 
@@ -124,7 +177,7 @@ pub fn emit(module: &Module) -> Vec<u8> {
     }
 
     let mut data = DataSection::new();
-    for segment in &module.data {
+    for segment in module.data.iter().filter(|_| !hosted) {
         let offset = offset(module.memory.memory64, segment.offset);
         data.active(0, &offset, segment.bytes.iter().copied());
     }
@@ -155,14 +208,17 @@ pub fn emit(module: &Module) -> Vec<u8> {
     out.section(&types.section)
         .section(&imports)
         .section(&functions);
-    if module.table.is_some() {
+    if module.table.is_some() && !hosted {
         out.section(&tables);
     }
-    out.section(&memories).section(&globals).section(&exports);
+    if !hosted {
+        out.section(&memories).section(&globals);
+    }
+    out.section(&exports);
     if let Some(start) = &start {
         out.section(start);
     }
-    if module.table.is_some() {
+    if !elements.is_empty() {
         out.section(&elements);
     }
     out.section(&code).section(&data).section(&names);

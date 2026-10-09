@@ -7,6 +7,7 @@ use crate::parse::ParseError;
 use crate::ty::{InstanceSite, TypeError};
 
 pub mod emit;
+mod eval;
 pub mod file;
 pub mod ir;
 pub mod lex;
