@@ -1,4 +1,5 @@
 use std::fmt;
+use std::mem;
 
 use crate::lex::{Span, Token, TokenKind};
 
@@ -246,7 +247,6 @@ pub struct Stmt {
 pub enum StmtKind {
     Binding(Binding),
     Expr(Expr),
-    Return(Option<Expr>),
     /// `else if` is represented as an `else` block holding a single `If`.
     If {
         cond: Expr,
@@ -333,6 +333,9 @@ pub enum ExprKind {
         op: Option<BinOp>,
         value: Box<Expr>,
     },
+    /// `return`, or `return value`, whose value is all that follows it. It
+    /// has no value of its own, as the function is left where it is.
+    Return(Option<Box<Expr>>),
 }
 
 /// A call argument, optionally labelled as in `f(name: value)`.
@@ -402,6 +405,9 @@ pub enum ParseErrorKind {
     GenericExtern,
     /// A pipe whose body has no `_` of its own.
     PipeWithoutPlaceholder,
+    /// A `|>` after a `return` in the body of a pipe, outside any brackets
+    /// in it: it would be in the value returned.
+    PipeAfterReturn,
     /// `_` as an expression that isn't in the body of a pipe.
     PlaceholderOutsidePipe,
     /// A line starting with `|>` that isn't indented deeper than the
@@ -430,6 +436,9 @@ struct Parser<'a> {
     /// Whether each pipe body being parsed has had a placeholder yet,
     /// innermost last.
     placeholder_used: Vec<bool>,
+    /// Whether what is being parsed is the body of a pipe, and in no
+    /// brackets within it: a `return` there ends the chain of pipes.
+    pipe_body: bool,
 }
 
 /// What a parenthesized list turned out to be.
@@ -539,6 +548,11 @@ impl fmt::Display for ParseErrorKind {
             Self::PipeWithoutPlaceholder => {
                 write!(f, "the right side of `|>` must use `_`, e.g. `x |> f(_)`")
             }
+            Self::PipeAfterReturn => write!(
+                f,
+                "a `return` on the right side of `|>` ends the chain: bracket its value to pipe \
+                 within it, e.g. `x |> return (_ |> f(_))`"
+            ),
             Self::PlaceholderOutsidePipe => {
                 write!(f, "`_` can only be used on the right side of `|>`")
             }
@@ -585,6 +599,7 @@ pub fn parse_partial(tokens: &[Token]) -> (Module, Vec<ParseError>) {
         errors: Vec::new(),
         flaws: 0,
         placeholder_used: Vec::new(),
+        pipe_body: false,
     };
     let module = parser.module();
     (module, parser.errors)
@@ -1029,16 +1044,6 @@ impl<'a> Parser<'a> {
         let kind = match self.peek().kind {
             TokenKind::Let | TokenKind::Var => StmtKind::Binding(self.binding()?),
             TokenKind::If => return self.if_stmt(),
-            TokenKind::Return => {
-                self.bump();
-                let value = if self.at(TokenKind::Newline) {
-                    None
-                } else {
-                    Some(self.expr()?)
-                };
-                self.expect(TokenKind::Newline)?;
-                StmtKind::Return(value)
-            }
             TokenKind::While => {
                 self.bump();
                 let cond = self.expr()?;
@@ -1257,7 +1262,9 @@ impl<'a> Parser<'a> {
         let mut expr = self.binary(0)?;
         while self.eat(TokenKind::PipeArrow) {
             self.placeholder_used.push(false);
+            let outer = mem::replace(&mut self.pipe_body, true);
             let body = self.binary(0);
+            self.pipe_body = outer;
             let used = self.placeholder_used.pop();
             let body = body?;
             if used == Some(false) {
@@ -1360,12 +1367,12 @@ impl<'a> Parser<'a> {
             let kind = match self.peek().kind {
                 TokenKind::LParen => {
                     self.bump();
-                    let args = self.comma_list(TokenKind::RParen, Self::arg)?;
+                    let args = self.bracketed(|p| p.comma_list(TokenKind::RParen, Self::arg))?;
                     ExprKind::Call(Box::new(expr), args)
                 }
                 TokenKind::LBracket => {
                     self.bump();
-                    let index = self.expr()?;
+                    let index = self.bracketed(Self::expr)?;
                     self.expect(TokenKind::RBracket)?;
                     ExprKind::Index(Box::new(expr), Box::new(index))
                 }
@@ -1420,7 +1427,7 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => ExprKind::Name(name.clone()),
             TokenKind::LParen => {
                 self.bump();
-                let kind = match self.parens(token.span, Self::expr)? {
+                let kind = match self.bracketed(|p| p.parens(token.span, Self::expr))? {
                     Parens::Empty => ExprKind::Unit,
                     Parens::Group(inner) => inner.kind,
                     Parens::Tuple(items) => ExprKind::Tuple(items),
@@ -1448,7 +1455,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LBracket => {
                 self.bump();
-                let kind = self.brackets()?;
+                let kind = self.bracketed(Self::brackets)?;
                 return Ok(Expr {
                     kind,
                     span: self.span_from(token.span),
@@ -1462,6 +1469,23 @@ impl<'a> Parser<'a> {
                     span: self.span_from(token.span),
                 });
             }
+            TokenKind::Return => {
+                self.bump();
+                // In the body of a pipe, a `|>` after its value would
+                // read as the next of the chain, so it is no part of it.
+                let value = match starts_expr(&self.peek().kind) {
+                    true if self.pipe_body => Some(Box::new(self.binary(0)?)),
+                    true => Some(Box::new(self.expr()?)),
+                    false => None,
+                };
+                if self.pipe_body && self.at(TokenKind::PipeArrow) {
+                    self.error(ParseErrorKind::PipeAfterReturn, self.peek().span);
+                }
+                return Ok(Expr {
+                    kind: ExprKind::Return(value),
+                    span: self.span_from(token.span),
+                });
+            }
             _ => return Err(self.unexpected("expression")),
         };
         self.bump();
@@ -1469,6 +1493,15 @@ impl<'a> Parser<'a> {
             kind,
             span: token.span,
         })
+    }
+
+    /// Parses what brackets hold with `inner`: a pipe body that they are in
+    /// is not what it is in.
+    fn bracketed<T>(&mut self, inner: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let outer = mem::take(&mut self.pipe_body);
+        let result = inner(self);
+        self.pipe_body = outer;
+        result
     }
 
     /// Parses the rest of a parenthesized list after the `(` at `start`. A
@@ -1707,6 +1740,29 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Whether an expression can start with a token of `kind`.
+fn starts_expr(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Int(_)
+            | TokenKind::Float(_)
+            | TokenKind::Str(_)
+            | TokenKind::Ident(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::LParen
+            | TokenKind::LBracket
+            | TokenKind::Dot
+            | TokenKind::Module
+            | TokenKind::Fn
+            | TokenKind::Minus
+            | TokenKind::Tilde
+            | TokenKind::Amp
+            | TokenKind::Not
+            | TokenKind::Return
+    )
+}
+
 /// Binary operators and their precedence; higher binds tighter.
 fn binary_op(kind: &TokenKind) -> Option<(BinOp, u8)> {
     let op = match kind {
@@ -1809,6 +1865,8 @@ mod tests {
                 let op = op.map(|op| format!("{op:?}")).unwrap_or_default();
                 format!("({op}= {} {})", sexpr(target), sexpr(value))
             }
+            ExprKind::Return(None) => "(return)".to_string(),
+            ExprKind::Return(Some(value)) => format!("(return {})", sexpr(value)),
         }
     }
 
@@ -1838,9 +1896,9 @@ mod tests {
                 StmtKind::Binding(_) => "binding",
                 StmtKind::Expr(expr) => match expr.kind {
                     ExprKind::Assign { .. } => "assign",
+                    ExprKind::Return(_) => "return",
                     _ => "expr",
                 },
-                StmtKind::Return(_) => "return",
                 StmtKind::If { .. } => "if",
                 StmtKind::While { .. } => "while",
                 StmtKind::For { .. } => "for",
@@ -1851,6 +1909,17 @@ mod tests {
                 StmtKind::Defer(_) => "defer",
             })
             .collect()
+    }
+
+    /// The value that `stmt` returns, if it's a `return` of one.
+    fn returned(stmt: &Stmt) -> Option<&Expr> {
+        match &stmt.kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Return(value),
+                ..
+            }) => value.as_deref(),
+            _ => None,
+        }
     }
 
     fn named(name: &str) -> TypeKind {
@@ -1958,7 +2027,7 @@ mod tests {
         assert_eq!(add.sig.name.name, "add");
         assert_eq!(add.sig.params.len(), 2);
         assert_eq!(add.sig.ret.as_ref().unwrap().kind, named("i32"));
-        let StmtKind::Return(Some(sum)) = &add.body[0].kind else {
+        let Some(sum) = returned(&add.body[0]) else {
             panic!()
         };
         assert_eq!(sexpr(sum), "(Add a b)");
@@ -2205,6 +2274,74 @@ mod tests {
     }
 
     #[test]
+    fn return_is_an_expression() {
+        // Its value is all that follows it.
+        assert_eq!(expr("a or return b or c"), "(Or a (return (Or b c)))");
+        assert_eq!(
+            expr("return a = n |> f(_)"),
+            "(return (= a (|> n (call f _))))"
+        );
+        assert_eq!(expr("-return x.y + 1"), "(Neg (return (Add (. x y) 1)))");
+        // It has none before a token that starts no expression.
+        assert_eq!(
+            expr("f(return, [return], (return) + 1)"),
+            "(call f (return) [(return)] (Add (return) 1))"
+        );
+        assert_eq!(expr("a and return or b"), "(Or (And a (return)) b)");
+        assert_eq!(expr("return -1"), "(return (Neg 1))");
+        assert_eq!(expr("return .none"), "(return .none)");
+        assert_eq!(expr("return (a, b).0"), "(return (. (tuple a b) 0))");
+        assert_eq!(expr("return not a"), "(return (Not a))");
+        assert_eq!(expr("return return"), "(return (return))");
+        // It ends a chain of pipes.
+        assert_eq!(
+            expr("x |> g(_) |> return _"),
+            "(|> (|> x (call g _)) (return _))"
+        );
+        assert_eq!(
+            expr("x |> ok(_) or return _ + 1"),
+            "(|> x (Or (call ok _) (return (Add _ 1))))"
+        );
+    }
+
+    #[test]
+    fn a_return_ends_its_chain_of_pipes() {
+        // Its value would be the rest of the chain, which reads as if it
+        // came after.
+        for src in [
+            "x |> return _ |> f(_)",
+            "x |> ok(_) or return _ |> f(_)",
+            "x |> g(_) or return |> f(_)",
+            "x |> return _ + 1 |> f(_) |> g(_)",
+        ] {
+            let src = format!("let _ = {src}");
+            assert_eq!(errors(&src), vec![ParseErrorKind::PipeAfterReturn], "{src}");
+        }
+        let src = "let a = x |> return _ |> f(_)\n";
+        let span = parse_src(src).unwrap_err()[0].span;
+        assert_eq!(&src[span.start..span.end], "|>");
+        // Brackets end its value, or hold a chain of its own.
+        assert_eq!(
+            expr("x |> (return _) + 1 |> f(_)"),
+            "(|> (|> x (Add (return _) 1)) (call f _))"
+        );
+        assert_eq!(
+            expr("x |> return (_ |> f(_))"),
+            "(|> x (return (|> _ (call f _))))"
+        );
+        assert_eq!(
+            expr("x |> g(return _ |> f(_)) |> h(_)"),
+            "(|> (|> x (call g (return (|> _ (call f _))))) (call h _))"
+        );
+        assert_eq!(
+            expr("x |> _[return _ |> f(_)] |> [return _ |> f(_)]"),
+            "(|> (|> x (index _ (return (|> _ (call f _))))) [(return (|> _ (call f _)))])"
+        );
+        // One that no pipe holds has a chain as its value.
+        assert_eq!(expr("return x |> f(_)"), "(return (|> x (call f _)))");
+    }
+
+    #[test]
     fn pipe_body_must_use_placeholder() {
         for src in ["x |> f", "x |> f()", "x |> f(y |> g(_))", "x |> f(_) |> g"] {
             let src = format!("let _ = {src}");
@@ -2425,7 +2562,7 @@ fn f():
             })
             .collect();
         assert_eq!(ops, vec![None, Some(BinOp::Add), Some(BinOp::Rem)]);
-        assert_eq!(f.body[4].kind, StmtKind::Return(None));
+        assert_eq!(returned(&f.body[4]), None);
 
         let StmtKind::If {
             else_body: Some(else_body),
@@ -2476,9 +2613,9 @@ fn f():
         );
         // The line of a `defer` is one expression, and no other statement.
         assert_eq!(
-            errors("fn f():\n    defer return\n    defer\n"),
+            errors("fn f():\n    defer pass\n    defer\n"),
             vec![
-                expected("expression", TokenKind::Return),
+                expected("expression", TokenKind::Pass),
                 expected("expression", TokenKind::Newline),
             ]
         );
@@ -3351,7 +3488,7 @@ let n = 1
         let ItemKind::Fn(f) = &module.items[0].kind else {
             panic!()
         };
-        let StmtKind::Return(Some(sum)) = &f.body[0].kind else {
+        let Some(sum) = returned(&f.body[0]) else {
             panic!()
         };
         assert_eq!(text(sum.span), "a + b");

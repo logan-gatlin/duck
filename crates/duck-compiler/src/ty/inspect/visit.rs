@@ -50,11 +50,6 @@ fn block<'p>(block: &'p [parse::Stmt], visit: &mut dyn FnMut(Node<'p>)) {
         match &stmt.kind {
             StmtKind::Binding(binding) => expr(&binding.value, visit),
             StmtKind::Expr(value) => expr(value, visit),
-            StmtKind::Return(value) => {
-                if let Some(value) = value {
-                    expr(value, visit);
-                }
-            }
             StmtKind::If {
                 cond,
                 then_body,
@@ -122,6 +117,11 @@ fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
             self::expr(callee, visit);
             for arg in args {
                 self::expr(&arg.value, visit);
+            }
+        }
+        ExprKind::Return(value) => {
+            if let Some(value) = value {
+                self::expr(value, visit);
             }
         }
     }

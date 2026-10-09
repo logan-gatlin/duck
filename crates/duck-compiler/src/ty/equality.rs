@@ -78,7 +78,7 @@ impl Checker {
                 }
             }
             Ty::ExternRef => unreachable!("`externref` can't be compared"),
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Error => {}
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 

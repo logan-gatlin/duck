@@ -625,3 +625,56 @@ fn f():
               (dereference_expression
                 (identifier))
               (integer))))))))
+
+====================
+Return expressions
+====================
+
+fn f():
+    a or return b or c
+    x |> g(_) |> return _
+    f(return, return -1)
+    return a = n |> f(_)
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (expression_statement
+        (binary_expression
+          (identifier)
+          (return_expression
+            (binary_expression
+              (identifier)
+              (identifier)))))
+      (expression_statement
+        (pipe_expression
+          (pipe_expression
+            (identifier)
+            (call_expression
+              (identifier)
+              (arguments
+                (placeholder))))
+          (return_expression
+            (placeholder))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (return_expression)
+            (return_expression
+              (unary_expression
+                (integer))))))
+      (expression_statement
+        (return_expression
+          (assignment_expression
+            (identifier)
+            (pipe_expression
+              (identifier)
+              (call_expression
+                (identifier)
+                (arguments
+                  (placeholder))))))))))

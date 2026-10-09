@@ -255,6 +255,13 @@ impl Body<'_> {
         // nothing an arm does changes what its names are.
         self.spill(&mut subject, |_| false);
         out.extend(subject.pre);
+        // No arm is run for a value that there never is: each is checked
+        // as it is for one that failed to check, and left out.
+        let mut unused = Vec::new();
+        let (ty, out) = match ty {
+            Ty::Never => (Ty::Error, &mut unused),
+            _ => (ty, out),
+        };
         let locals = subject
             .scalars
             .iter()
@@ -759,7 +766,6 @@ fn push_pattern_strings<'p>(block: &'p [parse::Stmt], out: &mut Vec<&'p str>) {
             // Every statement that holds others is above.
             StmtKind::Binding(_)
             | StmtKind::Expr(_)
-            | StmtKind::Return(_)
             | StmtKind::Break
             | StmtKind::Continue
             | StmtKind::Pass => {}

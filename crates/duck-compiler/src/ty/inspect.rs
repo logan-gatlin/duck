@@ -1708,7 +1708,6 @@ impl<'p> Walk<'p> {
         match &stmt.kind {
             StmtKind::Binding(binding) => self.binding(binding),
             StmtKind::Expr(expr) => self.expr(expr),
-            StmtKind::Return(value) => value.as_ref().is_some_and(|value| self.expr(value)),
             StmtKind::If {
                 cond,
                 then_body,
@@ -1854,6 +1853,7 @@ impl<'p> Walk<'p> {
             ExprKind::Cast(inner, ty, _) => self.expr(inner) || self.ty(ty),
             ExprKind::FnType(ty) => self.ty(ty),
             ExprKind::Assign { target, value, .. } => self.expr(target) || self.expr(value),
+            ExprKind::Return(value) => value.as_deref().is_some_and(|value| self.expr(value)),
         };
         within || self.find(Found::Expr(expr))
     }

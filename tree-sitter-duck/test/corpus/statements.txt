@@ -112,15 +112,17 @@ fn g() -> i32:
     (identifier)
     (parameters)
     (block
-      (return_statement)))
+      (expression_statement
+        (return_expression))))
   (function_declaration
     (identifier)
     (parameters)
     (named_type
       (identifier))
     (block
-      (return_statement
-        (integer)))))
+      (expression_statement
+        (return_expression
+          (integer))))))
 
 ====================
 Defer
@@ -305,8 +307,9 @@ fn f():
               (placeholder))))
         (block
           (pass_statement)))
-      (return_statement
-        (identifier)))))
+      (expression_statement
+        (return_expression
+          (identifier))))))
 
 ====================
 No trailing newline
@@ -376,7 +379,8 @@ fn f():
               (identifier)
               (discard)))
           (block
-            (return_statement)))
+            (expression_statement
+              (return_expression))))
         (match_arm
           (variant_pattern
             (identifier))

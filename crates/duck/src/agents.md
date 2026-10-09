@@ -57,8 +57,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
 - Keywords: `pub fn let var return if else while for in break continue pass
   defer match struct enum union extern use module and or not true false as
-  as!`. No item is named `array`, `varray`, `string`, `tuple`, `type`, `option`
-  or `result`.
+  as!`. No item is named `array`, `varray`, `string`, `tuple`, `type`,
+  `option`, `result` or `never`.
 
 ## Types
 
@@ -294,6 +294,7 @@ fn area(w: i32, h: i32 = id()) -> i32:  # 3, for every call without an `h`
   names the functions that were running. Nothing runs after an error.
 - A default is one value, made once: `h: i32 = id()` calls `id` once, not
   once for each call that leaves `h` out.
+- A constant has no `return`: it is evaluated for no function.
 - The constants of one item share its fuel, which `[const]` in `Duck.toml`
   sets, and is about a second's worth without it.
 - A constant takes memory as the host's code does, with `module.grow`, and
@@ -303,9 +304,27 @@ fn area(w: i32, h: i32 = id()) -> i32:  # 3, for every call without an `h`
 ## Operators
 
 Loosest to tightest, the binary ones left associative but for assignment,
-which is right associative: `= += -= *= /= %=`, `|>`, `or`, `and`, `not`,
-`== != < <= > >=`, `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, `as as!`, prefix
-`- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
+which is right associative: `return`, `= += -= *= /= %=`, `|>`, `or`, `and`,
+`not`, `== != < <= > >=`, `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, `as as!`,
+prefix `- ~ & &var`, postfix `f(x) a[i] x.f t.0 p.*`.
+
+```duck
+fn half(n: i32) -> i32:
+	n >= 0 or return -1          # returns only where `n` is negative
+	n % 2 == 0 and return n / 2
+	return (n + 1) / 2
+```
+
+- A `return` is an expression, written wherever an operand is. Its value is
+  all that follows it: `ok or return a or b` returns `a or b`. It has none
+  where nothing that starts an expression follows, as in `f(return)`.
+- It has no value of its own, as it leaves the function: its type is `never`,
+  which is accepted as any type. What is made of a `never` is one too, so
+  `f(return 1)` and `let x = return 1` are accepted, and return 1. `never`
+  is no type to write.
+- A function with a result ends by a `return` wherever it ends. The right
+  side of `and` and `or` may not be evaluated, so a `return` there ends
+  nothing: `half` needs its last line.
 
 - An assignment is an expression: its value is the one assigned, as the
   target's type. So `a = b = 0` assigns both, and `while (n = next()) != 0:`
@@ -820,9 +839,20 @@ fn demo(n: i32) -> i32:
 	return n * 2
 		|> add(_, _) - 1           # `_` is the piped value, evaluated once
 		|> _ / 2                   # a deeper line starting with `|>` continues
+
+fn last(n: i32) -> i32:
+	n * 2
+		|> add(_, 1)
+		|> return _                # a `return` ends the chain
 ```
 
 - The body uses `_` at least once: `x |> f(_)`, never `x |> f`.
+- Nothing is piped on from a `return`: `x |> return _ |> f(_)` is an error,
+  as its value would be the rest of the chain. Brackets say which is meant:
+  `x |> return (_ |> f(_))`.
+- What is piped to a `return` is typed before the `return` is read, as it is
+  for any body: `1 |> return _` returns an `i32`, and `.none |> return _` is
+  an error.
 - A `_` belongs to the nearest pipe: in `x |> f(_, y |> g(_))` the second is
   `y`.
 - A piped literal is typed before the body is read: `1 as u8 |> byte(_)`.

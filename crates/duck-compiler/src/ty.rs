@@ -166,6 +166,10 @@ const EXTERNREF: &str = "externref";
 /// The name of the built-in type of types used as values.
 const TYPE: &str = "type";
 
+/// The name of the type of an expression that has no value, which only the
+/// compiler gives one.
+const NEVER: &str = "never";
+
 /// The fields of every array, in order.
 const ARRAY_FIELDS: [&str; 2] = ["ptr", "len"];
 
@@ -284,6 +288,10 @@ pub enum Ty {
     /// `tuple()`, the return type of functions without one. Its values have no
     /// scalars, so they take no storage in wasm.
     Unit,
+    /// `never`, the type of an expression that has no value, as it leaves
+    /// where it is: a `return`. It is accepted as every type, and so is what
+    /// is made of one.
+    Never,
     /// The type of an expression that already failed to check. Compatible
     /// with everything, so one mistake is reported once.
     Error,
@@ -435,6 +443,9 @@ pub enum TypeErrorKind {
     },
     /// `type` written as any type but a function's parameter's.
     TypeOutsideParam,
+    /// `never` written as a type: only an expression that has no value is
+    /// one.
+    NeverWritten,
     /// A parameter of type `type` given a default.
     TypeParamDefault(String),
     /// A type parameter that a call infers, which is in no parameter's type.
@@ -537,6 +548,9 @@ pub enum TypeErrorKind {
     MissingReturn(String),
     BreakOutsideLoop,
     ContinueOutsideLoop,
+    /// A `return` in a global initializer, the value of an enum's member or
+    /// a default: a constant, which is evaluated for no function.
+    ReturnOutsideFn,
     /// A `return`, or a `break` or `continue` of a loop that the `defer` is
     /// in, in the body of a `defer`, which runs while its block is left.
     LeavesDefer(&'static str),
@@ -1325,6 +1339,10 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "`type` is only the type of a function's parameter, which it makes a type parameter"
             ),
+            Self::NeverWritten => write!(
+                f,
+                "`never` is the type of what has no value, like a `return`, and can't be written"
+            ),
             Self::TypeParamDefault(name) => {
                 write!(f, "type parameter `{name}` can't have a default")
             }
@@ -1433,6 +1451,7 @@ impl fmt::Display for TypeErrorKind {
             Self::MissingReturn(name) => write!(f, "`{name}` can finish without returning"),
             Self::BreakOutsideLoop => write!(f, "`break` outside of a loop"),
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
+            Self::ReturnOutsideFn => write!(f, "`return` outside of a function"),
             Self::LeavesDefer(keyword) => {
                 write!(f, "`{keyword}` leaves the body of a `defer`")
             }
@@ -1885,7 +1904,8 @@ impl Checker {
     fn declare_name(&mut self, name: &Ident, item: Item, is_pub: bool) {
         let scope = self.scopes.entry(self.module).or_default();
         if scope.contains_key(&name.name)
-            || [ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT].contains(&name.name.as_str())
+            || [ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT, NEVER]
+                .contains(&name.name.as_str())
         {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
@@ -2830,6 +2850,10 @@ impl Checker {
             Some(_) => None,
             None => self.type_params.iter().find(|(p, _)| p == name),
         };
+        if name == NEVER && param.is_none() && member.is_none() {
+            self.error(TypeErrorKind::NeverWritten, span);
+            return Ty::Error;
+        }
         let arity = match (param, member) {
             (Some(_), _) => Some(Arity::Plain),
             (None, Some(item)) => self.item_arity(item),
@@ -2911,7 +2935,7 @@ impl Checker {
             Ty::Fn(_) => true,
             // A type is in no value.
             Ty::Type => false,
-            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Unit | Ty::Error => true,
+            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Unit | Ty::Never | Ty::Error => true,
         }
     }
 
@@ -3151,6 +3175,7 @@ impl Checker {
             Ty::ExternRef => EXTERNREF.to_string(),
             Ty::Type => TYPE.to_string(),
             Ty::Unit => format!("{TUPLE}()"),
+            Ty::Never => NEVER.to_string(),
             Ty::Error => "{error}".to_string(),
         }
     }
@@ -3193,7 +3218,7 @@ impl Checker {
                     self.push_leaves(member, format!("{name}.{field}"), out);
                 }
             }
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Error => {}
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -3462,6 +3487,7 @@ impl Checker {
                         self.members(ty)
                     }
                     Ty::Unit if elems.is_empty() => Vec::new(),
+                    Ty::Never => vec![Ty::Never; elems.len()],
                     _ => {
                         if ty != Ty::Error {
                             let kind = TypeErrorKind::Mismatch {
@@ -3505,7 +3531,7 @@ impl Checker {
             }
             // Never in memory, but a struct holding one still has a layout
             // that `field` asks for.
-            Ty::ExternRef | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Error => (0, 1),
+            Ty::ExternRef | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
         }
     }
 
@@ -3586,7 +3612,7 @@ impl Checker {
                 }
             }
             Ty::ExternRef => unreachable!("`externref` has no pointer type"),
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Error => {}
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -3746,9 +3772,10 @@ impl<'c> Body<'c> {
     }
 
     /// Reports a mismatch unless `found` fits where `want` is expected or
-    /// either is an error.
+    /// either is an error, or a `never`.
     fn expect(&mut self, found: Ty, want: Ty, span: Span) {
-        if self.ck.fits(found, want) || found == Ty::Error || want == Ty::Error {
+        let any = |ty| matches!(ty, Ty::Error | Ty::Never);
+        if self.ck.fits(found, want) || any(found) || any(want) {
             return;
         }
         let kind = TypeErrorKind::Mismatch {
@@ -3931,26 +3958,6 @@ impl<'c> Body<'c> {
                     }
                 }
             }
-            StmtKind::Return(value) => {
-                if self.deferring.is_some() {
-                    self.error(TypeErrorKind::LeavesDefer("return"), stmt.span);
-                }
-                let mut value = match value {
-                    Some(value) => self.check(value, self.ret),
-                    None => {
-                        self.expect(Ty::Unit, self.ret, stmt.span);
-                        Value::default()
-                    }
-                };
-                let deferred = self.deferred(0);
-                if !deferred.is_empty() {
-                    // Held, as they may change what it is read from.
-                    self.spill(&mut value, |scalar| matches!(scalar, Expr::Const(_)));
-                }
-                out.extend(value.pre);
-                out.extend(deferred);
-                out.push(Stmt::Return(exprs(value.scalars)));
-            }
             StmtKind::If {
                 cond,
                 then_body,
@@ -4018,6 +4025,11 @@ impl<'c> Body<'c> {
             return (Ty::Error, Value::default());
         };
         let mut pre = mem::take(&mut place.pre);
+        // Nothing is stored where there is never a value.
+        if place.ty == Ty::Never {
+            pre.extend(self.expr(value, None).1.pre);
+            return never(pre);
+        }
         if !place.mutable {
             let kind = match place.behind {
                 Some(ty) => {
@@ -4075,6 +4087,8 @@ impl<'c> Body<'c> {
         let (ty, value) = self.expr(iter, None);
         let (elem, value) = match self.ck.array_view(ty) {
             Some(id) => (self.ck.element(id), self.array_start(value)),
+            // It has no elements, and none that the loop is run for.
+            None if ty == Ty::Never => (ty, value),
             None => (self.invalid_operand("for", ty, iter.span).0, value),
         };
         self.ck.record(var.span, elem);
@@ -4191,6 +4205,7 @@ impl<'c> Body<'c> {
                     | ExprKind::Index(..) => self.place(inner)?,
                     _ => match self.expr(inner, None) {
                         (ty @ Ty::Ptr(_), ptr) => self.deref_place(ptr, ty),
+                        (Ty::Never, value) => never_place(value.pre),
                         (Ty::Error, _) => return None,
                         _ => {
                             self.error(TypeErrorKind::NotAssignable, target.span);
@@ -4208,6 +4223,9 @@ impl<'c> Body<'c> {
                         ..deref
                     };
                 }
+                if place.ty == Ty::Never {
+                    return Some(place);
+                }
                 let (ty, range, field_offset) = self.ck.field(place.ty, field)?;
                 let slots = match place.slots {
                     Slots::Local(slots) => Slots::Local(slots[range].to_vec()),
@@ -4222,6 +4240,7 @@ impl<'c> Body<'c> {
             }
             ExprKind::Deref(inner) => match self.expr(inner, None) {
                 (ty @ Ty::Ptr(_), ptr) => Some(self.deref_place(ptr, ty)),
+                (Ty::Never, value) => Some(never_place(value.pre)),
                 (ty, _) => {
                     self.invalid_operand(".*", ty, target.span);
                     None
@@ -4279,6 +4298,9 @@ impl<'c> Body<'c> {
             array = self.load(array, 0, ty);
         }
         let index = self.check(index, Ty::Prim(Prim::Uint));
+        if ty == Ty::Never {
+            return Some(never_place(self.seq(vec![array, index]).pre));
+        }
         let Some(id) = self.ck.array_view(ty) else {
             self.invalid_operand("[]", written, span);
             return None;
@@ -4444,8 +4466,13 @@ impl<'c> Body<'c> {
 
     /// Checks `expr` against `want`, using it to type literals.
     fn check(&mut self, expr: &parse::Expr, want: Ty) -> Value {
-        let (ty, value) = self.expr(expr, Some(want));
+        let (ty, mut value) = self.expr(expr, Some(want));
         self.expect(ty, want, expr.span);
+        // Nothing reads the value of a `never`, which is still to be one
+        // of the type wanted.
+        if ty == Ty::Never {
+            value.scalars = self.blank(want).scalars;
+        }
         value
     }
 
@@ -4542,6 +4569,9 @@ impl<'c> Body<'c> {
                     return self.type_field(ty, field, inner.span);
                 }
                 let (mut ty, mut value) = self.expr(inner, None);
+                if ty == Ty::Never {
+                    return (ty, value);
+                }
                 // Fields are reached through any number of pointers.
                 while let Ty::Ptr(id) = ty {
                     let pointee = self.ck.pointee(id);
@@ -4566,6 +4596,7 @@ impl<'c> Body<'c> {
                         let pointee = self.ck.pointee(id);
                         (pointee, self.load(value, 0, pointee))
                     }
+                    Ty::Never => (ty, value),
                     _ => self.invalid_operand(".*", ty, expr.span),
                 }
             }
@@ -4591,7 +4622,40 @@ impl<'c> Body<'c> {
             ExprKind::Assign { target, op, value } => {
                 self.assignment(target, *op, value, expr.span, true)
             }
+            ExprKind::Return(value) => self.returned(value.as_deref(), expr.span),
         }
+    }
+
+    /// `return`, or `return value`: the value is evaluated, then the
+    /// `defer`s of every block it's in are run, and then the function is
+    /// left.
+    fn returned(&mut self, value: Option<&parse::Expr>, span: Span) -> (Ty, Value) {
+        if self.global.is_some() {
+            if let Some(value) = value {
+                self.expr(value, None);
+            }
+            self.error(TypeErrorKind::ReturnOutsideFn, span);
+            return (Ty::Error, Value::default());
+        }
+        if self.deferring.is_some() {
+            self.error(TypeErrorKind::LeavesDefer("return"), span);
+        }
+        let mut value = match value {
+            Some(value) => self.check(value, self.ret),
+            None => {
+                self.expect(Ty::Unit, self.ret, span);
+                Value::default()
+            }
+        };
+        let deferred = self.deferred(0);
+        if !deferred.is_empty() {
+            // Held, as they may change what it is read from.
+            self.spill(&mut value, |scalar| matches!(scalar, Expr::Const(_)));
+        }
+        let mut pre = value.pre;
+        pre.extend(deferred);
+        pre.push(Stmt::Return(exprs(value.scalars)));
+        never(pre)
     }
 
     /// `value |> body`. The value is evaluated first and held in temporaries,
@@ -4631,6 +4695,9 @@ impl<'c> Body<'c> {
         }
         if tys.contains(&Ty::Error) {
             return (Ty::Error, Value::default());
+        }
+        if tys.contains(&Ty::Never) {
+            return never(self.seq(values).pre);
         }
         (self.ck.tuple_of(tys), self.seq(values))
     }
@@ -4780,6 +4847,7 @@ impl<'c> Body<'c> {
         let value = self.bound_args(&params, &[], args, binding, checked);
         let prim = match ty {
             Ty::Prim(prim) if prim.is_int() => self.ck.fixed(prim),
+            Ty::Never => return never(value.pre),
             _ => {
                 let op = match leading {
                     true => "module.count_leading_zeros",
@@ -5120,6 +5188,7 @@ impl<'c> Body<'c> {
         };
         let prim = match ty {
             Ty::Prim(prim) => self.ck.fixed(prim),
+            Ty::Never => return (ty, value),
             _ => {
                 let symbol = if op == UnaryOp::Neg { "-" } else { "~" };
                 return self.invalid_operand(symbol, ty, span);
@@ -5212,6 +5281,7 @@ impl<'c> Body<'c> {
         let bool = Ty::Prim(Prim::Bool);
         let prim = match ty {
             Ty::Prim(prim) => self.ck.fixed(prim),
+            Ty::Never => return never(self.seq(vec![lhs, rhs]).pre),
             // A type parameter is no type that an operator takes.
             Ty::Param(_) => return self.invalid_operand(binop_symbol(op), ty, span),
             // Pointers compare as unsigned addresses.
@@ -5330,6 +5400,9 @@ impl<'c> Body<'c> {
             _ => None,
         };
         let (from, value) = self.expr(operand, expected);
+        if from == Ty::Never {
+            return (from, value);
+        }
         if from == Ty::Error || to == Ty::Error {
             return (Ty::Error, Value::default());
         }
@@ -6021,6 +6094,26 @@ impl<'c> Body<'c> {
     }
 }
 
+/// The place that a `never` is, or is a pointer to, or has as a field or an
+/// element: one of no value, which is left where `pre` is run.
+fn never_place(pre: Vec<Stmt>) -> Place {
+    Place {
+        name: String::new(),
+        ty: Ty::Never,
+        mutable: true,
+        behind: None,
+        pre,
+        slots: Slots::Local(Vec::new()),
+    }
+}
+
+/// What is left of an expression that never has a value: only `pre`, which
+/// leaves it.
+fn never(pre: Vec<Stmt>) -> (Ty, Value) {
+    let scalars = Vec::new();
+    (Ty::Never, Value { pre, scalars })
+}
+
 fn scalar(ty: ValType, expr: Expr) -> Value {
     Value {
         pre: Vec::new(),
@@ -6333,16 +6426,11 @@ fn assigned_within(stmt: &parse::Stmt) -> Vec<String> {
         }
         StmtKind::Binding(parse::Binding { value: expr, .. })
         | StmtKind::Expr(expr)
-        | StmtKind::Return(Some(expr))
         | StmtKind::If { cond: expr, .. }
         | StmtKind::While { cond: expr, .. }
         | StmtKind::For { iter: expr, .. }
         | StmtKind::Match { value: expr, .. } => push_assigned(expr, &mut names),
-        StmtKind::Return(None)
-        | StmtKind::Break
-        | StmtKind::Continue
-        | StmtKind::Pass
-        | StmtKind::Defer(_) => {}
+        StmtKind::Break | StmtKind::Continue | StmtKind::Pass | StmtKind::Defer(_) => {}
     }
     names
 }
@@ -6394,6 +6482,11 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
             }
             push_assigned(target, names);
             push_assigned(value, names);
+        }
+        ExprKind::Return(value) => {
+            if let Some(value) = value {
+                push_assigned(value, names);
+            }
         }
     }
 }
@@ -6500,20 +6593,68 @@ fn fn_sigs(program: &Program) -> impl Iterator<Item = (bool, &FnSig)> {
 /// Whether control can never reach the end of `block`.
 fn diverges(block: &[parse::Stmt]) -> bool {
     block.iter().any(|stmt| match &stmt.kind {
-        StmtKind::Return(_) => true,
-        StmtKind::Expr(expr) => is_unreachable_call(expr),
+        StmtKind::Binding(parse::Binding { value: expr, .. })
+        | StmtKind::Expr(expr)
+        | StmtKind::For { iter: expr, .. } => never_ends(expr),
         StmtKind::If {
+            cond,
             then_body,
-            else_body: Some(else_body),
-            ..
-        } => diverges(then_body) && diverges(else_body),
+            else_body,
+        } => {
+            let bodies = else_body
+                .as_ref()
+                .is_some_and(|else_body| diverges(then_body) && diverges(else_body));
+            never_ends(cond) || bodies
+        }
         StmtKind::While { cond, body } => {
-            matches!(cond.kind, ExprKind::Bool(true)) && !breaks(body)
+            never_ends(cond) || matches!(cond.kind, ExprKind::Bool(true)) && !breaks(body)
         }
         // One of its arms runs, or it traps.
-        StmtKind::Match { arms, .. } => arms.iter().all(|arm| diverges(&arm.body)),
-        _ => false,
+        StmtKind::Match { value, arms } => {
+            never_ends(value) || arms.iter().all(|arm| diverges(&arm.body))
+        }
+        StmtKind::Break | StmtKind::Continue | StmtKind::Pass | StmtKind::Defer(_) => false,
     })
+}
+
+/// Whether evaluating `expr` never ends: it is a `return` or it traps, or an
+/// operand that it always evaluates is one that never ends.
+fn never_ends(expr: &parse::Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Return(_) => true,
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Name(_)
+        | ExprKind::Module(_)
+        | ExprKind::FnType(_)
+        | ExprKind::Placeholder
+        | ExprKind::Dot(_) => false,
+        ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().any(never_ends),
+        ExprKind::Unary(_, inner)
+        | ExprKind::Field(inner, _)
+        | ExprKind::Deref(inner)
+        | ExprKind::AddrOf(_, inner)
+        | ExprKind::Cast(inner, ..) => never_ends(inner),
+        // The right side is only evaluated if the left doesn't decide it.
+        ExprKind::Binary(BinOp::And | BinOp::Or, lhs, _) => never_ends(lhs),
+        ExprKind::Repeat(a, b)
+        | ExprKind::Binary(_, a, b)
+        | ExprKind::Index(a, b)
+        | ExprKind::Pipe(a, b)
+        | ExprKind::Assign {
+            target: a,
+            value: b,
+            ..
+        } => never_ends(a) || never_ends(b),
+        ExprKind::Call(callee, args) => {
+            is_unreachable_call(expr)
+                || never_ends(callee)
+                || args.iter().any(|arg| never_ends(&arg.value))
+        }
+    }
 }
 
 /// Whether control can never reach the end of `block`, or leaves it first for
@@ -7119,6 +7260,237 @@ fn f(a: bool) -> i32:
              (if (I32.Eqz tmp1) (then (drop (call read )) (return 2)) (else )) \
              unreachable) unreachable"
         );
+    }
+
+    #[test]
+    fn return_is_an_expression() {
+        let src = "\
+extern:
+    fn log(n: i32)
+fn piped(n: i32) -> i32:
+    n + 1 |> return _
+fn guarded(ok: bool, n: i32) -> i32:
+    ok or return n
+    ok and n > 0 and return 1
+    return 2
+fn deferred(n: i32) -> i32:
+    defer log(n)
+    n * 2 |> return _
+fn nothing(ok: bool):
+    ok and return
+    not ok or return ()
+fn scoped(ok: bool, n: i32) -> i32:
+    if ok:
+        defer log(1)
+        n |> return _
+    return 0
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "piped"),
+            "(set tmp1 (I32.Add n 1)) (return tmp1)"
+        );
+        // Only if the right side is evaluated does it leave the function.
+        assert_eq!(
+            body(&module, "guarded"),
+            "(drop (if ok 1 (seq (return n) 0))) \
+             (drop (if (if ok (I32.GtS n 0) 0) (seq (return 1) 0) 0)) \
+             (return 2)"
+        );
+        // Its value is evaluated before the `defer`s that it runs.
+        assert_eq!(
+            body(&module, "deferred"),
+            "(set tmp1 (I32.Mul n 2)) (set tmp2 tmp1) (call log [n] -> []) (return tmp2)"
+        );
+        assert_eq!(
+            body(&module, "nothing"),
+            "(drop (if ok (seq (return ) 0) 0)) \
+             (drop (if (I32.Eqz ok) 1 (seq (return ) 0)))"
+        );
+        // A block that it ends runs its `defer`s once, as it is left.
+        assert_eq!(
+            body(&module, "scoped"),
+            "(if ok (then (set tmp2 n) (call log [1] -> []) (return tmp2)) (else )) (return 0)"
+        );
+        // The value is one of the type the function returns, and a pipe
+        // that ends in one ends the function, as a guard doesn't.
+        assert_eq!(
+            errors("fn f() -> i32:\n    1.5 |> return _\n"),
+            vec![mismatch("i32", "f64")]
+        );
+        assert_eq!(
+            errors("fn f(ok: bool):\n    ok or return 1\n"),
+            vec![mismatch("tuple()", "i32")]
+        );
+        assert_eq!(
+            errors("fn f(ok: bool) -> i32:\n    ok or return 1\n"),
+            vec![TypeErrorKind::MissingReturn("f".into())]
+        );
+    }
+
+    #[test]
+    fn a_return_is_in_a_function_and_no_defer() {
+        // A constant is evaluated for no function that it could leave.
+        let src = "\
+let x: i32 = return 1
+struct P:
+    x: i32 = return 2
+enum(u8) E:
+    a = 1 + return 3
+fn f(a: i32 = return nope) -> i32:
+    return a
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (TypeErrorKind::ReturnOutsideFn, "return 1"),
+                (TypeErrorKind::ReturnOutsideFn, "return 2"),
+                (TypeErrorKind::ReturnOutsideFn, "return 3"),
+                (TypeErrorKind::UnknownName("nope".into()), "nope"),
+                (TypeErrorKind::ReturnOutsideFn, "return nope"),
+            ]
+        );
+        let src = "\
+fn f(n: i32) -> i32:
+    defer return 1
+    defer n |> return _
+    return 2
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (TypeErrorKind::LeavesDefer("return"), "return 1"),
+                (TypeErrorKind::LeavesDefer("return"), "return _"),
+            ]
+        );
+    }
+
+    #[test]
+    fn never_is_no_type_to_write_and_no_item() {
+        use TypeErrorKind::*;
+        let src = "\
+fn never():
+    pass
+struct(never) Box:
+    value: never
+fn f(a: &never, b: array(never)) -> never:
+    pass
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (DuplicateItem("never".into()), "never"),
+                (DuplicateItem("never".into()), "never"),
+                (NeverWritten, "never"),
+                (NeverWritten, "never"),
+                (NeverWritten, "never"),
+                (NeverWritten, "never"),
+            ]
+        );
+        // Only an item's name is taken.
+        let src = "fn f(never: i32) -> i32:\n    let never = never + 1\n    return never\n";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set never (I32.Add never 1)) (return never)"
+        );
+    }
+
+    #[test]
+    fn what_is_made_of_a_never_is_one() {
+        let src = "\
+var calls = 0
+let text = \"hello\"
+struct P:
+    x: i32
+    y: i32
+fn tick() -> i32:
+    calls += 1
+    return calls
+fn add(a: i32, b: i32) -> i32:
+    return a + b
+fn(T) id(x: T) -> T:
+    return x
+fn arg() -> i32:
+    add(tick(), return tick() * 10)
+fn generic() -> i32:
+    id(return 1)
+fn made() -> i32:
+    let p = P(x: return 2, y: 0)
+    return p.x
+fn variant() -> i32:
+    let o: option(i32) = .some(return 3)
+    return 0
+fn operand() -> i32:
+    -return 4
+fn left() -> i32:
+    (return 5) + 1 == 2
+fn right() -> i32:
+    1 + return 6
+fn cast() -> i32:
+    (return 7) as i64
+fn field() -> P:
+    (return P(x: 8, y: 0)).x
+fn pointee() -> i32:
+    let p = return 9
+    p.*
+fn element() -> i32:
+    text[return 10]
+fn indexed() -> i32:
+    let a = return 11
+    a[0]
+fn callee() -> i32:
+    let f = return 12
+    f(1)
+fn pair() -> i32:
+    let (a, b) = (tick(), return 13)
+    return a + b
+fn bound() -> i32:
+    var x = return 14
+    x = 1
+    x += 1
+    x.y = 2
+    return x
+fn assigned() -> i32:
+    var x = 0
+    x = return 15
+    return x
+fn piped() -> i32:
+    (return 16) |> add(_, 1)
+fn looped() -> i32:
+    for c in return 17:
+        pass
+fn tested() -> i32:
+    if return 18:
+        pass
+fn repeated() -> i32:
+    while return 19:
+        pass
+fn matched() -> i32:
+    match return 20:
+        1:
+            pass
+        else:
+            pass
+fn counted() -> i32:
+    module.count_leading_zeros(return 21)
+fn twice() -> i32:
+    return return 22
+pub let got = (
+    (arg(), generic(), made(), variant(), operand(), left(), right(), cast()),
+    (field().x, pointee(), element(), indexed(), callee(), pair(), bound()),
+    (assigned(), piped(), looped(), tested(), repeated(), matched(), counted()),
+    (twice(), calls),
+)
+";
+        // Each is accepted, and returns before anything is made of it:
+        // what is evaluated before it has been, and nothing after it is.
+        let module = lower(src);
+        let exported = module.globals.iter().filter(|g| !g.exports.is_empty());
+        let got: Vec<_> = exported.map(|g| konst(g.init)).collect();
+        // `arg` returns its second `tick`, and `pair` runs the third.
+        let wanted = [20].into_iter().chain(1..=22).chain([3]);
+        let wanted: Vec<_> = wanted.map(|n| n.to_string()).collect();
+        assert_eq!(got, wanted);
     }
 
     #[test]
@@ -12115,11 +12487,9 @@ fn g():
             "(if (I32.Eq x 0) (then (return 1)) (else )) unreachable"
         );
         assert_eq!(body(&module, "g"), "unreachable");
-        // Only a statement of its own ends a function.
-        assert_eq!(
-            errors("fn h() -> u32:\n    let u = module.unreachable()\n"),
-            [TypeErrorKind::MissingReturn("h".into())]
-        );
+        // So does what always evaluates it.
+        let module = lower("fn h() -> u32:\n    let u = module.unreachable()\n");
+        assert_eq!(body(&module, "h"), "unreachable");
         assert_eq!(
             errors("fn k():\n    module.unreachable(1)\n"),
             [TypeErrorKind::TooManyArgs {

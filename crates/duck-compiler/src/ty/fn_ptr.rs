@@ -126,6 +126,9 @@ impl Body<'_> {
         span: Span,
     ) -> (Ty, Value) {
         let (ty, callee_value) = self.expr(callee, None);
+        if ty == Ty::Never {
+            return (ty, callee_value);
+        }
         let Ty::Fn(id) = ty else {
             if ty != Ty::Error {
                 self.error(TypeErrorKind::NotCallable(path_text(callee)), callee.span);

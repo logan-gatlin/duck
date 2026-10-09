@@ -333,6 +333,7 @@ fn param_in_expr<'a>(
         ExprKind::Cast(value, ty, _) => within(value).or_else(|| in_type(ty)),
         ExprKind::FnType(ty) => in_type(ty),
         ExprKind::Assign { target, value, .. } => within(target).or_else(|| within(value)),
+        ExprKind::Return(value) => value.as_deref().and_then(within),
     }
 }
 

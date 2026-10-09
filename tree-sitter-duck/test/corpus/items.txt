@@ -186,10 +186,11 @@ extern:
     (named_type
       (identifier))
     (block
-      (return_statement
-        (binary_expression
-          (identifier)
-          (identifier)))))
+      (expression_statement
+        (return_expression
+          (binary_expression
+            (identifier)
+            (identifier))))))
   (extern_block
     (extern_function
       (identifier)
@@ -402,10 +403,11 @@ pub fn add(a: i32, b: i32,) -> i32:
     (named_type
       (identifier))
     (block
-      (return_statement
-        (binary_expression
-          (identifier)
-          (identifier))))))
+      (expression_statement
+        (return_expression
+          (binary_expression
+            (identifier)
+            (identifier)))))))
 
 ====================
 Bounds that list types
@@ -493,10 +495,11 @@ fn(T: mod.Head) id(T: type, x: &T) -> i32:
     (named_type
       (identifier))
     (block
-      (return_statement
-        (field_expression
-          (identifier)
-          (identifier))))))
+      (expression_statement
+        (return_expression
+          (field_expression
+            (identifier)
+            (identifier)))))))
 
 ====================
 Generic function
@@ -530,10 +533,11 @@ fn(T, U) pair(a: T, b: U) -> tuple(T, U):
         (named_type
           (identifier))))
     (block
-      (return_statement
-        (tuple
-          (identifier)
-          (identifier))))))
+      (expression_statement
+        (return_expression
+          (tuple
+            (identifier)
+            (identifier)))))))
 
 ====================
 Bindings

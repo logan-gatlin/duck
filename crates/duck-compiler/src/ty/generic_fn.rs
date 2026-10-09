@@ -22,7 +22,7 @@ use crate::parse::{self, Arg, FnSig};
 
 use super::{
     Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
-    generic_fn_decls, is_typed_by_other, pending_defaults,
+    generic_fn_decls, is_typed_by_other, never, pending_defaults,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -501,6 +501,14 @@ impl Body<'_> {
         }
         let mut checked: Vec<_> = args.iter().map(|_| None).collect();
         let type_args = self.type_args_of(generic, args, &binding, &mut checked, span);
+        // An argument that settles one is a `never`, and so is the call:
+        // there is no instance to call.
+        if type_args.contains(&Ty::Never) {
+            let params = sig.params.iter().map(|(p, _)| (p.clone(), Ty::Error));
+            let params: Vec<_> = params.collect();
+            let value = self.bound_args(&params, &sig.defaults, args, binding, checked);
+            return never(value.pre);
+        }
         // A generic function checked as declared calls no instance.
         let id = match self.ck.open {
             true => None,
@@ -670,6 +678,9 @@ impl Body<'_> {
                 self.ck.settle_by_bounds(generic, &mut bound);
                 checked[k] = Some((ty, value));
             }
+        }
+        if checked.iter().flatten().any(|(ty, _)| *ty == Ty::Never) {
+            bound.fill(Some(Ty::Never));
         }
         // A default with a type of its own settles what no argument did.
         let default_tys = self.ck.generic_fns[generic.0 as usize].default_tys.clone();

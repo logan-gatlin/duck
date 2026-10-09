@@ -10,8 +10,10 @@
 
 // Binary operator precedence, as in `binary_op` in parse.rs; higher binds
 // tighter. `not`, casts, prefix and postfix operators slot in around them,
-// pipes sit below them all, and assignment below pipes.
+// pipes sit below them all, assignment below pipes, and `return` below
+// that: its value is all that follows it.
 const PREC = {
+  return: -2,
   assign: -1,
   pipe: 0,
   or: 1,
@@ -345,7 +347,6 @@ module.exports = grammar({
     _statement: $ => choice(
       $.binding,
       $.expression_statement,
-      $.return_statement,
       $.if_statement,
       $.while_statement,
       $.for_statement,
@@ -357,12 +358,6 @@ module.exports = grammar({
     ),
 
     expression_statement: $ => seq($._expression, $._newline),
-
-    return_statement: $ => seq(
-      'return',
-      field('value', optional($._expression)),
-      $._newline,
-    ),
 
     if_statement: $ => seq(
       'if',
@@ -440,6 +435,7 @@ module.exports = grammar({
       $.parenthesized_expression,
       $.placeholder,
       $.dot_expression,
+      $.return_expression,
       $.assignment_expression,
       $.pipe_expression,
       $.unary_expression,
@@ -477,6 +473,14 @@ module.exports = grammar({
 
     // `.name`, a variant of the union or member of the enum expected of it.
     dot_expression: $ => seq('.', field('name', $.identifier)),
+
+    // `return`, or `return value`, which leaves the function where it is.
+    // The compiler ends a chain of pipes at one that isn't in brackets:
+    // here the rest of the chain is in its value.
+    return_expression: $ => prec.right(PREC.return, seq(
+      'return',
+      optional(field('value', $._expression)),
+    )),
 
     // `target = value`, whose value is the one assigned. Groups to the right.
     assignment_expression: $ => prec.right(PREC.assign, seq(

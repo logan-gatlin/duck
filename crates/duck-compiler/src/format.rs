@@ -966,6 +966,17 @@ mod tests {
     }
 
     #[test]
+    fn a_return_is_laid_out_wherever_an_expression_is() {
+        let src = "fn f():\n  x|>g( _ )|>return _\n  a or return-1\n  f(return,return x,[return],(return))\n  a==return(b,c).0\n  ~return&x\n";
+        let expected = "fn f():\n\tx |> g(_) |> return _\n\ta or return -1\n\tf(return, return x, [return], (return))\n\ta == return (b, c).0\n\t~return &x\n";
+        assert_eq!(formatted(src), expected);
+        // A chain that is broken is broken before the `return` that ends it.
+        let src = "fn f():\n\tn * 2\n\t\t|> add(_, 1) |> return _\n";
+        let expected = "fn f():\n\tn * 2\n\t\t|> add(_, 1)\n\t\t|> return _\n";
+        assert_eq!(formatted(src), expected);
+    }
+
+    #[test]
     fn a_defer_is_laid_out_as_the_statement_or_block_it_holds() {
         let src = "fn f():\n  defer  close( h )\n  defer(a,b).0=1\n  defer  :\n      x=1\n  pass\n";
         let expected =

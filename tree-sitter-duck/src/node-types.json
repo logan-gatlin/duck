@@ -84,6 +84,10 @@
         "named": true
       },
       {
+        "type": "return_expression",
+        "named": true
+      },
+      {
         "type": "string",
         "named": true
       },
@@ -223,10 +227,6 @@
       },
       {
         "type": "pass_statement",
-        "named": true
-      },
-      {
-        "type": "return_statement",
         "named": true
       },
       {
@@ -1538,7 +1538,7 @@
     }
   },
   {
-    "type": "return_statement",
+    "type": "return_expression",
     "named": true,
     "fields": {
       "value": {

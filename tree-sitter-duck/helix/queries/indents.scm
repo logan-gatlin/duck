@@ -40,7 +40,8 @@
 ] @extend
 
 [
-  (return_statement)
+  (expression_statement (return_expression))
+  (expression_statement (pipe_expression body: (return_expression)))
   (break_statement)
   (continue_statement)
   (pass_statement)
