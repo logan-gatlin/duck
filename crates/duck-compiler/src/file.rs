@@ -39,6 +39,9 @@ pub struct Settings {
     /// The function the module runs when it is instantiated, which takes no
     /// arguments and returns nothing.
     pub start: Option<String>,
+    /// The fuel that the code run to evaluate the constants of one item has.
+    /// `None` is [`crate::ty::DEFAULT_FUEL`].
+    pub fuel: Option<u64>,
 }
 
 /// Sizes of the module's linear memory, in 64 KiB pages.

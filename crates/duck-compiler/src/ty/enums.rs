@@ -355,8 +355,8 @@ impl Checker {
         let mut body = Body::new(self, Ty::Unit);
         body.global = Some(program);
         let value = body.check(expr, ty);
-        let consts = self.fold_value(&value, expr.span);
-        (self.errors.len() == errors && ty != Ty::Error).then_some(consts)
+        let consts = body.evaluate(value, expr.span);
+        consts.filter(|_| self.errors.len() == errors && ty != Ty::Error)
     }
 
     /// The type of enum `id`'s values.

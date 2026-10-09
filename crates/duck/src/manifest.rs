@@ -46,6 +46,9 @@ pub struct Module {
     pub memory64: bool,
     /// `None` fits it to the literals, from address 0.
     pub static_section: Option<StaticSection>,
+    /// The fuel that the code run to evaluate the constants of one item
+    /// has. `None` is the compiler's own.
+    pub fuel: Option<u64>,
 }
 
 /// What a package offers the packages that depend on it.
@@ -53,6 +56,10 @@ pub struct Module {
 pub struct Library {
     /// The file other packages use, relative to the manifest.
     pub entry: PathBuf,
+    /// The fuel that the code run to evaluate the constants of one item
+    /// has, where the library is checked on its own. `None` is the
+    /// compiler's own.
+    pub fuel: Option<u64>,
 }
 
 /// Where a dependency is found.
@@ -134,6 +141,8 @@ struct Raw {
     module: Option<RawModule>,
     memory: Option<RawMemory>,
     library: Option<RawLibrary>,
+    #[serde(default, rename = "const")]
+    constants: RawConstants,
     #[serde(default)]
     dependencies: BTreeMap<String, RawDependency>,
 }
@@ -170,6 +179,12 @@ struct RawLibrary {
     entry: PathBuf,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConstants {
+    fuel: Option<u64>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDependency {
@@ -184,13 +199,18 @@ struct RawDependency {
 impl Manifest {
     pub fn parse(src: &str) -> Result<Self, ManifestError> {
         let raw: Raw = toml::from_str(src).map_err(ManifestError::Toml)?;
+        let fuel = raw.constants.fuel;
         let module = match (raw.module, raw.memory) {
-            (Some(module), memory) => Some(Module::parse(module, memory.unwrap_or_default())?),
+            (Some(module), memory) => {
+                let module = Module::parse(module, memory.unwrap_or_default())?;
+                Some(Module { fuel, ..module })
+            }
             (None, Some(_)) => return Err(ManifestError::MemoryWithoutModule),
             (None, None) => None,
         };
         let library = raw.library.map(|library| Library {
             entry: library.entry,
+            fuel,
         });
         if module.is_none() && library.is_none() {
             return Err(ManifestError::Empty);
@@ -257,6 +277,7 @@ impl Module {
             memory64: self.memory64,
             static_section: self.static_section,
             start: self.start.clone(),
+            fuel: self.fuel,
         }
     }
 
@@ -302,6 +323,7 @@ impl Module {
             },
             memory64,
             static_section,
+            fuel: None,
         })
     }
 }
@@ -322,6 +344,7 @@ impl Library {
                 end: u32::MAX.into(),
             }),
             start: None,
+            fuel: self.fuel,
         }
     }
 }
@@ -607,6 +630,7 @@ mod tests {
                         start: 0,
                         end: 64 * 1024,
                     }),
+                    fuel: None,
                 }),
                 library: None,
                 dependencies: BTreeMap::new(),
@@ -629,6 +653,22 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(manifest.module.unwrap().start.as_deref(), Some("init"));
+    }
+
+    #[test]
+    fn fuel_is_given_to_the_module_and_the_library() {
+        let src = "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n\n\
+                   [library]\nentry = \"lib.duck\"\n\n[const]\nfuel = 5000\n";
+        let manifest = Manifest::parse(src).unwrap();
+        assert_eq!(manifest.module.unwrap().settings().fuel, Some(5000));
+        assert_eq!(manifest.library.unwrap().settings().fuel, Some(5000));
+
+        let unset = Manifest::parse("[library]\nentry = \"lib.duck\"\n").unwrap();
+        assert_eq!(unset.library.unwrap().settings().fuel, None);
+        let error = |src: &str| Manifest::parse(src).unwrap_err().to_string();
+        let library = "[library]\nentry = \"lib.duck\"\n\n[const]\n";
+        assert!(error(&format!("{library}fuel = -1\n")).contains("fuel"));
+        assert!(error(&format!("{library}time = 1\n")).contains("unknown field `time`"));
     }
 
     #[test]
@@ -667,6 +707,7 @@ mod tests {
                 module: None,
                 library: Some(Library {
                     entry: "src/lib.duck".into(),
+                    fuel: None,
                 }),
                 dependencies: BTreeMap::from([
                     ("math".to_string(), Dependency::Path("../math".into())),

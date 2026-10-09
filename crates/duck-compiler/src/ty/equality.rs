@@ -9,8 +9,8 @@ use crate::lex::Span;
 use crate::parse::BinOp;
 
 use super::{
-    Body, Checker, FuncSig, Leaf, Prim, Synth, Ty, TypeErrorKind, Value, binary, binop_symbol,
-    exprs, is_pure, is_simple, is_stable, scalar, split1,
+    Body, Checker, FuncSig, Leaf, Prim, Synth, Ty, Value, binary, binop_symbol, exprs, is_pure,
+    is_stable, scalar, split1,
     unions::{self, Holds, narrow, tags_are, widen},
 };
 
@@ -82,12 +82,6 @@ impl Checker {
         }
     }
 
-    /// Whether comparing values of type `ty` compares arrays.
-    fn compares_arrays(&self, ty: Ty) -> bool {
-        let mut parts = self.parts(ty).into_iter();
-        parts.any(|part| matches!(part.how, Compare::Array(_)))
-    }
-
     /// The function comparing two arrays of type `ty`, created the first time
     /// it's asked for and lowered by [`Self::lower_eq_func`]. A `varray`
     /// compares through the function of its `array`.
@@ -148,12 +142,6 @@ impl Body<'_> {
         if ty == Ty::Error || !self.ck.storable(ty) {
             return self.invalid_operand(binop_symbol(op), ty, span);
         }
-        // Checked up front, as folding skips calls in branches it doesn't
-        // take.
-        if self.global.is_some() && self.ck.compares_arrays(ty) {
-            self.error(TypeErrorKind::NotConstant, span);
-            return (bool, scalar(ValType::I32, Expr::Const(Const::I32(0))));
-        }
         (bool, self.compare(op, ty, lhs, rhs))
     }
 
@@ -168,9 +156,9 @@ impl Body<'_> {
         let mut value = self.seq(vec![lhs, rhs]);
         // Scalars are compared in pairs, out of source order, and those of
         // arrays may not be read at all. A union's tags are read again for
-        // each piece of its variants, but a constant has no temporaries.
-        if has_union && self.global.is_none() {
-            self.spill(&mut value, is_simple);
+        // each piece of its variants.
+        if has_union {
+            self.spill_simple(&mut value);
         } else if has_array {
             self.spill(&mut value, is_stable);
         } else if width > 1 {

@@ -1,16 +1,16 @@
 //! Defaults: the constant a struct's field has where a constructor gives it
 //! no value, and a function's parameter where a call gives it no argument.
 //! Each is folded once, and every instance of a generic struct or function
-//! shares its declaration's. A field's is folded with the globals and enum
-//! members, which may use it as it may use them. A parameter's is folded
-//! after them all, as nothing constant calls a function.
+//! shares its declaration's. They are folded with the globals and enum
+//! members, which may use them as they may use those: a field's with its
+//! struct, and a parameter's with its function.
 
 use crate::ir::Const;
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, Arg, ExprKind, FnSig, Ident, StructDecl, TypeKind};
 
-use super::{Body, Checker, StructId, Ty, TypeErrorKind, Value, fn_sigs, param_names};
+use super::{Body, Checker, Dep, StructId, Ty, TypeErrorKind, Value, param_names};
 
 /// The default of a struct field or function parameter that has one.
 #[derive(Clone)]
@@ -68,14 +68,11 @@ impl Checker {
         }
     }
 
-    /// Checks and folds the defaults of every function's parameters.
-    pub(super) fn define_param_defaults(&mut self, program: &Program) {
-        for (id, (_, sig)) in fn_sigs(program).enumerate() {
-            self.module = sig.name.span.file;
-            let params = self.funcs[id].params.clone();
-            self.funcs[id].defaults = self.fold_param_defaults(program, sig, &params, &[]).0;
-        }
-        self.define_generic_fn_defaults(program);
+    /// Checks and folds the defaults of the parameters of function `id`,
+    /// which isn't generic and has the signature `sig`.
+    pub(super) fn define_param_defaults(&mut self, program: &Program, id: usize, sig: &FnSig) {
+        let params = self.funcs[id].params.clone();
+        self.funcs[id].defaults = self.fold_param_defaults(program, sig, &params, &[]).0;
     }
 
     /// The default of each parameter of `sig` that has one, checked and
@@ -155,6 +152,7 @@ impl Checker {
         body.global = Some(program);
         body.default = true;
         let (found, value) = body.expr(expr, Some(ty));
+        let locals = body.locals;
         let mut own = None;
         if self.fits(found, ty) || found == Ty::Error || ty == Ty::Error {
             // It is folded once for every instance, so it isn't a value
@@ -182,9 +180,9 @@ impl Checker {
                 own = Some(found);
             }
         }
-        let consts = self.fold_value(&value, expr.span);
+        let consts = self.evaluate(program, locals, value, expr.span);
         let folded = self.errors.len() == errors && ty != Ty::Error;
-        (folded.then_some(consts), own.filter(|_| folded))
+        (consts.filter(|_| folded), own.filter(|_| folded))
     }
 
     /// The default of field `index` of struct `id`. An instance of a generic
@@ -271,6 +269,8 @@ impl Body<'_> {
         if pending && self.folded(item, &ty, span) {
             defaults = field_defaults(self);
         }
+        // A default names what a constant built with it may call.
+        self.ck.note(Dep::Item(item));
         // A default with a type of its own is taken only as that type.
         for (i, (name, expected)) in params.iter().enumerate() {
             let own = self.ck.field_default_ty(id, i);

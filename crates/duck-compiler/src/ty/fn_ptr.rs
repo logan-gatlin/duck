@@ -9,7 +9,7 @@ use crate::lex::Span;
 use crate::parse::{self, Arg};
 
 use super::{
-    Body, Checker, FnId, FuncSig, Synth, Ty, TypeErrorKind, Value, exprs, is_pure, is_stable,
+    Body, Checker, Dep, FnId, FuncSig, Synth, Ty, TypeErrorKind, Value, exprs, is_pure, is_stable,
     path_text, scalar, split1,
 };
 
@@ -32,6 +32,7 @@ impl Checker {
             return 0;
         }
         let target = self.pointer_target(id);
+        self.note(Dep::Func(target));
         // Nothing is at index 0, so that calling zeroed memory traps.
         let next = self.table.len() as u32 + 1;
         let index = *self.table_indices.entry(target).or_insert(next);
