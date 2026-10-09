@@ -410,8 +410,9 @@ impl Checker {
     /// Settles the type parameters of generic function `generic` that
     /// `bound` leaves out, where the bound of one that it has names them:
     /// they are what makes the bound's fields those the type argument
-    /// starts with. A bound names only type parameters before its own, so
-    /// the last is taken first.
+    /// starts with, or the bound's `ptr` that of the array it starts as. A
+    /// bound names only type parameters before its own, so the last is
+    /// taken first.
     pub(super) fn settle_by_bounds(&self, generic: GenericFnId, bound: &mut [Option<Ty>]) {
         let params = &self.generic_fns[generic.0 as usize].params;
         for (i, param) in params.iter().enumerate().rev() {
@@ -426,6 +427,9 @@ impl Checker {
             }
             let have = self.known(arg);
             self.unify(want, have, bound);
+            if let (Some(want), Some(have)) = (self.array_ptr(want), self.array_ptr(have)) {
+                self.unify(want, have, bound);
+            }
             let (Ty::Struct(want), Ty::Struct(have)) = (want, have) else {
                 continue;
             };

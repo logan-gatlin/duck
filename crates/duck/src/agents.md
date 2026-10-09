@@ -92,7 +92,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 
 A `&var T` is accepted as a `&T`, and a `varray(T)` as an `array(T)`, for the
 type as a whole only: a `tuple(&var T, i32)` is not a `tuple(&T, i32)`, and a
-`fn(&T)` is not a `fn(&var T)`.
+`fn(&T)` is not a `fn(&var T)`. A field or a variant is accepted so too where
+one type starts as another, which a bound and `as` ask.
 
 ## Unions
 
@@ -319,12 +320,16 @@ which is right associative: `= += -= *= /= %=`, `|>`, `or`, `and`, `not`,
   number to number (float to integer saturates, NaN gives 0, and a narrower
   one may lose precision), `bool` to integer, an enum to its value type, a
   union or an enum to a wider one, which starts as it does, and a struct to
-  one that it starts as, which is its first fields. Nothing converts to
-  `bool`: write `x != 0`.
+  one that it starts as, which is its first fields, or to the array that it
+  starts as. Nothing converts to `bool`: write `x != 0`.
 - Of addresses, `as` makes a pointer or a function pointer an `int` or a
   `uint`, a `&var T` a `&T`, a `varray(T)` an `array(T)`, and a pointer to a
-  struct one to a struct that it starts as: a `&Named` a `&Head`, and a
-  `&var Named` a `&var Head`.
+  struct one to a struct or an array that it starts as: a `&Named` a `&Head`,
+  and a `&var Named` a `&var Head`. A `&varray(T)` is a `&array(T)` so too.
+- A pointer that writes is one only to what is typed just as its pointee is:
+  with `next: &var Node` in `Named` and `next: &Node` in `Head`, a
+  `&var Named` is a `&Head` and no `&var Head`, as a `&var varray(T)` is no
+  `&var array(T)`. What was stored through it would be written through.
 - `as!` makes an address one of any type, and checks nothing: pointer to
   pointer (how a `&T` becomes a `&var T`, and a `&Head` a `&Named`), `int`
   or `uint` to a pointer or a function pointer, function pointer to function
@@ -375,6 +380,9 @@ fn view(p: &i32, len: uint) -> array(i32):
   pointer or array on the way to the place decides: with `next: &var Node`,
   `p.next.val = 1` works through a `p: &Node`. `let` and `var` govern the
   binding, not the pointee.
+- `a[i]` reaches its array through any number of pointers, as `p.field` does
+  its struct: with `p: &varray(u8)`, `p[0] = 1`. `for` takes the array
+  itself: `for x in p.*`.
 - Pointer arithmetic is `((p as uint) + 4) as! &T`.
 - Layout follows C, and `bool` is 1 byte. A pointer, a function pointer, an
   `int` and a `uint` are each 4 bytes, or 8 with `memory64`.
@@ -462,6 +470,11 @@ fn demo(n: &Named) -> i32:
   or more, and those `Head` has are named and typed as its are, in order.
   `Head` itself is one. A struct that holds a `Head` as its first field is
   not.
+- A field is typed as the bound's is where it's the `&var T` or `varray(T)`
+  of a `&T` or an `array(T)` there: a struct with `next: &var Node` starts as
+  one with `next: &Node`, and not the reverse. Nothing checks what is then
+  written through the bound, as a cast does: with a `p: &var T`, `p.next = n`
+  leaves a `&Node` where the type argument has a `&var Node`.
 - A bound may name the type parameters before its own in
   the list, and any that are parameters: `fn(T, B: Box(T))`. A type argument
   for `B` then starts as a `Box(T)` does, and a call that settles `B` takes
@@ -524,9 +537,10 @@ fn demo(r: ReadError, w: Warm) -> i32:
 ```
 
 - A union is wider than one whose variants are its own first ones: named the
-  same, holding the same types or nothing, in order. An enum is wider than
-  one over the same type whose members are its own first ones, with the same
-  values. Each is as wide as itself.
+  same, holding the same types or nothing, in order. One that holds a `&T`
+  or an `array(T)` is wider than one that holds the `&var T` or `varray(T)`
+  there. An enum is wider than one over the same type whose members are its
+  own first ones, with the same values. Each is as wide as itself.
 - `x as Wider` is the same variant or member of the wider type. Nothing
   converts the other way: `match` the wider one. The two unions aren't laid
   out alike, so a `&ReadError` is no `&IoError`, and only `as!` makes it or
@@ -586,6 +600,8 @@ fn demo(n: &Named, r: ReadError) -> i32:
   variants or members of `Type`, in order, as if they were written there.
   A struct uses a struct, a union a union, and an enum an enum whose values
   have the type its own do. Any lines may be a `use`, among the others.
+- A struct uses an `array(T)` or a `varray(T)` too, for its `ptr` and `len`,
+  which are `pub`: see below.
 - The type is `Name`, `mod.Name` or a generic one with its type arguments,
   which may be the declaration's own type parameters. A union may use an
   `option(T)` or a `result(T, E)`. Nothing uses a type parameter: `use T` is
@@ -605,6 +621,62 @@ fn demo(n: &Named, r: ReadError) -> i32:
   whichever comes later.
 - A `use` never leads back to itself, as `use B` in `A` does when `B` has
   `use A`.
+
+### Structs that start as an array
+
+```duck
+struct(T) Vec:
+	use varray(T)                    # `pub ptr: &var T` and `pub len: uint`
+	cap: uint
+
+let numbers: varray(i32) = [0; 8]
+let vec = &var Vec(i32)(ptr: numbers.ptr, len: 0, cap: numbers.len)
+
+fn(T) push(v: &var Vec(T), x: T):
+	if v.len == v.cap:
+		module.unreachable()
+	v.len += 1
+	v[v.len - 1] = x                 # through the pointer, as `v.len` is
+
+fn(T, A: array(T)) last(a: A) -> T:  # an array, or a struct that starts as one
+	return a[a.len - 1]
+
+fn sum(a: array(i32)) -> i32:
+	var total = 0
+	for x in a:
+		total += x
+	return total
+
+fn demo() -> i32:
+	push(vec, 3)
+	push(vec, 4)
+	var total = sum(vec.* as array(i32))
+	for x in vec.*:                  # each of its `len` elements
+		total += x
+	return total + last(vec.*) + last(numbers)
+```
+
+- A struct starts as an array when its first fields are `ptr: &T` and
+  `len: uint`, by a `use` or as written. One with `ptr: &var T` starts as a
+  `varray(T)`, and so as an `array(T)` too.
+- It is indexed and iterated as that array is: `v[i]` checks `i` against its
+  `len`, and `for x in v` reads its `ptr` and `len` once, before the first
+  iteration. An element is written only through a `ptr: &var T`.
+- `as` makes it the array, `v as array(T)`, and a pointer to it one to the
+  array, `p as &array(T)`: a `&var varray(T)` only of one with `ptr: &var T`,
+  and never a `&var array(T)`. `as!` makes one that only reads a `varray(T)`.
+  Nothing makes an array the struct, and a function that takes an `array(T)`
+  doesn't take a `Vec(T)`: cast it.
+- `fn(T, A: array(T))`: `A` is bounded by an array, so a type argument is an
+  `array(T)`, a `varray(T)` or a struct that starts as either. A bound of
+  `varray(T)` takes those that write. A call that settles `A` takes `T` from
+  it.
+- In the body an `A` has the `ptr` and `len` of its bound, and is indexed,
+  iterated and cast as the bound is. It is otherwise as any `T` is: `a == b`
+  and the pattern `[x, y]` are errors.
+- Nothing else of an array is the struct's. `==` compares its fields, so two
+  of them are equal when they have the same `ptr`, whatever is there. The
+  patterns `[x, y]` and `"text"` match arrays only: `match v as array(u8)`.
 
 ## Function pointers
 

@@ -1115,14 +1115,23 @@ impl Analysis {
                 };
                 field.name == first.name
                     && field.bare == first.bare
-                    && self.fills(of_bound, of_def, &bound.params, &mut args)
+                    && self.fills(of_bound, of_def, true, &bound.params, &mut args)
             })
     }
 
     /// Whether `ty` is `pattern` with a type in place of each of `params`
     /// in it, which is the same wherever one is written: those in `args`,
-    /// and those it adds to them.
-    fn fills(&self, pattern: Ty, ty: Ty, params: &[Ty], args: &mut Vec<(Ty, Ty)>) -> bool {
+    /// and those it adds to them. If `fits`, a `ty` that writes its memory
+    /// is also a `pattern` that only reads it, as [`Checker::fits`] has it:
+    /// for the type as a whole only.
+    fn fills(
+        &self,
+        pattern: Ty,
+        ty: Ty,
+        fits: bool,
+        params: &[Ty],
+        args: &mut Vec<(Ty, Ty)>,
+    ) -> bool {
         if params.contains(&pattern) {
             let given = args.iter().find(|(param, _)| *param == pattern);
             return match given {
@@ -1147,7 +1156,8 @@ impl Analysis {
                 }
             }
             (Ty::Ptr(_), Ty::Ptr(_)) | (Ty::Array(_), Ty::Array(_))
-                if self.ck.writes(pattern) != self.ck.writes(ty) =>
+                if self.ck.writes(pattern) != self.ck.writes(ty)
+                    && !(fits && self.ck.writes(ty)) =>
             {
                 return false;
             }
@@ -1158,7 +1168,8 @@ impl Analysis {
             _ => return false,
         };
         let mut pairs = parts.iter().zip(&of_ty);
-        parts.len() == of_ty.len() && pairs.all(|(part, of)| self.fills(*part, *of, params, args))
+        parts.len() == of_ty.len()
+            && pairs.all(|(part, of)| self.fills(*part, *of, false, params, args))
     }
 
     /// The item `name` names in `module`.
@@ -2740,6 +2751,87 @@ fn demo(p: &Point, w: Wide, s: Shape) -> Shape:
         // Nothing but a type is.
         assert_eq!(implementations("demo(p", "demo"), [] as [&str; 0]);
         assert_eq!(implementations("log(high)", "high"), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_struct_that_uses_an_array_has_its_fields() {
+        let src = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+fn f(v: &Vec(u8)) -> uint:
+    let n = v.len
+    let first = v[0]
+    v
+    return n
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let at = |files: &Memory, text: &str, name: &str| {
+            let (file, offset) = files.at("main", text);
+            (file, offset + text.find(name).unwrap())
+        };
+        // The fields it has of the array are among its own.
+        let (file, offset) = at(&files, "    v\n", "v");
+        let members = analysis.members(&mut files, file, offset);
+        let members: Vec<_> = members
+            .iter()
+            .map(|member| (member.name.as_str(), member.detail.as_str()))
+            .collect();
+        assert_eq!(
+            members,
+            [
+                ("*", "Vec(u8)"),
+                ("ptr", "&var u8"),
+                ("len", "uint"),
+                ("cap", "uint")
+            ]
+        );
+        let (file, offset) = at(&files, "first = v[0]", "first");
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(hover.text, "let first: u8");
+        // Nothing declares them, as nothing does those of an array.
+        let (file, offset) = at(&files, "v.len", "len");
+        assert_eq!(analysis.definition(file, offset), None);
+        assert_eq!(analysis.rename(&mut files, file, offset), None);
+        let (file, offset) = at(&files, "cap: uint", "cap");
+        let cap = analysis.definition(file, offset).unwrap();
+        assert_eq!(&src[cap.start..cap.end], "cap");
+    }
+
+    #[test]
+    fn a_type_is_implemented_by_one_that_writes_what_it_reads() {
+        let src = "\
+struct Reads:
+    next: &i32
+    items: array(u8)
+struct Writes:
+    next: &var i32
+    items: varray(u8)
+    tag: u8
+struct(T) Held:
+    at: &T
+struct Holds:
+    at: &var &var u8
+union Reading:
+    at: &i32
+    none
+union Writing:
+    at: &var i32
+";
+        let implementations = |name: &str| -> Vec<&'static str> {
+            let mut files = Memory(vec![("main", src)]);
+            let analysis = analysis(&mut files);
+            let (file, offset) = files.at("main", name);
+            let spans = analysis.implementations(file, offset);
+            spans.into_iter().map(|s| &src[s.start..s.end]).collect()
+        };
+        assert_eq!(implementations("Reads"), ["Writes"]);
+        assert_eq!(implementations("Held"), ["Holds"]);
+        assert_eq!(implementations("Reading"), ["Writing"]);
+        // Nothing that only reads is given for one that writes.
+        assert_eq!(implementations("Writes"), [] as [&str; 0]);
+        assert_eq!(implementations("Writing"), [] as [&str; 0]);
     }
 
     /// Where each name is written that stands for what `name` does, in the

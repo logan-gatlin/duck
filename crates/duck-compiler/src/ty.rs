@@ -561,9 +561,10 @@ pub enum TypeErrorKind {
     /// uses it.
     RecursiveUse(String),
     /// A `use` in `within`, which is a struct, a union or an enum, of a
-    /// `ty`, which is no such type.
+    /// `ty`, which is none of what it `takes`.
     UseOfOther {
         within: &'static str,
+        takes: &'static str,
         ty: String,
     },
     /// A `use` in an enum of `expected` values of the enum `name`, whose
@@ -1226,7 +1227,7 @@ impl fmt::Display for TypeErrorKind {
             Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
             Self::NotABound(ty) => write!(
                 f,
-                "`{ty}` can't bound a type parameter; only a struct, a union or an enum can"
+                "`{ty}` can't bound a type parameter; only a struct, a union, an enum or an array can"
             ),
             Self::NotWithin { ty, bound, what } => write!(
                 f,
@@ -1397,8 +1398,8 @@ impl fmt::Display for TypeErrorKind {
             Self::NoItem { module, item } => write!(f, "`{module}` has no item `{item}`"),
             Self::NotAModule(name) => write!(f, "`{name}` is not a module"),
             Self::RecursiveUse(path) => write!(f, "`use` of `{path}` leads back to itself"),
-            Self::UseOfOther { within, ty } => {
-                write!(f, "`use` in {within} takes {within}, which `{ty}` isn't")
+            Self::UseOfOther { within, takes, ty } => {
+                write!(f, "`use` in {within} takes {takes}, which `{ty}` isn't")
             }
             Self::UseOfValues {
                 name,
@@ -2005,8 +2006,9 @@ impl Checker {
 
     /// The fields that `use written` gives struct or union declaration
     /// `id`: those of the struct or union that `written` names, as its type
-    /// arguments make them, each written where the `use` is. None after
-    /// reporting an error.
+    /// arguments make them, each written where the `use` is. A struct also
+    /// uses an array, for its `ptr` and `len`. None after reporting an
+    /// error.
     pub(super) fn used_fields(
         &mut self,
         program: &Program,
@@ -2018,14 +2020,17 @@ impl Checker {
         let union = self.structs[id].union;
         let used = match ty {
             Ty::Struct(used) if self.structs[used.0 as usize].union == union => used,
+            Ty::Array(_) if !union => return self.array_fields(ty, written.span),
             Ty::Error => return Vec::new(),
             _ => {
-                let within = match union {
-                    true => "a union",
-                    false => "a struct",
+                // A struct also has the `ptr` and `len` of an array.
+                let (within, takes) = match union {
+                    true => ("a union", "a union"),
+                    false => ("a struct", "a struct or an array"),
                 };
                 let ty = self.ty_name(ty);
-                self.error(TypeErrorKind::UseOfOther { within, ty }, written.span);
+                let kind = TypeErrorKind::UseOfOther { within, takes, ty };
+                self.error(kind, written.span);
                 return Vec::new();
             }
         };
@@ -2059,6 +2064,24 @@ impl Checker {
             field.span = written.span;
         }
         fields
+    }
+
+    /// The `ptr` and `len` of the array type `ty`, as the fields of a struct
+    /// that starts as it does, each written at `span`. Every module reads
+    /// them, as it does those of the array.
+    fn array_fields(&self, ty: Ty, span: Span) -> Vec<FieldDef> {
+        let fields = ARRAY_FIELDS.iter().zip(self.members(ty));
+        let field = |(name, ty): (&&str, Ty)| FieldDef {
+            name: name.to_string(),
+            ty,
+            is_pub: true,
+            bare: false,
+            default: None,
+            default_ty: None,
+            used: None,
+            span,
+        };
+        fields.map(field).collect()
     }
 
     /// Reports pointer fields whose pointee can't be stored in memory, which
@@ -2859,6 +2882,35 @@ impl Checker {
         Ty::Array(id)
     }
 
+    /// The `ptr` of the array that a `ty` is, or starts as: a struct whose
+    /// first fields are the `ptr` and `len` of one. A bounded type
+    /// parameter is as its bound is.
+    fn array_ptr(&self, ty: Ty) -> Option<Ty> {
+        match self.known(ty) {
+            Ty::Array(id) => Some(self.arrays[id.0 as usize]),
+            ty @ Ty::Struct(id) if self.union_id(ty).is_none() => {
+                let fields = &self.structs[id.0 as usize].fields;
+                let names = fields.iter().map(|field| field.name.as_str());
+                let [ptr, len] = [fields.first()?.ty, fields.get(1)?.ty];
+                let is_array = names.take(2).eq(ARRAY_FIELDS)
+                    && matches!(ptr, Ty::Ptr(_))
+                    && len == Ty::Prim(Prim::Uint);
+                is_array.then_some(ptr)
+            }
+            _ => None,
+        }
+    }
+
+    /// The array that a `ty` is, or [starts as](Self::array_ptr), which its
+    /// elements are reached through.
+    fn array_view(&mut self, ty: Ty) -> Option<ArrayId> {
+        let ptr = self.array_ptr(ty)?;
+        match self.array_of(self.components(ptr)[0], self.writes(ptr)) {
+            Ty::Array(id) => Some(id),
+            _ => unreachable!("`array_of` gives an array"),
+        }
+    }
+
     /// Whether `ty` is a `&var T` or a `varray(T)`, whose memory can be
     /// written.
     fn writes(&self, ty: Ty) -> bool {
@@ -3166,14 +3218,20 @@ impl Checker {
     }
 
     /// Whether a pointer `from` is one to what `to` points to, with no more
-    /// than that known of either: its pointee is a struct that starts as
-    /// that of `to` does, which `to` writes only if `from` does. A union
+    /// than that known of either: its pointee starts as that of `to` does,
+    /// a struct or an array, which `to` writes only if `from` does. A union
     /// that starts as another is laid out otherwise.
+    ///
+    /// What `to` writes is typed just as it is behind `from`: a `&T` stored
+    /// through `to` where `from` has a `&var T` would be written through. An
+    /// instance of a generic function casts as its declaration did, whose
+    /// type argument was only asked to meet its bound.
     fn points_to_start(&self, from: PtrId, to: PtrId) -> bool {
         let (have, writes) = self.pointees[from.0 as usize];
         let (want, written) = self.pointees[to.0 as usize];
-        let is_struct = matches!(want, Ty::Struct(_)) && !self.is_sum(want);
-        (writes || !written) && is_struct && self.meets(have, want)
+        let laid_alike = matches!(want, Ty::Struct(_) | Ty::Array(_)) && !self.is_sum(want);
+        let exact = written && self.instance_chain.is_empty();
+        (writes || !written) && laid_alike && self.starts_like(have, want, exact)
     }
 
     /// How many of the scalars of a `from` are a `to`, if `from as to` is a
@@ -3785,7 +3843,8 @@ impl<'c> Body<'c> {
 
     /// `for var in iter`, which copies each element of the array `iter`, or
     /// each member of the enum `iter` names, to `var` in turn. The array's
-    /// `ptr` and `len` are read once, before the first iteration.
+    /// `ptr` and `len` are read once, before the first iteration, as are
+    /// those that a struct which starts as an array starts with.
     fn for_loop(
         &mut self,
         var: &Ident,
@@ -3798,9 +3857,9 @@ impl<'c> Body<'c> {
             return;
         }
         let (ty, value) = self.expr(iter, None);
-        let elem = match ty {
-            Ty::Array(id) => self.ck.element(id),
-            _ => self.invalid_operand("for", ty, iter.span).0,
+        let (elem, value) = match self.ck.array_view(ty) {
+            Some(id) => (self.ck.element(id), self.array_start(value)),
+            None => (self.invalid_operand("for", ty, iter.span).0, value),
         };
         self.ck.record(var.span, elem);
         let vt = self.ck.addr_type();
@@ -3982,19 +4041,34 @@ impl<'c> Body<'c> {
     }
 
     /// The element `array[index]`, as a place whose `pre` traps unless
-    /// `index < array.len`. `None` after reporting an error.
+    /// `index < array.len`. `array` is one, a struct that starts as one, or
+    /// a pointer to either. `None` after reporting an error.
     fn index_place(
         &mut self,
         array: &parse::Expr,
         index: &parse::Expr,
         span: Span,
     ) -> Option<Place> {
-        let (ty, array) = self.expr(array, None);
+        let (written, mut array) = self.expr(array, None);
+        // Elements are reached through any number of pointers, as fields
+        // are. Of a struct behind one, only the array it starts as is read.
+        let mut ty = written;
+        while let Ty::Ptr(id) = ty {
+            let pointee = self.ck.pointee(id);
+            ty = match self.ck.array_view(pointee) {
+                Some(id) => Ty::Array(id),
+                None if matches!(pointee, Ty::Ptr(_)) => pointee,
+                None => break,
+            };
+            array = self.load(array, 0, ty);
+        }
         let index = self.check(index, Ty::Prim(Prim::Uint));
-        let Ty::Array(id) = ty else {
-            self.invalid_operand("[]", ty, span);
+        let Some(id) = self.ck.array_view(ty) else {
+            self.invalid_operand("[]", written, span);
             return None;
         };
+        let array = self.array_start(array);
+        let ty = Ty::Array(id);
         let elem = self.ck.element(id);
         let mut value = self.seq(vec![array, index]);
         // The bounds check reads the index again, and everything is read
@@ -4023,6 +4097,14 @@ impl<'c> Body<'c> {
                 offset: 0,
             },
         })
+    }
+
+    /// The `ptr` and `len` of `value`, whose type is or
+    /// [starts as](Checker::array_view) an array: those it starts with.
+    fn array_start(&mut self, value: Value) -> Value {
+        // Only a mistyped value has fewer scalars.
+        let len = ARRAY_FIELDS.len().min(value.scalars.len());
+        self.project(value, 0..len)
     }
 
     /// The memory that `ptr`, a pointer of type `ty`, points to, as a place.
@@ -5041,6 +5123,12 @@ impl<'c> Body<'c> {
         let from = match self.ck.known(from) {
             bound if !matches!(to, Ty::Param(_)) => bound,
             _ => from,
+        };
+        // A struct that starts as an array casts to one as that array
+        // does, which its `ptr` and `len` are.
+        let (from, value) = match (to, self.ck.array_view(from)) {
+            (Ty::Array(_), Some(id)) => (Ty::Array(id), self.array_start(value)),
+            _ => (from, value),
         };
         // Two enums are compared by the values of their members.
         if let (Ty::Enum(a), Ty::Enum(b)) = (from, to)
@@ -9305,6 +9393,254 @@ fn f(a: A, b: &var B, c: &var C) -> i64:
     }
 
     #[test]
+    fn a_type_starts_as_one_that_only_reads_what_it_writes() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct Reads:
+    next: &i32
+    items: array(u8)
+struct Writes:
+    next: &var i32
+    items: varray(u8)
+    tag: u8
+union Reading:
+    at: &i32
+    all: array(u8)
+    none
+union Writing:
+    at: &var i32
+    all: varray(u8)
+fn(T: Reads) next(x: &T) -> &i32:
+    return x.next
+fn(T: Reads) bound(x: &var T) -> &var Reads:
+    return x as &var Reads
+fn(E: Reading) at(e: E) -> &i32:
+    match e:
+        .at(p):
+            return p
+        else:
+            return 0
+";
+        let src = format!(
+            "{decls}\
+fn f(w: &var Writes, u: Writing) -> &i32:
+    let p = w as &Reads
+    let r = w.* as Reads
+    let wide = u as Reading
+    let n = next(w)
+    let b = bound(w)
+    return at(u)
+"
+        );
+        let module = lower(&src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set p w) \
+             (set r.next (I32.Load offset=0 w)) \
+             (set r.items.ptr (I32.Load offset=4 w)) \
+             (set r.items.len (I32.Load offset=8 w)) \
+             (set wide u) (set wide.0 u.0) (set wide.1 u.1) \
+             (set n (call next(Writes) w)) \
+             (set b (call bound(Writes) w)) \
+             (return (call at(Writing) u u.0 u.1))"
+        );
+        assert_eq!(
+            body(&module, "next(Writes)"),
+            "(return (I32.Load offset=0 x))"
+        );
+        // A type argument is cast as its bound is, which it only meets.
+        assert_eq!(body(&module, "bound(Writes)"), "(return x)");
+
+        // Nothing that only reads its memory starts as one that writes it.
+        let src = format!(
+            "{decls}\
+struct Tagged:
+    next: &i32
+    items: array(u8)
+    tag: u8
+fn(T: Writes) tag(x: &T) -> u8:
+    return x.tag
+fn(E: Writing) written(e: E):
+    pass
+fn g(t: &Tagged, r: Reads, u: Reading, w: &var Writes, a: &var varray(u8)):
+    tag(t)
+    written(u)
+    let v = t as &Writes
+    let wide = u as Writing
+    let p = w as &var Reads
+    let q = a as &var array(u8)
+"
+        );
+        let cast = |from: &str, to: &str| InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        let unchecked = |from: &str, to: &str| UncheckedCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(
+            errors(&src),
+            vec![
+                BoundNotMet {
+                    ty: "Tagged".into(),
+                    bound: "Writes".into()
+                },
+                NotWithin {
+                    ty: "Reading".into(),
+                    bound: "Writing".into(),
+                    what: "variants"
+                },
+                unchecked("&Tagged", "&Writes"),
+                cast("Reading", "Writing"),
+                // What is written through a pointer is typed as it is
+                // there: a `&i32` stored as the `next` of a `Reads` would
+                // be written through as that of a `Writes`.
+                unchecked("&var Writes", "&var Reads"),
+                unchecked("&var varray(u8)", "&var array(u8)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_array_bounds_the_types_that_start_as_it() {
+        let src = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+struct Text:
+    use array(u8)
+    hash: u32
+fn(T, A: array(T)) last(a: A) -> T:
+    return a[a.len - 1]
+fn(T, A: varray(T)) put(a: &A, i: uint, x: T):
+    a[i] = x
+fn(T, A: array(T)) count(a: A) -> uint:
+    var n: uint = 0
+    for x in a:
+        n += 1
+    let view = a as array(T)
+    return n + view.len
+fn f(v: Vec(u16), p: &Vec(u16), t: Text, a: array(u8), w: varray(u16)) -> uint:
+    put(p, 0, last(v))
+    let x = last(w)
+    return count(t) + count(a)
+";
+        let module = lower(src);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "f",
+                "put(u16, Vec(u16))",
+                "last(u16, Vec(u16))",
+                "last(u16, varray(u16))",
+                "count(u8, Text)",
+                "count(u8, array(u8))",
+            ]
+        );
+        let check =
+            |i: &str, len: &str| format!("(if (I32.GeU {i} {len}) (then unreachable) (else ))");
+        // An instance reads the `ptr` and `len` its type argument starts
+        // with, which it takes whole.
+        let last = module
+            .funcs
+            .iter()
+            .find(|f| f.name == "last(u16, Vec(u16))");
+        assert_eq!(last.unwrap().params, [ValType::I32; 3]);
+        assert_eq!(
+            body(&module, "last(u16, Vec(u16))"),
+            format!(
+                "(set tmp3 (I32.Sub a.len 1)) {} (set tmp4 (I32.Add a.ptr (I32.Mul tmp3 2))) \
+                 (return (I32.Load16U offset=0 tmp4))",
+                check("tmp3", "a.len")
+            )
+        );
+        assert_eq!(
+            body(&module, "put(u16, Vec(u16))"),
+            format!(
+                "(set tmp3 (I32.Load offset=0 a)) (set tmp4 (I32.Load offset=4 a)) \
+                 {} (set tmp5 (I32.Add tmp3 (I32.Mul i 2))) (I32.Store16 offset=0 tmp5 x)",
+                check("i", "tmp4")
+            )
+        );
+        assert_eq!(
+            body(&module, "count(u8, Text)"),
+            "(set n 0) (set tmp4 a.ptr) (set tmp5 a.len) (set tmp6 0) (block (loop \
+             (br_if 1 (I32.GeU tmp6 tmp5)) \
+             (set x (I32.Load8U offset=0 (I32.Add tmp4 tmp6))) \
+             (set tmp6 (I32.Add tmp6 1)) \
+             (set n (I32.Add n 1)) (br 0))) \
+             (set view.ptr a.ptr) (set view.len a.len) (return (I32.Add n view.len))"
+        );
+    }
+
+    #[test]
+    fn array_bound_errors() {
+        use TypeErrorKind::*;
+        let src = "\
+struct Text:
+    use array(u8)
+    hash: u32
+struct Last:
+    hash: u32
+    use array(u8)
+fn(T, A: array(T)) last(a: A) -> T:
+    return a[a.len - 1]
+fn(T, A: varray(T)) put(a: A, x: T):
+    a[0] = x
+fn(T, A: array(T)) body(a: A, b: A, x: T) -> bool:
+    a[0] = x
+    let c: array(T) = a
+    let d = a as varray(T)
+    match a:
+        [first]:
+            pass
+        else:
+            pass
+    return a == b
+fn(T, A: array(T)) has(a: A, x: T):
+    pass
+fn f(t: Text, l: Last, a: array(u8), n: i32, x: u8):
+    put(t, 1)
+    put(a, 1)
+    has(l, x)
+    has(n, x)
+    last(l)
+";
+        let not_met = |ty: &str, bound: &str| BoundNotMet {
+            ty: ty.into(),
+            bound: bound.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                ReadOnlyWrite {
+                    ty: "array(T)".into(),
+                    needs: "varray(T)".into(),
+                    element: true
+                },
+                mismatch("array(T)", "A"),
+                UncheckedCast {
+                    from: "A".into(),
+                    to: "varray(T)".into()
+                },
+                mismatch("array(_)", "A"),
+                invalid_operand("==", "A"),
+                not_met("Text", "varray(u8)"),
+                not_met("array(u8)", "varray(u8)"),
+                not_met("Last", "array(u8)"),
+                not_met("i32", "array(u8)"),
+                // Only what starts as the bound gives `T` a type.
+                CannotInfer {
+                    func: "last".into(),
+                    param: "T".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn bounds_name_the_type_parameters_before_them() {
         let src = "\
 struct(T) Box:
@@ -9585,7 +9921,7 @@ fn f(io: IoError, r: ReadError, s: Swapped, t: Retyped, h: Held, m: More, k: Clo
         );
         assert_eq!(
             NotABound("i32".into()).to_string(),
-            "`i32` can't bound a type parameter; only a struct, a union or an enum can"
+            "`i32` can't bound a type parameter; only a struct, a union, an enum or an array can"
         );
     }
 
@@ -10283,6 +10619,221 @@ fn f(a: array(u8), i: i32, n: i32):
     }
 
     #[test]
+    fn a_struct_that_starts_as_an_array_is_indexed_as_one() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+struct Text:
+    use array(u8)
+    hash: u32
+struct Raw:
+    ptr: &var u16
+    len: uint
+    tag: u8
+struct Last:
+    hash: u32
+    use array(u8)
+struct Sized:
+    ptr: &u8
+    len: u32
+union Either:
+    ptr: &u8
+    len: uint
+";
+        let src = format!(
+            "{decls}\
+fn f(v: Vec(u8), t: Text, i: uint) -> u8:
+    v[i] = t[0]
+    return v[i]
+fn g(r: Raw) -> &var u16:
+    return &var r[1]
+"
+        );
+        let module = lower(&src);
+        let check =
+            |i: &str, len: &str| format!("(if (I32.GeU {i} {len}) (then unreachable) (else ))");
+        // Only its `ptr` and `len` are read.
+        assert_eq!(
+            body(&module, "f"),
+            format!(
+                "{} (set tmp7 (I32.Add v.ptr i)) \
+                 {} (set tmp8 (I32.Add t.ptr 0)) \
+                 (I32.Store8 offset=0 tmp7 (I32.Load8U offset=0 tmp8)) \
+                 {} (set tmp9 (I32.Add v.ptr i)) \
+                 (return (I32.Load8U offset=0 tmp9))",
+                check("i", "v.len"),
+                check("0", "t.len"),
+                check("i", "v.len"),
+            )
+        );
+        assert_eq!(
+            body(&module, "g"),
+            format!(
+                "{} (set tmp3 (I32.Add r.ptr (I32.Mul 1 2))) (return tmp3)",
+                check("1", "r.len")
+            )
+        );
+
+        // Its `ptr` decides what is written, and only a struct whose first
+        // fields are those of an array has elements.
+        let src = format!(
+            "{decls}\
+fn f(t: Text, l: Last, s: Sized, e: Either):
+    t[0] = 1
+    let a = l[0]
+    let b = s[0]
+    let c = e[0]
+"
+        );
+        assert_eq!(
+            errors(&src),
+            vec![
+                ReadOnlyWrite {
+                    ty: "array(u8)".into(),
+                    needs: "varray(u8)".into(),
+                    element: true
+                },
+                invalid_operand("[]", "Last"),
+                invalid_operand("[]", "Sized"),
+                invalid_operand("[]", "Either"),
+            ]
+        );
+    }
+
+    #[test]
+    fn indexing_reaches_elements_through_pointers() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+";
+        let src = format!(
+            "{decls}\
+fn f(v: &Vec(u8), i: uint) -> u8:
+    v[i] = 1
+    return v[i]
+fn g(a: &&array(u16)) -> u16:
+    return a[2]
+"
+        );
+        let module = lower(&src);
+        let check =
+            |i: &str, len: &str| format!("(if (I32.GeU {i} {len}) (then unreachable) (else ))");
+        // Of the struct behind the pointer, only the `ptr` and `len` it
+        // starts with are loaded.
+        assert_eq!(
+            body(&module, "f"),
+            format!(
+                "(set tmp2 (I32.Load offset=0 v)) (set tmp3 (I32.Load offset=4 v)) \
+                 {} (set tmp4 (I32.Add tmp2 i)) (I32.Store8 offset=0 tmp4 1) \
+                 (set tmp5 (I32.Load offset=0 v)) (set tmp6 (I32.Load offset=4 v)) \
+                 {} (set tmp7 (I32.Add tmp5 i)) (return (I32.Load8U offset=0 tmp7))",
+                check("i", "tmp3"),
+                check("i", "tmp6"),
+            )
+        );
+        assert_eq!(
+            body(&module, "g"),
+            format!(
+                "(set tmp1 (I32.Load offset=0 a)) \
+                 (set tmp2 (I32.Load offset=0 tmp1)) (set tmp3 (I32.Load offset=4 tmp1)) \
+                 {} (set tmp4 (I32.Add tmp2 (I32.Mul 2 2))) \
+                 (return (I32.Load16U offset=0 tmp4))",
+                check("2", "tmp3"),
+            )
+        );
+
+        // The array decides what is written, whatever points to it.
+        let src = format!(
+            "{decls}\
+fn f(a: &var array(u8), p: &i32, q: &&Vec(u8)):
+    a[0] = 1
+    let b = p[0]
+    q[0] = 1
+"
+        );
+        assert_eq!(
+            errors(&src),
+            vec![
+                ReadOnlyWrite {
+                    ty: "array(u8)".into(),
+                    needs: "varray(u8)".into(),
+                    element: true
+                },
+                invalid_operand("[]", "&i32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_struct_that_starts_as_an_array_casts_to_it() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+struct Text:
+    use array(u8)
+    hash: u32
+struct Last:
+    hash: u32
+    use array(u8)
+";
+        let src = format!(
+            "{decls}\
+fn f(v: Vec(u8), t: Text, p: &var Vec(u8), q: &varray(u8)) -> array(u8):
+    let a = v as varray(u8)
+    let b = t as! varray(u8)
+    let c = p as &var varray(u8)
+    let d = p as &array(u8)
+    let e = q as &array(u8)
+    return v as array(u8)
+"
+        );
+        assert_eq!(
+            body(&lower(&src), "f"),
+            "(set a.ptr v.ptr) (set a.len v.len) (set b.ptr t.ptr) (set b.len t.len) \
+             (set c p) (set d p) (set e q) (return v.ptr v.len)"
+        );
+
+        // Nothing makes an array the struct, and only `as!` one that
+        // writes what it reads.
+        let src = format!(
+            "{decls}\
+fn f(v: Vec(u8), t: &Text, l: Last, a: array(u8), p: &var Vec(u8)):
+    let b = t.* as varray(u8)
+    let c = t as &varray(u8)
+    let d = v as array(u16)
+    let e = l as array(u8)
+    let g = a as Text
+    let h = p as &var array(u8)
+"
+        );
+        let unchecked = |from: &str, to: &str| UncheckedCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        let cast = |from: &str, to: &str| InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(
+            errors(&src),
+            vec![
+                unchecked("Text", "varray(u8)"),
+                unchecked("&Text", "&varray(u8)"),
+                cast("Vec(u8)", "array(u16)"),
+                cast("Last", "array(u8)"),
+                cast("array(u8)", "Text"),
+                unchecked("&var Vec(u8)", "&var array(u8)"),
+            ]
+        );
+    }
+
+    #[test]
     fn elements_are_assignable_and_addressable() {
         let src = "\
 struct P:
@@ -10504,6 +11055,52 @@ fn f(a: array(u8)):
             vec![
                 TypeErrorKind::ImmutableAssign("x".into()),
                 invalid_operand("for", "i32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn for_loops_copy_each_element_of_a_struct_that_starts_as_an_array() {
+        let decls = "\
+extern:
+    fn log(n: u16)
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+struct Last:
+    cap: uint
+    use array(u16)
+";
+        let src = format!(
+            "{decls}\
+fn f(v: Vec(u16)):
+    for x in v:
+        log(x)
+"
+        );
+        // As many as its `len`, whatever follows that.
+        assert_eq!(
+            body(&lower(&src), "f"),
+            "(set tmp3 v.ptr) (set tmp4 v.len) (set tmp5 0) (block (loop \
+             (br_if 1 (I32.GeU tmp5 tmp4)) \
+             (set x (I32.Load16U offset=0 (I32.Add tmp3 (I32.Mul tmp5 2)))) \
+             (set tmp5 (I32.Add tmp5 1)) \
+             (call log [x] -> []) (br 0)))"
+        );
+        let src = format!(
+            "{decls}\
+fn f(l: Last, p: &Vec(u16)):
+    for x in l:
+        log(x)
+    for y in p:
+        log(y)
+"
+        );
+        assert_eq!(
+            errors(&src),
+            vec![
+                invalid_operand("for", "Last"),
+                invalid_operand("for", "&Vec(u16)"),
             ]
         );
     }
@@ -13799,6 +14396,76 @@ fn g(l: &Last, n: Named) -> i32:
     }
 
     #[test]
+    fn a_use_gives_a_struct_the_fields_of_an_array() {
+        use TypeErrorKind::*;
+        let src = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+struct Text:
+    hash: u32
+    use array(u8)
+fn f(v: Vec(i64), t: &Text) -> uint:
+    let w = Vec(i64)(ptr: v.ptr, len: 0, cap: v.cap)
+    w.ptr.* = 1
+    let first: &u8 = t.ptr
+    return w.len + t.len + Vec(i64).size + Text.size
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set w.ptr v.ptr) (set w.len 0) (set w.cap v.cap) \
+             (I64.Store offset=0 w.ptr 1i64) \
+             (set first (I32.Load offset=4 t)) \
+             (return (I32.Add (I32.Add (I32.Add w.len (I32.Load offset=8 t)) 12) 12))"
+        );
+
+        // Only a struct has them, once, and an array of what is stored.
+        let src = "\
+struct Twice:
+    use array(u8)
+    len: u8
+    use varray(u8)
+union Held:
+    use array(u8)
+struct Text:
+    use array(u8)
+    hash: u32
+struct Host:
+    use array(externref)
+fn f(t: Text, p: &u8):
+    t.ptr.* = 1
+    let u = Text(ptr: p, hash: 0)
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (DuplicateField("len".into()), "len"),
+                (DuplicateField("ptr".into()), "varray(u8)"),
+                (DuplicateField("len".into()), "varray(u8)"),
+                (
+                    UseOfOther {
+                        within: "a union",
+                        takes: "a union",
+                        ty: "array(u8)".into()
+                    },
+                    "array(u8)"
+                ),
+                (NotStorable("externref".into()), "array(externref)"),
+                (
+                    ReadOnlyWrite {
+                        ty: "&u8".into(),
+                        needs: "&var u8".into(),
+                        element: false
+                    },
+                    "t.ptr.*"
+                ),
+                (MissingArg("len".into()), "Text(ptr: p, hash: 0)"),
+            ]
+        );
+    }
+
+    #[test]
     fn used_fields_take_the_type_arguments_of_the_use() {
         let decls = "\
 struct(T) Box:
@@ -14014,7 +14681,6 @@ struct(T) G:
     use T
     use U
     use E
-    use array(u8)
     use tuple(i32, i32)
     use &S
     use Missing
@@ -14030,6 +14696,10 @@ enum(u8) H:
 ";
         let other = |within: &'static str, ty: &str| UseOfOther {
             within,
+            takes: match within {
+                "a struct" => "a struct or an array",
+                _ => within,
+            },
             ty: ty.into(),
         };
         let values = UseOfValues {
@@ -14046,7 +14716,6 @@ enum(u8) H:
                 (other("a struct", "T"), "T"),
                 (other("a struct", "U"), "U"),
                 (other("a struct", "E"), "E"),
-                (other("a struct", "array(u8)"), "array(u8)"),
                 (other("a struct", "tuple(i32, i32)"), "tuple(i32, i32)"),
                 (other("a struct", "&S"), "&S"),
                 (UnknownType("Missing".into()), "Missing"),
@@ -14059,6 +14728,10 @@ enum(u8) H:
         assert_eq!(
             other("a union", "S").to_string(),
             "`use` in a union takes a union, which `S` isn't"
+        );
+        assert_eq!(
+            other("a struct", "&S").to_string(),
+            "`use` in a struct takes a struct or an array, which `&S` isn't"
         );
         assert_eq!(
             values.to_string(),

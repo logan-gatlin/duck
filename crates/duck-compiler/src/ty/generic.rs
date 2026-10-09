@@ -150,16 +150,19 @@ impl Checker {
 
     /// Resolves the bound of each of a declaration's type parameters
     /// `params` that has one, whose types are `tys`. A bound is a struct, a
-    /// union or an enum, and of `params` it names only those before its
-    /// own, so that no bound leads back to itself. Any other is reported
-    /// and bounds nothing.
+    /// union, an enum or an array, and of `params` it names only those
+    /// before its own, so that no bound leads back to itself. Any other is
+    /// reported and bounds nothing.
     pub(super) fn resolve_bounds(&mut self, params: &[TypeParam], tys: &[Ty]) {
         for (i, (param, ty)) in params.iter().zip(tys).enumerate() {
             let (Some(written), Ty::Param(id)) = (&param.bound, *ty) else {
                 continue;
             };
             let bound = self.resolve_ty(written);
-            if !matches!(bound, Ty::Struct(_) | Ty::Enum(_) | Ty::Error) {
+            if !matches!(
+                bound,
+                Ty::Struct(_) | Ty::Enum(_) | Ty::Array(_) | Ty::Error
+            ) {
                 self.error(TypeErrorKind::NotABound(self.ty_name(bound)), written.span);
                 continue;
             }
@@ -197,8 +200,26 @@ impl Checker {
     /// named, and hold or are what the first of `bound` do, in order. So
     /// every value of a `ty` is the same variant or member of `bound`.
     ///
+    /// Either way, what `ty` holds [fits](Self::fits) where `bound` holds
+    /// it: a `&var T` or a `varray(T)` is where `bound` has one that only
+    /// reads.
+    ///
+    /// An array bounds those that fit it, and the structs that start as
+    /// one: their first fields are its `ptr` and `len`.
+    ///
     /// A type parameter is bounded by what its own bound is.
     pub(super) fn meets(&self, ty: Ty, bound: Ty) -> bool {
+        self.starts_like(ty, bound, false)
+    }
+
+    /// Whether a `ty` starts as `bound` does, as one that [meets] it does.
+    /// If `exact`, what it holds is also typed just as what `bound` holds
+    /// is: nothing that writes its memory is where `bound` only reads it.
+    /// So a `ty` can be written as a `bound` is, through a pointer to one.
+    ///
+    /// [meets]: Self::meets
+    pub(super) fn starts_like(&self, ty: Ty, bound: Ty, exact: bool) -> bool {
+        let fits = |found: Ty, want: Ty| found == want || !exact && self.fits(found, want);
         let ty = self.known(ty);
         if ty == bound || ty == Ty::Error || bound == Ty::Error {
             return true;
@@ -210,10 +231,19 @@ impl Checker {
                     &self.structs[want.0 as usize],
                 );
                 match (have.union, want.union) {
-                    (false, false) => starts_as(&have.fields, &want.fields),
-                    (true, true) => starts_as(&want.fields, &have.fields),
+                    (false, false) => starts_as(&have.fields, &want.fields, fits),
+                    (true, true) => {
+                        let fits = |field, first| fits(first, field);
+                        starts_as(&want.fields, &have.fields, fits)
+                    }
                     _ => false,
                 }
+            }
+            // An array, or a struct that starts as one, whose `ptr` is
+            // where `bound` has its own.
+            (_, Ty::Array(want)) => {
+                let want = self.arrays[want.0 as usize];
+                self.array_ptr(ty).is_some_and(|ptr| fits(ptr, want))
             }
             (Ty::Enum(have), Ty::Enum(want)) => self.enum_starts_as(want, have),
             _ => false,
@@ -721,14 +751,15 @@ impl Body<'_> {
 }
 
 /// Whether `fields` start as `first` do: there are as many or more, and
-/// those that `first` has are named and typed as its are, in order. Of
-/// variants, they also hold a value or none as those of `first` do.
-fn starts_as(fields: &[FieldDef], first: &[FieldDef]) -> bool {
+/// those that `first` has are named as its are, in order, and typed so that
+/// `fits` holds of the two types. Of variants, they also hold a value or
+/// none as those of `first` do.
+fn starts_as(fields: &[FieldDef], first: &[FieldDef], fits: impl Fn(Ty, Ty) -> bool) -> bool {
     let mut pairs = fields.iter().zip(first);
     fields.len() >= first.len()
         && pairs.all(|(field, first)| {
             let failed = field.ty == Ty::Error || first.ty == Ty::Error;
-            let typed = field.ty == first.ty || failed;
+            let typed = fits(field.ty, first.ty) || failed;
             field.name == first.name && field.bare == first.bare && typed
         })
 }

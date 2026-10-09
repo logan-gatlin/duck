@@ -137,8 +137,9 @@ impl Checker {
             Ty::Enum(used) => used,
             Ty::Error => return Vec::new(),
             _ => {
-                let (within, ty) = ("an enum", self.ty_name(ty));
-                self.error(TypeErrorKind::UseOfOther { within, ty }, written.span);
+                let (within, takes, ty) = ("an enum", "an enum", self.ty_name(ty));
+                let kind = TypeErrorKind::UseOfOther { within, takes, ty };
+                self.error(kind, written.span);
                 return Vec::new();
             }
         };
