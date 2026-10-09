@@ -4826,9 +4826,10 @@ impl<'c> Body<'c> {
                 pre.push(Stmt::MemoryCopy { dst, src, len });
                 (Ty::Unit, Vec::new())
             }
+            // It has no value: nothing is evaluated after it traps.
             _ => {
                 pre.push(Stmt::Unreachable);
-                (Ty::Unit, Vec::new())
+                (Ty::Never, Vec::new())
             }
         };
         (ty, Value { pre, scalars })
@@ -12629,6 +12630,24 @@ fn g():
         // So does what always evaluates it.
         let module = lower("fn h() -> u32:\n    let u = module.unreachable()\n");
         assert_eq!(body(&module, "h"), "unreachable");
+        // It has no value, so it is a `never`, which is of any type.
+        let src = "\
+fn guard(ok: bool) -> i32:
+    ok or module.unreachable()
+    return 1
+fn value(n: i32) -> i32:
+    let x: i32 = module.unreachable()
+    return n + module.unreachable()
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "guard"),
+            "(drop (if ok 1 (seq unreachable 0))) (return 1)"
+        );
+        assert_eq!(
+            body(&module, "value"),
+            "unreachable (set x 0) unreachable (return (I32.Add n 0))"
+        );
         assert_eq!(
             errors("fn k():\n    module.unreachable(1)\n"),
             [TypeErrorKind::TooManyArgs {

@@ -23,9 +23,9 @@ pub use lints::{Unused, UnusedKind};
 pub use symbols::{Symbol, SymbolKind};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Checker, EXTERNREF, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, OPTION,
-    Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY, is_builtin_type,
-    lower_program,
+    ARRAY, ARRAY_FIELDS, Checker, EXTERNREF, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, NEVER,
+    OPTION, Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY,
+    is_builtin_type, lower_program,
 };
 
 mod actions;
@@ -237,7 +237,7 @@ const MODULE_SIGNATURES: [(&str, &[(&str, &str)], &str); 8] = [
         &[("dst", "&var u8"), ("src", "&u8"), ("len", "uint")],
         "",
     ),
-    ("unreachable", &[], ""),
+    ("unreachable", &[], NEVER),
     ("count_leading_zeros", &[("value", "")], ""),
     ("count_trailing_zeros", &[("value", "")], ""),
 ];

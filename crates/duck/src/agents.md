@@ -437,7 +437,8 @@ pointers.
 - `module.memory() -> varray(u8)` is all of memory from address 0.
 - `module.fill(dst: &var u8, value: u8, len: uint)` and
   `module.copy(dst: &var u8, src: &u8, len: uint)`. `copy` handles overlap.
-- `module.unreachable()` traps, and ends a function as `return` does.
+- `module.unreachable()` traps. It is a `never`, as a `return` is, and ends
+  a function as one does: `ok or module.unreachable()`.
 - `module.count_leading_zeros(x)` and `module.count_trailing_zeros(x)` take
   any integer type and give that type.
 
