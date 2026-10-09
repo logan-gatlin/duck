@@ -212,7 +212,7 @@ impl Evaluator {
         // one another.
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for (index, block) in memory.chunks(BLOCK).enumerate() {
-            if block.iter().all(|byte| *byte == 0) {
+            if *block == [0; BLOCK][..block.len()] {
                 continue;
             }
             for (i, _) in block.iter().enumerate().filter(|(_, byte)| **byte != 0) {

@@ -145,10 +145,8 @@ impl Overlay<'_> {
             Ok(program) => program,
             Err(errors) => return errors,
         };
-        match ty::check(&program, &self.settings()) {
-            Ok(_) => Vec::new(),
-            Err(errors) => errors.into_iter().map(Error::Type).collect(),
-        }
+        let errors = ty::errors(&program, &self.settings());
+        errors.into_iter().map(Error::Type).collect()
     }
 
     fn place(&mut self, span: Span) -> Place {

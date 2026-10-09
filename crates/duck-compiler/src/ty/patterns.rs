@@ -193,7 +193,8 @@ impl Checker {
     }
 
     /// Places each string that a pattern of `program` is in memory, after
-    /// the literals of its globals: a `match` compares with it there.
+    /// the literals of its globals: a `match` compares with it there. One
+    /// in a function lowered for a constant to call is placed already.
     pub(super) fn place_pattern_strings(&mut self, program: &Program) {
         let mut strings = Vec::new();
         for item in &program.items {
@@ -202,12 +203,19 @@ impl Checker {
             }
         }
         for string in strings {
-            if self.pattern_strings.contains_key(string) {
-                continue;
-            }
-            let offset = self.place_data(string.as_bytes().to_vec(), 1);
-            self.pattern_strings.insert(string.to_string(), offset);
+            self.pattern_string(string);
         }
+    }
+
+    /// The address of `string`, which a pattern is, placing it in memory
+    /// unless it is there.
+    fn pattern_string(&mut self, string: &str) -> u64 {
+        if let Some(placed) = self.pattern_strings.get(string) {
+            return *placed;
+        }
+        let offset = self.place_data(string.as_bytes().to_vec(), 1);
+        self.pattern_strings.insert(string.to_string(), offset);
+        offset
     }
 }
 
@@ -502,8 +510,9 @@ impl Body<'_> {
             (ExprKind::Str(string), Ty::Array(id)) if self.ck.element(id) == Ty::Prim(Prim::U8) => {
                 let ty = self.ck.with_writes(ty, false);
                 let value = self.read_locals(ty, subject);
-                // Every function's are placed before any is lowered.
-                let placed = self.ck.pattern_strings[string];
+                // Every function's are placed before any is lowered, but
+                // one lowered for a constant to call.
+                let placed = self.ck.pattern_string(string);
                 let string_value = self.ck.array_value(placed, string.len() as u64);
                 let equal = self.compare(BinOp::Eq, ty, value, string_value);
                 case.steps.push(Step::Test(single(equal)));

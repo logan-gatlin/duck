@@ -257,6 +257,7 @@ impl Module {
             memory64: self.memory64,
             static_section: self.static_section,
             start: self.start.clone(),
+            fuel: None,
         }
     }
 
@@ -322,6 +323,7 @@ impl Library {
                 end: u32::MAX.into(),
             }),
             start: None,
+            fuel: None,
         }
     }
 }

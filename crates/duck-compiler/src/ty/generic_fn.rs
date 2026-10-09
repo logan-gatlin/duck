@@ -18,7 +18,7 @@ use std::mem;
 use crate::ir::{self, FuncId};
 use crate::lex::Span;
 use crate::load::Program;
-use crate::parse::{self, Arg};
+use crate::parse::{self, Arg, FnSig};
 
 use super::{
     Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
@@ -155,18 +155,20 @@ impl Checker {
         }
     }
 
-    /// Checks and folds the defaults of every generic function's parameters,
-    /// which each instance shares.
-    pub(super) fn define_generic_fn_defaults(&mut self, program: &Program) {
-        for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
-            self.module = item.span.file;
-            let def = &self.generic_fns[i];
-            let (params, tys) = (def.sig.params.clone(), def.params.clone());
-            let (defaults, own) = self.fold_param_defaults(program, &decl.sig, &params, &tys);
-            let def = &mut self.generic_fns[i];
-            def.sig.defaults = defaults;
-            def.default_tys = own;
-        }
+    /// Checks and folds the defaults of the parameters of generic function
+    /// `id`, which has the signature `sig`. Each instance shares them.
+    pub(super) fn define_generic_fn_defaults(
+        &mut self,
+        program: &Program,
+        id: GenericFnId,
+        sig: &FnSig,
+    ) {
+        let def = &self.generic_fns[id.0 as usize];
+        let (params, tys) = (def.sig.params.clone(), def.params.clone());
+        let (defaults, own) = self.fold_param_defaults(program, sig, &params, &tys);
+        let def = &mut self.generic_fns[id.0 as usize];
+        def.sig.defaults = defaults;
+        def.default_tys = own;
     }
 
     /// Checks the body of every generic function as declared, with its type
@@ -181,7 +183,7 @@ impl Checker {
             self.type_params = names.zip(params).collect();
             let errors = self.errors.len();
             self.open = true;
-            self.lower_body(sig, &decl.body, item.span, None);
+            self.lower_body(program, sig, &decl.body, item.span, None);
             self.open = false;
             self.type_params.clear();
             self.generic_fns[i].failed |= self.errors.len() > errors;
@@ -305,7 +307,7 @@ impl Checker {
                 body: Vec::new(),
             }
         } else {
-            let func = self.lower_body(sig, &decl.body, item.span, None);
+            let func = self.lower_body(program, sig, &decl.body, item.span, None);
             for error in &mut self.errors[errors..] {
                 // Only what an instance is too deep or too large for is its
                 // type arguments' doing, and is reported at the call that led
@@ -465,8 +467,12 @@ impl Body<'_> {
         args: &[Arg],
         span: Span,
     ) -> (Ty, Value) {
-        let sig = self.ck.generic_fns[generic.0 as usize].sig.clone();
+        let mut sig = self.ck.generic_fns[generic.0 as usize].sig.clone();
         let binding = self.bind_args(&sig.params, &sig.defaults, args, false, span);
+        let item = self.ck.generic_fn_items[generic.0 as usize];
+        if self.takes_defaults(item, &sig, &binding, span) {
+            sig = self.ck.generic_fns[generic.0 as usize].sig.clone();
+        }
         let mut checked: Vec<_> = args.iter().map(|_| None).collect();
         let type_args = self.type_args_of(generic, args, &binding, &mut checked, span);
         // A generic function checked as declared calls no instance.

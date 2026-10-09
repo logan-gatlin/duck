@@ -9,6 +9,7 @@ use std::fmt;
 use std::mem;
 use std::ops::Range;
 
+use crate::eval::Evaluator;
 use crate::file::{FileId, MemoryLimits, Settings, StaticSection};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
@@ -23,6 +24,7 @@ use crate::parse::{
 
 use defaults::DefaultValue;
 use enums::EnumDef;
+use evaluate::Dep;
 use generic::{Arity, Instance, ParamDef, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
 use unions::{Holds, narrow, tags_are, where_held, widen};
@@ -30,11 +32,14 @@ use unions::{Holds, narrow, tags_are, where_held, widen};
 mod defaults;
 mod enums;
 mod equality;
+mod evaluate;
 mod fn_ptr;
 mod generic;
 mod generic_fn;
 mod patterns;
 mod unions;
+
+pub use evaluate::DEFAULT_FUEL;
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
 /// signed type `$s` and unsigned counterpart `$u`. Returns from the enclosing
@@ -503,11 +508,32 @@ pub enum TypeErrorKind {
     MissingReturn(String),
     BreakOutsideLoop,
     ContinueOutsideLoop,
-    /// A global initializer, enum member's value or default that can't be
-    /// evaluated at compile time.
-    NotConstant,
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
+    /// Code that traps while it's run to evaluate a constant.
+    ConstTraps {
+        trap: String,
+        stack: Vec<String>,
+    },
+    /// Code run to evaluate a constant that used up its fuel.
+    ConstOutOfFuel {
+        fuel: u64,
+        stack: Vec<String>,
+    },
+    /// A call of an `extern` function by code run to evaluate a constant.
+    ConstCallsExtern {
+        name: String,
+        stack: Vec<String>,
+    },
+    /// A call, by code run to evaluate a constant, of a function that
+    /// nothing the constant names leads to: only a pointer that other code
+    /// left in memory does.
+    ConstCallsUnnamed {
+        name: String,
+        stack: Vec<String>,
+    },
+    /// Code that couldn't be run to evaluate a constant, and why.
+    ConstNotRun(String),
     /// A global, enum or struct that the global's initializer, the enum's
     /// members' values or the struct's fields' defaults use.
     RecursiveConstant(String),
@@ -734,8 +760,45 @@ struct Checker {
     data_end: u128,
     /// The address of each string that a pattern is, which is placed once.
     pattern_strings: HashMap<String, u64>,
+    /// The item of the program that declares each function that isn't
+    /// generic, indexed by [`FuncId`], and each that is, by [`GenericFnId`].
+    func_items: Vec<usize>,
+    generic_fn_items: Vec<usize>,
+    /// The items whose constants are being folded, innermost last.
+    folding: Vec<usize>,
+    /// What each item being folded and each function being lowered for one
+    /// names, innermost last.
+    deps: Vec<Vec<Dep>>,
+    /// What the constants of each item that is folded name.
+    item_deps: HashMap<usize, Vec<Dep>>,
+    /// The functions lowered for a constant to call, which are lowered once,
+    /// and what each names.
+    lowered: HashMap<FuncId, ir::Func>,
+    func_deps: HashMap<FuncId, Vec<Dep>>,
+    /// The functions being lowered for a constant to call.
+    lowering: HashSet<FuncId>,
+    /// The state that the code constants run leaves, which the module
+    /// starts with. `None` until one runs any.
+    eval: Option<Evaluator>,
+    /// How many of `data` are in the memory of `eval`.
+    synced: usize,
+    /// The addresses of literals that are all zeros, which aren't in `data`,
+    /// and how many bytes each is: those placed since `eval` was last given
+    /// them.
+    zeroed: Vec<(u64, u64)>,
+    /// Whether code run for a constant failed. None is run after that, as
+    /// it left the state half made.
+    failed: bool,
+    /// The fuel the constants of one item run on, and what is left of it
+    /// for the item being folded.
+    fuel_limit: u64,
+    fuel: u64,
     errors: Vec<TypeError>,
 }
+
+/// The functions that were running where code run for a constant stopped,
+/// innermost first, as an error says them.
+struct Stack<'a>(&'a [String]);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Item {
@@ -870,6 +933,9 @@ struct Body<'c> {
     /// literals that need memory can be, and where a constant that isn't
     /// folded yet is folded to be read.
     global: Option<&'c Program>,
+    /// The program, if this is the body of a function: one lowered for a
+    /// constant to call folds the constants it is first to read.
+    program: Option<&'c Program>,
     /// Whether this is a field's or parameter's default, a kind of global
     /// initializer whose value is shared wherever the default is used.
     default: bool,
@@ -977,6 +1043,7 @@ struct Cell {
 
 /// Why a global initializer could not be folded.
 enum Fold {
+    /// It is only known by running it.
     NotConstant,
     Trap,
 }
@@ -1299,11 +1366,28 @@ impl fmt::Display for TypeErrorKind {
             Self::MissingReturn(name) => write!(f, "`{name}` can finish without returning"),
             Self::BreakOutsideLoop => write!(f, "`break` outside of a loop"),
             Self::ContinueOutsideLoop => write!(f, "`continue` outside of a loop"),
-            Self::NotConstant => write!(
-                f,
-                "global initializers, enum members and defaults must be constant"
-            ),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
+            Self::ConstTraps { trap, stack } => {
+                write!(f, "constant evaluation traps: {trap}{}", Stack(stack))
+            }
+            Self::ConstOutOfFuel { fuel, stack } => write!(
+                f,
+                "constant evaluation used up its fuel of {fuel}{}; \
+                 `fuel` under `[const]` in Duck.toml gives it more",
+                Stack(stack)
+            ),
+            Self::ConstCallsExtern { name, stack } => write!(
+                f,
+                "constant evaluation calls the extern function `{name}`{}",
+                Stack(stack)
+            ),
+            Self::ConstCallsUnnamed { name, stack } => write!(
+                f,
+                "constant evaluation calls `{name}` through a pointer that nothing the \
+                 constant names leads to{}",
+                Stack(stack)
+            ),
+            Self::ConstNotRun(why) => write!(f, "constant evaluation couldn't run: {why}"),
             Self::RecursiveConstant(name) => {
                 write!(f, "`{name}` is used in its own definition")
             }
@@ -1374,7 +1458,7 @@ impl fmt::Display for TypeErrorKind {
             }
             Self::DefaultReadsParam(param) => write!(
                 f,
-                "a default is constant, so it can't use the parameter `{param}`"
+                "a default is evaluated once, so it can't use the parameter `{param}`"
             ),
             Self::UntypedEmptyArray => write!(f, "can't infer the element type of `[]`"),
             Self::NotAType => write!(f, "expected a type"),
@@ -1385,6 +1469,18 @@ impl fmt::Display for TypeErrorKind {
                  {error}; please report this"
             ),
         }
+    }
+}
+
+impl fmt::Display for Stack<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, name) in self.0.iter().enumerate() {
+            match i {
+                0 => write!(f, ", in `{name}`")?,
+                _ => write!(f, ", called from `{name}`")?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1414,6 +1510,42 @@ impl std::error::Error for TypeError {}
 /// Checking continues past errors, so every error in the program is reported
 /// at once.
 pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
+    let (ck, imports, funcs, start) = lower_program(program, settings);
+    if !ck.errors.is_empty() {
+        return Err(ck.errors);
+    }
+    Ok(ir::Module {
+        memory: ir::Memory {
+            min_pages: ck.min_pages(),
+            max_pages: settings.memory.max_pages,
+            memory64: settings.memory64,
+            export: MEMORY_EXPORT.to_string(),
+        },
+        data: ck.data,
+        table: (!ck.table.is_empty()).then(|| ir::Table {
+            table64: settings.memory64,
+            export: TABLE_EXPORT.to_string(),
+            funcs: ck.table,
+        }),
+        globals: ck.ir_globals,
+        imports,
+        funcs,
+        start,
+    })
+}
+
+/// The errors that [`check`] finds in `program`, without the module it
+/// makes of one that has none.
+pub fn errors(program: &Program, settings: &Settings) -> Vec<TypeError> {
+    lower_program(program, settings).0.errors
+}
+
+/// Checks and lowers `program`. Returns the checker, which has its errors,
+/// and its imports, its functions and its start function.
+fn lower_program(
+    program: &Program,
+    settings: &Settings,
+) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
     let mut ck = Checker::define(program, settings, None);
     if ck.unfitted {
         // Literals are only in globals, so every one has been placed.
@@ -1451,28 +1583,7 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
     if !ck.errors.iter().all(unchecked) {
         ck.errors.retain(|e| !unchecked(e));
     }
-    if ck.errors.is_empty() {
-        Ok(ir::Module {
-            memory: ir::Memory {
-                min_pages: ck.min_pages(),
-                max_pages: settings.memory.max_pages,
-                memory64: settings.memory64,
-                export: MEMORY_EXPORT.to_string(),
-            },
-            data: ck.data,
-            table: (!ck.table.is_empty()).then(|| ir::Table {
-                table64: settings.memory64,
-                export: TABLE_EXPORT.to_string(),
-                funcs: ck.table,
-            }),
-            globals: ck.ir_globals,
-            imports,
-            funcs,
-            start,
-        })
-    } else {
-        Err(ck.errors)
-    }
+    (ck, imports, funcs, start)
 }
 
 impl Checker {
@@ -1511,13 +1622,22 @@ impl Checker {
                 ret: Ty::Unit,
             })
             .collect();
+        self.func_items = vec![0; self.funcs.len()];
         let (mut next_import, mut next_def) = (0, self.import_count);
         for (index, item) in program.items.iter().enumerate() {
             self.module = item.span.file;
+            let has_default = |sig: &FnSig| sig.params.iter().any(|p| p.default.is_some());
             let (id, state) = match &item.kind {
                 ItemKind::Struct(_) => (self.structs.len(), Visit::New),
                 ItemKind::Enum(_) => (self.enums.len(), Visit::New),
                 ItemKind::Binding(_) => (self.globals.len(), Visit::New),
+                // The defaults of its parameters.
+                ItemKind::Fn(f) if !has_default(&f.sig) => (0, Visit::Done),
+                ItemKind::Fn(f) if f.sig.is_generic() => (self.generic_fns.len(), Visit::New),
+                ItemKind::Fn(_) => (next_def as usize, Visit::New),
+                ItemKind::Extern(block) if block.fns.iter().any(|f| has_default(&f.sig)) => {
+                    (next_import as usize, Visit::New)
+                }
                 _ => (0, Visit::Done),
             };
             self.constants.push(Constants { id, state });
@@ -1540,14 +1660,17 @@ impl Checker {
                     (name, Item::Struct(id))
                 }
                 ItemKind::Fn(f) if f.sig.is_generic() => {
+                    self.generic_fn_items.push(index);
                     (&f.sig.name, Item::GenericFn(self.declare_generic_fn(f)))
                 }
                 ItemKind::Fn(f) => {
+                    self.func_items[next_def as usize] = index;
                     next_def += 1;
                     (&f.sig.name, Item::Func(FuncId(next_def - 1)))
                 }
                 ItemKind::Extern(block) => {
                     for f in &block.fns {
+                        self.func_items[next_import as usize] = index;
                         self.declare_name(&f.sig.name, Item::Func(FuncId(next_import)), f.is_pub);
                         next_import += 1;
                     }
@@ -2129,8 +2252,8 @@ impl Checker {
     }
 
     /// Checks and folds global initializers, the values of enum members and
-    /// the defaults of struct fields: in declaration order, but for those
-    /// that an earlier one uses, which are folded then.
+    /// the defaults of struct fields and of parameters: in declaration
+    /// order, but for those that an earlier one uses, which are folded then.
     fn define_globals(&mut self, program: &Program) {
         for index in 0..program.items.len() {
             self.fold_item(program, index);
@@ -2146,15 +2269,36 @@ impl Checker {
         }
         self.constants[index].state = Visit::Active;
         self.constant_depth += 1;
+        self.folding.push(index);
+        self.deps.push(Vec::new());
         let item = &program.items[index];
+        // What first reads them may be an instance of a generic function.
         let module = mem::replace(&mut self.module, item.span.file);
+        let type_params = mem::take(&mut self.type_params);
+        let chain = mem::take(&mut self.instance_chain);
+        let fuel = mem::replace(&mut self.fuel, self.fuel_limit);
         match &item.kind {
             ItemKind::Binding(decl) => self.define_binding(program, item, decl, id),
             ItemKind::Enum(decl) => self.define_members(program, EnumId(id as u32), decl),
             ItemKind::Struct(decl) => self.define_defaults(program, StructId(id as u32), decl),
+            ItemKind::Fn(decl) if decl.sig.is_generic() => {
+                self.define_generic_fn_defaults(program, GenericFnId(id as u32), &decl.sig);
+            }
+            ItemKind::Fn(decl) => self.define_param_defaults(program, id, &decl.sig),
+            ItemKind::Extern(block) => {
+                for (i, decl) in block.fns.iter().enumerate() {
+                    self.define_param_defaults(program, id + i, &decl.sig);
+                }
+            }
             _ => {}
         }
+        self.fuel = fuel;
         self.module = module;
+        self.type_params = type_params;
+        self.instance_chain = chain;
+        let deps = self.deps.pop().unwrap_or_default();
+        self.item_deps.insert(index, deps);
+        self.folding.pop();
         self.constant_depth -= 1;
         self.constants[index].state = Visit::Done;
     }
@@ -2167,12 +2311,40 @@ impl Checker {
             self.fold_item(program, index);
         }
         let kind = match self.constants[index].state {
-            Visit::Done => return true,
+            Visit::Done => {
+                self.note(Dep::Item(index));
+                return true;
+            }
             Visit::Active => TypeErrorKind::RecursiveConstant(name.to_string()),
             Visit::New => TypeErrorKind::ConstantTooDeep(name.to_string()),
         };
         self.error(kind, span);
         false
+    }
+
+    /// Records that what is being folded or lowered names `dep`, which code
+    /// that a constant runs may then call.
+    fn note(&mut self, dep: Dep) {
+        if let Some(deps) = self.deps.last_mut() {
+            deps.push(dep);
+        }
+    }
+
+    /// The name of item `index` of `program`, as an error says whose
+    /// constants are being folded.
+    fn item_name(&self, program: &Program, index: usize) -> String {
+        match &program.items[index].kind {
+            ItemKind::Binding(decl) => {
+                let names = pattern_names(&decl.pattern);
+                names.first().map_or("_", |name| &name.name).to_string()
+            }
+            ItemKind::Struct(StructDecl { name, .. }) | ItemKind::Union(UnionDecl { name, .. }) => {
+                name.name.clone()
+            }
+            ItemKind::Enum(decl) => decl.name.name.clone(),
+            ItemKind::Fn(decl) => decl.sig.name.name.clone(),
+            ItemKind::Extern(_) | ItemKind::Use(_) => "extern".to_string(),
+        }
     }
 
     /// Checks and folds the initializer of `decl`, the binding that `item`
@@ -2188,7 +2360,7 @@ impl Checker {
         body.global = Some(program);
         let (ty, value) = body.binding_value(decl);
         let mutable = decl.mutability == Mutability::Var;
-        let inits = self.fold_value(&value, decl.value.span);
+        let inits = body.evaluate(value, decl.value.span).unwrap_or_default();
         let exported = self.exports(item);
         // Each name gets its own globals, in the order `declare` gave them.
         for bound in self.destructure(&decl.pattern, ty) {
@@ -2236,6 +2408,7 @@ impl Checker {
             static_section,
             unfitted: settings.static_section.is_none() && fitted.is_none(),
             data_end: static_section.start.into(),
+            fuel_limit: settings.fuel.unwrap_or(DEFAULT_FUEL),
             ..Self::default()
         };
         ck.data_limit = match settings.static_section {
@@ -2246,7 +2419,6 @@ impl Checker {
         ck.define_structs(program);
         ck.define_funcs(program);
         ck.define_globals(program);
-        ck.define_param_defaults(program);
         ck.check_pending_bounds();
         ck.place_pattern_strings(program);
         ck
@@ -2333,21 +2505,41 @@ impl Checker {
             .collect()
     }
 
+    /// Lowers every function the source defines that isn't generic, but for
+    /// those lowered for a constant to call, which are lowered already.
     fn lower_funcs(&mut self, program: &Program) -> Vec<ir::Func> {
         let mut funcs = Vec::new();
         for (i, (item, decl)) in fn_decls(program).enumerate() {
-            self.module = item.span.file;
-            let sig = self.funcs[self.import_count as usize + i].clone();
-            let export = self.exports(item).then(|| sig.name.clone());
-            funcs.push(self.lower_body(sig, &decl.body, item.span, export));
+            let id = FuncId(self.import_count + i as u32);
+            let func = match self.lowered.remove(&id) {
+                Some(func) => func,
+                None => self.lower_decl(program, id, item, decl),
+            };
+            funcs.push(func);
         }
         funcs
     }
 
-    /// Lowers a function with signature `sig` and body `block`, declared by
-    /// the item spanning `span`, and exported as `export` if given.
+    /// Lowers function `id`, which `decl` of `item` defines.
+    fn lower_decl(
+        &mut self,
+        program: &Program,
+        id: FuncId,
+        item: &parse::Item,
+        decl: &parse::FnDecl,
+    ) -> ir::Func {
+        self.module = item.span.file;
+        let sig = self.funcs[id.0 as usize].clone();
+        let export = self.exports(item).then(|| sig.name.clone());
+        self.lower_body(program, sig, &decl.body, item.span, export)
+    }
+
+    /// Lowers a function of `program` with signature `sig` and body `block`,
+    /// declared by the item spanning `span`, and exported as `export` if
+    /// given.
     fn lower_body(
         &mut self,
+        program: &Program,
         sig: FuncSig,
         block: &parse::Block,
         span: Span,
@@ -2355,6 +2547,7 @@ impl Checker {
     ) -> ir::Func {
         let returns = diverges(block);
         let mut body = Body::new(self, sig.ret);
+        body.program = Some(program);
         // A type parameter is a type by its name, and no variable.
         for (name, ty) in sig.params.iter().filter(|(_, ty)| *ty != Ty::Type) {
             let slots = body.alloc(name, *ty);
@@ -2384,23 +2577,33 @@ impl Checker {
     }
 
     /// Lowers every function in `synths`, including those that lowering the
-    /// others creates.
+    /// others creates, but for those lowered for a constant to call, which
+    /// are lowered already.
     fn lower_synths(&mut self, program: &Program) -> Vec<ir::Func> {
         let first = self.funcs.len() - self.synths.len();
         let mut funcs = Vec::new();
         while funcs.len() < self.synths.len() {
             let id = FuncId((first + funcs.len()) as u32);
-            let func = match &self.synths[funcs.len()] {
-                Synth::Eq(ty) => self.lower_eq_func(id, *ty),
-                Synth::Instance(instance) => {
-                    let instance = instance.clone();
-                    self.lower_instance(program, id, instance)
-                }
-                Synth::Wrapper(import) => self.lower_wrapper(id, *import),
+            let func = match self.lowered.remove(&id) {
+                Some(func) => func,
+                None => self.lower_synth(program, id),
             };
             funcs.push(func);
         }
         funcs
+    }
+
+    /// Lowers function `id`, which is one of `synths`.
+    fn lower_synth(&mut self, program: &Program, id: FuncId) -> ir::Func {
+        let first = self.funcs.len() - self.synths.len();
+        match &self.synths[id.0 as usize - first] {
+            Synth::Eq(ty) => self.lower_eq_func(id, *ty),
+            Synth::Instance(instance) => {
+                let instance = instance.clone();
+                self.lower_instance(program, id, instance)
+            }
+            Synth::Wrapper(import) => self.lower_wrapper(id, *import),
+        }
     }
 
     fn resolve_ty(&mut self, ty: &parse::Type) -> Ty {
@@ -3192,7 +3395,8 @@ impl Checker {
     /// storing it to `cells` would.
     fn write_consts(&self, out: &mut [u8], cells: &[Cell], consts: &[Const]) {
         for cell in cells {
-            // A value that isn't constant, already reported, lacks some.
+            // A value that failed to fold, or is stored when it is run,
+            // lacks some.
             let Some(c) = consts.get(cell.leaf.index) else {
                 continue;
             };
@@ -3248,6 +3452,9 @@ impl Checker {
         if !zeroed && self.data_fits() {
             let bytes = bytes.repeat(count as usize);
             self.data.push(ir::Data { offset, bytes });
+        } else if self.eval.is_some() && self.data_fits() {
+            // Code that has run may have written there.
+            self.zeroed.push((offset, u64::from(size) * count));
         }
         offset
     }
@@ -3258,31 +3465,17 @@ impl Checker {
         self.data_end <= self.data_limit.into()
     }
 
-    /// Evaluates each scalar of a lowered constant at compile time, reporting
-    /// at `span` if it isn't constant. Stops at the first that can't be.
-    fn fold_value(&mut self, value: &Value, span: Span) -> Vec<Const> {
+    /// Evaluates each scalar of a lowered constant without running it.
+    /// Stops at the first that can't be.
+    fn fold_value(&self, value: &Value) -> Result<Vec<Const>, Fold> {
         if !value.pre.is_empty() {
-            self.error(TypeErrorKind::NotConstant, span);
-            return Vec::new();
+            return Err(Fold::NotConstant);
         }
-        let mut consts = Vec::new();
-        for (_, scalar) in &value.scalars {
-            match self.fold(scalar) {
-                Ok(c) => consts.push(c),
-                Err(fold) => {
-                    let kind = match fold {
-                        Fold::NotConstant => TypeErrorKind::NotConstant,
-                        Fold::Trap => TypeErrorKind::ConstTrap,
-                    };
-                    self.error(kind, span);
-                    break;
-                }
-            }
-        }
-        consts
+        let scalars = value.scalars.iter();
+        scalars.map(|(_, scalar)| self.fold(scalar)).collect()
     }
 
-    /// Evaluates a lowered global initializer at compile time.
+    /// Evaluates a lowered global initializer without running it.
     fn fold(&self, expr: &Expr) -> Result<Const, Fold> {
         match expr {
             Expr::Const(c) => Ok(*c),
@@ -3297,7 +3490,8 @@ impl Checker {
                 Const::I32(0) => self.fold(else_expr),
                 _ => self.fold(then_expr),
             },
-            // Only a `var` is read from a global.
+            // Only a `var` is read from a global, and may have been
+            // assigned.
             Expr::Local(_)
             | Expr::Global(_)
             | Expr::Call(..)
@@ -3319,6 +3513,7 @@ impl<'c> Body<'c> {
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
             global: None,
+            program: None,
             default: false,
             piped: Vec::new(),
         }
@@ -3332,7 +3527,8 @@ impl<'c> Body<'c> {
     /// which a global initializer that is first to use them has done here.
     /// Otherwise reports why `name`, used at `span`, has none.
     fn folded(&mut self, index: usize, name: &str, span: Span) -> bool {
-        self.ck.folded(self.global, index, name, span)
+        self.ck
+            .folded(self.global.or(self.program), index, name, span)
     }
 
     /// Reports a mismatch unless `found` fits where `want` is expected or
@@ -4016,8 +4212,8 @@ impl<'c> Body<'c> {
     }
 
     /// `value |> body`. The value is evaluated first and held in temporaries,
-    /// which each `_` in the body reads. A global initializer has no locals
-    /// and must be constant, so there the value is read in place.
+    /// which each `_` in the body reads. In a global initializer, what folds
+    /// of it is read as its constant.
     fn pipe(
         &mut self,
         value: &parse::Expr,
@@ -4025,9 +4221,7 @@ impl<'c> Body<'c> {
         expected: Option<Ty>,
     ) -> (Ty, Value) {
         let (value_ty, mut value) = self.expr(value, None);
-        if self.global.is_none() {
-            self.spill(&mut value, |e| matches!(e, Expr::Const(_) | Expr::Local(_)));
-        }
+        self.spill_simple(&mut value);
         self.piped.push((value_ty, value.scalars));
         let (ty, mut result) = self.expr(body, expected);
         self.piped.pop();
@@ -4247,9 +4441,10 @@ impl<'c> Body<'c> {
     }
 
     /// An array literal, whose elements are typed like those of `expected`,
-    /// or else like the first element, and must be constant. Its elements are
-    /// placed in memory after any literals within them. It's a `varray` where
-    /// one is expected.
+    /// or else like the first element. Its elements are placed in memory
+    /// after any literals within them, and one that isn't constant is stored
+    /// there when the initializer is run. It's a `varray` where one is
+    /// expected.
     fn list(&mut self, items: &[parse::Expr], expected: Option<Ty>, span: Span) -> (Ty, Value) {
         let mutable = self.literal_writes(expected);
         self.check_shared(mutable, items.len(), span);
@@ -4265,11 +4460,11 @@ impl<'c> Body<'c> {
             let (ty, value) = self.expr(item, elem);
             let want = *elem.get_or_insert(ty);
             self.expect(ty, want, item.span);
-            let item_consts = self.ck.fold_value(&value, item.span);
+            let item_consts = self.constant(value, item.span);
             // A mistyped element's scalars don't fit the cells.
             consts.push(match self.ck.fits(ty, want) {
                 true => item_consts,
-                false => Vec::new(),
+                false => Ok(Vec::new()),
             });
         }
         let Some(elem) = elem else {
@@ -4283,10 +4478,22 @@ impl<'c> Body<'c> {
         let cells = self.ck.cells(elem);
         let mut bytes = vec![0; size as usize * items.len()];
         for (i, consts) in consts.iter().enumerate() {
+            let consts = consts.as_deref().unwrap_or_default();
             self.ck
                 .write_consts(&mut bytes[i * size as usize..], &cells, consts);
         }
-        let value = self.ck.push_data(bytes, align, items.len() as u64);
+        let mut value = self.ck.push_data(bytes, align, items.len() as u64);
+        let first = match value.scalars.first() {
+            Some((_, Expr::Const(Const::I32(addr)))) => u64::from(*addr as u32),
+            Some((_, Expr::Const(Const::I64(addr)))) => *addr as u64,
+            _ => unreachable!("a literal is placed at a constant address"),
+        };
+        for (i, item) in consts.into_iter().enumerate() {
+            if let Err(item) = item {
+                let place = self.placed(elem, first + i as u64 * u64::from(size));
+                self.assign(&place, item, &mut value.pre);
+            }
+        }
         (self.ck.array_of(elem, mutable), value)
     }
 
@@ -4306,9 +4513,11 @@ impl<'c> Body<'c> {
     }
 
     /// `[value; len]`, an array of `len` copies of `value`, which is typed
-    /// like the elements of `expected`. Both must be constant. A literal
-    /// within `value` is placed in memory once, and every copy views it. It's
-    /// a `varray` where one is expected.
+    /// like the elements of `expected`. `len` is evaluated here, before the
+    /// rest of the initializer, as the copies are placed by it. A `value`
+    /// that isn't constant is evaluated once and stored when the initializer
+    /// is run. A literal within `value` is placed in memory once, and every
+    /// copy views it. It's a `varray` where one is expected.
     fn repeat(
         &mut self,
         value: &parse::Expr,
@@ -4327,9 +4536,9 @@ impl<'c> Body<'c> {
         let (ty, lowered) = self.expr(value, want);
         let elem = want.unwrap_or(ty);
         self.expect(ty, elem, value.span);
-        let consts = self.ck.fold_value(&lowered, value.span);
+        let consts = self.constant(lowered, value.span);
         let lowered = self.check(len, Ty::Prim(Prim::Uint));
-        let count = self.ck.fold_value(&lowered, len.span);
+        let count = self.evaluate(lowered, len.span).unwrap_or_default();
         if !self.ck.fits(ty, elem) || !self.placeable(elem, errors, span) {
             return (Ty::Error, Value::default());
         }
@@ -4340,8 +4549,15 @@ impl<'c> Body<'c> {
         };
         let len = usize::try_from(count).unwrap_or(usize::MAX);
         self.check_shared(mutable, len, span);
+        let (consts, stored) = match consts {
+            Ok(consts) => (consts, None),
+            Err(stored) => (Vec::new(), Some(stored)),
+        };
         let offset = self.ck.repeat_data(elem, consts, count);
-        let value = self.ck.array_value(offset, count);
+        let mut value = self.ck.array_value(offset, count);
+        if let Some(stored) = stored {
+            value.pre = self.fill(elem, stored, offset, count);
+        }
         (self.ck.array_of(elem, mutable), value)
     }
 
@@ -4864,9 +5080,10 @@ impl<'c> Body<'c> {
     }
 
     /// `&value` or `&var value` in a global initializer, where `value` is a
-    /// `ty` that isn't in memory: it must be constant, and is placed there
-    /// after any literals within it. It's a `want` if it fits one, as a
-    /// literal is of the type expected of it.
+    /// `ty` that isn't in memory: it is placed there after any literals
+    /// within it, and stored there when the initializer is run if it isn't
+    /// constant. It's a `want` if it fits one, as a literal is of the type
+    /// expected of it.
     fn cell(
         &mut self,
         mutable: bool,
@@ -4879,14 +5096,21 @@ impl<'c> Body<'c> {
             self.error(TypeErrorKind::SharedPointee, span);
         }
         let errors = self.ck.errors.len();
-        let consts = self.ck.fold_value(&value, span);
+        let consts = self.constant(value, span);
         if !self.placeable(ty, errors, span) {
             return (Ty::Error, Value::default());
         }
         let ty = want.filter(|want| self.ck.fits(ty, *want)).unwrap_or(ty);
+        let (consts, stored) = match consts {
+            Ok(consts) => (consts, None),
+            Err(stored) => (Vec::new(), Some(stored)),
+        };
         let offset = self.ck.repeat_data(ty, consts, 1);
         let addr = Expr::Const(self.ck.addr_const(offset));
-        let value = scalar(self.ck.addr_type(), addr);
+        let mut value = scalar(self.ck.addr_type(), addr);
+        if let Some(stored) = stored {
+            value.pre = self.fill(ty, stored, offset, 1);
+        }
         (self.ck.ptr_to(ty, mutable), value)
     }
 
@@ -4935,8 +5159,14 @@ impl<'c> Body<'c> {
         };
         match item {
             Ok(Item::Func(id)) => {
-                let sig = self.ck.funcs[id.0 as usize].clone();
-                let value = self.args(&sig.params, &sig.defaults, args, false, span);
+                let mut sig = self.ck.funcs[id.0 as usize].clone();
+                let binding = self.bind_args(&sig.params, &sig.defaults, args, false, span);
+                let item = self.ck.func_items[id.0 as usize];
+                if self.takes_defaults(item, &sig, &binding, span) {
+                    sig = self.ck.funcs[id.0 as usize].clone();
+                }
+                let checked = args.iter().map(|_| None).collect();
+                let value = self.bound_args(&sig.params, &sig.defaults, args, binding, checked);
                 self.call_func(id, value)
             }
             Ok(Item::GenericFn(generic)) => self.generic_fn_call(generic, args, span),
@@ -4954,6 +5184,37 @@ impl<'c> Body<'c> {
                     self.expr(&arg.value, None);
                 }
                 (Ty::Error, Value::default())
+            }
+        }
+    }
+
+    /// Whether a call spanning `span` that binds its arguments as `binding`
+    /// takes a default of `sig`, the function that `item` of the program
+    /// declares, that is folded only now, so that `sig` has it no longer.
+    /// The defaults are folded when the first of them is used.
+    fn takes_defaults(
+        &mut self,
+        item: usize,
+        sig: &FuncSig,
+        binding: &[Option<usize>],
+        span: Span,
+    ) -> bool {
+        let mut taken = (0..)
+            .zip(&sig.defaults)
+            .filter(|(i, default)| default.is_some() && !binding.contains(&Some(*i)));
+        let Some(first) = taken.next() else {
+            return false;
+        };
+        let pending = |(_, default): &(usize, &Option<DefaultValue>)| {
+            matches!(default, Some(DefaultValue::Pending))
+        };
+        let pending = pending(&first) || taken.any(|default| pending(&default));
+        // A default that is folded names what its function may call.
+        match pending {
+            true => self.folded(item, &sig.name, span),
+            false => {
+                self.ck.note(Dep::Item(item));
+                false
             }
         }
     }
@@ -5271,6 +5532,101 @@ impl<'c> Body<'c> {
             out.pre.extend(value.pre);
             out.scalars.extend(value.scalars);
         }
+        out
+    }
+
+    /// Makes each scalar of `value` as cheap to read again as to keep: one
+    /// that isn't is moved into a temporary. In a global initializer, one
+    /// that folds is its constant, so that a constant stays one.
+    fn spill_simple(&mut self, value: &mut Value) {
+        if self.global.is_none() {
+            return self.spill(value, is_simple);
+        }
+        for (vt, scalar) in &mut value.scalars {
+            match self.ck.fold(scalar) {
+                Ok(c) => *scalar = Expr::Const(c),
+                // Reported where the constant is folded.
+                Err(Fold::Trap) => {}
+                Err(Fold::NotConstant) if is_simple(scalar) => {}
+                Err(Fold::NotConstant) => {
+                    let tmp = self.push_local(TEMP.to_string(), *vt);
+                    let expr = mem::replace(scalar, Expr::Local(tmp));
+                    value.pre.push(Stmt::SetLocal(tmp, expr));
+                }
+            }
+        }
+    }
+
+    /// The scalars of `value`, part of a global initializer, if they fold.
+    /// Otherwise `value` itself, which is only known by running it. One
+    /// that traps is reported at `span`, and has no scalars.
+    fn constant(&mut self, value: Value, span: Span) -> Result<Vec<Const>, Value> {
+        match self.ck.fold_value(&value) {
+            Ok(consts) => Ok(consts),
+            Err(Fold::NotConstant) => Err(value),
+            Err(Fold::Trap) => {
+                self.error(TypeErrorKind::ConstTrap, span);
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// The scalars of `value`, the whole of a constant in a global
+    /// initializer, as [`Checker::evaluate`] finds them.
+    fn evaluate(&mut self, value: Value, span: Span) -> Option<Vec<Const>> {
+        let program = self.global?;
+        self.ck.evaluate(program, self.locals.clone(), value, span)
+    }
+
+    /// The memory at `addr`, where a literal of type `ty` is placed, as a
+    /// place to assign what isn't constant of it.
+    fn placed(&self, ty: Ty, addr: u64) -> Place {
+        Place {
+            name: String::new(),
+            ty,
+            mutable: true,
+            behind: None,
+            pre: Vec::new(),
+            slots: Slots::Memory {
+                addr: Expr::Const(self.ck.addr_const(addr)),
+                offset: 0,
+            },
+        }
+    }
+
+    /// Stores `value`, a `ty`, to each of the `count` elements placed at
+    /// `addr`. It is evaluated once, whatever `count` is.
+    fn fill(&mut self, ty: Ty, mut value: Value, addr: u64, count: u64) -> Vec<Stmt> {
+        if count == 0 {
+            self.spill(&mut value, is_pure);
+            return value.pre;
+        }
+        let mut out = Vec::new();
+        let place = self.placed(ty, addr);
+        self.assign(&place, value, &mut out);
+        let (size, _) = self.ck.layout(ty);
+        if count == 1 || size == 0 {
+            return out;
+        }
+        // The rest are copies of the first.
+        let vt = self.ck.addr_type();
+        let konst = |n: u64| Expr::Const(self.ck.addr_const(n));
+        let (first, size, count) = (konst(addr), konst(size.into()), konst(count));
+        let one = konst(1);
+        let i = self.temp(vt);
+        let at = binary(vt, IrBinOp::Mul, Expr::Local(i), size.clone());
+        let next = binary(vt, IrBinOp::Add, Expr::Local(i), one.clone());
+        out.push(Stmt::SetLocal(i, one));
+        out.push(Stmt::Block(vec![Stmt::Loop(vec![
+            Stmt::BrIf(1, binary(vt, IrBinOp::GeU, Expr::Local(i), count)),
+            Stmt::MemoryCopy {
+                dst: binary(vt, IrBinOp::Add, first.clone(), at),
+                src: first,
+                len: size,
+            },
+            Stmt::SetLocal(i, next),
+            Stmt::Br(0),
+        ])]));
         out
     }
 
@@ -6327,17 +6683,20 @@ pub let PAIR = (KIB |> _ + _, 1.5 |> -_)
         let inits: Vec<_> = lower(src).globals.iter().map(|g| konst(g.init)).collect();
         assert_eq!(inits, vec!["4096", "8192", "-1.5f64"]);
 
+        // What doesn't fold is evaluated once, however often it is read.
         let src = "\
+var calls = 0
 fn one() -> i32:
-    return 1
+    calls += 1
+    return calls
 var v = 1
-let a = one() |> _ + _
-let b = v |> _ + 1
+pub let a = one() |> _ + _
+pub let b = v |> _ + 1
 ";
-        assert_eq!(
-            errors(src),
-            vec![TypeErrorKind::NotConstant, TypeErrorKind::NotConstant]
-        );
+        let module = lower(src);
+        let exported = module.globals.iter().filter(|g| g.export.is_some());
+        let inits: Vec<_> = exported.map(|g| konst(g.init)).collect();
+        assert_eq!(inits, vec!["2", "2"]);
     }
 
     #[test]
@@ -6546,7 +6905,7 @@ var v = 1.5 as f32
     }
 
     #[test]
-    fn global_initializers_must_be_constant() {
+    fn global_initializers_that_trap_are_errors() {
         let src = "\
 fn f() -> i32:
     return 1
@@ -6555,14 +6914,7 @@ let d = 1 / 0
 var m = 1
 let n = m
 ";
-        assert_eq!(
-            errors(src),
-            vec![
-                TypeErrorKind::NotConstant,
-                TypeErrorKind::ConstTrap,
-                TypeErrorKind::NotConstant,
-            ]
-        );
+        assert_eq!(errors(src), vec![TypeErrorKind::ConstTrap]);
     }
 
     #[test]
@@ -7801,8 +8153,6 @@ fn f(x: i32):
             errors(src),
             vec![
                 SharedPointee,
-                NotConstant,
-                NotConstant,
                 mismatch("&var i32", "&i32"),
                 NotAddressable,
                 NotAddressable,
@@ -7966,7 +8316,6 @@ fn f(a: externref, p: &externref):
                 not_storable("S"),
                 not_storable("U"),
                 not_storable("externref"),
-                TypeErrorKind::NotConstant,
                 invalid_operand("==", "externref"),
                 invalid_operand("+", "externref"),
                 invalid_operand("-", "externref"),
@@ -10040,8 +10389,6 @@ fn f():
         assert_eq!(
             errors(src),
             vec![
-                NotConstant,
-                NotConstant,
                 mismatch("uint", "i32"),
                 mismatch("uint", "f64"),
                 invalid_operand("-", "uint"),
@@ -10074,7 +10421,6 @@ fn f():
             vec![
                 UntypedEmptyArray,
                 mismatch("i32", "f64"),
-                NotConstant,
                 IntOutOfRange("u8".into()),
                 ConstTrap,
                 NotStorable("externref".into()),
@@ -10559,8 +10905,6 @@ enum(i32) Later:
                     same_as: "pos".into()
                 },
                 MissingValue("far".into()),
-                NotConstant,
-                NotConstant,
                 RecursiveConstant("Bad".into()),
                 mismatch("i32", "bool"),
             ]
@@ -12073,9 +12417,6 @@ fn f(h: H, p: P) -> bool:
         assert_eq!(
             errors(src),
             vec![
-                TypeErrorKind::NotConstant,
-                TypeErrorKind::NotConstant,
-                TypeErrorKind::NotConstant,
                 invalid_operand("==", "H"),
                 invalid_operand("!=", "tuple(i32, H)"),
                 invalid_operand("<", "P"),
@@ -12749,7 +13090,6 @@ fn f() -> i32:
             errors(src),
             vec![
                 ConstTrap,
-                NotConstant,
                 IntOutOfRange("u8".into()),
                 mismatch("bool", "i32"),
                 MissingArg("g".into()),
@@ -13033,12 +13373,9 @@ fn m():
         assert_eq!(
             errors_at(src),
             vec![
-                (NotConstant, "call()"),
                 (DefaultReadsParam("a".into()), "a"),
                 (DefaultReadsParam("b".into()), "b"),
                 (DefaultReadsParam("d".into()), "d"),
-                (NotConstant, "call()"),
-                (NotConstant, "count"),
                 (IntOutOfRange("u8".into()), "300"),
                 (mismatch("bool", "i32"), "1"),
                 (ConstTrap, "1 / 0"),
