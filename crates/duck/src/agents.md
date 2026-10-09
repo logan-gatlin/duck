@@ -313,6 +313,13 @@ fn half(n: i32) -> i32:
 	n >= 0 or return -1          # returns only where `n` is negative
 	n % 2 == 0 and return n / 2
 	return (n + 1) / 2
+
+fn log2(n: u32) -> u32:
+	var bits: u32 = 0
+	while true:
+		n >> bits > 1 or break   # leaves the loop
+		bits += 1
+	return bits
 ```
 
 - A `return` is an expression, written wherever an operand is. Its value is
@@ -322,6 +329,9 @@ fn half(n: i32) -> i32:
   which is accepted as any type. What is made of a `never` is one too, so
   `f(return 1)` and `let x = return 1` are accepted, and return 1. `never`
   is no type to write.
+- A `break` and a `continue` are expressions as a `return` is, with no value
+  to take, and each is a `never`. One in the condition of a `while` is of
+  that loop: `while more() or break:`.
 - A function with a result ends by a `return` wherever it ends. The right
   side of `and` and `or` may not be evaluated, so a `return` there ends
   nothing: `half` needs its last line.

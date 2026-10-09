@@ -1755,7 +1755,7 @@ impl<'p> Walk<'p> {
                 false
             }
             StmtKind::Defer(body) => self.block(body),
-            StmtKind::Break | StmtKind::Continue | StmtKind::Pass => false,
+            StmtKind::Pass => false,
         }
     }
 
@@ -1829,7 +1829,9 @@ impl<'p> Walk<'p> {
             | ExprKind::Name(_)
             | ExprKind::Module(_)
             | ExprKind::Placeholder
-            | ExprKind::Dot(_) => false,
+            | ExprKind::Dot(_)
+            | ExprKind::Break
+            | ExprKind::Continue => false,
             ExprKind::Tuple(elems) | ExprKind::List(elems) => {
                 elems.iter().any(|elem| self.expr(elem))
             }

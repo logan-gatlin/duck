@@ -88,8 +88,8 @@
   "while"
   "for"
   "in"
-  "break"
-  "continue"
+  (break_expression)
+  (continue_expression)
 ] @keyword.repeat
 
 [

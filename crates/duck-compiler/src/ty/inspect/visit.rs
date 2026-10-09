@@ -74,7 +74,7 @@ fn block<'p>(block: &'p [parse::Stmt], visit: &mut dyn FnMut(Node<'p>)) {
                 }
             }
             StmtKind::Defer(body) => self::block(body, visit),
-            StmtKind::Break | StmtKind::Continue | StmtKind::Pass => {}
+            StmtKind::Pass => {}
         }
     }
 }
@@ -91,7 +91,9 @@ fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
         | ExprKind::Module(_)
         | ExprKind::Placeholder
         | ExprKind::Dot(_)
-        | ExprKind::FnType(_) => {}
+        | ExprKind::FnType(_)
+        | ExprKind::Break
+        | ExprKind::Continue => {}
         ExprKind::Tuple(elems) | ExprKind::List(elems) => {
             for elem in elems {
                 self::expr(elem, visit);

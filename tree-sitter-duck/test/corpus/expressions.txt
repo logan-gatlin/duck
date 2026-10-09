@@ -678,3 +678,37 @@ fn f():
                 (identifier)
                 (arguments
                   (placeholder))))))))))
+
+====================
+Break and continue
+====================
+
+fn f():
+    while a:
+        b or break
+        f(continue) and break
+        break
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (while_statement
+        (identifier)
+        (block
+          (expression_statement
+            (binary_expression
+              (identifier)
+              (break_expression)))
+          (expression_statement
+            (binary_expression
+              (call_expression
+                (identifier)
+                (arguments
+                  (continue_expression)))
+              (break_expression)))
+          (expression_statement
+            (break_expression)))))))

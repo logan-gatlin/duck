@@ -351,8 +351,6 @@ module.exports = grammar({
       $.while_statement,
       $.for_statement,
       $.match_statement,
-      $.break_statement,
-      $.continue_statement,
       $.pass_statement,
       $.defer_statement,
     ),
@@ -403,10 +401,6 @@ module.exports = grammar({
 
     else_arm: $ => seq('else', field('body', $.block)),
 
-    break_statement: $ => seq('break', $._newline),
-
-    continue_statement: $ => seq('continue', $._newline),
-
     pass_statement: $ => seq('pass', $._newline),
 
     // What runs when the block it is in is left: an expression, or a block.
@@ -436,6 +430,8 @@ module.exports = grammar({
       $.placeholder,
       $.dot_expression,
       $.return_expression,
+      $.break_expression,
+      $.continue_expression,
       $.assignment_expression,
       $.pipe_expression,
       $.unary_expression,
@@ -481,6 +477,11 @@ module.exports = grammar({
       'return',
       optional(field('value', $._expression)),
     )),
+
+    // Neither has a value: each leaves where it is, as a `return` does.
+    break_expression: _ => 'break',
+
+    continue_expression: _ => 'continue',
 
     // `target = value`, whose value is the one assigned. Groups to the right.
     assignment_expression: $ => prec.right(PREC.assign, seq(

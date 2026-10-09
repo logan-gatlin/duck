@@ -20,11 +20,19 @@
         "named": true
       },
       {
+        "type": "break_expression",
+        "named": true
+      },
+      {
         "type": "call_expression",
         "named": true
       },
       {
         "type": "cast_expression",
+        "named": true
+      },
+      {
+        "type": "continue_expression",
         "named": true
       },
       {
@@ -195,14 +203,6 @@
     "subtypes": [
       {
         "type": "binding",
-        "named": true
-      },
-      {
-        "type": "break_statement",
-        "named": true
-      },
-      {
-        "type": "continue_statement",
         "named": true
       },
       {
@@ -593,11 +593,6 @@
     }
   },
   {
-    "type": "break_statement",
-    "named": true,
-    "fields": {}
-  },
-  {
     "type": "call_expression",
     "named": true,
     "fields": {
@@ -648,11 +643,6 @@
         ]
       }
     }
-  },
-  {
-    "type": "continue_statement",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "defer_statement",
@@ -2143,8 +2133,8 @@
     "named": false
   },
   {
-    "type": "break",
-    "named": false
+    "type": "break_expression",
+    "named": true
   },
   {
     "type": "comment",
@@ -2152,8 +2142,8 @@
     "extra": true
   },
   {
-    "type": "continue",
-    "named": false
+    "type": "continue_expression",
+    "named": true
   },
   {
     "type": "defer",

@@ -268,8 +268,6 @@ pub enum StmtKind {
         value: Expr,
         arms: Vec<Arm>,
     },
-    Break,
-    Continue,
     Pass,
     /// `defer expr`, whose block is that one expression, or `defer:` and a
     /// block. It runs when the block that the `defer` is in is left.
@@ -336,6 +334,11 @@ pub enum ExprKind {
     /// `return`, or `return value`, whose value is all that follows it. It
     /// has no value of its own, as the function is left where it is.
     Return(Option<Box<Expr>>),
+    /// `break`, which has no value either: the loop is left where it is.
+    Break,
+    /// `continue`, which has none, as the loop goes on to its next
+    /// iteration from where it is.
+    Continue,
 }
 
 /// A call argument, optionally labelled as in `f(name: value)`.
@@ -1064,8 +1067,6 @@ impl<'a> Parser<'a> {
                 let arms = self.arms()?;
                 StmtKind::Match { value, arms }
             }
-            TokenKind::Break => self.keyword_stmt(StmtKind::Break)?,
-            TokenKind::Continue => self.keyword_stmt(StmtKind::Continue)?,
             TokenKind::Pass => self.keyword_stmt(StmtKind::Pass)?,
             TokenKind::Defer => {
                 self.bump();
@@ -1425,6 +1426,8 @@ impl<'a> Parser<'a> {
                 ExprKind::Placeholder
             }
             TokenKind::Ident(name) => ExprKind::Name(name.clone()),
+            TokenKind::Break => ExprKind::Break,
+            TokenKind::Continue => ExprKind::Continue,
             TokenKind::LParen => {
                 self.bump();
                 let kind = match self.bracketed(|p| p.parens(token.span, Self::expr))? {
@@ -1760,6 +1763,8 @@ fn starts_expr(kind: &TokenKind) -> bool {
             | TokenKind::Amp
             | TokenKind::Not
             | TokenKind::Return
+            | TokenKind::Break
+            | TokenKind::Continue
     )
 }
 
@@ -1865,6 +1870,8 @@ mod tests {
                 let op = op.map(|op| format!("{op:?}")).unwrap_or_default();
                 format!("({op}= {} {})", sexpr(target), sexpr(value))
             }
+            ExprKind::Break => "break".to_string(),
+            ExprKind::Continue => "continue".to_string(),
             ExprKind::Return(None) => "(return)".to_string(),
             ExprKind::Return(Some(value)) => format!("(return {})", sexpr(value)),
         }
@@ -1897,14 +1904,14 @@ mod tests {
                 StmtKind::Expr(expr) => match expr.kind {
                     ExprKind::Assign { .. } => "assign",
                     ExprKind::Return(_) => "return",
+                    ExprKind::Break => "break",
+                    ExprKind::Continue => "continue",
                     _ => "expr",
                 },
                 StmtKind::If { .. } => "if",
                 StmtKind::While { .. } => "while",
                 StmtKind::For { .. } => "for",
                 StmtKind::Match { .. } => "match",
-                StmtKind::Break => "break",
-                StmtKind::Continue => "continue",
                 StmtKind::Pass => "pass",
                 StmtKind::Defer(_) => "defer",
             })
@@ -2301,6 +2308,27 @@ mod tests {
         assert_eq!(
             expr("x |> ok(_) or return _ + 1"),
             "(|> x (Or (call ok _) (return (Add _ 1))))"
+        );
+    }
+
+    #[test]
+    fn break_and_continue_are_expressions() {
+        assert_eq!(expr("a or break"), "(Or a break)");
+        assert_eq!(
+            expr("f(continue, x) and break or c"),
+            "(Or (And (call f continue x) break) c)"
+        );
+        // Neither has a value, so a `return` before one has none.
+        assert_eq!(expr("return break"), "(return break)");
+        assert_eq!(expr("(break, continue).0"), "(. (tuple break continue) 0)");
+        // Nor is either a value to pipe on from.
+        assert_eq!(
+            errors("let _ = x |> break\n"),
+            vec![ParseErrorKind::PipeWithoutPlaceholder]
+        );
+        assert_eq!(
+            expr("x |> g(_) or break |> f(_)"),
+            "(|> (|> x (Or (call g _) break)) (call f _))"
         );
     }
 

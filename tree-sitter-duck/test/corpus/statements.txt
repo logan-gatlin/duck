@@ -90,11 +90,13 @@ fn f():
         (identifier)
         (identifier)
         (block
-          (continue_statement)))
+          (expression_statement
+            (continue_expression))))
       (while_statement
         (boolean)
         (block
-          (break_statement))))))
+          (expression_statement
+            (break_expression)))))))
 
 ====================
 Return

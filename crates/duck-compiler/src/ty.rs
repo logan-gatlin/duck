@@ -9,7 +9,6 @@ use std::fmt;
 use std::iter;
 use std::mem;
 use std::ops::Range;
-use std::slice;
 
 use crate::eval::Evaluator;
 use crate::file::{FileId, Settings};
@@ -994,6 +993,9 @@ struct Body<'c> {
     default: bool,
     /// The value piped into each enclosing pipe body, innermost last.
     piped: Vec<(Ty, Vec<(ValType, Expr)>)>,
+    /// How many `break`s and `continue`s have been lowered. Each counts the
+    /// `labels` it is in, so what holds one stays where it was lowered.
+    branches: usize,
     /// The variables that an assignment within the statement being lowered
     /// changes before the statement ends. What is read of one is held in
     /// temporaries, so that it is what the variable had when it was read.
@@ -3755,6 +3757,7 @@ impl<'c> Body<'c> {
             program: None,
             default: false,
             piped: Vec::new(),
+            branches: 0,
             assigned: Vec::new(),
         }
     }
@@ -3888,17 +3891,20 @@ impl<'c> Body<'c> {
         label: Label,
         outside: TypeErrorKind,
         span: Span,
-        out: &mut Vec<Stmt>,
-    ) {
+    ) -> (Ty, Value) {
         let Some(depth) = self.depth(label) else {
-            return self.error(outside, span);
+            self.error(outside, span);
+            return (Ty::Error, Value::default());
         };
         let nesting = self.labels.len() - depth as usize;
         if self.deferring.is_some_and(|outer| nesting <= outer) {
-            return self.error(TypeErrorKind::LeavesDefer(keyword), span);
+            self.error(TypeErrorKind::LeavesDefer(keyword), span);
+            return (Ty::Error, Value::default());
         }
-        out.extend(self.deferred(nesting));
-        out.push(Stmt::Br(depth));
+        let mut pre = self.deferred(nesting);
+        pre.push(Stmt::Br(depth));
+        self.branches += 1;
+        never(pre)
     }
 
     /// A block nested in a wasm label.
@@ -3978,7 +3984,11 @@ impl<'c> Body<'c> {
             }
             StmtKind::While { cond, body } => {
                 let infinite = matches!(cond.kind, ExprKind::Bool(true));
+                // The condition is in the loop, so a `break` or a `continue`
+                // in it is of this loop, as one in the body is.
+                self.labels.extend([Label::Break, Label::Continue]);
                 let (mut inner, cond) = split1(self.check(cond, Ty::Prim(Prim::Bool)));
+                self.labels.truncate(self.labels.len() - 2);
                 if !infinite {
                     let exit = Expr::Unary(ValType::I32, IrUnOp::Eqz, Box::new(cond));
                     inner.push(Stmt::BrIf(1, exit));
@@ -3987,14 +3997,6 @@ impl<'c> Body<'c> {
             }
             StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
             StmtKind::Match { value, arms } => self.match_stmt(value, arms, out),
-            StmtKind::Break => {
-                let outside = TypeErrorKind::BreakOutsideLoop;
-                self.branch("break", Label::Break, outside, stmt.span, out);
-            }
-            StmtKind::Continue => {
-                let outside = TypeErrorKind::ContinueOutsideLoop;
-                self.branch("continue", Label::Continue, outside, stmt.span, out);
-            }
             StmtKind::Pass => {}
             // Nothing runs here: the body is lowered as what it names is
             // now, and is run wherever the block is left.
@@ -4623,6 +4625,14 @@ impl<'c> Body<'c> {
                 self.assignment(target, *op, value, expr.span, true)
             }
             ExprKind::Return(value) => self.returned(value.as_deref(), expr.span),
+            ExprKind::Break => {
+                let outside = TypeErrorKind::BreakOutsideLoop;
+                self.branch("break", Label::Break, outside, expr.span)
+            }
+            ExprKind::Continue => {
+                let outside = TypeErrorKind::ContinueOutsideLoop;
+                self.branch("continue", Label::Continue, outside, expr.span)
+            }
         }
     }
 
@@ -5240,7 +5250,20 @@ impl<'c> Body<'c> {
     ) -> (Ty, Value) {
         let (ty, lhs, rhs) = if matches!(op, BinOp::And | BinOp::Or) {
             let bool = Ty::Prim(Prim::Bool);
-            (bool, self.check(lhs, bool), self.check(rhs, bool))
+            let lhs = self.check(lhs, bool);
+            // The right side is in the `if` that only evaluates it when
+            // needed, which is a label.
+            let branches = self.branches;
+            self.labels.push(Label::Other);
+            let rhs = self.check(rhs, bool);
+            self.labels.pop();
+            let (ty, mut value) = self.binary_values(op, bool, lhs, rhs, span);
+            // A `break` or a `continue` in it would be evaluated wherever
+            // the value is, so the value is held where it was lowered.
+            if self.branches != branches {
+                self.spill(&mut value, |_| false);
+            }
+            return (ty, value);
         } else {
             let expected = if is_comparison(op) { None } else { expected };
             // A literal operand takes the type of the other side, so both
@@ -6430,7 +6453,7 @@ fn assigned_within(stmt: &parse::Stmt) -> Vec<String> {
         | StmtKind::While { cond: expr, .. }
         | StmtKind::For { iter: expr, .. }
         | StmtKind::Match { value: expr, .. } => push_assigned(expr, &mut names),
-        StmtKind::Break | StmtKind::Continue | StmtKind::Pass | StmtKind::Defer(_) => {}
+        StmtKind::Pass | StmtKind::Defer(_) => {}
     }
     names
 }
@@ -6448,7 +6471,9 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
         | ExprKind::Module(_)
         | ExprKind::FnType(_)
         | ExprKind::Placeholder
-        | ExprKind::Dot(_) => {}
+        | ExprKind::Dot(_)
+        | ExprKind::Break
+        | ExprKind::Continue => {}
         ExprKind::Tuple(items) | ExprKind::List(items) => {
             for item in items {
                 push_assigned(item, names);
@@ -6592,10 +6617,24 @@ fn fn_sigs(program: &Program) -> impl Iterator<Item = (bool, &FnSig)> {
 
 /// Whether control can never reach the end of `block`.
 fn diverges(block: &[parse::Stmt]) -> bool {
+    ends(block, ends_function)
+}
+
+/// Whether control can never reach the end of `block`, or leaves it first for
+/// the loop that it's in, by a `break` or a `continue`.
+fn leaves(block: &[parse::Stmt]) -> bool {
+    ends(block, |expr| {
+        ends_function(expr) || matches!(expr.kind, ExprKind::Break | ExprKind::Continue)
+    })
+}
+
+/// Whether a statement of `block` always evaluates an expression that
+/// `leaves` holds of, so that control never reaches the end of the block.
+fn ends(block: &[parse::Stmt], leaves: fn(&parse::Expr) -> bool) -> bool {
     block.iter().any(|stmt| match &stmt.kind {
         StmtKind::Binding(parse::Binding { value: expr, .. })
         | StmtKind::Expr(expr)
-        | StmtKind::For { iter: expr, .. } => never_ends(expr),
+        | StmtKind::For { iter: expr, .. } => finds(expr, true, leaves),
         StmtKind::If {
             cond,
             then_body,
@@ -6603,25 +6642,37 @@ fn diverges(block: &[parse::Stmt]) -> bool {
         } => {
             let bodies = else_body
                 .as_ref()
-                .is_some_and(|else_body| diverges(then_body) && diverges(else_body));
-            never_ends(cond) || bodies
+                .is_some_and(|else_body| ends(then_body, leaves) && ends(else_body, leaves));
+            finds(cond, true, leaves) || bodies
         }
+        // A `break` or a `continue` in its condition is of the loop itself,
+        // which a `break` ends.
         StmtKind::While { cond, body } => {
-            never_ends(cond) || matches!(cond.kind, ExprKind::Bool(true)) && !breaks(body)
+            let infinite = matches!(cond.kind, ExprKind::Bool(true)) && !breaks(body);
+            finds(cond, true, ends_function) || infinite
         }
         // One of its arms runs, or it traps.
         StmtKind::Match { value, arms } => {
-            never_ends(value) || arms.iter().all(|arm| diverges(&arm.body))
+            finds(value, true, leaves) || arms.iter().all(|arm| ends(&arm.body, leaves))
         }
-        StmtKind::Break | StmtKind::Continue | StmtKind::Pass | StmtKind::Defer(_) => false,
+        StmtKind::Pass | StmtKind::Defer(_) => false,
     })
 }
 
-/// Whether evaluating `expr` never ends: it is a `return` or it traps, or an
-/// operand that it always evaluates is one that never ends.
-fn never_ends(expr: &parse::Expr) -> bool {
+/// Whether `expr` ends the function it's in: it is a `return`, or it traps.
+fn ends_function(expr: &parse::Expr) -> bool {
+    matches!(expr.kind, ExprKind::Return(_)) || is_unreachable_call(expr)
+}
+
+/// Whether `found` holds of `expr` or of an expression within it. If
+/// `always`, only of those that are evaluated whenever `expr` is, which the
+/// right side of an `and` or an `or` is not.
+fn finds(expr: &parse::Expr, always: bool, found: fn(&parse::Expr) -> bool) -> bool {
+    let within = |expr: &parse::Expr| finds(expr, always, found);
+    if found(expr) {
+        return true;
+    }
     match &expr.kind {
-        ExprKind::Return(_) => true,
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -6631,15 +6682,18 @@ fn never_ends(expr: &parse::Expr) -> bool {
         | ExprKind::Module(_)
         | ExprKind::FnType(_)
         | ExprKind::Placeholder
-        | ExprKind::Dot(_) => false,
-        ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().any(never_ends),
+        | ExprKind::Dot(_)
+        | ExprKind::Break
+        | ExprKind::Continue
+        | ExprKind::Return(None) => false,
+        ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().any(within),
         ExprKind::Unary(_, inner)
         | ExprKind::Field(inner, _)
         | ExprKind::Deref(inner)
         | ExprKind::AddrOf(_, inner)
-        | ExprKind::Cast(inner, ..) => never_ends(inner),
-        // The right side is only evaluated if the left doesn't decide it.
-        ExprKind::Binary(BinOp::And | BinOp::Or, lhs, _) => never_ends(lhs),
+        | ExprKind::Cast(inner, ..)
+        | ExprKind::Return(Some(inner)) => within(inner),
+        ExprKind::Binary(BinOp::And | BinOp::Or, lhs, _) if always => within(lhs),
         ExprKind::Repeat(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
@@ -6648,28 +6702,9 @@ fn never_ends(expr: &parse::Expr) -> bool {
             target: a,
             value: b,
             ..
-        } => never_ends(a) || never_ends(b),
-        ExprKind::Call(callee, args) => {
-            is_unreachable_call(expr)
-                || never_ends(callee)
-                || args.iter().any(|arg| never_ends(&arg.value))
-        }
+        } => within(a) || within(b),
+        ExprKind::Call(callee, args) => within(callee) || args.iter().any(|arg| within(&arg.value)),
     }
-}
-
-/// Whether control can never reach the end of `block`, or leaves it first for
-/// the loop that it's in, by a `break` or a `continue`.
-fn leaves(block: &[parse::Stmt]) -> bool {
-    block.iter().any(|stmt| match &stmt.kind {
-        StmtKind::Break | StmtKind::Continue => true,
-        StmtKind::If {
-            then_body,
-            else_body: Some(else_body),
-            ..
-        } => leaves(then_body) && leaves(else_body),
-        StmtKind::Match { arms, .. } => arms.iter().all(|arm| leaves(&arm.body)),
-        _ => diverges(slice::from_ref(stmt)),
-    })
 }
 
 /// Whether `stmt` is a `defer`, which runs nothing where it is.
@@ -6687,15 +6722,22 @@ fn is_unreachable_call(expr: &parse::Expr) -> bool {
 
 /// Whether `block` can break out of the loop it's directly in.
 fn breaks(block: &[parse::Stmt]) -> bool {
+    let within = |expr: &parse::Expr| finds(expr, false, |expr| expr.kind == ExprKind::Break);
     block.iter().any(|stmt| match &stmt.kind {
-        StmtKind::Break => true,
+        // What a `for` iterates is evaluated before it, so a `break` there
+        // is of this loop, as none in the `for` or in a `while` is.
+        StmtKind::Binding(parse::Binding { value: expr, .. })
+        | StmtKind::Expr(expr)
+        | StmtKind::For { iter: expr, .. } => within(expr),
         StmtKind::If {
+            cond,
             then_body,
             else_body,
-            ..
-        } => breaks(then_body) || else_body.as_deref().is_some_and(breaks),
-        StmtKind::Match { arms, .. } => arms.iter().any(|arm| breaks(&arm.body)),
-        _ => false,
+        } => within(cond) || breaks(then_body) || else_body.as_deref().is_some_and(breaks),
+        StmtKind::Match { value, arms } => {
+            within(value) || arms.iter().any(|arm| breaks(&arm.body))
+        }
+        StmtKind::While { .. } | StmtKind::Pass | StmtKind::Defer(_) => false,
     })
 }
 
@@ -7325,6 +7367,103 @@ fn scoped(ok: bool, n: i32) -> i32:
         assert_eq!(
             errors("fn f(ok: bool) -> i32:\n    ok or return 1\n"),
             vec![TypeErrorKind::MissingReturn("f".into())]
+        );
+    }
+
+    #[test]
+    fn break_and_continue_are_expressions() {
+        let src = "\
+fn over(limit: i32) -> i32:
+    var n = 0
+    while true:
+        n += 1
+        n <= limit or break
+    return n
+fn evens(limit: i32) -> i32:
+    var n = 0
+    var count = 0
+    while n < limit:
+        n += 1
+        n % 2 == 0 or continue
+        count += 1
+    return count
+fn tested(limit: i32) -> i32:
+    var n = 0
+    while (n += 1) < 100 and (n < limit or break):
+        pass
+    return n
+fn inner(limit: i32) -> i32:
+    var n = 0
+    while true:
+        while n < limit or break:
+            n += 1
+        n += 10
+        n < 30 or return n
+fn compared(limit: i32) -> i32:
+    var n = 0
+    while true:
+        n += 1
+        if (n, n < limit or break) == (0, false):
+            pass
+    return n
+fn held(limit: i32) -> i32:
+    var n = 0
+    while true:
+        let more = (n += 1) < limit or break
+        more and continue
+    return n
+pub let got = (over(3), evens(9), tested(5), inner(7), compared(6), held(8))
+";
+        let module = lower(src);
+        let exported = module.globals.iter().filter(|g| !g.exports.is_empty());
+        let got: Vec<_> = exported.map(|g| konst(g.init)).collect();
+        assert_eq!(got, ["4", "4", "5", "37", "6", "8"]);
+        // The right side of an `and` or an `or` is in a label of its own,
+        // and a value that branches is held where it does.
+        assert_eq!(
+            body(&module, "over"),
+            "(set n 0) (block (loop (set n (I32.Add n 1)) \
+             (set tmp2 (if (I32.LeS n limit) 1 (seq (br 2) 0))) (br 0))) (return n)"
+        );
+        let src = "\
+extern:
+    fn log(n: i32)
+fn f(a: bool, b: bool):
+    while a:
+        defer log(1)
+        b and break
+";
+        // Each runs the `defer`s of the blocks it leaves.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(block (loop (br_if 1 (I32.Eqz a)) \
+             (set tmp2 (if b (seq (call log [1] -> []) (br 2) 0) 0)) \
+             (call log [1] -> []) (br 0)))"
+        );
+        // A loop that one may leave ends, and one in the condition of a
+        // loop is of that loop.
+        assert_eq!(
+            errors("fn f(a: bool) -> i32:\n    while true:\n        a or break\n"),
+            vec![TypeErrorKind::MissingReturn("f".into())]
+        );
+        lower(
+            "fn f(a: bool) -> i32:\n    while true:\n        while a or break:\n            pass\n",
+        );
+        let src = "\
+fn f(a: bool):
+    a or break
+    f(continue)
+    while a:
+        defer a and break
+        pass
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (TypeErrorKind::BreakOutsideLoop, "break"),
+                (TypeErrorKind::ContinueOutsideLoop, "continue"),
+                (TypeErrorKind::LeavesDefer("break"), "break"),
+            ]
         );
     }
 

@@ -764,11 +764,7 @@ fn push_pattern_strings<'p>(block: &'p [parse::Stmt], out: &mut Vec<&'p str>) {
                 }
             }
             // Every statement that holds others is above.
-            StmtKind::Binding(_)
-            | StmtKind::Expr(_)
-            | StmtKind::Break
-            | StmtKind::Continue
-            | StmtKind::Pass => {}
+            StmtKind::Binding(_) | StmtKind::Expr(_) | StmtKind::Pass => {}
         }
     }
 }

@@ -235,7 +235,7 @@ pub enum Expr {
     /// `memory.grow`, adding the number of pages and producing the old size,
     /// or -1 if the memory can't grow that much.
     MemoryGrow(Box<Expr>),
-    /// `if (result ty)`. A label, but nothing inside can branch.
+    /// `if (result ty)`. A label, which a `Br` inside counts.
     If {
         ty: ValType,
         cond: Box<Expr>,

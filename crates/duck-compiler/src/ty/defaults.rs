@@ -317,7 +317,9 @@ fn param_in_expr<'a>(
         | ExprKind::Unit
         | ExprKind::Module(_)
         | ExprKind::Placeholder
-        | ExprKind::Dot(_) => None,
+        | ExprKind::Dot(_)
+        | ExprKind::Break
+        | ExprKind::Continue => None,
         ExprKind::Tuple(items) | ExprKind::List(items) => any(items),
         ExprKind::Unary(_, inner)
         | ExprKind::Field(inner, _)
