@@ -534,7 +534,8 @@ impl Analysis {
             }
             Some(Target::Item(Item::Enum(bound))) => {
                 let enums = (0..self.ck.enums.len() as u32).map(EnumId);
-                let within = enums.filter(|id| *id != bound && self.ck.enum_starts_as(bound, *id));
+                let within = enums
+                    .filter(|id| *id != bound && self.ck.meets(Ty::Enum(*id), Ty::Enum(bound)));
                 within.map(Item::Enum).collect()
             }
             _ => Vec::new(),
@@ -1005,7 +1006,17 @@ impl Analysis {
     /// bound for a bounded type parameter. `None` for a type that no item
     /// declares.
     fn entry<'p>(&self, ty: Ty, name: &'p str) -> Option<Target<'p>> {
-        let index = match self.ck.known(ty) {
+        let ty = self.ck.known(ty);
+        // A list has the field of the struct that it lists.
+        let has = |id: StructId| {
+            let mut fields = self.ck.structs[id.0 as usize].fields.iter();
+            fields.find(|field| field.name == name)?.used
+        };
+        let ty = match ty {
+            Ty::Struct(id) if self.ck.listed(ty).is_some() => Ty::Struct(has(id)?.0),
+            _ => ty,
+        };
+        let index = match ty {
             Ty::Struct(id) if !self.is_builtin(id) => self.ck.structs[id.0 as usize].item,
             Ty::Enum(id) => self.ck.enums[id.0 as usize].item,
             _ => return None,
@@ -1094,82 +1105,20 @@ impl Analysis {
     /// bounds, as [`Checker::meets`] finds of two types, for some types in
     /// place of the type parameters of `bound`.
     fn struct_meets(&self, id: StructId, bound: StructId) -> bool {
-        let (def, bound) = (
-            &self.ck.structs[id.0 as usize],
-            &self.ck.structs[bound.0 as usize],
-        );
-        // A struct has the fields of its bound first, and a union has only
-        // the first variants of its bound.
-        let (fields, first) = match (def.union, bound.union) {
-            (false, false) => (&def.fields, &bound.fields),
-            (true, true) => (&bound.fields, &def.fields),
+        let def = |id: StructId| &self.ck.structs[id.0 as usize];
+        // A struct starts as its bound does, and a union is what its bound
+        // starts as.
+        let (starts, first) = match (def(id).union, def(bound).union) {
+            (false, false) => (id, bound),
+            (true, true) => (bound, id),
             _ => return false,
         };
-        let mut args = Vec::new();
-        let mut pairs = fields.iter().zip(first);
-        fields.len() >= first.len()
-            && pairs.all(|(field, first)| {
-                let (of_bound, of_def) = match def.union {
-                    true => (field.ty, first.ty),
-                    false => (first.ty, field.ty),
-                };
-                field.name == first.name
-                    && field.bare == first.bare
-                    && self.fills(of_bound, of_def, true, &bound.params, &mut args)
-            })
-    }
-
-    /// Whether `ty` is `pattern` with a type in place of each of `params`
-    /// in it, which is the same wherever one is written: those in `args`,
-    /// and those it adds to them. If `fits`, a `ty` that writes its memory
-    /// is also a `pattern` that only reads it, as [`Checker::fits`] has it:
-    /// for the type as a whole only.
-    fn fills(
-        &self,
-        pattern: Ty,
-        ty: Ty,
-        fits: bool,
-        params: &[Ty],
-        args: &mut Vec<(Ty, Ty)>,
-    ) -> bool {
-        if params.contains(&pattern) {
-            let given = args.iter().find(|(param, _)| *param == pattern);
-            return match given {
-                Some((_, arg)) => *arg == ty,
-                None => {
-                    args.push((pattern, ty));
-                    true
-                }
-            };
-        }
-        if pattern == ty {
-            return true;
-        }
-        let (parts, of_ty) = match (pattern, ty) {
-            (Ty::Struct(a), Ty::Struct(b)) => {
-                let instance = |id: StructId| self.ck.structs[id.0 as usize].instance.as_ref();
-                match (instance(a), instance(b)) {
-                    (Some(a), Some(b)) if a.generic == b.generic => {
-                        (a.args.clone(), b.args.clone())
-                    }
-                    _ => return false,
-                }
-            }
-            (Ty::Ptr(_), Ty::Ptr(_)) | (Ty::Array(_), Ty::Array(_))
-                if self.ck.writes(pattern) != self.ck.writes(ty)
-                    && !(fits && self.ck.writes(ty)) =>
-            {
-                return false;
-            }
-            (Ty::Ptr(_), Ty::Ptr(_))
-            | (Ty::Array(_), Ty::Array(_))
-            | (Ty::Tuple(_), Ty::Tuple(_))
-            | (Ty::Fn(_), Ty::Fn(_)) => (self.ck.components(pattern), self.ck.components(ty)),
-            _ => return false,
+        let declared = |ty: Ty| match ty {
+            Ty::Struct(id) => Some(def(id).instance.as_ref().map_or(id, |i| i.generic)),
+            _ => None,
         };
-        let mut pairs = parts.iter().zip(&of_ty);
-        parts.len() == of_ty.len()
-            && pairs.all(|(part, of)| self.fills(*part, *of, false, params, args))
+        let mut starts = self.ck.starts(Ty::Struct(starts));
+        starts.any(|ty| declared(ty) == Some(first))
     }
 
     /// The item `name` names in `module`.
@@ -1274,12 +1223,12 @@ impl Analysis {
         }
     }
 
-    /// Whether struct `id` is a union of the language's own, or an instance
-    /// of one, which no item declares.
+    /// Whether struct `id` is a union of the language's own, an instance of
+    /// one, or the list of a bound, which no item declares.
     fn is_builtin(&self, id: StructId) -> bool {
         let def = &self.ck.structs[id.0 as usize];
         let generic = def.instance.as_ref().map_or(id, |i| i.generic);
-        self.ck.builtin_unions.contains(&generic)
+        self.ck.builtin_unions.contains(&generic) || self.ck.list == Some(generic)
     }
 
     /// What `local` is, as it would be declared.
@@ -1527,9 +1476,9 @@ impl Analysis {
         let ty = self.ck.known(ty);
         match ty {
             Ty::Struct(id) if !self.ck.structs[id.0 as usize].union => {
-                let def = &self.ck.structs[id.0 as usize];
-                let seen = def.fields.iter().filter(|f| f.is_pub || def.module == file);
-                members.extend(seen.map(|def| field(&def.name, def.ty)));
+                let fields = self.ck.structs[id.0 as usize].fields.iter().enumerate();
+                let seen = fields.filter(|(i, _)| self.ck.sees_field(id, *i, file));
+                members.extend(seen.map(|(_, def)| field(&def.name, def.ty)));
             }
             Ty::Tuple(id) => {
                 let elems = self.ck.tuples[id.0 as usize].iter().enumerate();
@@ -1616,7 +1565,7 @@ impl<'p> Walk<'p> {
     /// scope as it is there.
     fn item(&mut self, item: &'p parse::Item) -> bool {
         self.site.locals.clear();
-        let bounds = |params: &'p [TypeParam]| params.iter().filter_map(|p| p.bound.as_ref());
+        let bounds = |params: &'p [TypeParam]| params.iter().flat_map(|p| &p.bound);
         let names = |params: &'p [TypeParam]| params.iter().map(|p| &p.name);
         let index = self.item;
         match &item.kind {
@@ -1707,7 +1656,7 @@ impl<'p> Walk<'p> {
     }
 
     fn sig(&mut self, sig: &'p FnSig) -> bool {
-        let mut bounds = sig.type_params.iter().filter_map(|p| p.bound.as_ref());
+        let mut bounds = sig.type_params.iter().flat_map(|p| &p.bound);
         if self.declared(&sig.name)
             || self.type_params(&sig.type_params)
             || bounds.any(|bound| self.ty(bound))
@@ -2099,9 +2048,13 @@ fn type_params_text(params: &[TypeParam]) -> String {
     if params.is_empty() {
         return String::new();
     }
-    let param = |param: &TypeParam| match &param.bound {
-        Some(bound) => format!("{}: {bound}", param.name.name),
-        None => param.name.name.clone(),
+    let param = |param: &TypeParam| match &param.bound[..] {
+        [] => param.name.name.clone(),
+        [bound] => format!("{}: {bound}", param.name.name),
+        bounds => {
+            let bounds: Vec<_> = bounds.iter().map(|bound| bound.to_string()).collect();
+            format!("{}: ({})", param.name.name, bounds.join(", "))
+        }
     };
     let params: Vec<_> = params.iter().map(param).collect();
     format!("({})", params.join(", "))
@@ -2738,10 +2691,10 @@ fn demo(p: &Point, w: Wide, s: Shape) -> Shape:
     #[test]
     fn a_type_is_implemented_by_those_it_bounds() {
         // The structs that start as a struct does, for some type arguments
-        // of a generic one.
+        // of a generic one: not one that only has its fields.
         assert_eq!(implementations("Head:\n", "Head"), ["Named"]);
         assert_eq!(implementations("T: Head", "Head"), ["Named"]);
-        assert_eq!(implementations("Box:\n", "Box"), ["Pair", "Tagged"]);
+        assert_eq!(implementations("Box:\n", "Box"), ["Pair"]);
         assert_eq!(implementations("Named:\n", "Named"), [] as [&str; 0]);
         // The unions and enums that one is wider than.
         assert_eq!(implementations("w: Wide", "Wide"), ["Shape"]);
@@ -2800,24 +2753,34 @@ fn f(v: &Vec(u8)) -> uint:
     }
 
     #[test]
-    fn a_type_is_implemented_by_one_that_writes_what_it_reads() {
+    fn a_type_is_implemented_by_those_whose_first_use_leads_to_it() {
         let src = "\
-struct Reads:
-    next: &i32
-    items: array(u8)
-struct Writes:
-    next: &var i32
-    items: varray(u8)
-    tag: u8
-struct(T) Held:
-    at: &T
-struct Holds:
-    at: &var &var u8
-union Reading:
-    at: &i32
-    none
-union Writing:
-    at: &var i32
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    name: u8
+struct Deep:
+    use Named
+struct Other:
+    o: u8
+struct Late:
+    use Other
+    use Head
+struct(T) Box:
+    value: T
+struct(T) Pair:
+    use Box(&T)
+struct Ints:
+    use Pair(i32)
+union Narrow:
+    a
+union Wide:
+    use Narrow
+    b
+union Wider:
+    use Wide
+    c
 ";
         let implementations = |name: &str| -> Vec<&'static str> {
             let mut files = Memory(vec![("main", src)]);
@@ -2826,12 +2789,72 @@ union Writing:
             let spans = analysis.implementations(file, offset);
             spans.into_iter().map(|s| &src[s.start..s.end]).collect()
         };
-        assert_eq!(implementations("Reads"), ["Writes"]);
-        assert_eq!(implementations("Held"), ["Holds"]);
-        assert_eq!(implementations("Reading"), ["Writing"]);
-        // Nothing that only reads is given for one that writes.
-        assert_eq!(implementations("Writes"), [] as [&str; 0]);
-        assert_eq!(implementations("Writing"), [] as [&str; 0]);
+        // Through each first `use`, and no other.
+        assert_eq!(implementations("Head"), ["Named", "Deep"]);
+        assert_eq!(implementations("Other"), ["Late"]);
+        assert_eq!(implementations("Box"), ["Pair", "Ints"]);
+        assert_eq!(implementations("Deep"), [] as [&str; 0]);
+        // A union is wider than those that it starts as.
+        assert_eq!(implementations("Wider"), ["Narrow", "Wide"]);
+        assert_eq!(implementations("Wide"), ["Narrow"]);
+        assert_eq!(implementations("Narrow"), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_type_parameter_has_the_fields_of_each_type_its_bound_lists() {
+        let lib = "\
+pub struct Meta:
+    pub flag: u8
+    hidden: u8
+";
+        let src = "\
+use lib
+struct Head:
+    id: i32
+fn(T, A: (lib.Meta, Head, array(T))) f(x: &A) -> u8:
+    let n = x.flag
+    x
+    return n
+";
+        let mut files = Memory(vec![("main", src), ("lib", lib)]);
+        let analysis = analysis(&mut files);
+        let at = |files: &Memory, text: &str, name: &str| {
+            let (file, offset) = files.at("main", text);
+            (file, offset + text.find(name).unwrap())
+        };
+        // Those that it sees in the struct that has each.
+        let (file, offset) = at(&files, "    x\n", "x");
+        let members = analysis.members(&mut files, file, offset);
+        let members: Vec<_> = members
+            .iter()
+            .map(|member| (member.name.as_str(), member.detail.as_str()))
+            .collect();
+        assert_eq!(
+            members,
+            [
+                ("*", "A"),
+                ("flag", "u8"),
+                ("id", "i32"),
+                ("ptr", "&T"),
+                ("len", "uint")
+            ]
+        );
+        // A field is declared where the struct that the list names has it.
+        let (file, offset) = at(&files, "x.flag", "flag");
+        let flag = analysis.definition(file, offset).unwrap();
+        assert_eq!(&lib[flag.start..].lines().next().unwrap(), &"flag: u8");
+        // Each type that it lists is named as any type is.
+        let (file, offset) = at(&files, "Head, array", "Head");
+        let head = analysis.definition(file, offset).unwrap();
+        assert_eq!(&src[head.start..].lines().next().unwrap(), &"Head:");
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(hover.text, "struct Head:\n\tid: i32");
+        let (file, offset) = at(&files, "f(x", "f");
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(
+            hover.text,
+            "fn(T, A: (lib.Meta, Head, array(T))) f(x: &A) -> u8"
+        );
     }
 
     /// Where each name is written that stands for what `name` does, in the

@@ -26,8 +26,12 @@ pub(super) struct EnumDef {
     pub(super) ty: Ty,
     /// Where the type of the values is written.
     ty_span: Span,
-    /// Its own and those that it uses of other enums, in the order they are
-    /// written. Empty until [`Checker::resolve_enums`] lists them.
+    /// The enum that each of its `use` lines names, in order, of which it
+    /// [starts as](Checker::starts) the first. The error type for one that
+    /// failed to resolve.
+    pub(super) uses: Vec<Ty>,
+    /// Those that it uses of other enums and then its own, in the order
+    /// they are written. Empty until [`Checker::resolve_enums`] lists them.
     pub(super) members: Vec<MemberDef>,
 }
 
@@ -57,6 +61,7 @@ impl Checker {
             is_pub,
             ty: Ty::Error,
             ty_span: decl.ty.span,
+            uses: Vec::new(),
             members: Vec::new(),
         });
         EnumId(self.enums.len() as u32 - 1)
@@ -107,7 +112,9 @@ impl Checker {
                     span: member.span,
                 }),
                 parse::Entry::Use(used) => {
-                    for member in self.used_members(program, id, used, visits) {
+                    let (ty, used_members) = self.used_members(program, id, used, visits);
+                    self.enums[id].uses.push(ty);
+                    for member in used_members {
                         if members.iter().any(|m| m.name == member.name) {
                             self.error(TypeErrorKind::DuplicateMember(member.name), used.span);
                             continue;
@@ -122,32 +129,34 @@ impl Checker {
         visits[id] = Visit::Done;
     }
 
-    /// The members that `use written` gives enum `id`: those of the enum
-    /// that `written` names, whose values have the type that its own do,
-    /// each written where the `use` is. None after reporting an error.
+    /// The enum that `use written` names in enum `id`, and the members it
+    /// gives it: those of that enum, whose values have the type that its
+    /// own do, each written where the `use` is. The error type and no
+    /// members after reporting an error.
     fn used_members(
         &mut self,
         program: &Program,
         id: usize,
         written: &parse::Type,
         visits: &mut [Visit],
-    ) -> Vec<MemberDef> {
+    ) -> (Ty, Vec<MemberDef>) {
+        let failed = (Ty::Error, Vec::new());
         let ty = self.resolve_ty(written);
         let used = match ty {
             Ty::Enum(used) => used,
-            Ty::Error => return Vec::new(),
+            Ty::Error => return failed,
             _ => {
                 let (within, takes, ty) = ("an enum", "an enum", self.ty_name(ty));
                 let kind = TypeErrorKind::UseOfOther { within, takes, ty };
                 self.error(kind, written.span);
-                return Vec::new();
+                return failed;
             }
         };
         let index = used.0 as usize;
         if visits[index] == Visit::Active {
             let kind = TypeErrorKind::RecursiveUse(self.ty_name(ty));
             self.error(kind, written.span);
-            return Vec::new();
+            return failed;
         }
         self.list_members(program, index, visits);
         let (expected, found) = (self.enums[id].ty, self.enums[index].ty);
@@ -158,12 +167,12 @@ impl Checker {
                 found: self.ty_name(found),
             };
             self.error(kind, written.span);
-            return Vec::new();
+            return failed;
         }
         let members = &self.enums[index].members;
         let firsts = (0..members.len())
             .filter(|i| !members[..*i].iter().any(|m| m.name == members[*i].name));
-        firsts
+        let members = firsts
             .map(|i| MemberDef {
                 name: members[i].name.clone(),
                 value: Vec::new(),
@@ -172,7 +181,8 @@ impl Checker {
                 used: Some((used, i)),
                 span: written.span,
             })
-            .collect()
+            .collect();
+        (ty, members)
     }
 
     fn break_enum_cycles(&mut self, id: usize, visits: &mut [Visit]) {
@@ -364,26 +374,6 @@ impl Checker {
     pub(super) fn enum_ty(&self, id: EnumId) -> Ty {
         self.enums[id.0 as usize].ty
     }
-
-    /// Whether the values of enum `id`'s members are folded.
-    pub(super) fn enum_folded(&self, id: EnumId) -> bool {
-        let item = self.enums[id.0 as usize].item;
-        self.constants[item].state == Visit::Done
-    }
-
-    /// Whether enum `id` starts as enum `first` does: its values have the
-    /// same type, and it has as many members or more, of which those that
-    /// `first` has are named as its are and have their values, in order.
-    pub(super) fn enum_starts_as(&self, id: EnumId, first: EnumId) -> bool {
-        let (def, first) = (&self.enums[id.0 as usize], &self.enums[first.0 as usize]);
-        let bits = |member: &MemberDef| -> Vec<_> {
-            member.value.iter().map(|c| const_bits(*c)).collect()
-        };
-        let mut pairs = def.members.iter().zip(&first.members);
-        def.ty == first.ty
-            && def.members.len() >= first.members.len()
-            && pairs.all(|(member, first)| member.name == first.name && bits(member) == bits(first))
-    }
 }
 
 impl Body<'_> {
@@ -424,15 +414,6 @@ impl Body<'_> {
         let member = &self.ck.enums[id.0 as usize].members[index];
         let consts = member.value.iter().map(|c| Expr::Const(*c)).collect();
         Some((Ty::Enum(id), self.scalars(Ty::Enum(id), consts)))
-    }
-
-    /// Whether the values of enum `id`'s members are folded, which a global
-    /// initializer that is first to use them does here. Otherwise reports,
-    /// at `span`, why they aren't.
-    pub(super) fn fold_enum(&mut self, id: EnumId, span: Span) -> bool {
-        let def = &self.ck.enums[id.0 as usize];
-        let (name, item) = (def.name.clone(), def.item);
-        self.folded(item, &name, span)
     }
 
     /// `for var in E`, where `E` names enum `id`: a copy of `body` per

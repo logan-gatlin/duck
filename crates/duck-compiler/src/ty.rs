@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::iter;
 use std::mem;
 use std::ops::Range;
 
@@ -379,15 +380,31 @@ pub enum TypeErrorKind {
     /// A generic function instantiated within its instances, or those of
     /// others, too many times over, as recursion with ever larger type
     /// arguments would be.
-    /// A type parameter bounded by a type that isn't a struct, a union or an
-    /// enum.
+    /// A type parameter bounded by a type that isn't a struct, a union, an
+    /// enum or an array.
     NotABound(String),
-    /// A type argument that isn't a union of the first variants of its type
-    /// parameter's bound, or an enum of its first members, which `what`
-    /// says.
+    /// A type that a bound lists which isn't a struct or an array.
+    NotListed(String),
+    /// A bound that lists types with a field of the same name, which no
+    /// struct uses together.
+    BoundRepeats {
+        bound: String,
+        field: String,
+    },
+    /// A type argument that its type parameter's bound, a union or an
+    /// enum, doesn't start as.
     NotWithin {
         ty: String,
         bound: String,
+    },
+    /// A type that a bound lists twice.
+    ListedTwice(String),
+    /// A type that has the fields or variants of another, which `what`
+    /// says, where it is asked to start as that type does and has no `use`
+    /// that makes it.
+    NotUsed {
+        ty: String,
+        used: String,
         what: &'static str,
     },
     /// A bound that names its own type parameter, or one declared after it
@@ -646,11 +663,18 @@ struct Checker {
     module: FileId,
     /// The module whose `pub` items are exported.
     entry: FileId,
-    /// Struct declarations in declaration order, then the built-in unions,
-    /// then instances of generic ones as they are used.
+    /// Struct declarations in declaration order, then the built-in unions
+    /// and the struct that lists are instances of, then instances of
+    /// generic ones as they are used.
     structs: Vec<StructDef>,
     /// The built-in unions, `option` and then `result`, once declared.
     builtin_unions: Vec<StructId>,
+    /// The struct that every [list](Checker::list_of) is an instance of,
+    /// once declared.
+    list: Option<StructId>,
+    /// Each list that bounds a type parameter, and where it is written,
+    /// until [`Checker::check_lists`] has seen that a struct can use it.
+    list_bounds: Vec<(StructId, Span)>,
     /// Each instance of a generic struct by its declaration and type
     /// arguments.
     instances: HashMap<(StructId, Vec<Ty>), StructId>,
@@ -712,10 +736,6 @@ struct Checker {
     /// of a field it reads, or the value a `match` takes apart. Each
     /// instance uses it as that bound too.
     bound_uses: HashMap<(FileId, usize), Ty>,
-    /// The type arguments still to be compared with the bounds they were
-    /// given, and where: those that are enums whose members' values weren't
-    /// folded.
-    pending_bounds: Vec<(Ty, Ty, Span)>,
     /// While checking or lowering an instance of a generic function, it and
     /// the instances whose calls led to it, innermost first. Given to errors.
     instance_chain: Vec<InstanceCall>,
@@ -834,8 +854,14 @@ struct StructDef {
     params: Vec<Ty>,
     /// Set for instances of generic declarations.
     instance: Option<Instance>,
-    /// An instance's are its declaration's, with its type arguments in place
-    /// of the type parameters.
+    /// The type that each of its `use` lines names, in order, of which it
+    /// [starts as](Checker::starts) the first. The error type for one
+    /// that failed to resolve. An instance's are its declaration's, with
+    /// its type arguments in place of the type parameters.
+    uses: Vec<Ty>,
+    /// Its own, after those that its `use` lines give it. An instance's are
+    /// its declaration's, with its type arguments in place of the type
+    /// parameters.
     fields: Vec<FieldDef>,
     /// How many structs and unions nest by value in it, itself included, as
     /// [`Checker::value_depth`] found. `None` until it is asked for.
@@ -1229,9 +1255,24 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "`{ty}` can't bound a type parameter; only a struct, a union, an enum or an array can"
             ),
-            Self::NotWithin { ty, bound, what } => write!(
+            Self::NotListed(ty) => write!(
                 f,
-                "`{ty}` doesn't have only the first {what} of `{bound}`, in order"
+                "`{ty}` can't be listed in a bound; only a struct or an array can"
+            ),
+            Self::BoundRepeats { bound, field } => write!(
+                f,
+                "nothing starts as `{bound}` does: `{field}` would be a field of it twice"
+            ),
+            Self::NotWithin { ty, bound } => {
+                write!(f, "`{bound}` doesn't start as `{ty}` does")
+            }
+            Self::NotUsed { ty, used, what } => write!(
+                f,
+                "`{ty}` has the {what} of `{used}`, but doesn't `use` it first"
+            ),
+            Self::ListedTwice(ty) => write!(
+                f,
+                "`{ty}` is listed twice in a bound, and no struct uses it twice"
             ),
             Self::BoundNamesLater { bound, param } => write!(
                 f,
@@ -1655,6 +1696,7 @@ impl Checker {
                         union: matches!(item.kind, ItemKind::Union(_)),
                         params,
                         instance: None,
+                        uses: Vec::new(),
                         fields: Vec::new(),
                         depth: None,
                     });
@@ -1695,6 +1737,7 @@ impl Checker {
             self.declare_item(item, name, entry);
         }
         self.declare_builtin_unions();
+        self.declare_list();
         self.uses = vec![Visit::New; program.uses.len()];
         for index in 0..program.uses.len() {
             self.declare_use(program, index);
@@ -1968,7 +2011,9 @@ impl Checker {
             let field = match entry {
                 parse::Entry::Own(field) => field,
                 parse::Entry::Use(used) => {
-                    for field in self.used_fields(program, id, used, visits) {
+                    let (ty, used_fields) = self.used_fields(program, id, used, visits);
+                    self.structs[id].uses.push(ty);
+                    for field in used_fields {
                         if self.structs[id].is_pub && field.is_pub {
                             self.check_public(field.ty, used.span, &field.name);
                         }
@@ -2004,24 +2049,25 @@ impl Checker {
         fields
     }
 
-    /// The fields that `use written` gives struct or union declaration
-    /// `id`: those of the struct or union that `written` names, as its type
-    /// arguments make them, each written where the `use` is. A struct also
-    /// uses an array, for its `ptr` and `len`. None after reporting an
-    /// error.
+    /// The type that `use written` names in struct or union declaration
+    /// `id`, and the fields it gives it: those of the struct or union, as
+    /// its type arguments make them, each written where the `use` is. A
+    /// struct also uses an array, for its `ptr` and `len`. The error type
+    /// and no fields after reporting an error.
     pub(super) fn used_fields(
         &mut self,
         program: &Program,
         id: usize,
         written: &parse::Type,
         visits: &mut [Visit],
-    ) -> Vec<FieldDef> {
+    ) -> (Ty, Vec<FieldDef>) {
+        let failed = (Ty::Error, Vec::new());
         let ty = self.resolve_ty(written);
         let union = self.structs[id].union;
         let used = match ty {
             Ty::Struct(used) if self.structs[used.0 as usize].union == union => used,
-            Ty::Array(_) if !union => return self.array_fields(ty, written.span),
-            Ty::Error => return Vec::new(),
+            Ty::Array(_) if !union => return (ty, self.array_fields(ty, written.span)),
+            Ty::Error => return failed,
             _ => {
                 // A struct also has the `ptr` and `len` of an array.
                 let (within, takes) = match union {
@@ -2031,7 +2077,7 @@ impl Checker {
                 let ty = self.ty_name(ty);
                 let kind = TypeErrorKind::UseOfOther { within, takes, ty };
                 self.error(kind, written.span);
-                return Vec::new();
+                return failed;
             }
         };
         let (decl, args) = match &self.structs[used.0 as usize].instance {
@@ -2043,7 +2089,7 @@ impl Checker {
             if *visit == Visit::Active {
                 let kind = TypeErrorKind::RecursiveUse(self.ty_name(ty));
                 self.error(kind, written.span);
-                return Vec::new();
+                return failed;
             }
             self.define_fields(program, decl.0 as usize, visits);
         }
@@ -2063,7 +2109,23 @@ impl Checker {
             field.used = Some((used, index));
             field.span = written.span;
         }
-        fields
+        (ty, fields)
+    }
+
+    /// The type that each `use` line of a `ty` names, in order: a struct,
+    /// a union or an enum has them, and a list is of them.
+    fn used_by(&self, ty: Ty) -> &[Ty] {
+        match ty {
+            Ty::Struct(id) => &self.structs[id.0 as usize].uses,
+            Ty::Enum(id) => &self.enums[id.0 as usize].uses,
+            _ => &[],
+        }
+    }
+
+    /// A `ty` and then each type that it starts as, nearest first: what its
+    /// first `use` names, what the first of that names, and so on.
+    fn starts(&self, ty: Ty) -> impl Iterator<Item = Ty> {
+        iter::successors(Some(ty), |ty| self.used_by(*ty).first().copied())
     }
 
     /// The `ptr` and `len` of the array type `ty`, as the fields of a struct
@@ -2439,7 +2501,7 @@ impl Checker {
         ck.define_structs(program);
         ck.define_funcs(program);
         ck.define_globals(program);
-        ck.check_pending_bounds();
+        ck.check_lists();
         ck.place_pattern_strings(program);
         ck
     }
@@ -2882,21 +2944,15 @@ impl Checker {
         Ty::Array(id)
     }
 
-    /// The `ptr` of the array that a `ty` is, or starts as: a struct whose
-    /// first fields are the `ptr` and `len` of one. A bounded type
-    /// parameter is as its bound is.
+    /// The `ptr` of the array that a `ty` is, or [starts as]: a struct
+    /// whose first `use` names one, or a struct that starts as one. Its
+    /// first fields are then the `ptr` and `len` of the array. A bounded
+    /// type parameter is as its bound is.
+    ///
+    /// [starts as]: Self::starts
     fn array_ptr(&self, ty: Ty) -> Option<Ty> {
-        match self.known(ty) {
-            Ty::Array(id) => Some(self.arrays[id.0 as usize]),
-            ty @ Ty::Struct(id) if self.union_id(ty).is_none() => {
-                let fields = &self.structs[id.0 as usize].fields;
-                let names = fields.iter().map(|field| field.name.as_str());
-                let [ptr, len] = [fields.first()?.ty, fields.get(1)?.ty];
-                let is_array = names.take(2).eq(ARRAY_FIELDS)
-                    && matches!(ptr, Ty::Ptr(_))
-                    && len == Ty::Prim(Prim::Uint);
-                is_array.then_some(ptr)
-            }
+        match self.starts(self.known(ty)).last() {
+            Some(Ty::Array(id)) => Some(self.arrays[id.0 as usize]),
             _ => None,
         }
     }
@@ -3147,7 +3203,7 @@ impl Checker {
         };
         if let (Some(index), Ty::Struct(id)) = (index, ty) {
             let def = &self.structs[id.0 as usize];
-            if !def.fields[index].is_pub && def.module != self.module {
+            if !self.sees_field(id, index, self.module) {
                 let kind = TypeErrorKind::PrivateField {
                     ty: def.name.clone(),
                     field: field.name.clone(),
@@ -3174,6 +3230,19 @@ impl Checker {
             self.error(kind, field.span);
         }
         None
+    }
+
+    /// Whether `module` sees field `index` of struct `id`: it is `pub`, or
+    /// the module is the one that declares the struct. A list has each
+    /// field as the struct that it lists does.
+    fn sees_field(&self, id: StructId, index: usize, module: FileId) -> bool {
+        let def = &self.structs[id.0 as usize];
+        let field = &def.fields[index];
+        let declared = match (self.listed(Ty::Struct(id)), field.used) {
+            (Some(_), Some((used, _))) => self.structs[used.0 as usize].module,
+            _ => def.module,
+        };
+        field.is_pub || declared == module
     }
 
     /// `value as to`, where `value` has type `from`, and its type: `to`, or
@@ -3220,12 +3289,12 @@ impl Checker {
     /// Whether a pointer `from` is one to what `to` points to, with no more
     /// than that known of either: its pointee starts as that of `to` does,
     /// a struct or an array, which `to` writes only if `from` does. A union
-    /// that starts as another is laid out otherwise.
+    /// that another starts as is laid out otherwise.
     ///
-    /// What `to` writes is typed just as it is behind `from`: a `&T` stored
-    /// through `to` where `from` has a `&var T` would be written through. An
-    /// instance of a generic function casts as its declaration did, whose
-    /// type argument was only asked to meet its bound.
+    /// What `to` writes is typed just as it is behind `from`: an `array(T)`
+    /// stored through `to` where `from` has a `varray(T)` would be written
+    /// through. An instance of a generic function casts as its declaration
+    /// did, whose type argument was only asked to meet its bound.
     fn points_to_start(&self, from: PtrId, to: PtrId) -> bool {
         let (have, writes) = self.pointees[from.0 as usize];
         let (want, written) = self.pointees[to.0 as usize];
@@ -5130,13 +5199,6 @@ impl<'c> Body<'c> {
             (Ty::Array(_), Some(id)) => (Ty::Array(id), self.array_start(value)),
             _ => (from, value),
         };
-        // Two enums are compared by the values of their members.
-        if let (Ty::Enum(a), Ty::Enum(b)) = (from, to)
-            && a != b
-            && !(self.fold_enum(a, span) && self.fold_enum(b, span))
-        {
-            return (Ty::Error, Value::default());
-        }
         let reinterprets = self.ck.reinterprets(from, to);
         if unchecked && reinterprets {
             return (to, value);
@@ -5163,11 +5225,18 @@ impl<'c> Body<'c> {
         }
         let address = self.ck.casts_address(from, to);
         let is_address = matches!(to, Ty::Ptr(_) | Ty::Fn(_) | Ty::Array(_));
+        // What `as` would cast if a `use` made one type start as the other.
+        let (starts, first) = match (from, to) {
+            (Ty::Ptr(from), Ty::Ptr(to)) => (self.ck.pointee(from), self.ck.pointee(to)),
+            _ => (from, to),
+        };
+        let not_used = self.ck.not_used(starts, first).filter(|_| !unchecked);
         let (from, to) = (self.ck.ty_name(written), self.ck.ty_name(to));
-        let kind = match (unchecked, reinterprets, address) {
-            (true, _, _) if !is_address => TypeErrorKind::UncheckedValue { from, to },
-            (false, true, _) => TypeErrorKind::UncheckedCast { from, to },
-            (_, _, true) => TypeErrorKind::AddressCast { from, to },
+        let kind = match (not_used, unchecked, reinterprets, address) {
+            (Some(not_used), ..) => not_used,
+            (_, true, _, _) if !is_address => TypeErrorKind::UncheckedValue { from, to },
+            (_, false, true, _) => TypeErrorKind::UncheckedCast { from, to },
+            (_, _, _, true) => TypeErrorKind::AddressCast { from, to },
             _ => TypeErrorKind::InvalidCast { from, to },
         };
         self.error(kind, span);
@@ -9345,16 +9414,15 @@ fn h(r: R):
     }
 
     #[test]
-    fn bounded_type_parameters_take_structs_that_start_with_the_bound() {
+    fn bounded_type_parameters_take_structs_that_start_as_the_bound() {
         let src = "\
 struct A:
     a: i32
 struct B:
-    a: i32
+    use A
     b: i64
 struct C:
-    a: i32
-    b: i64
+    use B
     c: u8
 struct(T: B) Held:
     item: &var T
@@ -9393,88 +9461,328 @@ fn f(a: A, b: &var B, c: &var C) -> i64:
     }
 
     #[test]
-    fn a_type_starts_as_one_that_only_reads_what_it_writes() {
+    fn a_list_bounds_the_structs_that_use_what_it_lists() {
+        let src = "\
+struct Head:
+    id: i32
+    tag: u8
+struct Meta:
+    flag: u8
+    size: u64
+struct Both:
+    use Head
+    use Meta
+    more: i32
+struct Tail:
+    t: u8
+struct Deep:
+    use Both
+    use Tail
+struct(T: (Head, Meta)) Held:
+    item: &T
+fn(T: Head) tag(x: T) -> u8:
+    return x.tag
+fn(T: (Head, Meta)) held(h: Held(T)) -> u64:
+    return size(h.item)
+fn(T: (Head, Meta)) size(x: &T) -> u64:
+    return x.size + x.id as u64
+fn(T: (Head, Meta)) flag(x: T) -> u8:
+    let h = x as Head
+    return x.flag + h.tag + tag(x)
+fn(T: (Both, Tail)) tail(x: &var T) -> u8:
+    x.t = 1
+    let h = x as &var Head
+    return x.t + flag(x.*)
+fn f(b: &Both, d: &var Deep) -> u64:
+    let h = Held(Deep)(item: d)
+    return size(b) + held(h) + flag(b.*) as u64 + tail(d) as u64
+";
+        let module = lower(src);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "f",
+                "size(Both)",
+                "held(Deep)",
+                "flag(Both)",
+                "tail(Deep)",
+                "size(Deep)",
+                "tag(Both)",
+                "flag(Deep)",
+                "tag(Deep)",
+            ]
+        );
+        // A field is where a struct that uses each type in turn has it,
+        // whatever else the type argument has after them.
+        assert_eq!(
+            body(&module, "size(Deep)"),
+            "(return (I64.Add (I64.Load offset=8 x) (I32.ExtendS (I32.Load offset=0 x))))"
+        );
+        assert_eq!(
+            body(&module, "tail(Deep)"),
+            "(I32.Store8 offset=20 x 1) (set h x) (return (I32.And (I32.Add \
+             (I32.Load8U offset=20 x) (call flag(Deep) (I32.Load offset=0 x) \
+             (I32.Load8U offset=4 x) (I32.Load8U offset=5 x) (I64.Load offset=8 x) \
+             (I32.Load offset=16 x) (I32.Load8U offset=20 x))) 255))"
+        );
+        // It is what the first type it lists is, and so meets its bound.
+        assert_eq!(
+            body(&module, "flag(Both)"),
+            "(set h.id x.id) (set h.tag x.tag) \
+             (return (I32.And (I32.Add (I32.And (I32.Add x.flag h.tag) 255) \
+             (call tag(Both) x.id x.tag x.flag x.size x.more)) 255))"
+        );
+    }
+
+    #[test]
+    fn a_list_names_the_type_parameters_before_it() {
+        let src = "\
+struct(T) Box:
+    value: T
+struct Meta:
+    flag: u8
+struct(T) Vec:
+    use varray(T)
+    use Meta
+    cap: uint
+struct Tagged:
+    use Box(i64)
+    use Meta
+struct Wide:
+    use Tagged
+    w: u8
+fn(T, B: (Box(T), Meta)) value(b: &B) -> T:
+    return b.value
+fn(T, A: (array(T), Meta)) first(a: A) -> T:
+    return a[0]
+fn(T, A: (varray(T), Meta)) put(a: &A, x: T) -> u8:
+    a[0] = x
+    return a.flag
+fn(B: ()) any(b: B) -> B:
+    return b
+fn(B: (Meta)) one(b: &B) -> u8:
+    return b.flag
+fn f(t: &Tagged, w: &Wide, v: Vec(u16), p: &Vec(u16), m: &Meta) -> i64:
+    put(p, 1)
+    return value(t) + value(w) + first(v) as i64 + one(any(m)) as i64
+";
+        let module = lower(src);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        // A call that settles the type argument takes the others from what
+        // it uses, or from what a struct that it starts as does.
+        assert_eq!(
+            names,
+            [
+                "f",
+                "put(u16, Vec(u16))",
+                "value(i64, Tagged)",
+                "value(i64, Wide)",
+                "first(u16, Vec(u16))",
+                "any(&Meta)",
+                "one(Meta)",
+            ]
+        );
+        let check =
+            |i: &str, len: &str| format!("(if (I32.GeU {i} {len}) (then unreachable) (else ))");
+        // It is indexed as the array that it lists first.
+        assert_eq!(
+            body(&module, "first(u16, Vec(u16))"),
+            format!(
+                "{} (set tmp4 (I32.Add a.ptr (I32.Mul 0 2))) (return (I32.Load16U offset=0 tmp4))",
+                check("0", "a.len")
+            )
+        );
+    }
+
+    #[test]
+    fn list_bound_errors() {
+        use TypeErrorKind::*;
+        let src = "\
+struct Head:
+    id: i32
+struct Meta:
+    flag: u8
+struct Named:
+    use Head
+    name: u8
+struct Both:
+    use Head
+    use Meta
+struct Swapped:
+    use Meta
+    use Head
+struct Wrapped:
+    use Named
+    use Meta
+struct Thin:
+    use Head
+struct Seen:
+    use Thin
+    use Meta
+struct Alike:
+    id: i32
+    flag: u8
+struct(T) Vec:
+    use array(T)
+    use Meta
+union U:
+    a
+enum(u8) E:
+    m
+fn(T: (Head, Meta)) both(x: &T):
+    let m = x as &Meta
+    let n = x.* as Meta
+fn(T: (Head, U)) a(x: &T):
+    pass
+fn(T: (E, Head)) b(x: &T):
+    pass
+fn(T: (Head, i32)) c(x: &T):
+    pass
+fn(T: (Head, Head)) d(x: &T):
+    pass
+struct Empty:
+    pass
+fn(T: (Empty, Empty)) h(x: &T):
+    pass
+fn(T: (Named, Head)) e(x: &T):
+    pass
+fn(T: (array(u8), varray(u8))) g(x: &T):
+    pass
+fn(T, V: (varray(T), Meta)) put(v: &V, x: T):
+    pass
+struct(T: (Head, Meta)) Held:
+    item: &T
+    other: &Held(Swapped)
+fn f(b: &Both, s: &Swapped, w: &Wrapped, t: &Thin, n: &Seen, a: &Alike, v: &Vec(u8)):
+    both(b)
+    both(s)
+    both(w)
+    both(t)
+    both(n)
+    both(a)
+    put(v, 1)
+";
+        let not_met = |ty: &str, bound: &str| BoundNotMet {
+            ty: ty.into(),
+            bound: bound.into(),
+        };
+        let repeats = |bound: &str, field: &str| BoundRepeats {
+            bound: bound.into(),
+            field: field.into(),
+        };
+        let not_used = |ty: &str, used: &str| NotUsed {
+            ty: ty.into(),
+            used: used.into(),
+            what: "fields",
+        };
+        let unchecked = |from: &str, to: &str| UncheckedCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        let cast = |from: &str, to: &str| InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (not_met("Swapped", "(Head, Meta)"), "Held(Swapped)"),
+                (NotListed("U".into()), "U"),
+                (NotListed("E".into()), "E"),
+                (NotListed("i32".into()), "i32"),
+                // No struct has a field twice, so none uses these.
+                (ListedTwice("Head".into()), "Head, Head"),
+                (ListedTwice("Empty".into()), "Empty, Empty"),
+                (repeats("(Named, Head)", "id"), "Named, Head"),
+                (
+                    repeats("(array(u8), varray(u8))", "ptr"),
+                    "array(u8), varray(u8)"
+                ),
+                // Only its first type is what a type argument starts as.
+                (unchecked("&T", "&Meta"), "x as &Meta"),
+                (cast("T", "Meta"), "x.* as Meta"),
+                // Each is what a struct uses, in order, and no more: not
+                // what starts as it, nor what a struct with no fields of
+                // its own uses, though that has the same fields.
+                (not_met("Swapped", "(Head, Meta)"), "both(s)"),
+                (not_met("Wrapped", "(Head, Meta)"), "both(w)"),
+                (not_met("Thin", "(Head, Meta)"), "both(t)"),
+                (not_used("Seen", "(Head, Meta)"), "both(n)"),
+                (not_used("Alike", "(Head, Meta)"), "both(a)"),
+                // An array that only reads is no `varray`.
+                (not_met("Vec(u8)", "(varray(u8), Meta)"), "put(v, 1)"),
+            ]
+        );
+        assert_eq!(
+            NotListed("U".into()).to_string(),
+            "`U` can't be listed in a bound; only a struct or an array can"
+        );
+        assert_eq!(
+            repeats("(Named, Head)", "id").to_string(),
+            "nothing starts as `(Named, Head)` does: `id` would be a field of it twice"
+        );
+        assert_eq!(
+            ListedTwice("Head".into()).to_string(),
+            "`Head` is listed twice in a bound, and no struct uses it twice"
+        );
+    }
+
+    #[test]
+    fn only_an_array_starts_as_one_that_only_reads_what_it_writes() {
         use TypeErrorKind::*;
         let decls = "\
+struct(T) Box:
+    value: T
 struct Reads:
-    next: &i32
-    items: array(u8)
+    use Box(&i32)
 struct Writes:
-    next: &var i32
-    items: varray(u8)
-    tag: u8
+    use Box(&var i32)
+struct(T) Vec:
+    use varray(T)
+    cap: uint
 union Reading:
     at: &i32
-    all: array(u8)
-    none
 union Writing:
     at: &var i32
-    all: varray(u8)
-fn(T: Reads) next(x: &T) -> &i32:
-    return x.next
-fn(T: Reads) bound(x: &var T) -> &var Reads:
-    return x as &var Reads
-fn(E: Reading) at(e: E) -> &i32:
-    match e:
-        .at(p):
-            return p
-        else:
-            return 0
+fn(B: Box(&i32)) value(b: &B) -> &i32:
+    return b.value
+fn(T, A: array(T)) len(a: &A) -> uint:
+    return a.len
+fn(T, A: array(T)) bound(a: &var A) -> &var array(T):
+    return a as &var array(T)
 ";
         let src = format!(
             "{decls}\
-fn f(w: &var Writes, u: Writing) -> &i32:
-    let p = w as &Reads
-    let r = w.* as Reads
-    let wide = u as Reading
-    let n = next(w)
-    let b = bound(w)
-    return at(u)
+fn f(r: &Reads, v: &var Vec(u8)) -> uint:
+    let p = value(r)
+    let a = v as &array(u8)
+    let w = v as &var varray(u8)
+    let b = bound(v)
+    return len(v)
 "
         );
         let module = lower(&src);
         assert_eq!(
             body(&module, "f"),
-            "(set p w) \
-             (set r.next (I32.Load offset=0 w)) \
-             (set r.items.ptr (I32.Load offset=4 w)) \
-             (set r.items.len (I32.Load offset=8 w)) \
-             (set wide u) (set wide.0 u.0) (set wide.1 u.1) \
-             (set n (call next(Writes) w)) \
-             (set b (call bound(Writes) w)) \
-             (return (call at(Writing) u u.0 u.1))"
-        );
-        assert_eq!(
-            body(&module, "next(Writes)"),
-            "(return (I32.Load offset=0 x))"
+            "(set p (call value(Reads) r)) (set a v) (set w v) \
+             (set b (call bound(u8, Vec(u8)) v)) (return (call len(u8, Vec(u8)) v))"
         );
         // A type argument is cast as its bound is, which it only meets.
-        assert_eq!(body(&module, "bound(Writes)"), "(return x)");
+        assert_eq!(body(&module, "bound(u8, Vec(u8))"), "(return a)");
 
-        // Nothing that only reads its memory starts as one that writes it.
+        // Nothing else that writes its memory starts as what only reads
+        // it, and nothing is written as an array that only reads is.
         let src = format!(
             "{decls}\
-struct Tagged:
-    next: &i32
-    items: array(u8)
-    tag: u8
-fn(T: Writes) tag(x: &T) -> u8:
-    return x.tag
-fn(E: Writing) written(e: E):
-    pass
-fn g(t: &Tagged, r: Reads, u: Reading, w: &var Writes, a: &var varray(u8)):
-    tag(t)
-    written(u)
-    let v = t as &Writes
-    let wide = u as Writing
-    let p = w as &var Reads
-    let q = a as &var array(u8)
+fn g(w: &var Writes, u: Writing, v: &var Vec(u8), a: &var varray(u8)):
+    value(w)
+    let p = w as &Box(&i32)
+    let wide = u as Reading
+    let q = v as &var array(u8)
+    let r = a as &var array(u8)
 "
         );
-        let cast = |from: &str, to: &str| InvalidCast {
-            from: from.into(),
-            to: to.into(),
-        };
         let unchecked = |from: &str, to: &str| UncheckedCast {
             from: from.into(),
             to: to.into(),
@@ -9483,20 +9791,18 @@ fn g(t: &Tagged, r: Reads, u: Reading, w: &var Writes, a: &var varray(u8)):
             errors(&src),
             vec![
                 BoundNotMet {
-                    ty: "Tagged".into(),
-                    bound: "Writes".into()
+                    ty: "Writes".into(),
+                    bound: "Box(&i32)".into()
                 },
-                NotWithin {
-                    ty: "Reading".into(),
-                    bound: "Writing".into(),
-                    what: "variants"
+                unchecked("&var Writes", "&Box(&i32)"),
+                InvalidCast {
+                    from: "Writing".into(),
+                    to: "Reading".into()
                 },
-                unchecked("&Tagged", "&Writes"),
-                cast("Reading", "Writing"),
                 // What is written through a pointer is typed as it is
-                // there: a `&i32` stored as the `next` of a `Reads` would
-                // be written through as that of a `Writes`.
-                unchecked("&var Writes", "&var Reads"),
+                // there: an `array(u8)` stored through one would be written
+                // through as the `varray(u8)` that is there.
+                unchecked("&var Vec(u8)", "&var array(u8)"),
                 unchecked("&var varray(u8)", "&var array(u8)"),
             ]
         );
@@ -9582,9 +9888,18 @@ fn f(v: Vec(u16), p: &Vec(u16), t: Text, a: array(u8), w: varray(u16)) -> uint:
 struct Text:
     use array(u8)
     hash: u32
-struct Last:
+struct Hash:
     hash: u32
+struct Last:
+    use Hash
     use array(u8)
+struct Written:
+    ptr: &u8
+    len: uint
+struct Writes:
+    ptr: &var u8
+    len: uint
+    cap: uint
 fn(T, A: array(T)) last(a: A) -> T:
     return a[a.len - 1]
 fn(T, A: varray(T)) put(a: A, x: T):
@@ -9601,16 +9916,27 @@ fn(T, A: array(T)) body(a: A, b: A, x: T) -> bool:
     return a == b
 fn(T, A: array(T)) has(a: A, x: T):
     pass
-fn f(t: Text, l: Last, a: array(u8), n: i32, x: u8):
+fn f(t: Text, l: Last, w: Written, v: Writes, a: array(u8), n: i32, x: u8):
     put(t, 1)
     put(a, 1)
     has(l, x)
+    has(w, x)
+    has(v, x)
     has(n, x)
     last(l)
+    let y = w[0]
+    for z in w:
+        pass
+    let v = w as array(u8)
 ";
         let not_met = |ty: &str, bound: &str| BoundNotMet {
             ty: ty.into(),
             bound: bound.into(),
+        };
+        let not_used = |ty: &str, used: &str| NotUsed {
+            ty: ty.into(),
+            used: used.into(),
+            what: "fields",
         };
         assert_eq!(
             errors(src),
@@ -9629,13 +9955,20 @@ fn f(t: Text, l: Last, a: array(u8), n: i32, x: u8):
                 invalid_operand("==", "A"),
                 not_met("Text", "varray(u8)"),
                 not_met("array(u8)", "varray(u8)"),
+                // Only its first `use` makes a struct start as an array, and
+                // no fields of its own do.
                 not_met("Last", "array(u8)"),
+                not_used("Written", "array(u8)"),
+                not_used("Writes", "array(u8)"),
                 not_met("i32", "array(u8)"),
                 // Only what starts as the bound gives `T` a type.
                 CannotInfer {
                     func: "last".into(),
                     param: "T".into()
                 },
+                invalid_operand("[]", "Written"),
+                invalid_operand("for", "Written"),
+                not_used("Written", "array(u8)"),
             ]
         );
     }
@@ -9646,10 +9979,10 @@ fn f(t: Text, l: Last, a: array(u8), n: i32, x: u8):
 struct(T) Box:
     v: T
 struct(T) Tagged:
-    v: T
+    use Box(T)
     tag: u8
 struct Counted:
-    v: f64
+    use Box(f64)
     count: i32
 struct(B) Wrap:
     inner: &B
@@ -9701,7 +10034,7 @@ fn f(t: &var Tagged(i64), c: &var Counted, b: &Box(u8)) -> f64:
 struct(T) Box:
     v: T
 struct Counted:
-    v: f64
+    use Box(f64)
     count: i32
 struct Empty:
     pass
@@ -9736,16 +10069,14 @@ fn f(c: &var Counted, e: &Empty, p: Pair(i32, Counted)):
     fn unions_and_enums_are_bounded_by_those_that_start_as_they_do() {
         let src = "\
 union IoError:
-    closed
-    timeout: u32
+    use ReadError
     denied
     big: tuple(i64, f32)
 union ReadError:
     closed
     timeout: u32
 pub enum(u8) Color:
-    red
-    green = 5
+    use Warm
     blue
 enum(u8) Warm:
     red
@@ -9815,10 +10146,12 @@ fn g(p: &ReadError) -> bool:
         use TypeErrorKind::*;
         let src = "\
 union IoError:
-    closed
-    timeout: u32
+    use ReadError
     denied
 union ReadError:
+    closed
+    timeout: u32
+union Alike:
     closed
     timeout: u32
 union Swapped:
@@ -9830,22 +10163,24 @@ union Retyped:
 union Held:
     closed: tuple()
 union More:
-    closed
-    timeout: u32
-    denied
+    use IoError
     other
+union Gone:
+    gone
+union Late:
+    use Gone
+    use ReadError
 struct Closed:
     closed: tuple()
 enum(u8) Color:
-    red
-    green = 5
+    use Warm
     blue
 enum(u8) Warm:
     red
     green = 5
 enum(u8) Cool:
     red
-    green
+    green = 5
 enum(i8) Signed:
     red
 struct(C: Color) Paint:
@@ -9863,91 +10198,82 @@ fn(C: Color) shade(c: C) -> u8:
     return c as u8
 fn(S: Closed) field(s: S):
     pass
-fn f(io: IoError, r: ReadError, s: Swapped, t: Retyped, h: Held, m: More, k: Closed):
+fn f(io: IoError, r: ReadError, s: Swapped, t: Retyped, h: Held, m: More, k: Closed, a: Alike):
     code(s)
     code(t)
     code(h)
     code(m)
     code(k)
+    code(a)
     field(h)
     shade(Cool.red)
     shade(Signed.red)
     shade(io)
-    let a = io as ReadError
-    let b = Color.red as Warm
-    let c = Cool.red as Color
-    let d = r as More
-    let e = r as Swapped
+    let b = io as ReadError
+    let c = Color.red as Warm
+    let d = Cool.red as Color
+    let e = r as More
+    let g = r as Swapped
+    let i = a as IoError
+    let j = r as Late
 ";
-        let not_within = |ty: &str, bound: &str, what| NotWithin {
+        let not_within = |ty: &str, bound: &str| NotWithin {
             ty: ty.into(),
             bound: bound.into(),
-            what,
         };
         let cast = |from: &str, to: &str| InvalidCast {
             from: from.into(),
             to: to.into(),
         };
+        let not_used = |ty: &str, used: &str| NotUsed {
+            ty: ty.into(),
+            used: used.into(),
+            what: "variants",
+        };
         assert_eq!(
             errors(src),
             vec![
-                not_within("Cool", "Color", "members"),
+                not_within("Cool", "Color"),
                 NonExhaustive(".timeout(_)".into()),
                 NotAValue("E".into()),
                 UntypedDot("closed".into()),
                 invalid_operand("==", "E"),
                 mismatch("E", "IoError"),
-                not_within("Swapped", "IoError", "variants"),
-                not_within("Retyped", "IoError", "variants"),
-                not_within("Held", "IoError", "variants"),
-                not_within("More", "IoError", "variants"),
-                not_within("Closed", "IoError", "variants"),
+                not_within("Swapped", "IoError"),
+                not_within("Retyped", "IoError"),
+                not_within("Held", "IoError"),
+                not_within("More", "IoError"),
+                not_within("Closed", "IoError"),
+                // What holds the same as another is no more it than that.
+                not_used("IoError", "Alike"),
                 BoundNotMet {
                     ty: "Held".into(),
                     bound: "Closed".into()
                 },
-                not_within("Cool", "Color", "members"),
-                not_within("Signed", "Color", "members"),
-                not_within("IoError", "Color", "members"),
+                not_within("Cool", "Color"),
+                not_within("Signed", "Color"),
+                not_within("IoError", "Color"),
                 cast("IoError", "ReadError"),
                 cast("Color", "Warm"),
                 cast("Cool", "Color"),
                 cast("ReadError", "Swapped"),
+                not_used("IoError", "Alike"),
+                // Only its first `use` makes a union wider than another.
+                cast("ReadError", "Late"),
             ]
         );
         assert_eq!(
-            not_within("Cool", "Color", "members").to_string(),
-            "`Cool` doesn't have only the first members of `Color`, in order"
+            not_within("Cool", "Color").to_string(),
+            "`Color` doesn't start as `Cool` does"
+        );
+        assert_eq!(
+            not_used("IoError", "Alike").to_string(),
+            "`IoError` has the variants of `Alike`, but doesn't `use` it first"
         );
         assert_eq!(
             NotABound("i32".into()).to_string(),
             "`i32` can't bound a type parameter; only a struct, a union, an enum or an array can"
         );
-    }
-
-    #[test]
-    fn a_union_with_a_variant_that_failed_to_resolve_is_widened_to() {
-        // The variant holds nothing, so the wider union lacks the leaf that
-        // the narrower one has for it.
-        let src = "\
-union IoError:
-    closed
-    timeout: Nope
-    denied
-union ReadError:
-    closed
-    timeout: u32
-fn(E: IoError) code(e: E) -> i32:
-    match e:
-        .timeout(ms):
-            return 1
-        else:
-            return 2
-fn f(r: ReadError) -> i32:
-    let io = r as IoError
-    return code(r) + code(io)
-";
-        assert_eq!(errors(src), vec![TypeErrorKind::UnknownType("Nope".into())]);
     }
 
     #[test]
@@ -10629,15 +10955,16 @@ struct Text:
     use array(u8)
     hash: u32
 struct Raw:
-    ptr: &var u16
-    len: uint
+    use Vec(u16)
     tag: u8
-struct Last:
+struct Hash:
     hash: u32
+struct Last:
+    use Hash
     use array(u8)
 struct Sized:
     ptr: &u8
-    len: u32
+    len: uint
 union Either:
     ptr: &u8
     len: uint
@@ -10671,13 +10998,14 @@ fn g(r: Raw) -> &var u16:
         assert_eq!(
             body(&module, "g"),
             format!(
-                "{} (set tmp3 (I32.Add r.ptr (I32.Mul 1 2))) (return tmp3)",
+                "{} (set tmp4 (I32.Add r.ptr (I32.Mul 1 2))) (return tmp4)",
                 check("1", "r.len")
             )
         );
 
-        // Its `ptr` decides what is written, and only a struct whose first
-        // fields are those of an array has elements.
+        // Its `ptr` decides what is written, and only a struct that starts
+        // as an array has elements: its first `use` names one, not a later
+        // one, and not fields of its own.
         let src = format!(
             "{decls}\
 fn f(t: Text, l: Last, s: Sized, e: Either):
@@ -10778,8 +11106,10 @@ struct(T) Vec:
 struct Text:
     use array(u8)
     hash: u32
-struct Last:
+struct Hash:
     hash: u32
+struct Last:
+    use Hash
     use array(u8)
 ";
         let src = format!(
@@ -11067,8 +11397,10 @@ extern:
 struct(T) Vec:
     use varray(T)
     cap: uint
-struct Last:
+struct Cap:
     cap: uint
+struct Last:
+    use Cap
     use array(u16)
 ";
         let src = format!(
@@ -13946,7 +14278,7 @@ fn f() -> Bad(u8, u8):
 struct Head:
     id: i32
 struct Named:
-    id: i32
+    use Head
     name: array(u8)
 let nobody = &Named(id: 3, name: \"\")
 struct(T: Head) Holder:
@@ -13974,7 +14306,7 @@ fn f() -> i32:
 struct Head:
     id: i32
 struct Named:
-    id: i32
+    use Head
     name: array(u8)
 struct Other:
     x: f32
@@ -14274,7 +14606,7 @@ fn f() -> i32:
 struct Head:
     id: i32
 struct Named:
-    id: i32
+    use Head
     name: array(u8)
 let first = &Named(id: 7, name: \"a\")
 fn(T: Head) id(x: &T = first) -> i32:
@@ -14347,51 +14679,78 @@ struct Head:
 struct Named:
     use Head
     len: u8
-struct Last:
+struct Deep:
+    use Named
+    more: i64
+struct Byte:
     len: u8
+struct Last:
+    use Byte
     use Head
+struct Alike:
+    id: i32
+    tag: u8
+    len: u8
 fn(T: Head) id(x: &T) -> i32:
     return x.id
 ";
         let src = format!(
             "{decls}\
-fn f(n: &Named) -> i32:
+fn f(n: &Named, d: &Deep) -> i32:
     let m = Named(id: 1, len: 2)
     let h = n as &Head
-    return n.id + m.tag as i32 + id(n) + h.id
+    let k = d as &Head
+    return n.id + m.tag as i32 + id(n) + h.id + id(d)
 fn size() -> uint:
     return Named.size + Last.size
 "
         );
         let module = lower(&src);
+        // A struct starts as what its first `use` names, and as what that
+        // starts as.
         assert_eq!(
             body(&module, "f"),
-            "(set m.id 1) (set m.tag 7) (set m.len 2) (set h n) \
-             (return (I32.Add (I32.Add (I32.Add (I32.Load offset=0 n) m.tag) \
-             (call id(Named) n)) (I32.Load offset=0 h)))"
+            "(set m.id 1) (set m.tag 7) (set m.len 2) (set h n) (set k d) \
+             (return (I32.Add (I32.Add (I32.Add (I32.Add (I32.Load offset=0 n) m.tag) \
+             (call id(Named) n)) (I32.Load offset=0 h)) (call id(Deep) d)))"
         );
         // The fields are its own, laid out where the `use` is: no `Head` is
         // within either.
         assert_eq!(body(&module, "size"), "(return (I32.Add 8 12))");
 
-        // Only a struct that starts with them starts as `Head` does, and
-        // neither is a `Head`.
+        // Only a struct whose first `use` names it starts as `Head` does:
+        // not one that uses it later, nor one with fields like its own. And
+        // none is a `Head`.
         let src = format!(
             "{decls}\
-fn g(l: &Last, n: Named) -> i32:
+fn g(l: &Last, n: Named, a: &Alike) -> i32:
     let h: Head = n
-    return id(l)
+    let p = a as &Head
+    let v = a.* as Head
+    return id(l) + id(a)
 "
         );
+        let not_used = NotUsed {
+            ty: "Alike".into(),
+            used: "Head".into(),
+            what: "fields",
+        };
         assert_eq!(
             errors(&src),
             vec![
                 mismatch("Head", "Named"),
+                not_used.clone(),
+                not_used.clone(),
                 BoundNotMet {
                     ty: "Last".into(),
                     bound: "Head".into()
                 },
+                not_used.clone(),
             ]
+        );
+        assert_eq!(
+            not_used.to_string(),
+            "`Alike` has the fields of `Head`, but doesn't `use` it first"
         );
     }
 
@@ -14402,8 +14761,10 @@ fn g(l: &Last, n: Named) -> i32:
 struct(T) Vec:
     use varray(T)
     cap: uint
-struct Text:
+struct Hash:
     hash: u32
+struct Text:
+    use Hash
     use array(u8)
 fn f(v: Vec(i64), t: &Text) -> uint:
     let w = Vec(i64)(ptr: v.ptr, len: 0, cap: v.cap)
@@ -14424,8 +14785,8 @@ fn f(v: Vec(i64), t: &Text) -> uint:
         let src = "\
 struct Twice:
     use array(u8)
-    len: u8
     use varray(u8)
+    len: u8
 union Held:
     use array(u8)
 struct Text:
@@ -14440,9 +14801,9 @@ fn f(t: Text, p: &u8):
         assert_eq!(
             errors_at(src),
             vec![
-                (DuplicateField("len".into()), "len"),
                 (DuplicateField("ptr".into()), "varray(u8)"),
                 (DuplicateField("len".into()), "varray(u8)"),
+                (DuplicateField("len".into()), "len"),
                 (
                     UseOfOther {
                         within: "a union",
@@ -14473,8 +14834,10 @@ struct(T) Box:
 struct(T) Pair:
     use Box(T)
     other: T
-struct Ints:
+struct Byte:
     first: u8
+struct Ints:
+    use Byte
     use Pair(i64)
 struct(N) Link:
     next: &N
@@ -14570,8 +14933,8 @@ union IoError:
     use ReadError
     denied
 union(T) Maybe:
-    unknown
     use option(T)
+    unknown
 fn f(r: ReadError) -> i32:
     match r as IoError:
         .closed:
@@ -14590,16 +14953,20 @@ fn g(m: Maybe(i32)) -> i32:
             return x
 fn h() -> Maybe(u8):
     return .some(4)
+fn w(o: option(u8)) -> Maybe(u8):
+    return o as Maybe(u8)
 ";
         let module = lower(src);
-        // `none` is the second variant of `Maybe`, and `some` the third.
-        assert_eq!(body(&module, "h"), "(return 2 4)");
+        // `some` is the second variant of `Maybe`, as it is of `option`,
+        // and `unknown` the third.
+        assert_eq!(body(&module, "h"), "(return 1 4)");
+        assert_eq!(body(&module, "w"), "(return o o.0)");
         assert_eq!(
             body(&module, "g"),
             "(set tmp2 m) (set x m.0) (block \
-             (if (I32.Eq tmp2 0) (then (return -1)) (else )) \
-             (if (I32.Eq tmp2 1) (then (return 0)) (else )) \
-             (if (I32.Eq tmp2 2) (then (return x)) (else )) unreachable) unreachable"
+             (if (I32.Eq tmp2 2) (then (return -1)) (else )) \
+             (if (I32.Eq tmp2 0) (then (return 0)) (else )) \
+             (if (I32.Eq tmp2 1) (then (return x)) (else )) unreachable) unreachable"
         );
         // A `ReadError` is the variant of `IoError` that it is of its own.
         assert_eq!(
@@ -14612,16 +14979,18 @@ fn h() -> Maybe(u8):
     }
 
     #[test]
-    fn used_members_count_up_where_they_are_used() {
+    fn used_members_count_up_from_those_before_them() {
         let src = "\
 enum(u8) A:
     x
     y = FIVE
     z
 let FIVE: u8 = 5
-enum(u8) B:
+enum(u8) Two:
     p
     q
+enum(u8) B:
+    use Two
     use A
     r
 enum(u8) Wide:
@@ -14631,8 +15000,10 @@ enum(u8) Wider:
     use Wide
 enum(tuple(u8, bool)) Pairs:
     one = (1, true)
-enum(tuple(u8, bool)) More:
+enum(tuple(u8, bool)) Zero:
     zero = (0, false)
+enum(tuple(u8, bool)) More:
+    use Zero
     use Pairs
 fn b() -> tuple(u8, u8, u8, u8, u8, u8):
     return (B.p as u8, B.q as u8, B.x as u8, B.y as u8, B.z as u8, B.r as u8)
@@ -14648,21 +15019,23 @@ fn count() -> i32:
 ";
         let module = lower(src);
         // A member given a value keeps it, and one given none counts up from
-        // the member before it where the `use` is.
+        // the member before it, which a `use` before its own may give.
         assert_eq!(body(&module, "b"), "(return 0 1 2 5 6 7)");
-        // An enum that starts with a `use` is wider than what it uses.
+        // An enum is wider than what its first `use` names, and than what
+        // that is wider than.
         assert_eq!(body(&module, "wide"), "(return a 7)");
         assert_eq!(body(&module, "more"), "(return 1 1)");
         assert_eq!(body(&module, "count").matches("(set n ").count(), 3);
 
-        let src = format!("{src}fn narrow(b: B) -> A:\n    return b as A\n");
-        assert_eq!(
-            errors(&src),
-            vec![TypeErrorKind::InvalidCast {
-                from: "B".into(),
-                to: "A".into()
-            }]
+        // No other `use` makes it wider, and nothing makes it narrower.
+        let src = format!(
+            "{src}fn narrow(b: B) -> A:\n    return b as A\nfn late(a: A) -> B:\n    return a as B\n"
         );
+        let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
+            from: from.into(),
+            to: to.into(),
+        };
+        assert_eq!(errors(&src), vec![cast("B", "A"), cast("A", "B")]);
     }
 
     #[test]
@@ -14747,10 +15120,9 @@ struct A:
     x: i32
     y: i32
 struct B:
+    use A
+    use A
     y: u8
-    use A
-    x: u8
-    use A
 struct L:
     use A
 struct R:
@@ -14763,16 +15135,16 @@ union P:
     b: i32
 union Q:
     use P
-    a: u8
     use P
+    a: u8
 enum(u8) M:
     a
     b
 enum(u8) N:
-    b
+    use M
     use M
     a
-fn f(b: B, n: N) -> tuple(u8, i32, u8):
+fn f(b: B, n: N) -> tuple(i32, i32, u8):
     return (b.y, b.x, n as u8)
 ";
         let field = |name: &str| DuplicateField(name.into());
@@ -14783,16 +15155,16 @@ fn f(b: B, n: N) -> tuple(u8, i32, u8):
         assert_eq!(
             errors_at(src),
             vec![
+                (member("a"), "M"),
                 (member("b"), "M"),
-                (field("y"), "A"),
-                (field("x"), "x"),
                 (field("x"), "A"),
                 (field("y"), "A"),
+                (field("y"), "y"),
                 (field("x"), "R"),
                 (field("y"), "R"),
-                (variant("a"), "a"),
                 (variant("a"), "P"),
                 (variant("b"), "P"),
+                (variant("a"), "a"),
                 (member("a"), "a"),
             ]
         );
@@ -14890,8 +15262,10 @@ enum(u8) Tail:
 enum(u8) Over:
     use Top
     use Tail
-enum(u8) Same:
+enum(u8) Z:
     z = 254
+enum(u8) Same:
+    use Z
     use Top
 ";
         let private = |item: &str| PrivateInPublic {
@@ -15031,8 +15405,10 @@ struct Head:
 struct Named:
     use Head
     len: u8
-struct Last:
+struct Byte:
     len: u8
+struct Last:
+    use Byte
     use Head
 union Narrow:
     a

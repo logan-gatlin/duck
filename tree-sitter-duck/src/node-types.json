@@ -544,6 +544,21 @@
     "fields": {}
   },
   {
+    "type": "bound_list",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "_type",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "bounded_type_parameter",
     "named": true,
     "fields": {
@@ -553,6 +568,10 @@
         "types": [
           {
             "type": "_type",
+            "named": true
+          },
+          {
+            "type": "bound_list",
             "named": true
           }
         ]

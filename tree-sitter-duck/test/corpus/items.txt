@@ -297,16 +297,16 @@ Use in a struct, a union and an enum
 
 struct(T) Named:
     use Head
-    pub name: array(u8)
     use geo.Box(&T)
+    pub name: array(u8)
 
 union Wide:
     use option(i32)
     other
 
 enum(u8) Color:
-    red
     use Warm
+    red
 
 ---
 
@@ -318,13 +318,6 @@ enum(u8) Color:
     (type_use
       (named_type
         (identifier)))
-    (field_declaration
-      (identifier)
-      (named_type
-        (identifier)
-        (type_arguments
-          (named_type
-            (identifier)))))
     (type_use
       (qualified_type
         (identifier)
@@ -333,7 +326,14 @@ enum(u8) Color:
           (type_arguments
             (pointer_type
               (named_type
-                (identifier))))))))
+                (identifier)))))))
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier)
+        (type_arguments
+          (named_type
+            (identifier))))))
   (union_declaration
     (identifier)
     (type_use
@@ -348,11 +348,35 @@ enum(u8) Color:
     (named_type
       (identifier))
     (identifier)
-    (enum_member
-      (identifier))
     (type_use
       (named_type
-        (identifier)))))
+        (identifier)))
+    (enum_member
+      (identifier))))
+
+====================
+Use after a field
+====================
+
+struct Named:
+    name: array(u8)
+    use Head
+
+---
+
+(source_file
+  (struct_declaration
+    (identifier)
+    (field_declaration
+      (identifier)
+      (named_type
+        (identifier)
+        (type_arguments
+          (named_type
+            (identifier)))))
+    (ERROR
+      (identifier)
+      (identifier))))
 
 ====================
 Function
@@ -382,6 +406,48 @@ pub fn add(a: i32, b: i32,) -> i32:
         (binary_expression
           (identifier)
           (identifier))))))
+
+====================
+Bounds that list types
+====================
+
+fn(T: (Head, mod.Meta(U),), U: (), V: (Head)) f(x: &T):
+    pass
+
+---
+
+(source_file
+  (function_declaration
+    (type_parameters
+      (bounded_type_parameter
+        (identifier)
+        (bound_list
+          (named_type
+            (identifier))
+          (qualified_type
+            (identifier)
+            (named_type
+              (identifier)
+              (type_arguments
+                (named_type
+                  (identifier)))))))
+      (bounded_type_parameter
+        (identifier)
+        (bound_list))
+      (bounded_type_parameter
+        (identifier)
+        (bound_list
+          (named_type
+            (identifier)))))
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (pointer_type
+          (named_type
+            (identifier)))))
+    (block
+      (pass_statement))))
 
 ====================
 Bounded type parameters

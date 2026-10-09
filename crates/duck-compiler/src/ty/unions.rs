@@ -132,6 +132,7 @@ impl Checker {
                 item: 0,
                 is_pub: true,
                 union: true,
+                uses: Vec::new(),
                 fields: variants.iter().map(variant).collect(),
                 params,
                 instance: None,
@@ -162,7 +163,9 @@ impl Checker {
             let variant = match entry {
                 parse::Entry::Own(variant) => variant,
                 parse::Entry::Use(used) => {
-                    for variant in self.used_fields(program, id, used, visits) {
+                    let (ty, used_variants) = self.used_fields(program, id, used, visits);
+                    self.structs[id].uses.push(ty);
+                    for variant in used_variants {
                         if self.structs[id].is_pub {
                             self.check_public(variant.ty, used.span, &variant.name);
                         }

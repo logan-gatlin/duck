@@ -848,7 +848,7 @@ fn f(q: &Point) -> f32:
     }
 
     #[test]
-    fn bounds_match_fields_whether_or_not_they_are_pub() {
+    fn bounds_read_fields_whether_or_not_they_are_pub() {
         let lib = "\
 pub struct Head:
     pub id: i32
@@ -859,8 +859,7 @@ pub fn(T: Head) id(x: &T) -> i32:
         let main = "\
 use lib
 struct Mine:
-    id: i32
-    tag: u8
+    use lib.Head
     rest: i64
 fn(T: lib.Head) peek(x: &T) -> i32:
     return x.id
@@ -880,6 +879,25 @@ fn(T: lib.Head) peek(x: &T) -> u8:
         assert_eq!(
             errors(&mut files),
             ["main \"tag\": field `tag` of `Head` is private"]
+        );
+
+        // A list has each field as the struct that it lists does.
+        let main = "\
+use lib
+struct Meta:
+    flag: u8
+struct Mine:
+    use lib.Head
+    use Meta
+fn(T: (lib.Head, Meta)) peek(x: &T) -> u8:
+    return x.flag + x.tag
+fn f(m: &Mine) -> u8:
+    return peek(m)
+";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        assert_eq!(
+            errors(&mut files),
+            ["main \"tag\": field `tag` of `(Head, Meta)` is private"]
         );
     }
 
@@ -1028,7 +1046,7 @@ fn f() -> i32:
     #[test]
     fn used_fields_are_private_to_the_module_that_uses_them() {
         let a = "let BASE = 3\nstruct Hidden:\n    x: i32\npub struct Point:\n    pub x: f32\n    secret: i32 = BASE\npub struct Sealed:\n    pub open: i32\n    key: &Hidden\npub enum(u8) Level:\n    low = BASE as u8\n    high\n";
-        let b = "use a\nlet BASE = 9\npub struct P3:\n    use a.Point\n    pub z: f32\npub enum(u8) More:\n    none\n    use a.Level\npub fn secrets() -> tuple(i32, i32):\n    return (P3(x: 1.0, z: 2.0).secret, P3(x: 1.0, secret: BASE, z: 2.0).secret)\n";
+        let b = "use a\nlet BASE = 9\npub struct P3:\n    use a.Point\n    pub z: f32\npub enum(u8) More:\n    use a.Level\n    none\npub fn secrets() -> tuple(i32, i32):\n    return (P3(x: 1.0, z: 2.0).secret, P3(x: 1.0, secret: BASE, z: 2.0).secret)\n";
         let main = "use b\npub fn f() -> tuple(u8, u8, f32):\n    return (b.More.low as u8, b.More.high as u8, b.P3(x: 1.0, z: 2.0).z)\n";
         let mut files = Memory(vec![("main", main), ("a", a), ("b", b)]);
         let module = lower(&mut files);
@@ -1065,6 +1083,35 @@ fn f() -> i32:
             [
                 "main \"a.Sealed\": `use` of `key`, whose type holds the private `Hidden`",
                 "main \"Hidden\": `Hidden` is private",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_union_that_uses_a_variant_it_cannot_name_is_widened_to() {
+        // The variant holds nothing where it is used, so the wider union
+        // lacks the leaf that the narrower one has for it.
+        let lib = "\
+struct Hidden:
+    x: i32
+pub union Read:
+    closed
+    at: &Hidden
+";
+        let main = "\
+use lib
+union Io:
+    use lib.Read
+    denied
+fn f(r: lib.Read) -> Io:
+    return r as Io
+";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "lib \"&Hidden\": private type `Hidden` in the type of `pub` item `at`",
+                "main \"lib.Read\": `use` of `at`, whose type holds the private `Hidden`",
             ]
         );
     }

@@ -45,6 +45,14 @@ function commaSep2(rule) {
   return seq(rule, repeat1(seq(',', rule)), optional(','));
 }
 
+/**
+ * The body of a struct, a union or an enum: its `use` lines, then lines of
+ * its own, each of which is `own`. At least one line of either.
+ */
+function usesThen($, own) {
+  return choice(seq(repeat1($.type_use), repeat(own)), repeat1(own));
+}
+
 module.exports = grammar({
   name: 'duck',
 
@@ -103,8 +111,11 @@ module.exports = grammar({
     bounded_type_parameter: $ => seq(
       field('name', $.identifier),
       ':',
-      field('bound', $._type),
+      field('bound', choice($._type, $.bound_list)),
     ),
+
+    // `(A, B)`: the types that a type argument uses, first and in order.
+    bound_list: $ => seq('(', commaSep($._type), ')'),
 
     parameters: $ => seq('(', commaSep($.parameter), ')'),
 
@@ -140,7 +151,7 @@ module.exports = grammar({
       ':',
       $._newline,
       $._indent,
-      repeat1(choice($.field_declaration, $.type_use, $.pass_statement)),
+      usesThen($, choice($.field_declaration, $.pass_statement)),
       $._dedent,
     ),
 
@@ -163,7 +174,7 @@ module.exports = grammar({
       ':',
       $._newline,
       $._indent,
-      repeat1(choice($.enum_member, $.type_use)),
+      usesThen($, $.enum_member),
       $._dedent,
     ),
 
@@ -181,7 +192,7 @@ module.exports = grammar({
       ':',
       $._newline,
       $._indent,
-      repeat1(choice($.union_variant, $.type_use)),
+      usesThen($, $.union_variant),
       $._dedent,
     ),
 
@@ -192,7 +203,7 @@ module.exports = grammar({
     ),
 
     // `use Type` in a struct, a union or an enum: the fields, variants or
-    // members of another, in its place.
+    // members of another, before its own.
     type_use: $ => seq(
       'use',
       field('type', $._type),

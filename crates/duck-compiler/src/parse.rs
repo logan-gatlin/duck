@@ -69,9 +69,9 @@ pub struct FnSig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
     pub name: Ident,
-    /// The struct whose fields its type arguments start with, if it's
-    /// bounded.
-    pub bound: Option<Type>,
+    /// The types its type arguments use, first and in order: one for
+    /// `: Bound`, each of a list `: (A, B)`, and none if it isn't bounded.
+    pub bound: Vec<Type>,
 }
 
 /// `extern "module":` and the host functions it imports. The module name is
@@ -117,6 +117,7 @@ pub enum Entry<T> {
     /// A field, variant or member of the declaration's own.
     Own(T),
     /// `use Type`: those of another struct, union or enum, in its place.
+    /// Every one comes before the declaration's own.
     Use(Type),
 }
 
@@ -390,6 +391,8 @@ pub enum ParseErrorKind {
     PubExtern,
     /// A `use` after an item that isn't one.
     UseAfterItem,
+    /// A `use` after a field, variant or member of the declaration's own.
+    UseAfterEntry,
     /// `(x,)`, which would be a tuple of one element.
     OneElementTuple,
     /// A function in an `extern` block with type parameters.
@@ -519,6 +522,10 @@ impl fmt::Display for ParseErrorKind {
             Self::ExternFnBody => write!(f, "functions in `extern` blocks cannot have a body"),
             Self::PubExtern => write!(f, "`extern` blocks cannot be `pub`"),
             Self::UseAfterItem => write!(f, "`use` must come before other items"),
+            Self::UseAfterEntry => write!(
+                f,
+                "`use` must come before the fields, variants or members of the declaration's own"
+            ),
             Self::OneElementTuple => write!(f, "tuples must have at least two elements"),
             Self::GenericExtern => {
                 write!(
@@ -744,12 +751,14 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Struct)?;
         let params = self.type_params()?;
         let name = self.ident()?;
+        let mut past_uses = false;
         let entries = self.indented(|p| {
             if p.eat(TokenKind::Pass) {
+                past_uses = true;
                 p.expect(TokenKind::Newline)?;
                 return Ok(None);
             }
-            p.entry(Self::field).map(Some)
+            p.entry(&mut past_uses, Self::field).map(Some)
         })?;
         Ok(StructDecl {
             name,
@@ -759,18 +768,33 @@ impl<'a> Parser<'a> {
     }
 
     /// A line of a struct's, a union's or an enum's body: `use Type`, or
-    /// what `own` parses.
-    fn entry<T>(&mut self, own: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<Entry<T>> {
+    /// what `own` parses. `past_uses` is whether a line before it was the
+    /// declaration's own, which a `use` is reported for coming after.
+    fn entry<T>(
+        &mut self,
+        past_uses: &mut bool,
+        own: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<Entry<T>> {
+        let start = self.peek().span;
         let entry = match self.eat(TokenKind::Use) {
             true => Entry::Use(self.ty()?),
             false => Entry::Own(own(self)?),
         };
+        match entry {
+            Entry::Use(_) if *past_uses => {
+                let span = self.span_from(start);
+                self.error(ParseErrorKind::UseAfterEntry, span);
+            }
+            Entry::Use(_) => {}
+            Entry::Own(_) => *past_uses = true,
+        }
         self.expect(TokenKind::Newline)?;
         Ok(entry)
     }
 
     /// The `(A, B: Bound)` after `struct`, `union` or `fn` that makes a
-    /// declaration generic, if there is one.
+    /// declaration generic, if there is one. A bound is a type, or a list
+    /// of them in brackets.
     fn type_params(&mut self) -> PResult<Vec<TypeParam>> {
         if !self.eat(TokenKind::LParen) {
             return Ok(Vec::new());
@@ -781,8 +805,9 @@ impl<'a> Parser<'a> {
         self.comma_list(TokenKind::RParen, |p| {
             let name = p.ident()?;
             let bound = match p.eat(TokenKind::Colon) {
-                true => Some(p.ty()?),
-                false => None,
+                true if p.eat(TokenKind::LParen) => p.comma_list(TokenKind::RParen, Self::ty)?,
+                true => vec![p.ty()?],
+                false => Vec::new(),
             };
             Ok(TypeParam { name, bound })
         })
@@ -794,7 +819,8 @@ impl<'a> Parser<'a> {
         let ty = self.ty()?;
         self.expect(TokenKind::RParen)?;
         let name = self.ident()?;
-        let entries = self.indented(|p| p.entry(Self::member))?;
+        let mut past_uses = false;
+        let entries = self.indented(|p| p.entry(&mut past_uses, Self::member))?;
         Ok(EnumDecl { name, ty, entries })
     }
 
@@ -813,7 +839,8 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Union)?;
         let params = self.type_params()?;
         let name = self.ident()?;
-        let entries = self.indented(|p| p.entry(Self::variant))?;
+        let mut past_uses = false;
+        let entries = self.indented(|p| p.entry(&mut past_uses, Self::variant))?;
         Ok(UnionDecl {
             name,
             params,
@@ -2661,14 +2688,14 @@ fn f():
         let src = "\
 struct Named:
     use Head
-    pub name: array(u8)
     use geo.Box(&T)
+    pub name: array(u8)
 union Wide:
     use option(i32)
     other
 enum(u8) Color:
-    red
     use Warm
+    red
 ";
         let module = parse_src(src).unwrap();
         let entries = |item: &Item| -> Vec<String> {
@@ -2687,14 +2714,14 @@ enum(u8) Color:
         };
         assert_eq!(
             entries(&module.items[0]),
-            ["use Head", "name", "use geo.Box(&T)"]
+            ["use Head", "use geo.Box(&T)", "name"]
         );
         assert_eq!(entries(&module.items[1]), ["use option(i32)", "other"]);
-        assert_eq!(entries(&module.items[2]), ["red", "use Warm"]);
+        assert_eq!(entries(&module.items[2]), ["use Warm", "red"]);
         let ItemKind::Struct(named) = &module.items[0].kind else {
             panic!()
         };
-        let Entry::Use(ty) = &named.entries[2] else {
+        let Entry::Use(ty) = &named.entries[1] else {
             panic!()
         };
         assert_eq!(&src[ty.span.start..ty.span.end], "geo.Box(&T)");
@@ -2711,6 +2738,59 @@ enum(u8) Color:
         assert_eq!(
             errors("union U:\n    use\n"),
             vec![expected("type", TokenKind::Newline)]
+        );
+    }
+
+    #[test]
+    fn uses_come_before_the_rest_of_a_body() {
+        let src = "struct S:\n    use A\n    x: i32\n    use B\n    use C\n";
+        assert_eq!(
+            errors(src),
+            [ParseErrorKind::UseAfterEntry, ParseErrorKind::UseAfterEntry]
+        );
+        let span = parse_src(src).unwrap_err()[0].span;
+        assert_eq!(&src[span.start..span.end], "use B");
+        let after = [ParseErrorKind::UseAfterEntry];
+        assert_eq!(errors("union U:\n    a\n    use V\n"), after);
+        assert_eq!(errors("enum(u8) E:\n    a = 1\n    use F\n"), after);
+        // A `pass` stands for the lines of its own that a struct lacks.
+        assert_eq!(errors("struct S:\n    pass\n    use A\n"), after);
+    }
+
+    #[test]
+    fn bounds_list_the_types_a_type_argument_uses() {
+        let bounds = |src: &str| -> Vec<Vec<String>> {
+            let module = parse_src(src).unwrap();
+            let ItemKind::Fn(f) = &module.items[0].kind else {
+                panic!()
+            };
+            let params = f.sig.type_params.iter();
+            params
+                .map(|p| p.bound.iter().map(render_ty).collect())
+                .collect()
+        };
+        let src = "fn(A, B: Head, C: (Head, mod.Meta(A)), D: (), E: (Head), F: (Head, Tail,)) f():
+    pass
+";
+        assert_eq!(
+            bounds(src),
+            [
+                vec![],
+                vec!["Head"],
+                vec!["Head", "mod.Meta(A)"],
+                vec![],
+                vec!["Head"],
+                vec!["Head", "Tail"],
+            ]
+        );
+        // A list is no type: it holds none, and nothing else is one.
+        assert_eq!(
+            errors("fn(T: ((A, B), C)) f():\n    pass\n"),
+            vec![expected("type", TokenKind::LParen)]
+        );
+        assert_eq!(
+            errors("fn f(x: (A, B)):\n    pass\n"),
+            vec![expected("type", TokenKind::LParen)]
         );
     }
 
@@ -2740,9 +2820,11 @@ enum(u8) Color:
         let ItemKind::Struct(pair) = &module.items[0].kind else {
             panic!()
         };
-        let bounds = pair.params.iter().map(|p| p.bound.as_ref().map(render_ty));
-        let bounds: Vec<_> = bounds.collect();
-        assert_eq!(bounds, vec![Some("mod.Head(u8)".to_string()), None]);
+        let bounds = pair.params.iter();
+        let bounds: Vec<Vec<_>> = bounds
+            .map(|p| p.bound.iter().map(render_ty).collect())
+            .collect();
+        assert_eq!(bounds, vec![vec!["mod.Head(u8)".to_string()], vec![]]);
         let ItemKind::Fn(f) = &module.items[1].kind else {
             panic!()
         };
@@ -2754,10 +2836,8 @@ enum(u8) Color:
             .map(|p| p.name)
             .collect();
         assert_eq!(names, vec!["T", "T"]);
-        assert_eq!(
-            f.sig.type_params[0].bound.as_ref().map(render_ty),
-            Some("Head".to_string())
-        );
+        let bound: Vec<_> = f.sig.type_params[0].bound.iter().map(render_ty).collect();
+        assert_eq!(bound, ["Head"]);
     }
 
     #[test]

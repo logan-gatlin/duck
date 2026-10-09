@@ -92,8 +92,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 
 A `&var T` is accepted as a `&T`, and a `varray(T)` as an `array(T)`, for the
 type as a whole only: a `tuple(&var T, i32)` is not a `tuple(&T, i32)`, and a
-`fn(&T)` is not a `fn(&var T)`. A field or a variant is accepted so too where
-one type starts as another, which a bound and `as` ask.
+`fn(&T)` is not a `fn(&var T)`. No other type is accepted as another, whatever
+the two hold: only a `use` relates them, which a bound and `as` ask.
 
 ## Unions
 
@@ -321,15 +321,16 @@ which is right associative: `= += -= *= /= %=`, `|>`, `or`, `and`, `not`,
   one may lose precision), `bool` to integer, an enum to its value type, a
   union or an enum to a wider one, which starts as it does, and a struct to
   one that it starts as, which is its first fields, or to the array that it
-  starts as. Nothing converts to `bool`: write `x != 0`.
+  starts as. Only a `use` makes one type start as another, not what the two
+  hold. Nothing converts to `bool`: write `x != 0`.
 - Of addresses, `as` makes a pointer or a function pointer an `int` or a
   `uint`, a `&var T` a `&T`, a `varray(T)` an `array(T)`, and a pointer to a
   struct one to a struct or an array that it starts as: a `&Named` a `&Head`,
   and a `&var Named` a `&var Head`. A `&varray(T)` is a `&array(T)` so too.
 - A pointer that writes is one only to what is typed just as its pointee is:
-  with `next: &var Node` in `Named` and `next: &Node` in `Head`, a
-  `&var Named` is a `&Head` and no `&var Head`, as a `&var varray(T)` is no
-  `&var array(T)`. What was stored through it would be written through.
+  a `&var Vec(T)` that starts as a `varray(T)` is a `&var varray(T)` and a
+  `&array(T)`, and no `&var array(T)`, as a `&var varray(T)` is none. What
+  was stored through it would be written through.
 - `as!` makes an address one of any type, and checks nothing: pointer to
   pointer (how a `&T` becomes a `&var T`, and a `&Head` a `&Named`), `int`
   or `uint` to a pointer or a function pointer, function pointer to function
@@ -419,8 +420,8 @@ struct(T) Box:
 struct Head:                         # used as a bound below
 	id: i32
 
-struct Named:                        # starts with the field of `Head`
-	id: i32
+struct Named:
+	use Head                         # `id: i32`, so it starts as `Head` does
 	name: array(u8)
 
 let nobody = &Named(id: 0, name: "")
@@ -466,19 +467,19 @@ fn demo(n: &Named) -> i32:
   `f(T: u8)`. `T` is a type throughout the signature and the body. It has no
   default, and is nothing at run time. A function may have both kinds.
 - `fn(T: Head)`, `struct(T: Head)`: `T` is bounded by the struct `Head`, so a
-  type argument is a struct that starts as `Head` does: it has as many fields
-  or more, and those `Head` has are named and typed as its are, in order.
-  `Head` itself is one. A struct that holds a `Head` as its first field is
-  not.
-- A field is typed as the bound's is where it's the `&var T` or `varray(T)`
-  of a `&T` or an `array(T)` there: a struct with `next: &var Node` starts as
-  one with `next: &Node`, and not the reverse. Nothing checks what is then
-  written through the bound, as a cast does: with a `p: &var T`, `p.next = n`
-  leaves a `&Node` where the type argument has a `&var Node`.
+  type argument is a struct that starts as `Head` does: `Head` itself, a
+  struct whose first `use` names it, or one whose first `use` names a struct
+  that starts as it does. Its first fields are then those of `Head`, as they
+  are there. A struct that only has fields named and typed as those of
+  `Head` is not one, and nor is one that holds a `Head` as its first field.
+- `fn(T: (Head, Meta))`: `T` is bounded by a list of the types that a type
+  argument uses, first and in order: see below. `(Head)` is `Head`, and `()`
+  bounds nothing.
 - A bound may name the type parameters before its own in
   the list, and any that are parameters: `fn(T, B: Box(T))`. A type argument
   for `B` then starts as a `Box(T)` does, and a call that settles `B` takes
-  `T` from it: with a `B` whose first field is `value: f64`, `T` is `f64`.
+  `T` from it: with a `B` that starts with `use Box(f64)`, `T` is `f64`. A
+  type argument is the bound's own: a `Box(&var u8)` is no `Box(&u8)`.
 - In the body a `T` has the fields of `Head`, read and written as a struct's
   are, and is otherwise as any `T` is.
 - `pub` plays no part in a bound. The body sees the fields that it sees in
@@ -503,23 +504,21 @@ fn demo(n: &Named) -> i32:
 ### Wider unions and enums
 
 ```duck
-union IoError:
+union ReadError:
 	closed
 	timeout: u32
+
+union IoError:
+	use ReadError                    # starts as `ReadError` does, so is wider
 	denied
 
-union ReadError:                     # starts as `IoError` does, and stops sooner
-	closed
-	timeout: u32
+enum(u8) Warm:
+	red
+	green = 5
 
 enum(u8) Color:
-	red
-	green = 5
+	use Warm                         # `red` and `green = 5`
 	blue
-
-enum(u8) Warm:                       # the first members of `Color`, as valued
-	red
-	green = 5
 
 fn(E: IoError) code(e: E) -> i32:    # `E` is a union that `IoError` is wider than
 	match e:                         # as an `IoError`
@@ -536,18 +535,20 @@ fn demo(r: ReadError, w: Warm) -> i32:
 	return code(r) + code(io) + c as u8 as i32
 ```
 
-- A union is wider than one whose variants are its own first ones: named the
-  same, holding the same types or nothing, in order. One that holds a `&T`
-  or an `array(T)` is wider than one that holds the `&var T` or `varray(T)`
-  there. An enum is wider than one over the same type whose members are its
-  own first ones, with the same values. Each is as wide as itself.
+- A union is wider than one that it starts as: the union that its first
+  `use` names, and any that one starts as. Its first variants are then those
+  of the other. An enum is wider than the enum that its first `use` names so
+  too, whose members are its own first ones, with the same values. Each is
+  as wide as itself.
+- Nothing else makes one wider: not a later `use`, and not variants or
+  members that are named, typed and valued as another's are.
 - `x as Wider` is the same variant or member of the wider type. Nothing
   converts the other way: `match` the wider one. The two unions aren't laid
   out alike, so a `&ReadError` is no `&IoError`, and only `as!` makes it or
   a `&Warm` the pointer to the wider type.
 - A type parameter bounded by a union or an enum takes the types it is wider
-  than, the reverse of a struct, which bounds those with more fields. In the
-  body a `T` is matched as the bound, with an arm for each of the bound's
+  than, the reverse of a struct, which bounds those that start as it does. In
+  the body a `T` is matched as the bound, with an arm for each of the bound's
   variants or members, and `x as IoError` is the bound's own value. It
   builds no `T`: `T.closed` and `.closed` for a `T` are errors, as a type
   argument may have no such variant.
@@ -576,8 +577,7 @@ enum(u8) Warm:
 	green = 5
 
 enum(u8) Color:
-	black                            # 0
-	use Warm                         # `red` is 1 here, and `green` is 5
+	use Warm                         # `red` is 0, and `green` is 5
 	blue                             # 6
 
 struct(T) Box:
@@ -599,28 +599,77 @@ fn demo(n: &Named, r: ReadError) -> i32:
 - A `use Type` line of a struct, a union or an enum stands for the fields,
   variants or members of `Type`, in order, as if they were written there.
   A struct uses a struct, a union a union, and an enum an enum whose values
-  have the type its own do. Any lines may be a `use`, among the others.
+  have the type its own do. Every `use` line comes before the lines of the
+  declaration's own.
 - A struct uses an `array(T)` or a `varray(T)` too, for its `ptr` and `len`,
   which are `pub`: see below.
 - The type is `Name`, `mod.Name` or a generic one with its type arguments,
   which may be the declaration's own type parameters. A union may use an
   `option(T)` or a `result(T, E)`. Nothing uses a type parameter: `use T` is
   an error.
-- Nothing else relates the two types: a `Named` holds no `Head`, and is
-  laid out as its fields are. A struct that starts with `use Head` starts as
-  `Head` does, so `as` makes it one, and a pointer to it a `&Head`. A union
-  or an enum that starts with a `use` is wider than what it uses, which `as`
-  makes it. A `use` further down gives neither.
+- A `Named` holds no `Head`, and is laid out as its fields are. A struct
+  starts as what its first `use` names, and as what that starts as, so `as`
+  makes it one, and a pointer to it a `&Head`. A union or an enum is wider
+  than what its first `use` names, and than what that is wider than, which
+  `as` makes it. A later `use` gives neither.
+- Only a `use` relates two types. A struct with `pub id: i32` and `tag: u8`
+  of its own is no `Head`, a bound of `Head` doesn't take it, and no `as`
+  casts it. The error says that it has the fields and doesn't `use` it
+  first.
 - A used field keeps its type, `pub` and default as declared. A `next: &Node`
   of `Node` is a `&Node` wherever it is used, and a default is a constant of
   the module that wrote it. A field that isn't `pub` is private to the
   module that uses it, and its type holds no private type of another.
 - A used member keeps a value that it was given. One given none counts up
-  from the member before it, where the `use` is.
+  from the member before it, as it does where it is declared.
 - No name is given twice, by a `use` or a line of its own: it's an error at
   whichever comes later.
 - A `use` never leads back to itself, as `use B` in `A` does when `B` has
   `use A`.
+
+### Bounds that list what is used
+
+```duck
+struct Head:
+	id: i32
+
+struct Meta:
+	flag: u8
+
+struct Both:
+	use Head
+	use Meta
+	more: i64
+
+struct Deep:
+	use Both                         # starts as `Both` does
+	last: u8
+
+fn(T: (Head, Meta)) flag(x: &T) -> i32:  # `T` uses `Head` and then `Meta`
+	let h = x as &Head               # it starts as the first of them
+	return h.id + x.flag as i32
+
+fn demo(b: &Both, d: &Deep) -> i32:
+	return flag(b) + flag(d)
+```
+
+- `fn(T: (Head, Meta))`: `T` is bounded by a list, so a type argument is a
+  struct whose first `use` lines name `Head` and then `Meta`, or a struct
+  that starts as one. What follows them is its own.
+- The order is the list's: a bound says how a type argument is laid out,
+  and one with `use Meta` and then `use Head` has its fields elsewhere. In
+  the body a `T` has the fields of each type, where a struct that uses only
+  those has them. They are laid out one after another, as a struct's are,
+  and not as a `tuple(Head, Meta)` is: nothing points to the `Meta` in one.
+- Each type is the one that is used, and no other that starts as it: a
+  struct with `use Named` and `use Meta` is no `(Head, Meta)`, though a
+  `Named` starts as a `Head` does. Nor is one that uses a struct which has
+  only `use Head` in it. An `array(T)` in a list takes a `varray(T)`.
+- A list names structs and arrays, none of them twice, and no field of
+  theirs twice: `(Head, Head)` is an error, as no struct uses both. Only a
+  bound is a list, which no value has the type of.
+- A `T` bounded by a list is cast, indexed and iterated as the first type in
+  it is, and meets the bounds that it does.
 
 ### Structs that start as an array
 
@@ -656,21 +705,25 @@ fn demo() -> i32:
 	return total + last(vec.*) + last(numbers)
 ```
 
-- A struct starts as an array when its first fields are `ptr: &T` and
-  `len: uint`, by a `use` or as written. One with `ptr: &var T` starts as a
-  `varray(T)`, and so as an `array(T)` too.
+- A struct starts as an array when its first `use` names one, or names a
+  struct that starts as one. One that starts as a `varray(T)` starts as an
+  `array(T)` too. Fields of its own named `ptr` and `len` don't make it one.
 - It is indexed and iterated as that array is: `v[i]` checks `i` against its
   `len`, and `for x in v` reads its `ptr` and `len` once, before the first
-  iteration. An element is written only through a `ptr: &var T`.
+  iteration. An element is written only through a `varray(T)`.
 - `as` makes it the array, `v as array(T)`, and a pointer to it one to the
-  array, `p as &array(T)`: a `&var varray(T)` only of one with `ptr: &var T`,
-  and never a `&var array(T)`. `as!` makes one that only reads a `varray(T)`.
+  array, `p as &array(T)`: a `&var varray(T)` only of one that starts as a
+  `varray(T)`, and never a `&var array(T)`. `as!` makes one that only reads
+  a `varray(T)`.
   Nothing makes an array the struct, and a function that takes an `array(T)`
   doesn't take a `Vec(T)`: cast it.
 - `fn(T, A: array(T))`: `A` is bounded by an array, so a type argument is an
   `array(T)`, a `varray(T)` or a struct that starts as either. A bound of
   `varray(T)` takes those that write. A call that settles `A` takes `T` from
   it.
+- Nothing checks what is written through a bound that only reads: with a
+  `p: &var A`, `p.ptr = s.ptr` leaves the `ptr` of an `array(T)` where the
+  type argument has that of a `varray(T)`.
 - In the body an `A` has the `ptr` and `len` of its bound, and is indexed,
   iterated and cast as the bound is. It is otherwise as any `T` is: `a == b`
   and the pattern `[x, y]` are errors.

@@ -409,9 +409,9 @@ impl Checker {
 
     /// Settles the type parameters of generic function `generic` that
     /// `bound` leaves out, where the bound of one that it has names them:
-    /// they are what makes the bound's fields those the type argument
-    /// starts with, or the bound's `ptr` that of the array it starts as. A
-    /// bound names only type parameters before its own, so the last is
+    /// they are what makes the bound a type that the type argument starts
+    /// as, or for a union or an enum, one that starts as the type argument.
+    /// A bound names only type parameters before its own, so the last is
     /// taken first.
     pub(super) fn settle_by_bounds(&self, generic: GenericFnId, bound: &mut [Option<Ty>]) {
         let params = &self.generic_fns[generic.0 as usize].params;
@@ -426,21 +426,42 @@ impl Checker {
                 continue;
             }
             let have = self.known(arg);
-            self.unify(want, have, bound);
-            if let (Some(want), Some(have)) = (self.array_ptr(want), self.array_ptr(have)) {
-                self.unify(want, have, bound);
+            if self.is_sum(want) {
+                for first in self.starts(want) {
+                    self.unify(first, have, bound);
+                }
+                continue;
             }
-            let (Ty::Struct(want), Ty::Struct(have)) = (want, have) else {
+            let Some(listed) = self.listed(want) else {
+                for first in self.starts(have) {
+                    self.unify(want, first, bound);
+                }
                 continue;
             };
-            let want = &self.structs[want.0 as usize].fields;
-            let have = &self.structs[have.0 as usize].fields;
-            for (want, have) in want.iter().zip(have) {
-                if want.name == have.name {
-                    self.unify(want.ty, have.ty, bound);
-                }
+            // The first that uses what the bound lists, whatever the type
+            // arguments of each.
+            let alike = |(want, used): (&Ty, &Ty)| self.alike(*want, *used);
+            let mut levels = self.starts(have).map(|first| self.used_by(first));
+            let used = levels
+                .find(|used| listed.len() <= used.len() && listed.iter().zip(*used).all(alike));
+            for (want, used) in listed.iter().zip(used.unwrap_or_default()) {
+                self.unify(*want, *used, bound);
             }
         }
+    }
+
+    /// Whether `pattern` and `actual` are the same type, type arguments
+    /// aside: both arrays, or instances of one generic struct.
+    fn alike(&self, pattern: Ty, actual: Ty) -> bool {
+        let generic = |ty: Ty| match ty {
+            Ty::Struct(id) => {
+                let instance = self.structs[id.0 as usize].instance.as_ref();
+                instance.map(|instance| instance.generic)
+            }
+            _ => None,
+        };
+        let arrays = matches!((pattern, actual), (Ty::Array(_), Ty::Array(_)));
+        pattern == actual || arrays || generic(pattern).is_some_and(|g| Some(g) == generic(actual))
     }
 
     /// Whether `ty` is the type parameter `param`, or holds it anywhere

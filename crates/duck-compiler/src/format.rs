@@ -930,6 +930,14 @@ mod tests {
             "struct(T, B: Box(T)) Pair:\n\ta: fn(T) -> B\n"
         );
         assert_eq!(
+            formatted("fn (T:( Head,Box (T) ),U:( )) f(x:T):\n\tpass\n"),
+            "fn(T: (Head, Box(T)), U: ()) f(x: T):\n\tpass\n"
+        );
+        assert_eq!(
+            formatted("struct S:\n\tuse   Head\n\tuse Box (T)\n\tx:i32\n"),
+            "struct S:\n\tuse Head\n\tuse Box(T)\n\tx: i32\n"
+        );
+        assert_eq!(
             formatted("enum (u8) Color:\n\tred\nfn (T) id(x:T)->T:\n\treturn x\n"),
             "enum(u8) Color:\n\tred\n\nfn(T) id(x: T) -> T:\n\treturn x\n"
         );

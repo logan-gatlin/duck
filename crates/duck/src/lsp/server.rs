@@ -1961,7 +1961,7 @@ mod tests {
     #[test]
     fn places_are_answered_of_as_they_are_in_the_editor() {
         let dir = TempDir::new("server-places");
-        let geo = "pub struct Point:\n    pub x: f32\n    pub y: f32 = 0.0\npub fn len(p: Point, scale: f32 = 1.0) -> f32:\n    return p.x * scale\npub struct Pixel:\n    pub x: f32\n    pub y: f32 = 0.0\n    pub color: u32\n";
+        let geo = "pub struct Point:\n    pub x: f32\n    pub y: f32 = 0.0\npub fn len(p: Point, scale: f32 = 1.0) -> f32:\n    return p.x * scale\npub struct Pixel:\n    use Point\n    pub color: u32\n";
         let saved = "use geo\npub fn main():\n    let p = geo.Point(x: 1.0)\n";
         dir.write(&[
             ("Duck.toml", MODULE),
@@ -2048,11 +2048,16 @@ mod tests {
         });
         assert_eq!(
             editor.request(References::METHOD, referred(true)),
-            json!([used, located(0, 11, 16), located(3, 14, 19)])
+            json!([
+                used,
+                located(0, 11, 16),
+                located(3, 14, 19),
+                located(6, 8, 13)
+            ])
         );
         assert_eq!(
             editor.request(References::METHOD, referred(false)),
-            json!([used, located(3, 14, 19)])
+            json!([used, located(3, 14, 19), located(6, 8, 13)])
         );
         // A struct is implemented by those that start as it does.
         let pixel = editor.request(GotoImplementation::METHOD, at(2, 16));

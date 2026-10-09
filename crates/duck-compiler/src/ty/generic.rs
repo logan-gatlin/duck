@@ -9,8 +9,9 @@ use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeKind, TypeParam};
 
 use super::{
-    ARRAY, Body, Checker, FieldDef, Item, OPTION, ParamId, RESULT, StructDef, StructId, TUPLE, Ty,
-    TypeErrorKind, VARRAY, Value, Visit, is_builtin_type, module_path, path_text,
+    ARRAY, ARRAY_FIELDS, Body, Checker, FieldDef, Item, OPTION, ParamId, RESULT, StructDef,
+    StructId, TUPLE, Ty, TypeErrorKind, VARRAY, Value, Visit, is_builtin_type, module_path,
+    path_text,
 };
 
 /// A use of a generic struct with type arguments.
@@ -31,8 +32,10 @@ pub(super) struct ParamDef {
     pub(super) name: String,
     /// Position in its declaration's type parameters.
     pub(super) index: usize,
-    /// The struct whose fields its type arguments start with, once it is
-    /// resolved, if the type parameter is bounded.
+    /// What its type arguments [meet](Checker::meets), once it is
+    /// resolved, if the type parameter is bounded: a struct, a union, an
+    /// enum, an array, or a [list](Checker::list_of) of the types that a
+    /// struct uses.
     pub(super) bound: Option<Ty>,
 }
 
@@ -150,30 +153,131 @@ impl Checker {
 
     /// Resolves the bound of each of a declaration's type parameters
     /// `params` that has one, whose types are `tys`. A bound is a struct, a
-    /// union, an enum or an array, and of `params` it names only those
-    /// before its own, so that no bound leads back to itself. Any other is
-    /// reported and bounds nothing.
+    /// union, an enum or an array, or a list of structs and arrays, and of
+    /// `params` it names only those before its own, so that no bound leads
+    /// back to itself. Any other is reported and bounds nothing.
     pub(super) fn resolve_bounds(&mut self, params: &[TypeParam], tys: &[Ty]) {
         for (i, (param, ty)) in params.iter().zip(tys).enumerate() {
-            let (Some(written), Ty::Param(id)) = (&param.bound, *ty) else {
+            let (Some(first), Some(last), Ty::Param(id)) =
+                (param.bound.first(), param.bound.last(), *ty)
+            else {
                 continue;
             };
-            let bound = self.resolve_ty(written);
-            if !matches!(
-                bound,
-                Ty::Struct(_) | Ty::Enum(_) | Ty::Array(_) | Ty::Error
-            ) {
-                self.error(TypeErrorKind::NotABound(self.ty_name(bound)), written.span);
-                continue;
-            }
+            let span = Span {
+                end: last.span.end,
+                ..first.span
+            };
+            let bound = match &param.bound[..] {
+                [written] => {
+                    let bound = self.resolve_ty(written);
+                    if !matches!(
+                        bound,
+                        Ty::Struct(_) | Ty::Enum(_) | Ty::Array(_) | Ty::Error
+                    ) {
+                        self.error(TypeErrorKind::NotABound(self.ty_name(bound)), span);
+                        continue;
+                    }
+                    bound
+                }
+                listed => {
+                    let uses = listed.iter().map(|written| self.listed_ty(written));
+                    let uses: Vec<_> = uses.collect();
+                    let list = self.list_of(uses, span);
+                    if let Ty::Struct(id) = list {
+                        self.list_bounds.push((id, span));
+                    }
+                    list
+                }
+            };
             let later = &tys[i..params.len()];
             if let Some(later) = later.iter().find(|later| self.holds(bound, **later)) {
                 let (bound, param) = (self.ty_name(bound), self.param_name(*later));
                 let kind = TypeErrorKind::BoundNamesLater { bound, param };
-                self.error(kind, written.span);
+                self.error(kind, span);
                 continue;
             }
             self.params[id.0 as usize].bound = Some(bound);
+        }
+    }
+
+    /// Resolves `written`, one of the types that a bound lists: a struct or
+    /// an array, as a struct uses. The error type after reporting any
+    /// other.
+    fn listed_ty(&mut self, written: &parse::Type) -> Ty {
+        let ty = self.resolve_ty(written);
+        if matches!(ty, Ty::Struct(_) | Ty::Array(_) | Ty::Error) && !self.is_sum(ty) {
+            return ty;
+        }
+        self.error(TypeErrorKind::NotListed(self.ty_name(ty)), written.span);
+        Ty::Error
+    }
+
+    /// Declares the struct that every list is an instance of. It is
+    /// generic over any number of types, has no name, and is no item.
+    pub(super) fn declare_list(&mut self) {
+        self.list = Some(StructId(self.structs.len() as u32));
+        self.structs.push(StructDef {
+            name: String::new(),
+            module: self.entry,
+            item: 0,
+            is_pub: true,
+            union: false,
+            params: Vec::new(),
+            instance: None,
+            uses: Vec::new(),
+            fields: Vec::new(),
+            depth: None,
+        });
+    }
+
+    /// The list `(A, B)` of `uses`, written at `site`, which bounds the
+    /// structs whose first `use` lines name those types: a struct that
+    /// uses each of them and has no fields of its own. So a type parameter
+    /// that it bounds has their fields, laid out as a type argument's are.
+    /// The error type if one of `uses` is.
+    fn list_of(&mut self, uses: Vec<Ty>, site: Span) -> Ty {
+        let Some(list) = self.list else {
+            unreachable!("the list is declared before any bound is resolved")
+        };
+        self.instantiate(list, uses, site)
+    }
+
+    /// The types that `ty` lists, if it's a [list](Self::list_of).
+    pub(super) fn listed(&self, ty: Ty) -> Option<&[Ty]> {
+        let Ty::Struct(id) = ty else {
+            return None;
+        };
+        let instance = self.structs[id.0 as usize].instance.as_ref()?;
+        (Some(instance.generic) == self.list).then_some(&instance.args[..])
+    }
+
+    /// Reports each list that bounds a type parameter and names a type or
+    /// a field twice, as no struct does, so that nothing meets it.
+    pub(super) fn check_lists(&mut self) {
+        for (id, span) in mem::take(&mut self.list_bounds) {
+            let def = &self.structs[id.0 as usize];
+            let twice = (0..def.uses.len()).find(|i| def.uses[..*i].contains(&def.uses[*i]));
+            if let Some(twice) = twice {
+                let kind = TypeErrorKind::ListedTwice(self.ty_name(def.uses[twice]));
+                self.error(kind, span);
+                continue;
+            }
+            let mut names: Vec<String> = Vec::new();
+            for used in &def.uses {
+                let fields: Vec<_> = match *used {
+                    Ty::Struct(used) => {
+                        let fields = self.structs[used.0 as usize].fields.iter();
+                        fields.map(|field| field.name.clone()).collect()
+                    }
+                    _ => ARRAY_FIELDS.iter().map(|name| name.to_string()).collect(),
+                };
+                names.extend(fields);
+            }
+            let repeated = (0..names.len()).find(|i| names[..*i].contains(&names[*i]));
+            if let Some(repeated) = repeated {
+                let (bound, field) = (def.name.clone(), names.swap_remove(repeated));
+                self.error(TypeErrorKind::BoundRepeats { bound, field }, span);
+            }
         }
     }
 
@@ -190,62 +294,91 @@ impl Checker {
 
     /// Whether a `ty` is a type that `bound` bounds.
     ///
-    /// A struct is bounded by one that it starts as: it has as many fields
-    /// or more, of which those that `bound` has are named and typed as its
-    /// are, in order. So a field of `bound` is where it would be in a `ty`,
-    /// in memory and among its leaves.
+    /// A struct bounds those that [start as](Self::starts_as) it does, and
+    /// so does an array, which a struct starts as too. So a field of
+    /// `bound` is where it would be in a `ty`, in memory and among its
+    /// leaves. A [list](Self::list_of) bounds the structs that start as a
+    /// struct whose first `use` lines name what it lists, in order.
     ///
     /// A union is bounded by one that starts as it does, and so is an
-    /// enum: `ty` has as many variants or members or fewer, which are
-    /// named, and hold or are what the first of `bound` do, in order. So
-    /// every value of a `ty` is the same variant or member of `bound`.
+    /// enum: the variants or members of a `ty` are the first of `bound`.
+    /// So every value of a `ty` is the same variant or member of `bound`.
     ///
-    /// Either way, what `ty` holds [fits](Self::fits) where `bound` holds
-    /// it: a `&var T` or a `varray(T)` is where `bound` has one that only
-    /// reads.
-    ///
-    /// An array bounds those that fit it, and the structs that start as
-    /// one: their first fields are its `ptr` and `len`.
+    /// Nothing else relates the two: not what they hold, however alike.
     ///
     /// A type parameter is bounded by what its own bound is.
     pub(super) fn meets(&self, ty: Ty, bound: Ty) -> bool {
         self.starts_like(ty, bound, false)
     }
 
-    /// Whether a `ty` starts as `bound` does, as one that [meets] it does.
-    /// If `exact`, what it holds is also typed just as what `bound` holds
-    /// is: nothing that writes its memory is where `bound` only reads it.
-    /// So a `ty` can be written as a `bound` is, through a pointer to one.
+    /// Whether a `ty` [meets] `bound`. If `exact`, it is also typed just as
+    /// `bound` is: no `varray` is where `bound` has an array that only
+    /// reads. So a `ty` can be written as a `bound` is, through a pointer
+    /// to one.
     ///
     /// [meets]: Self::meets
     pub(super) fn starts_like(&self, ty: Ty, bound: Ty, exact: bool) -> bool {
-        let fits = |found: Ty, want: Ty| found == want || !exact && self.fits(found, want);
         let ty = self.known(ty);
-        if ty == bound || ty == Ty::Error || bound == Ty::Error {
-            return true;
+        match self.is_sum(bound) {
+            true => self.starts_as(bound, ty, exact),
+            false => self.starts_as(ty, bound, exact),
         }
-        match (ty, bound) {
+    }
+
+    /// Whether a `ty` starts as `first` does: it is `first`, or its first
+    /// `use` names a type that starts as `first` does. What it has of that
+    /// type then comes before all else it has, as it is there. A `ty`
+    /// starts as a list does if a type that it starts as uses what the list
+    /// does, first and in order.
+    ///
+    /// An array is one that it [fits](Self::fits), unless `exact`. A `use`
+    /// that failed to resolve names any type.
+    fn starts_as(&self, ty: Ty, first: Ty, exact: bool) -> bool {
+        let same = |have: Ty, want: Ty| {
+            let arrays = matches!((have, want), (Ty::Array(_), Ty::Array(_)));
+            let failed = have == Ty::Error || want == Ty::Error;
+            have == want || failed || arrays && !exact && self.fits(have, want)
+        };
+        let listed = self.listed(first);
+        self.starts(ty).any(|ty| {
+            let used = self.used_by(ty);
+            let lists = listed.is_some_and(|listed| {
+                let mut pairs = used.iter().zip(listed);
+                used.len() >= listed.len() && pairs.all(|(used, listed)| same(*used, *listed))
+            });
+            same(ty, first) || lists
+        })
+    }
+
+    /// Whether a `ty` holds what one that [meets] `bound` does: the fields
+    /// that a struct or a list starts with, named and typed as they are
+    /// there, the `ptr` and `len` of an array that it [fits], or the first
+    /// variants of a union. So a `use` would make it one that does, if it
+    /// isn't. An enum is never said to: the values of its members aren't
+    /// known where its bound is first asked.
+    ///
+    /// [fits]: Self::fits
+    ///
+    /// [meets]: Self::meets
+    fn resembles(&self, ty: Ty, bound: Ty) -> bool {
+        let (ty, first) = match self.is_sum(bound) {
+            true => (bound, self.known(ty)),
+            false => (self.known(ty), bound),
+        };
+        match (ty, first) {
             (Ty::Struct(have), Ty::Struct(want)) => {
                 let (have, want) = (
                     &self.structs[have.0 as usize],
                     &self.structs[want.0 as usize],
                 );
-                match (have.union, want.union) {
-                    (false, false) => starts_as(&have.fields, &want.fields, fits),
-                    (true, true) => {
-                        let fits = |field, first| fits(first, field);
-                        starts_as(&want.fields, &have.fields, fits)
-                    }
-                    _ => false,
-                }
+                have.union == want.union && fields_start_as(&have.fields, &want.fields)
             }
-            // An array, or a struct that starts as one, whose `ptr` is
-            // where `bound` has its own.
-            (_, Ty::Array(want)) => {
-                let want = self.arrays[want.0 as usize];
-                self.array_ptr(ty).is_some_and(|ptr| fits(ptr, want))
+            (Ty::Struct(have), Ty::Array(_)) if !self.is_sum(ty) => {
+                let fields = &self.structs[have.0 as usize].fields;
+                let names = fields.iter().map(|field| field.name.as_str());
+                let mut tys = fields.iter().map(|field| field.ty).zip(self.members(first));
+                names.take(2).eq(ARRAY_FIELDS) && tys.all(|(ty, of)| self.fits(ty, of))
             }
-            (Ty::Enum(have), Ty::Enum(want)) => self.enum_starts_as(want, have),
             _ => false,
         }
     }
@@ -253,12 +386,6 @@ impl Checker {
     /// Whether `ty` is a union or an enum.
     pub(super) fn is_sum(&self, ty: Ty) -> bool {
         matches!(ty, Ty::Enum(_)) || self.union_id(ty).is_some()
-    }
-
-    /// Whether whether `ty` is bounded by another type isn't known yet: it
-    /// is an enum whose members' values aren't folded.
-    fn unfolded(&self, ty: Ty) -> bool {
-        matches!(self.known(ty), Ty::Enum(id) if !self.enum_folded(id))
     }
 
     /// The type that a field named `field` is looked up in, as a field of a
@@ -299,10 +426,7 @@ impl Checker {
                 continue;
             };
             let bound = self.substitute(bound, args, site);
-            // An enum is compared once its members' values are folded.
-            if self.unfolded(*arg) || self.unfolded(bound) {
-                self.pending_bounds.push((*arg, bound, site));
-            } else if !self.meets(*arg, bound) {
+            if !self.meets(*arg, bound) {
                 self.bound_error(*arg, bound, site);
                 met = false;
             }
@@ -312,28 +436,30 @@ impl Checker {
 
     /// Reports, at `site`, that a `ty` isn't a type that `bound` bounds.
     fn bound_error(&mut self, ty: Ty, bound: Ty, site: Span) {
-        let what = match bound {
-            Ty::Enum(_) => Some("members"),
-            _ if self.union_id(bound).is_some() => Some("variants"),
-            _ => None,
-        };
-        let (ty, bound) = (self.ty_name(ty), self.ty_name(bound));
-        let kind = match what {
-            Some(what) => TypeErrorKind::NotWithin { ty, bound, what },
-            None => TypeErrorKind::BoundNotMet { ty, bound },
-        };
+        let kind = self.not_used(ty, bound).unwrap_or_else(|| {
+            let sum = self.is_sum(bound);
+            let (ty, bound) = (self.ty_name(ty), self.ty_name(bound));
+            match sum {
+                true => TypeErrorKind::NotWithin { ty, bound },
+                false => TypeErrorKind::BoundNotMet { ty, bound },
+            }
+        });
         self.error(kind, site);
     }
 
-    /// Checks the type arguments that were given a type parameter bounded
-    /// by an enum, or were an enum, before every enum's members were
-    /// folded.
-    pub(super) fn check_pending_bounds(&mut self) {
-        for (ty, bound, site) in mem::take(&mut self.pending_bounds) {
-            if !self.meets(ty, bound) {
-                self.bound_error(ty, bound, site);
-            }
+    /// The error for a `ty` that isn't a type that `bound` bounds, if it
+    /// [resembles](Self::resembles) one: it only lacks a `use`.
+    pub(super) fn not_used(&self, ty: Ty, bound: Ty) -> Option<TypeErrorKind> {
+        if self.meets(ty, bound) || !self.resembles(ty, bound) {
+            return None;
         }
+        // A union uses what it bounds.
+        let (by, used, what) = match self.is_sum(bound) {
+            true => (bound, ty, "variants"),
+            false => (ty, bound, "fields"),
+        };
+        let (ty, used) = (self.ty_name(by), self.ty_name(used));
+        Some(TypeErrorKind::NotUsed { ty, used, what })
     }
 
     /// Checks the type arguments of struct `id`, if it's an instance,
@@ -585,6 +711,7 @@ impl Checker {
                         filled: false,
                         too_deep: false,
                     }),
+                    uses: Vec::new(),
                     fields: Vec::new(),
                     depth: None,
                 });
@@ -626,9 +753,11 @@ impl Checker {
         self.check_field_pointers(first..self.structs.len());
     }
 
-    /// Gives instance `id` the fields of its generic declaration, with type
-    /// arguments in place of type parameters, unless it has them. Does
-    /// nothing for a struct that is no instance.
+    /// Gives instance `id` the fields of its generic declaration and the
+    /// types that it uses, with type arguments in place of type parameters,
+    /// unless it has them. A [list](Self::list_of) uses its type arguments,
+    /// and is given their fields. Does nothing for a struct that is no
+    /// instance.
     pub(super) fn fill_instance(&mut self, id: StructId) {
         let index = id.0 as usize;
         let Some(instance) = &mut self.structs[index].instance else {
@@ -638,8 +767,18 @@ impl Checker {
             return;
         }
         let (generic, args, site) = (instance.generic, instance.args.clone(), instance.site);
+        if Some(generic) == self.list {
+            self.structs[index].fields = self.listed_fields(&args, site);
+            self.structs[index].uses = args;
+            return;
+        }
         // Until it has its fields, it counts for nothing in what holds it.
         self.structs[index].depth = Some(0);
+        let mut uses = self.structs[generic.0 as usize].uses.clone();
+        for used in &mut uses {
+            *used = self.substitute(*used, &args, site);
+        }
+        self.structs[index].uses = uses;
         let mut fields = self.structs[generic.0 as usize].fields.clone();
         let mut too_deep = false;
         for field in &mut fields {
@@ -655,6 +794,36 @@ impl Checker {
         if let Some(instance) = &mut def.instance {
             instance.too_deep |= too_deep;
         }
+    }
+
+    /// The fields of a list of `uses` written at `site`: those of each
+    /// struct and the `ptr` and `len` of each array, in order, as a struct
+    /// that uses them has them. One named as another before it is left
+    /// out, which [`Self::check_lists`] reports.
+    fn listed_fields(&mut self, uses: &[Ty], site: Span) -> Vec<FieldDef> {
+        let mut fields: Vec<FieldDef> = Vec::new();
+        for used in uses {
+            let held = match *used {
+                Ty::Struct(used) => {
+                    self.fill_instance(used);
+                    let mut held = self.structs[used.0 as usize].fields.clone();
+                    for (index, field) in held.iter_mut().enumerate() {
+                        field.default = None;
+                        field.default_ty = None;
+                        field.used = Some((used, index));
+                        field.span = site;
+                    }
+                    held
+                }
+                _ => self.array_fields(*used, site),
+            };
+            for field in held {
+                if !fields.iter().any(|f| f.name == field.name) {
+                    fields.push(field);
+                }
+            }
+        }
+        fields
     }
 
     /// `ty` with each type parameter replaced by its argument in `args`. The
@@ -751,16 +920,15 @@ impl Body<'_> {
 }
 
 /// Whether `fields` start as `first` do: there are as many or more, and
-/// those that `first` has are named as its are, in order, and typed so that
-/// `fits` holds of the two types. Of variants, they also hold a value or
-/// none as those of `first` do.
-fn starts_as(fields: &[FieldDef], first: &[FieldDef], fits: impl Fn(Ty, Ty) -> bool) -> bool {
+/// those that `first` has, which are some, are named and typed as its are,
+/// in order. Of variants, they also hold a value or none as those of
+/// `first` do.
+fn fields_start_as(fields: &[FieldDef], first: &[FieldDef]) -> bool {
     let mut pairs = fields.iter().zip(first);
     fields.len() >= first.len()
+        && !first.is_empty()
         && pairs.all(|(field, first)| {
-            let failed = field.ty == Ty::Error || first.ty == Ty::Error;
-            let typed = fits(field.ty, first.ty) || failed;
-            field.name == first.name && field.bare == first.bare && typed
+            field.name == first.name && field.bare == first.bare && field.ty == first.ty
         })
 }
 
