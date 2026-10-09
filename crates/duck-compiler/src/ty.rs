@@ -3777,8 +3777,8 @@ impl<'c> Body<'c> {
     /// Reports a mismatch unless `found` fits where `want` is expected or
     /// either is an error, or a `never`.
     fn expect(&mut self, found: Ty, want: Ty, span: Span) {
-        let any = |ty| matches!(ty, Ty::Error | Ty::Never);
-        if self.ck.fits(found, want) || any(found) || any(want) {
+        let unchecked = |ty| matches!(ty, Ty::Error | Ty::Never);
+        if self.ck.fits(found, want) || unchecked(found) || unchecked(want) {
             return;
         }
         let kind = TypeErrorKind::Mismatch {
@@ -4029,7 +4029,7 @@ impl<'c> Body<'c> {
         let mut pre = mem::take(&mut place.pre);
         // Nothing is stored where there is never a value.
         if place.ty == Ty::Never {
-            pre.extend(self.expr(value, None).1.pre);
+            pre.extend(self.expr(value, Some(place.ty)).1.pre);
             return never(pre);
         }
         if !place.mutable {
@@ -4624,7 +4624,7 @@ impl<'c> Body<'c> {
             ExprKind::Assign { target, op, value } => {
                 self.assignment(target, *op, value, expr.span, true)
             }
-            ExprKind::Return(value) => self.returned(value.as_deref(), expr.span),
+            ExprKind::Return(value) => self.returns(value.as_deref(), expr.span),
             ExprKind::Break => {
                 let outside = TypeErrorKind::BreakOutsideLoop;
                 self.branch("break", Label::Break, outside, expr.span)
@@ -4639,7 +4639,7 @@ impl<'c> Body<'c> {
     /// `return`, or `return value`: the value is evaluated, then the
     /// `defer`s of every block it's in are run, and then the function is
     /// left.
-    fn returned(&mut self, value: Option<&parse::Expr>, span: Span) -> (Ty, Value) {
+    fn returns(&mut self, value: Option<&parse::Expr>, span: Span) -> (Ty, Value) {
         if self.global.is_some() {
             if let Some(value) = value {
                 self.expr(value, None);
@@ -5249,7 +5249,7 @@ impl<'c> Body<'c> {
         expected: Option<Ty>,
         span: Span,
     ) -> (Ty, Value) {
-        let (ty, lhs, rhs) = if matches!(op, BinOp::And | BinOp::Or) {
+        if matches!(op, BinOp::And | BinOp::Or) {
             let bool = Ty::Prim(Prim::Bool);
             let lhs = self.check(lhs, bool);
             // The right side is in the `if` that only evaluates it when
@@ -5265,20 +5265,19 @@ impl<'c> Body<'c> {
                 self.spill(&mut value, |_| false);
             }
             return (ty, value);
+        }
+        let expected = if is_comparison(op) { None } else { expected };
+        // A literal operand takes the type of the other side, so both
+        // `x + 1` and `1 + x` work for any integer `x`, and so does a
+        // `.name`, as in `.red == c`.
+        let (ty, lhs, rhs) = if is_typed_by_other(lhs) && !is_typed_by_other(rhs) {
+            let (ty, rhs) = self.expr(rhs, expected);
+            let ty = self.compared(op, ty);
+            (ty, self.check(lhs, ty), rhs)
         } else {
-            let expected = if is_comparison(op) { None } else { expected };
-            // A literal operand takes the type of the other side, so both
-            // `x + 1` and `1 + x` work for any integer `x`, and so does a
-            // `.name`, as in `.red == c`.
-            if is_typed_by_other(lhs) && !is_typed_by_other(rhs) {
-                let (ty, rhs) = self.expr(rhs, expected);
-                let ty = self.compared(op, ty);
-                (ty, self.check(lhs, ty), rhs)
-            } else {
-                let (ty, lhs) = self.expr(lhs, expected);
-                let ty = self.compared(op, ty);
-                (ty, lhs, self.check(rhs, ty))
-            }
+            let (ty, lhs) = self.expr(lhs, expected);
+            let ty = self.compared(op, ty);
+            (ty, lhs, self.check(rhs, ty))
         };
         self.binary_values(op, ty, lhs, rhs, span)
     }
@@ -5515,6 +5514,16 @@ impl<'c> Body<'c> {
         };
         if is_value {
             if self.global.is_none() {
+                // Only what leaves where it is can be a `never`, which has
+                // no address to take, as it has no value.
+                let local =
+                    matches!(&inner.kind, ExprKind::Name(name) if self.lookup(name).is_some());
+                if local || finds(inner, true, exits) {
+                    let (ty, value) = self.expr(inner, want);
+                    if ty == Ty::Never {
+                        return (ty, value);
+                    }
+                }
                 self.error(TypeErrorKind::NotAddressable, span);
                 return (Ty::Error, Value::default());
             }
@@ -5524,6 +5533,9 @@ impl<'c> Body<'c> {
         let Some(place) = self.place(inner) else {
             return (Ty::Error, Value::default());
         };
+        if place.ty == Ty::Never {
+            return never(place.pre);
+        }
         let Slots::Memory { addr, offset } = place.slots else {
             if self.global.is_none() {
                 self.error(TypeErrorKind::NotAddressable, span);
@@ -6624,18 +6636,16 @@ fn diverges(block: &[parse::Stmt]) -> bool {
 /// Whether control can never reach the end of `block`, or leaves it first for
 /// the loop that it's in, by a `break` or a `continue`.
 fn leaves(block: &[parse::Stmt]) -> bool {
-    ends(block, |expr| {
-        ends_function(expr) || matches!(expr.kind, ExprKind::Break | ExprKind::Continue)
-    })
+    ends(block, exits)
 }
 
 /// Whether a statement of `block` always evaluates an expression that
-/// `leaves` holds of, so that control never reaches the end of the block.
-fn ends(block: &[parse::Stmt], leaves: fn(&parse::Expr) -> bool) -> bool {
+/// `exit` holds of, so that control never reaches the end of the block.
+fn ends(block: &[parse::Stmt], exit: fn(&parse::Expr) -> bool) -> bool {
     block.iter().any(|stmt| match &stmt.kind {
         StmtKind::Binding(parse::Binding { value: expr, .. })
         | StmtKind::Expr(expr)
-        | StmtKind::For { iter: expr, .. } => finds(expr, true, leaves),
+        | StmtKind::For { iter: expr, .. } => finds(expr, true, exit),
         StmtKind::If {
             cond,
             then_body,
@@ -6643,8 +6653,8 @@ fn ends(block: &[parse::Stmt], leaves: fn(&parse::Expr) -> bool) -> bool {
         } => {
             let bodies = else_body
                 .as_ref()
-                .is_some_and(|else_body| ends(then_body, leaves) && ends(else_body, leaves));
-            finds(cond, true, leaves) || bodies
+                .is_some_and(|else_body| ends(then_body, exit) && ends(else_body, exit));
+            finds(cond, true, exit) || bodies
         }
         // A `break` or a `continue` in its condition is of the loop itself,
         // which a `break` ends.
@@ -6654,10 +6664,16 @@ fn ends(block: &[parse::Stmt], leaves: fn(&parse::Expr) -> bool) -> bool {
         }
         // One of its arms runs, or it traps.
         StmtKind::Match { value, arms } => {
-            finds(value, true, leaves) || arms.iter().all(|arm| ends(&arm.body, leaves))
+            finds(value, true, exit) || arms.iter().all(|arm| ends(&arm.body, exit))
         }
         StmtKind::Pass | StmtKind::Defer(_) => false,
     })
+}
+
+/// Whether `expr` leaves where it is: it ends the function, or it is a
+/// `break` or a `continue`.
+fn exits(expr: &parse::Expr) -> bool {
+    ends_function(expr) || matches!(expr.kind, ExprKind::Break | ExprKind::Continue)
 }
 
 /// Whether `expr` ends the function it's in: it is a `return`, or it traps.
@@ -7361,6 +7377,11 @@ fn scoped(ok: bool, n: i32) -> i32:
             errors("fn f() -> i32:\n    1.5 |> return _\n"),
             vec![mismatch("i32", "f64")]
         );
+        // What is piped to it is typed before it is read.
+        assert_eq!(
+            errors("fn f() -> i64:\n    1 |> return _\n"),
+            vec![mismatch("i64", "i32")]
+        );
         assert_eq!(
             errors("fn f(ok: bool):\n    ok or return 1\n"),
             vec![mismatch("tuple()", "i32")]
@@ -7615,11 +7636,24 @@ fn counted() -> i32:
     module.count_leading_zeros(return 21)
 fn twice() -> i32:
     return return 22
+fn address() -> P:
+    &(return P(x: 23, y: 0)).x
+fn local() -> i32:
+    var p = return 24
+    &p
+    &var p.x[3]
+fn dotted() -> i32:
+    .some(tick()) == return 25
+fn reversed() -> i32:
+    (return 26) != .none
+fn member() -> i32:
+    var e = return 27
+    e = .none
 pub let got = (
     (arg(), generic(), made(), variant(), operand(), left(), right(), cast()),
     (field().x, pointee(), element(), indexed(), callee(), pair(), bound()),
     (assigned(), piped(), looped(), tested(), repeated(), matched(), counted()),
-    (twice(), calls),
+    (twice(), address().x, local(), dotted(), reversed(), member(), calls),
 )
 ";
         // Each is accepted, and returns before anything is made of it:
@@ -7627,8 +7661,9 @@ pub let got = (
         let module = lower(src);
         let exported = module.globals.iter().filter(|g| !g.exports.is_empty());
         let got: Vec<_> = exported.map(|g| konst(g.init)).collect();
-        // `arg` returns its second `tick`, and `pair` runs the third.
-        let wanted = [20].into_iter().chain(1..=22).chain([3]);
+        // `arg` returns its second `tick`, `pair` runs the third and
+        // `dotted` the fourth.
+        let wanted = [20].into_iter().chain(1..=27).chain([4]);
         let wanted: Vec<_> = wanted.map(|n| n.to_string()).collect();
         assert_eq!(got, wanted);
     }

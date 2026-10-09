@@ -1743,7 +1743,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Whether an expression can start with a token of `kind`.
+/// Whether an expression can start with a token of `kind`: one that
+/// [`Parser::primary`], [`Parser::unary`] or `not` takes.
 fn starts_expr(kind: &TokenKind) -> bool {
     matches!(
         kind,
@@ -2318,7 +2319,7 @@ mod tests {
             expr("f(continue, x) and break or c"),
             "(Or (And (call f continue x) break) c)"
         );
-        // Neither has a value, so a `return` before one has none.
+        // Each is an expression, so one after a `return` is its value.
         assert_eq!(expr("return break"), "(return break)");
         assert_eq!(expr("(break, continue).0"), "(. (tuple break continue) 0)");
         // Nor is either a value to pipe on from.
@@ -2367,6 +2368,11 @@ mod tests {
         );
         // One that no pipe holds has a chain as its value.
         assert_eq!(expr("return x |> f(_)"), "(return (|> x (call f _)))");
+        // One with no value is the body of no pipe.
+        assert_eq!(
+            errors("let _ = x |> return\n"),
+            vec![ParseErrorKind::PipeWithoutPlaceholder]
+        );
     }
 
     #[test]

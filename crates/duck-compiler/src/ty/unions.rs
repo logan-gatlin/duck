@@ -16,7 +16,7 @@ use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
     Body, Checker, FieldDef, Item, Leaf, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS,
-    Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_stable, zero,
+    Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_pure, is_stable, never, zero,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -408,6 +408,15 @@ impl Body<'_> {
             Some(Ty::Enum(_)) => {
                 let kind = TypeErrorKind::NotCallable(format!(".{}", name.name));
                 self.error(kind, name.span);
+            }
+            // What it is compared with or assigned to has no value, so it
+            // has none either: only what it would hold is evaluated.
+            Some(Ty::Never) => {
+                let args = args.into_iter().flatten();
+                let held = args.map(|arg| self.expr(&arg.value, None).1).collect();
+                let mut held = self.seq(held);
+                self.spill(&mut held, is_pure);
+                return never(held.pre);
             }
             // A type that failed to resolve, already reported.
             Some(Ty::Error) => {}
