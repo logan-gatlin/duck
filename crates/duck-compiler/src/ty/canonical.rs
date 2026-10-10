@@ -61,11 +61,8 @@ impl Checker {
             let at = size.next_multiple_of(align);
             (at, at + bytes)
         };
-        // An `externref` is in no memory, and no world has one: what holds
-        // one stays as wasm values, which is what a module's host takes.
-        let stored = |ty: &Ty| self.storable(*ty) || *ty == Ty::Never;
         let mut size = 0;
-        let params = (flat > MAX_FLAT_PARAMS && params.iter().all(stored)).then(|| {
+        let params = (flat > MAX_FLAT_PARAMS).then(|| {
             let mut offsets = Vec::new();
             for ty in params {
                 let (at, end) = place(size, ty);
@@ -79,7 +76,7 @@ impl Checker {
             size = 0;
         }
         let results = self.val_types(sig.ret).len();
-        let result = (results > MAX_FLAT_RESULTS && stored(&sig.ret)).then(|| {
+        let result = (results > MAX_FLAT_RESULTS).then(|| {
             let (at, end) = place(size, sig.ret);
             size = end;
             at

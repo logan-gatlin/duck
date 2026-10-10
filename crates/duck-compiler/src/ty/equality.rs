@@ -77,7 +77,6 @@ impl Checker {
                     self.push_parts(member, bits, &held, when, out);
                 }
             }
-            Ty::ExternRef => unreachable!("`externref` can't be compared"),
             Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
@@ -128,8 +127,8 @@ impl Checker {
 
 impl Body<'_> {
     /// `lhs == rhs` or `lhs != rhs` for values of the type `ty`. Values that
-    /// hold an `externref` have nothing to compare, and arrays can't be
-    /// compared in constants, as that takes a call.
+    /// hold a `never` have nothing to compare, and arrays can't be compared
+    /// in constants, as that takes a call.
     pub(super) fn eq_values(
         &mut self,
         op: BinOp,

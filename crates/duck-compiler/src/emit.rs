@@ -16,9 +16,9 @@ use std::collections::HashMap;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
-    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, HeapType,
-    ImportSection, IndirectNameMap, Instruction, MemArg, MemorySection, MemoryType, NameMap,
-    NameSection, RefType, TableSection, TableType, TypeSection,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    IndirectNameMap, Instruction, MemArg, MemorySection, MemoryType, NameMap, NameSection, RefType,
+    TableSection, TableType, TypeSection,
 };
 
 use crate::ir::{
@@ -417,7 +417,6 @@ fn konst(c: Const) -> Instruction<'static> {
         Const::I64(x) => Instruction::I64Const(x),
         Const::F32(x) => Instruction::F32Const(x.into()),
         Const::F64(x) => Instruction::F64Const(x.into()),
-        Const::Null => Instruction::RefNull(HeapType::EXTERN),
     }
 }
 
@@ -427,7 +426,6 @@ fn const_expr(c: Const) -> ConstExpr {
         Const::I64(x) => ConstExpr::i64_const(x),
         Const::F32(x) => ConstExpr::f32_const(x.into()),
         Const::F64(x) => ConstExpr::f64_const(x.into()),
-        Const::Null => ConstExpr::ref_null(HeapType::EXTERN),
     }
 }
 
@@ -615,7 +613,6 @@ fn val_type(ty: ValType) -> wasm_encoder::ValType {
         ValType::I64 => wasm_encoder::ValType::I64,
         ValType::F32 => wasm_encoder::ValType::F32,
         ValType::F64 => wasm_encoder::ValType::F64,
-        ValType::ExternRef => wasm_encoder::ValType::EXTERNREF,
     }
 }
 
@@ -675,38 +672,6 @@ mod tests {
             "{wat}"
         );
         assert!(wat.contains(r#"(global $counter (;1;) (mut i32) i32.const 0)"#));
-    }
-
-    #[test]
-    fn unions_hold_externrefs_and_null_in_place_of_them() {
-        let src = "\
-extern:
-    fn get() -> externref
-    fn put(r: Ref)
-pub union Ref:
-    some: externref
-    none
-pub var held: Ref = .none
-pub fn f():
-    held = .some(get())
-    put(held)
-    put(.none)
-";
-        let bytes = emit_src(src);
-        let wat = wat(&bytes);
-        assert!(
-            wat.contains(r#"(global $held.0 (;1;) (mut externref) ref.null extern)"#),
-            "{wat}"
-        );
-        assert!(
-            wat.contains("(type (;1;) (func (param i32 externref)))"),
-            "{wat}"
-        );
-        let f = func_wat(&bytes, "f");
-        assert!(
-            f.contains("i32.const 1\n    ref.null extern\n    call $put"),
-            "{f}"
-        );
     }
 
     #[test]
@@ -1004,33 +969,6 @@ fn c(y: i32) -> i64:
             ]
         );
         assert!(wat.contains("(func $c (;2;) (type 0)"), "{wat}");
-    }
-
-    #[test]
-    fn externrefs_are_reference_values() {
-        let src = "\
-pub struct Handle:
-    el: externref
-    id: i32
-extern:
-    fn get(id: i32) -> externref
-    fn put(el: externref)
-pub fn f(a: externref) -> Handle:
-    var b = get(1)
-    put(b)
-    b = a
-    return Handle(el: b, id: 2)
-";
-        let wat = wat(&emit_src(src));
-        assert!(
-            wat.contains("(type (;0;) (func (param i32) (result externref)))"),
-            "{wat}"
-        );
-        assert!(
-            wat.contains("(func $f (;2;) (type 2) (param $a externref) (result externref i32)"),
-            "{wat}"
-        );
-        assert!(wat.contains("(local $b externref)"), "{wat}");
     }
 
     #[test]

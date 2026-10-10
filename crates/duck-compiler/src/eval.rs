@@ -272,7 +272,6 @@ fn val_type(ty: ValType) -> wasmtime::ValType {
         ValType::I64 => wasmtime::ValType::I64,
         ValType::F32 => wasmtime::ValType::F32,
         ValType::F64 => wasmtime::ValType::F64,
-        ValType::ExternRef => wasmtime::ValType::EXTERNREF,
     }
 }
 
@@ -282,19 +281,18 @@ fn val(c: Const) -> Val {
         Const::I64(x) => Val::I64(x),
         Const::F32(x) => Val::F32(x.to_bits()),
         Const::F64(x) => Val::F64(x.to_bits()),
-        Const::Null => Val::ExternRef(None),
     }
 }
 
-/// The constant `val` is. Only the host makes a reference that isn't null,
-/// and it is never called.
+/// The constant `val` is, which is a number: no function has a result of
+/// another type.
 fn konst(val: &Val) -> Const {
     match val {
         Val::I32(x) => Const::I32(*x),
         Val::I64(x) => Const::I64(*x),
         Val::F32(bits) => Const::F32(f32::from_bits(*bits)),
         Val::F64(bits) => Const::F64(f64::from_bits(*bits)),
-        _ => Const::Null,
+        _ => unreachable!("only numbers are results"),
     }
 }
 
@@ -373,14 +371,11 @@ mod tests {
     #[test]
     fn runs_return_every_result() {
         let add = Expr::Binary(ValType::I32, BinOp::Add, Box::new(i32(2)), Box::new(i32(3)));
-        let results = vec![add, Expr::Const(Const::F64(1.5)), Expr::Const(Const::Null)];
-        let types = vec![ValType::I32, ValType::F64, ValType::ExternRef];
+        let results = vec![add, Expr::Const(Const::F64(1.5))];
+        let types = vec![ValType::I32, ValType::F64];
         let module = module(vec![entry(types, vec![Stmt::Return(results)])]);
         let (results, _) = evaluator().run(&module, 1000);
-        assert_eq!(
-            results,
-            Ok(vec![Const::I32(5), Const::F64(1.5), Const::Null])
-        );
+        assert_eq!(results, Ok(vec![Const::I32(5), Const::F64(1.5)]));
     }
 
     #[test]

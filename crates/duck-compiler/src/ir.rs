@@ -1,7 +1,7 @@
 //! The lowered program handed to codegen.
 //!
 //! Everything here is already resolved and type checked, and shaped after
-//! wasm: values are the four numeric wasm value types and `externref`, structs
+//! wasm: values are the four numeric wasm value types, structs
 //! have been split into one local or global per scalar field, function
 //! pointers are indices into the module's table, and control flow is wasm's
 //! structured `block`/`loop`/`if` with branch targets given as label depths.
@@ -66,8 +66,6 @@ pub enum ValType {
     I64,
     F32,
     F64,
-    /// An opaque reference from the host. Only null is constant.
-    ExternRef,
 }
 
 /// The wasm type of a function.
@@ -83,9 +81,6 @@ pub enum Const {
     I64(i64),
     F32(f32),
     F64(f64),
-    /// The null `externref`, which a union has for a variant it doesn't
-    /// hold.
-    Null,
 }
 
 /// A `var`, or an exported `let`. A `let` is a [`Expr::Const`] wherever it

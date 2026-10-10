@@ -82,8 +82,6 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - A type has a `size: uint` and an `align: uint`, as in `Point.size`,
   `(&Point).size` and `i64.align`. It is no value: `type` is only the type of
   a function's parameter, which makes it a type parameter.
-- `externref`: an opaque host reference. It is never stored in memory or
-  compared.
 - `never`: the type of what has no value, as a `return` has none. It is
   accepted as any type, and nothing else is accepted as it, so no value of
   it is made: a function that returns it never returns. It is never stored
@@ -598,7 +596,7 @@ fn demo(n: &Named) -> i32:
 - Only a type parameter is bounded. A function that takes a `Head` doesn't
   take a `Named`, and a `&Named` is not a `&Head`: cast it, `n as &Head`, or
   `n.* as Head` for the value. A `T` bounded by `Head` casts as `Head` does.
-- A type argument is storable: nothing is generic over `externref`.
+- A type argument is storable: nothing is generic over `never`.
 - A default, of a parameter or a field, is one value for every call and
   constructor, so it never names `T`, and is no value laid out by one:
   `none: option(T) = .none` is an error. It may fit the type as declared,
@@ -1052,8 +1050,6 @@ those as the Canonical ABI of the component model has them.
   are each a wasm `i32`, as are an `int`, a `uint`, a pointer and a function
   pointer, which no WIT has. The host may give any `i32` for a narrow one,
   which is brought into its range.
-- `externref` is an opaque reference of the host of a wasm module, which no
-  world has: a component neither takes nor gives one.
 
 ## WASI
 

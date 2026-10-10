@@ -723,7 +723,6 @@ fn number_bits(number: Const) -> u64 {
         Const::I64(x) => x as u64,
         Const::F32(x) => (x + 0.0).to_bits().into(),
         Const::F64(x) => (x + 0.0).to_bits(),
-        Const::Null => unreachable!("only numbers are literals"),
     }
 }
 

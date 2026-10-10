@@ -16,7 +16,7 @@ use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
     Body, Checker, FieldDef, Item, Leaf, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS,
-    Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_pure, is_stable, never, zero,
+    Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_pure, never, zero,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -254,58 +254,34 @@ impl Checker {
     /// counting the tag as leaf 0. The variants share the leaves as the
     /// Canonical ABI has them: the scalars of each are held in order from
     /// the first leaf, each of which has the [`join`] of the types it holds.
-    /// An `externref` is a number in no way, so those of each variant are
-    /// held in leaves of their own, which follow the rest.
     pub(super) fn union_leaves(&self, id: StructId) -> (Vec<ValType>, Vec<Vec<usize>>) {
         let variants = &self.structs[id.0 as usize].fields;
         let held: Vec<_> = variants.iter().map(|v| self.val_types(v.ty)).collect();
-        let is_ref = |vt: &&ValType| **vt == ValType::ExternRef;
         let mut shared: Vec<ValType> = Vec::new();
         for scalars in &held {
-            for (i, vt) in scalars.iter().filter(|vt| !is_ref(vt)).enumerate() {
+            for (i, vt) in scalars.iter().enumerate() {
                 match shared.get_mut(i) {
                     Some(leaf) => *leaf = join(*leaf, *vt),
                     None => shared.push(*vt),
                 }
             }
         }
-        let numbers = shared.len();
-        let refs = held
-            .iter()
-            .map(|scalars| scalars.iter().filter(is_ref).count());
-        shared.extend(iter::repeat_n(ValType::ExternRef, refs.max().unwrap_or(0)));
-        let leaves = |scalars: &Vec<ValType>| {
-            let (mut number, mut reference) = (1, 1 + numbers);
-            let leaf = |vt: &ValType| {
-                let next = match vt {
-                    ValType::ExternRef => &mut reference,
-                    _ => &mut number,
-                };
-                *next += 1;
-                *next - 1
-            };
-            scalars.iter().map(leaf).collect()
-        };
-        let leaves = held.iter().map(leaves).collect();
-        (shared, leaves)
+        // The first leaf is the tag.
+        let leaves = held.iter().map(|scalars| (1..=scalars.len()).collect());
+        (shared, leaves.collect())
     }
 }
 
 impl Checker {
     /// `value`, of union `from`, as a value of union `to`, which starts as
     /// `from` does: it holds the same variant. A scalar of a variant is in
-    /// the same leaf of its kind in both, which in `to` may be wider for
-    /// the variants that `from` hasn't, and the leaves that only those use
-    /// are zero.
+    /// the same leaf in both, which in `to` may be wider for the variants
+    /// that `from` hasn't, and the leaves that only those use are zero.
     pub(super) fn widen_union(&self, from: StructId, to: StructId, value: Value) -> Value {
-        let is_number = |vt: &&ValType| **vt != ValType::ExternRef;
         let (from_leaves, to_leaves) = (self.union_leaves(from).0, self.union_leaves(to).0);
-        let from_numbers = from_leaves.iter().filter(is_number).count();
-        let to_numbers = to_leaves.iter().filter(is_number).count();
         // Only a variant whose type failed to resolve leaves `to` without
         // a leaf that `from` has, as it then holds nothing.
-        let lacks_leaf = from_numbers > to_numbers
-            || from_leaves.len() - from_numbers > to_leaves.len() - to_numbers;
+        let lacks_leaf = from_leaves.len() > to_leaves.len();
         let types = iter::once(ValType::I32).chain(to_leaves);
         let mut scalars: Vec<_> = types.map(|vt| (vt, Expr::Const(zero(vt)))).collect();
         // Only a mistyped value has other scalars than the union's.
@@ -315,14 +291,7 @@ impl Checker {
                 scalars,
             };
         }
-        for (i, (vt, scalar)) in value.scalars.into_iter().enumerate() {
-            // The tag, a number, or an `externref`, which follow the
-            // numbers.
-            let leaf = match i {
-                0 => 0,
-                i if i <= from_numbers => i,
-                i => i - from_numbers + to_numbers,
-            };
+        for (leaf, (vt, scalar)) in value.scalars.into_iter().enumerate() {
             let (shared, zeroed) = &mut scalars[leaf];
             *zeroed = widen(vt, *shared, scalar);
         }
@@ -452,7 +421,7 @@ impl Body<'_> {
             }
             return (Ty::Error, Value::default());
         };
-        let mut held = match (bare, args) {
+        let held = match (bare, args) {
             (true, None) => Value::default(),
             (false, Some([arg])) if arg.label.is_none() => self.check(&arg.value, holds),
             _ => {
@@ -467,11 +436,6 @@ impl Body<'_> {
         // Only a mistyped value has other scalars than the variant's.
         if held.scalars.len() != leaves.len() {
             return (ty, self.blank(ty));
-        }
-        // The leaves are evaluated in their order, which isn't that of the
-        // scalars they hold where an `externref` comes before a number.
-        if !leaves.is_sorted() {
-            self.spill(&mut held, is_stable);
         }
         let mut value = self.blank(ty);
         value.scalars[0].1 = Expr::Const(Const::I32(index as i32));

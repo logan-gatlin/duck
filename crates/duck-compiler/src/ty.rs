@@ -164,9 +164,6 @@ const OPTION: &str = "option";
 /// The name of the built-in union that holds a value or an error.
 const RESULT: &str = "result";
 
-/// The name of the host reference type.
-const EXTERNREF: &str = "externref";
-
 /// The name of the built-in type of types used as values.
 const TYPE: &str = "type";
 
@@ -281,10 +278,6 @@ pub enum Ty {
     /// have, and the body of its generic function's while that is checked as
     /// declared. Uses of either replace it with a type argument.
     Param(ParamId),
-    /// `externref`, an opaque reference that only the host can create. It
-    /// can't be stored in linear memory, so nothing that holds one has a
-    /// pointer type.
-    ExternRef,
     /// `tuple()`, the return type of functions without one. Its values have no
     /// scalars, so they take no storage in wasm.
     Unit,
@@ -508,7 +501,7 @@ pub enum TypeErrorKind {
     NotAssignable,
     /// `&` applied to something not behind a pointer, such as a local.
     NotAddressable,
-    /// A pointer to a type holding an `externref`, which can't be in memory.
+    /// A pointer to a type holding a `never`, which nothing in memory is.
     NotStorable(String),
     ImmutableAssign(String),
     /// A write to memory behind `ty`, a `&T` or `array(T)`, which only read
@@ -3144,8 +3137,6 @@ impl Checker {
             Ty::Prim(prim)
         } else if name == STRING {
             self.string_ty()
-        } else if name == EXTERNREF {
-            Ty::ExternRef
         } else if name == NEVER {
             Ty::Never
         } else if name == TYPE {
@@ -3172,11 +3163,11 @@ impl Checker {
         }
     }
 
-    /// Whether `ty` can live in linear memory: it holds no `externref`, and
-    /// no `never`, which nothing there is.
+    /// Whether `ty` can live in linear memory: it holds no `never`, which
+    /// nothing there is.
     fn storable(&self, ty: Ty) -> bool {
         match ty {
-            Ty::ExternRef | Ty::Never => false,
+            Ty::Never => false,
             Ty::Enum(id) => self.storable(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) => self
                 .members(ty)
@@ -3425,7 +3416,6 @@ impl Checker {
                 format!("fn({}){ret}", params.join(", "))
             }
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
-            Ty::ExternRef => EXTERNREF.to_string(),
             Ty::Type => TYPE.to_string(),
             Ty::Unit => format!("{TUPLE}()"),
             Ty::Never => NEVER.to_string(),
@@ -3446,7 +3436,6 @@ impl Checker {
         match ty {
             Ty::Prim(prim) => out.push((name, self.fixed(prim).val_type())),
             Ty::Ptr(_) | Ty::Fn(_) => out.push((name, self.addr_type())),
-            Ty::ExternRef => out.push((name, ValType::ExternRef)),
             Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
             Ty::Struct(id) => {
                 // A union's tag has the name of the union itself, and the
@@ -3784,7 +3773,7 @@ impl Checker {
             }
             // Never in memory, but a struct holding one still has a layout
             // that `field` asks for.
-            Ty::ExternRef | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
         }
     }
 
@@ -3864,7 +3853,6 @@ impl Checker {
                     self.push_cells(member, offset + member_offset, &held, &when, out);
                 }
             }
-            Ty::ExternRef => unreachable!("`externref` has no pointer type"),
             Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
@@ -5227,9 +5215,8 @@ impl<'c> Body<'c> {
     }
 
     /// Whether a constant of type `ty` can be placed in memory. One that
-    /// holds an `externref` is reported at `span`, unless the literal it's
-    /// in has an error already, having had `errors` before it: only a union
-    /// that holds none in place of one is constant.
+    /// holds a `never` is reported at `span`, unless the literal it's in has
+    /// an error already, having had `errors` before it.
     fn placeable(&mut self, ty: Ty, errors: usize, span: Span) -> bool {
         if ty == Ty::Error {
             return false;
@@ -6584,7 +6571,6 @@ fn write_const(out: &mut [u8], store: StoreOp, c: Const) {
         Const::I64(x) => x.to_le_bytes().to_vec(),
         Const::F32(x) => x.to_le_bytes().to_vec(),
         Const::F64(x) => x.to_le_bytes().to_vec(),
-        Const::Null => unreachable!("`externref` has no pointer type"),
     };
     let width = match store {
         StoreOp::Store8 => 1,
@@ -6596,7 +6582,6 @@ fn write_const(out: &mut [u8], store: StoreOp, c: Const) {
 
 fn zero(ty: ValType) -> Const {
     match ty {
-        ValType::ExternRef => Const::Null,
         ValType::I32 => Const::I32(0),
         ValType::I64 => Const::I64(0),
         ValType::F32 => Const::F32(0.0),
@@ -6885,10 +6870,7 @@ fn module_path(expr: &parse::Expr) -> Option<Vec<Ident>> {
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
-    [
-        ARRAY, VARRAY, STRING, TUPLE, EXTERNREF, TYPE, OPTION, RESULT, NEVER,
-    ]
-    .contains(&name)
+    [ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT, NEVER].contains(&name)
         || Prim::from_name(name).is_some()
 }
 
@@ -7105,7 +7087,6 @@ fn float(c: Const) -> f64 {
         Const::F64(x) => x,
         Const::I32(x) => x as f64,
         Const::I64(x) => x as f64,
-        Const::Null => unreachable!("only numbers convert"),
     }
 }
 
@@ -7283,7 +7264,6 @@ mod tests {
             Const::I64(x) => format!("{x}i64"),
             Const::F32(x) => format!("{x}f32"),
             Const::F64(x) => format!("{x}f64"),
-            Const::Null => "null".to_string(),
         }
     }
 
@@ -8516,19 +8496,17 @@ fn f(a: u8, b: i8, c: i64, x: f32):
         let src = "\
 struct S:
     a: i32
-    e: externref
 fn u():
     pass
-fn f(b: bool, p: &i32, e: externref, s: S):
+fn f(b: bool, p: &i32, s: S):
     let b2 = b as bool
     let p2 = p as &i32
-    let e2 = e as externref
     let s2 = s as S
     let u2 = u() as tuple()
 ";
         assert_eq!(
             body(&lower(src), "f"),
-            "(set b2 b) (set p2 p) (set e2 e) (set s2.a s.a) (set s2.e s.e) (call u [] -> [])"
+            "(set b2 b) (set p2 p) (set s2.a s.a) (call u [] -> [])"
         );
     }
 
@@ -9681,87 +9659,6 @@ fn f(a: i16, b: i16, c: u8, d: i32):
     }
 
     #[test]
-    fn externrefs_pass_through_locals_and_structs() {
-        let src = "\
-pub struct Handle:
-    el: externref
-    id: i32
-extern:
-    fn get(id: i32) -> externref
-    fn put(el: externref)
-    fn wrap(h: Handle) -> Handle
-pub fn f(a: externref) -> Handle:
-    var b = get(1)
-    put(b)
-    b = a
-    let h = wrap(Handle(el: b, id: 2))
-    return Handle(el: h.el, id: 3)
-";
-        let module = lower(src);
-        assert_eq!(module.imports[0].results, vec![ValType::ExternRef]);
-        assert_eq!(
-            module.imports[2].params,
-            vec![ValType::ExternRef, ValType::I32]
-        );
-        assert_eq!(module.funcs[0].params, vec![ValType::ExternRef]);
-        assert_eq!(
-            module.funcs[0].results,
-            vec![ValType::ExternRef, ValType::I32]
-        );
-        assert_eq!(
-            body(&module, "f"),
-            "(set b (call get 1)) (call put [b] -> []) (set b a) \
-             (call wrap [b 2] -> [tmp2 tmp3]) (set h.el tmp2) (set h.id tmp3) \
-             (return h.el 3)"
-        );
-    }
-
-    #[test]
-    fn externrefs_are_opaque_and_never_in_memory() {
-        let src = "\
-struct S:
-    e: externref
-struct T:
-    p: &&S
-    q: &U
-    r: &T
-struct U:
-    s: S
-extern:
-    fn get() -> externref
-let g = get()
-fn f(a: externref, p: &externref):
-    let b = a == a
-    let c = a + a
-    let d = -a
-    let e: externref = 0
-    let h = a as i32
-    let i = 0 as externref
-    let j = 1 as &S
-";
-        let cast = |from: &str, to: &str| TypeErrorKind::InvalidCast {
-            from: from.into(),
-            to: to.into(),
-        };
-        let not_storable = |ty: &str| TypeErrorKind::NotStorable(ty.into());
-        assert_eq!(
-            errors(src),
-            vec![
-                not_storable("S"),
-                not_storable("U"),
-                not_storable("externref"),
-                invalid_operand("==", "externref"),
-                invalid_operand("+", "externref"),
-                invalid_operand("-", "externref"),
-                mismatch("externref", "i32"),
-                cast("externref", "i32"),
-                cast("i32", "externref"),
-                not_storable("S"),
-            ]
-        );
-    }
-
-    #[test]
     fn tuples_are_split_into_scalars() {
         let src = "\
 fn swap(t: tuple(i32, f64)) -> tuple(f64, i32):
@@ -9892,7 +9789,7 @@ fn f(p: &var tuple(u8, tuple(f64, i16)), q: &&var tuple(i32, i32)) -> &i16:
 struct A:
     t: tuple(i32, A)
 struct B:
-    p: &tuple(externref, i32)
+    p: &tuple(never, i32)
 fn f(t: tuple(i32, f32)) -> tuple(i32, i32):
     let x = t.2
     let y = t.x
@@ -9915,7 +9812,7 @@ fn f(t: tuple(i32, f32)) -> tuple(i32, i32):
             errors(src),
             vec![
                 RecursiveStruct("A".into()),
-                NotStorable("tuple(externref, i32)".into()),
+                NotStorable("tuple(never, i32)".into()),
                 no_field("2"),
                 no_field("x"),
                 mismatch("tuple(_, _, _)", "tuple(i32, f32)"),
@@ -10419,17 +10316,14 @@ fn(T) e(x: Nope) -> T:
     #[test]
     fn type_arguments_are_storable() {
         let src = "\
-extern:
-    fn host() -> externref
 struct R:
-    r: externref
+    r: never
 fn(T) f(x: T):
     pass
 fn g(T: type) -> array(T):
     return g(T)
 fn h(r: R):
-    f(host())
-    g(externref)
+    g(never)
     f(r)
     f(1)
 ";
@@ -10447,8 +10341,7 @@ fn h(r: R):
         assert_eq!(
             found,
             vec![
-                (not_storable("externref"), "f(host())"),
-                (not_storable("externref"), "g(externref)"),
+                (not_storable("never"), "g(never)"),
                 (not_storable("R"), "f(r)"),
             ]
         );
@@ -11597,8 +11490,8 @@ struct(T) Box:
 struct(T) Ptr:
     p: &T
 struct Holder:
-    h: Ptr(externref)
-fn f(a: Ptr(tuple(externref, i32)), b: &Box(externref), c: Box(i32), d: Box(u8)):
+    h: Ptr(never)
+fn f(a: Ptr(tuple(never, i32)), b: &Box(never), c: Box(i32), d: Box(u8)):
     pass
 ";
         let errors: Vec<_> = check_src(src)
@@ -11613,17 +11506,14 @@ fn f(a: Ptr(tuple(externref, i32)), b: &Box(externref), c: Box(i32), d: Box(u8))
             errors,
             vec![
                 (TypeErrorKind::UnknownType("Missing".into()), "Missing"),
+                (TypeErrorKind::NotStorable("never".into()), "Ptr(never)"),
                 (
-                    TypeErrorKind::NotStorable("externref".into()),
-                    "Ptr(externref)"
+                    TypeErrorKind::NotStorable("tuple(never, i32)".into()),
+                    "Ptr(tuple(never, i32))"
                 ),
                 (
-                    TypeErrorKind::NotStorable("tuple(externref, i32)".into()),
-                    "Ptr(tuple(externref, i32))"
-                ),
-                (
-                    TypeErrorKind::NotStorable("Box(externref)".into()),
-                    "&Box(externref)"
+                    TypeErrorKind::NotStorable("Box(never)".into()),
+                    "&Box(never)"
                 ),
             ]
         );
@@ -11844,8 +11734,8 @@ struct(T) Box:
 fn g(t: &type) -> type:
     pass
 fn f(T: type):
-    let a = externref
-    let b = Box(tuple(externref, i32)).size
+    let a = never
+    let b = Box(tuple(never, i32)).size
     let c = Box
     let d = i32(1)
     i32 = 1
@@ -11860,8 +11750,8 @@ fn f(T: type):
                 DuplicateItem("type".into()),
                 TypeOutsideParam,
                 TypeOutsideParam,
-                NotAValue("externref".into()),
-                NotStorable("Box(tuple(externref, i32))".into()),
+                NotAValue("never".into()),
+                NotStorable("Box(tuple(never, i32))".into()),
                 MissingTypeArgs("Box".into()),
                 NotCallable("i32".into()),
                 NotAssignable,
@@ -12688,7 +12578,7 @@ let b = [1, 2.0]
 let c = [get()]
 let d: array(u8) = [256]
 let e = [1 / 0]
-let g: array(externref) = []
+let g: array(never) = []
 fn f():
     let s = \"hi\"
     let l = [1]
@@ -12700,7 +12590,7 @@ fn f():
                 mismatch("i32", "f64"),
                 IntOutOfRange("u8".into()),
                 ConstTrap,
-                NotStorable("externref".into()),
+                NotStorable("never".into()),
                 LiteralOutsideGlobal,
                 LiteralOutsideGlobal,
             ]
@@ -13160,16 +13050,7 @@ union Mixed:
     float: f32
     pair: tuple(u8, f64)
     long: i64
-union Refs:
-    one: tuple(externref, f32)
-    two: tuple(i32, externref, externref)
-    none
-extern:
-    fn get() -> externref
-    fn number() -> f32
-fn order() -> Refs:
-    return .one((get(), number()))
-fn shapes(a: result(i32, f32), b: result(array(u8), f64), c: result(f32, f32), d: Refs):
+fn shapes(a: result(i32, f32), b: result(array(u8), f64), c: result(f32, f32)):
     pass
 fn build(x: i32, y: f32, z: f64, b: u8) -> Mixed:
     if x == 0:
@@ -13191,19 +13072,11 @@ fn read(m: Mixed) -> f64:
             return 0.0
 ";
         let module = lower(src);
-        // An `i32` and an `f32` share an `i32`, any others that differ an
-        // `i64`, and `externref`s only leaves of their own, after the rest.
+        // An `i32` and an `f32` share an `i32`, and any others that differ
+        // an `i64`.
         let shapes = module.funcs.iter().find(|f| f.name == "shapes").unwrap();
         let (a, b, c) = ([I32, I32], [I32, I64, I32], [I32, F32]);
-        let d = [I32, I32, ExternRef, ExternRef];
-        assert_eq!(shapes.params, [&a[..], &b[..], &c[..], &d[..]].concat());
-        // What a variant holds is evaluated in the order it's written,
-        // whichever leaves hold it.
-        assert_eq!(
-            body(&module, "order"),
-            "(set tmp0 (call get )) (set tmp1 (call number )) \
-             (return 0 (F32.Reinterpret tmp1) tmp0 null)"
-        );
+        assert_eq!(shapes.params, [&a[..], &b[..], &c[..]].concat());
         let build = module.funcs.iter().find(|f| f.name == "build").unwrap();
         assert_eq!(build.results, [I32, I64, F64]);
         // A leaf holds the bits of a scalar narrower than it, and zeroes
@@ -13621,38 +13494,12 @@ fn round(a: Shape) -> bool:
         );
         assert_eq!(
             errors(
-                "union R:\n    r: externref\n    none\nfn f(a: R) -> bool:\n    return a == .none\n"
+                "union R:\n    r: never\n    none\nfn f(a: R) -> bool:\n    return a == .none\n"
             ),
             vec![TypeErrorKind::InvalidOperand {
                 op: "==",
                 ty: "R".into()
             }]
-        );
-    }
-
-    #[test]
-    fn unions_holding_externrefs_are_constants_that_memory_cannot_hold() {
-        use TypeErrorKind::*;
-        let src = "\
-union Ref:
-    some: externref
-    none
-var held: Ref = .none
-let a = &Ref.none
-let b = [Ref.none]
-let c = [Ref.none; 2]
-fn f() -> u32:
-    return Ref.size
-";
-        let not_storable = || NotStorable("Ref".into());
-        assert_eq!(
-            errors(src),
-            vec![
-                not_storable(),
-                not_storable(),
-                not_storable(),
-                not_storable()
-            ]
         );
     }
 
@@ -14617,7 +14464,7 @@ fn f(a: N, b: N) -> bool:
     fn equality_needs_values_to_compare() {
         let src = "\
 struct H:
-    r: externref
+    r: never
 struct P:
     x: i32
 let s = \"ab\" == \"ab\"
@@ -14805,7 +14652,7 @@ enum(S) E:
     a = S(e: 1)
 enum(Nope) Z:
     z = 1
-enum(&externref) X:
+enum(&never) X:
     x = 1
 struct(R) Box:
     value: R
@@ -14824,7 +14671,7 @@ fn f():
                 RecursiveEnum("C".into()),
                 DuplicateItem("R".into()),
                 RecursiveStruct("S".into()),
-                NotStorable("externref".into()),
+                NotStorable("never".into()),
                 NotCallable("R".into()),
                 mismatch("tuple(_, _)", "P"),
             ]
@@ -15077,7 +14924,7 @@ fn f(p: &var S, g: fn(i32) -> i32) -> bool:
     let k = h as! fn() -> f32
     let z = 0 as! fn()
     let t = (fn(i32) -> i32).size
-    let s = tuple(u8, fn(externref) -> externref).size
+    let s = tuple(u8, fn(never) -> never).size
     return p.f == inc and g != inc
 ";
         let module = lower(src);
@@ -15211,7 +15058,7 @@ fn f(g: fn(i32) -> i32, n: i32, h: fn(i32)):
         let src = "\
 struct Node:
     visit: fn(Node) -> Node
-    host: fn(externref) -> externref
+    host: fn(never) -> never
 fn f(p: &Node) -> uint:
     return Node.size + Node.align
 ";
@@ -15223,7 +15070,7 @@ fn f(p: &Node) -> uint:
 struct Hidden:
     x: i32
 struct Host:
-    r: externref
+    r: never
 struct(T) Grow:
     next: fn(Grow(tuple(T, T)))
 pub fn take(f: fn(Hidden) -> i32):
@@ -15913,7 +15760,7 @@ struct Text:
     use array(u8)
     hash: u32
 struct Host:
-    use array(externref)
+    use array(never)
 fn f(t: Text, p: &u8):
     t.ptr.* = 1
     let u = Text(ptr: p, hash: 0)
@@ -15932,7 +15779,7 @@ fn f(t: Text, p: &u8):
                     },
                     "array(u8)"
                 ),
-                (NotStorable("externref".into()), "array(externref)"),
+                (NotStorable("never".into()), "array(never)"),
                 (
                     ReadOnlyWrite {
                         ty: "&u8".into(),
@@ -16351,15 +16198,15 @@ struct(T) Box:
 struct A:
     use Box(A)
 struct Ext:
-    p: &externref
+    p: &never
 struct Copy:
     use Ext
 struct(T) Ptr:
     p: &T
 struct E:
-    use Ptr(externref)
+    use Ptr(never)
 struct(T) Open:
-    use Ptr(tuple(T, externref))
+    use Ptr(tuple(T, never))
 struct Hidden:
     x: i32
 struct Inner:
@@ -16392,7 +16239,7 @@ enum(u8) Same:
             ty: "Hidden".into(),
             item: item.into(),
         };
-        let unstorable = || NotStorable("externref".into());
+        let unstorable = || NotStorable("never".into());
         assert_eq!(
             errors_at(src),
             vec![
@@ -16401,12 +16248,12 @@ enum(u8) Same:
                 (RecursiveStruct("A".into()), "Box(A)"),
                 // Reported once: where it is declared, or where the type
                 // arguments that make it so are given.
-                (unstorable(), "p: &externref"),
+                (unstorable(), "p: &never"),
                 (
-                    NotStorable("tuple(T, externref)".into()),
-                    "Ptr(tuple(T, externref))"
+                    NotStorable("tuple(T, never)".into()),
+                    "Ptr(tuple(T, never))"
                 ),
-                (unstorable(), "Ptr(externref)"),
+                (unstorable(), "Ptr(never)"),
                 (
                     BoundNotMet {
                         ty: "Inner".into(),

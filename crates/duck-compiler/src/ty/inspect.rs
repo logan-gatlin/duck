@@ -23,9 +23,9 @@ pub use lints::{Unused, UnusedKind};
 pub use symbols::{Symbol, SymbolKind};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Checker, EXTERNREF, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, NEVER,
-    OPTION, Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY,
-    is_builtin_type, lower_program,
+    ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, NEVER, OPTION, Prim,
+    RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY, is_builtin_type,
+    lower_program,
 };
 
 mod actions;
@@ -578,9 +578,7 @@ impl Analysis {
         }
         let type_params = site.type_params.iter().map(|param| param.name.as_str());
         let prims = PRIMS.iter().map(|prim| prim.name());
-        let builtins = [
-            ARRAY, VARRAY, STRING, TUPLE, OPTION, RESULT, EXTERNREF, NEVER, TYPE,
-        ];
+        let builtins = [ARRAY, VARRAY, STRING, TUPLE, OPTION, RESULT, NEVER, TYPE];
         for name in type_params.chain(prims).chain(builtins) {
             names.push(Completion {
                 name: name.to_string(),

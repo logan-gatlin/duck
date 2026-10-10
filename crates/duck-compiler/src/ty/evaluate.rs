@@ -510,7 +510,6 @@ mod tests {
             Const::I64(x) => format!("{x}i64"),
             Const::F32(x) => format!("{x:?}f32"),
             Const::F64(x) => format!("{x:?}f64"),
-            Const::Null => "null".to_string(),
         };
         let globals = module.globals.iter().filter(|g| !g.exports.is_empty());
         let globals = globals.map(|g| format!("{}={}", g.name, value(g.init)));
