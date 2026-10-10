@@ -80,10 +80,10 @@ struct Document {
 }
 
 /// The words of the language that a name can be written in place of.
-const KEYWORDS: [&str; 27] = [
+const KEYWORDS: [&str; 28] = [
     "and", "as", "break", "continue", "defer", "else", "enum", "extern", "false", "fn", "for",
-    "if", "in", "let", "match", "module", "not", "or", "pass", "pub", "return", "struct", "true",
-    "union", "use", "var", "while",
+    "if", "in", "let", "match", "module", "not", "or", "pass", "pub", "return", "struct", "todo",
+    "true", "union", "use", "var", "while",
 ];
 
 /// What marks the source in a hover as duck, for an editor to highlight.

@@ -717,3 +717,38 @@ fn f():
               (break_expression)))
           (expression_statement
             (break_expression)))))))
+
+====================
+Todo
+====================
+
+fn f(a: todo) -> &todo:
+    a or todo
+    let x: Box(todo) = todo
+    todo
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (todo_type)))
+    (pointer_type
+      (todo_type))
+    (block
+      (expression_statement
+        (binary_expression
+          (identifier)
+          (todo_expression)))
+      (binding
+        (identifier)
+        (named_type
+          (identifier)
+          (type_arguments
+            (todo_type)))
+        (todo_expression))
+      (expression_statement
+        (todo_expression)))))

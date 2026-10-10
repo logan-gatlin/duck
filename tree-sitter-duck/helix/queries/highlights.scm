@@ -83,6 +83,10 @@
 "use" @keyword.control.import
 "return" @keyword.control.return
 "defer" @keyword.control
+[
+  (todo_expression)
+  (todo_type)
+] @keyword.control.exception
 
 [
   "if"

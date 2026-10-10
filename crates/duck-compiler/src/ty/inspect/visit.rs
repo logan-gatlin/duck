@@ -93,7 +93,8 @@ fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
         | ExprKind::Dot(_)
         | ExprKind::FnType(_)
         | ExprKind::Break
-        | ExprKind::Continue => {}
+        | ExprKind::Continue
+        | ExprKind::Todo => {}
         ExprKind::Tuple(elems) | ExprKind::List(elems) => {
             for elem in elems {
                 self::expr(elem, visit);

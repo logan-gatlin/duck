@@ -77,6 +77,10 @@
 "fn" @keyword.function
 "use" @keyword.import
 "return" @keyword.return
+[
+  (todo_expression)
+  (todo_type)
+] @keyword.exception
 
 [
   "if"

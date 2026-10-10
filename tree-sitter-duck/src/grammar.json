@@ -1603,6 +1603,10 @@
         {
           "type": "SYMBOL",
           "name": "function_type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "todo_type"
         }
       ]
     },
@@ -1875,6 +1879,10 @@
           "value": ")"
         }
       ]
+    },
+    "todo_type": {
+      "type": "STRING",
+      "value": "todo"
     },
     "block": {
       "type": "SEQ",
@@ -2308,6 +2316,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "todo_expression"
+        },
+        {
+          "type": "SYMBOL",
           "name": "assignment_expression"
         },
         {
@@ -2615,6 +2627,10 @@
     "continue_expression": {
       "type": "STRING",
       "value": "continue"
+    },
+    "todo_expression": {
+      "type": "STRING",
+      "value": "todo"
     },
     "assignment_expression": {
       "type": "PREC_RIGHT",

@@ -978,6 +978,10 @@ mod tests {
         let src = "fn f():\n  while a:\n    b  or  break\n    f(continue,-break)and(break)\n";
         let expected = "fn f():\n\twhile a:\n\t\tb or break\n\t\tf(continue, -break) and (break)\n";
         assert_eq!(formatted(src), expected);
+        // And a `todo`.
+        let src = "fn f():\n  a  or  todo\n  f(todo,-todo)and(todo)\n";
+        let expected = "fn f():\n\ta or todo\n\tf(todo, -todo) and (todo)\n";
+        assert_eq!(formatted(src), expected);
         // A chain that is broken is broken before the `return` that ends it.
         let src = "fn f():\n\tn * 2\n\t\t|> add(_, 1) |> return _\n";
         let expected = "fn f():\n\tn * 2\n\t\t|> add(_, 1)\n\t\t|> return _\n";

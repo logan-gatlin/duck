@@ -3082,6 +3082,8 @@ impl Checker {
                     false => self.fn_of(params, ret),
                 }
             }
+            // Only a `todo` is of it, which is of any type.
+            TypeKind::Todo => Ty::Never,
         }
     }
 
@@ -3108,7 +3110,9 @@ impl Checker {
                 }
                 None => Ty::Error,
             },
-            TypeKind::Pointer(..) | TypeKind::Fn(..) => unreachable!("only names are qualified"),
+            TypeKind::Pointer(..) | TypeKind::Fn(..) | TypeKind::Todo => {
+                unreachable!("only names are qualified")
+            }
         }
     }
 
@@ -4958,6 +4962,8 @@ impl<'c> Body<'c> {
                 let outside = TypeErrorKind::ContinueOutsideLoop;
                 self.branch("continue", Label::Continue, outside, expr.span)
             }
+            // It has no value: nothing is evaluated after it traps.
+            ExprKind::Todo => never(vec![Stmt::Unreachable]),
         }
     }
 
@@ -6876,7 +6882,8 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
         | ExprKind::Placeholder
         | ExprKind::Dot(_)
         | ExprKind::Break
-        | ExprKind::Continue => {}
+        | ExprKind::Continue
+        | ExprKind::Todo => {}
         ExprKind::Tuple(items) | ExprKind::List(items) => {
             for item in items {
                 push_assigned(item, names);
@@ -7073,6 +7080,7 @@ fn has_break(expr: &parse::Expr) -> bool {
         | ExprKind::Placeholder
         | ExprKind::Dot(_)
         | ExprKind::Continue
+        | ExprKind::Todo
         | ExprKind::Return(None) => false,
         ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().any(has_break),
         ExprKind::Unary(_, inner)
@@ -12858,6 +12866,102 @@ fn copy(a: varray(u8), b: array(u8)):
         assert_eq!(body(&module, "grow"), "(return (memory.grow n))");
         assert_eq!(body(&module, "fill"), "(memory.fill p 7 n)");
         assert_eq!(body(&module, "copy"), "(memory.copy a.ptr b.ptr a.len)");
+    }
+
+    #[test]
+    fn todo_traps_and_diverges() {
+        let src = "\
+fn f(x: u32) -> u32:
+    if x == 0:
+        return 1
+    todo
+fn g():
+    todo
+    pass
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(if (I32.Eq x 0) (then (return 1)) (else )) unreachable"
+        );
+        assert_eq!(body(&module, "g"), "unreachable");
+        // It has no value, so it is a `never`, which is of any type.
+        let src = "\
+fn guard(ok: bool) -> i32:
+    ok or todo
+    return 1
+fn value(n: i32) -> i32:
+    let x: i32 = todo
+    return n + todo
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "guard"),
+            "(drop (if ok 1 (seq unreachable 0))) (return 1)"
+        );
+        assert_eq!(
+            body(&module, "value"),
+            "unreachable (set x 0) unreachable (return (I32.Add n 0))"
+        );
+        // One that is deferred ends no function, as nothing deferred does.
+        let src = "fn h() -> i32:\n    defer todo\n    pass\n";
+        assert_eq!(errors(src), [TypeErrorKind::MissingReturn("h".into())]);
+    }
+
+    #[test]
+    fn todo_is_the_type_of_a_todo() {
+        let src = "\
+struct(T) Box:
+    value: T
+struct Shape:
+    kind: todo
+    side: f32
+fn area(s: Shape) -> todo:
+    todo
+fn scale(s: Shape, by: todo) -> Shape:
+    return scale(s, todo)
+fn boxed() -> Box(todo):
+    let f: fn(todo) -> todo = todo
+    return Box(todo)(value: todo)
+fn double(s: Shape) -> f32:
+    let a = area(s)
+    return a * 2.0
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "area"), "unreachable");
+        assert_eq!(
+            body(&module, "scale"),
+            "unreachable (return (call scale s.side))"
+        );
+        assert_eq!(
+            body(&module, "boxed"),
+            "unreachable (set f 0) unreachable (return )"
+        );
+        // What is made of one is of any type, as it is.
+        assert_eq!(
+            body(&module, "double"),
+            "(call area [s.side] -> []) unreachable (return 0f32)"
+        );
+        // Nothing else is of it, and it is stored nowhere.
+        let src = "\
+fn f(by: todo):
+    pass
+fn g(p: &todo):
+    f(1)
+";
+        assert_eq!(
+            errors_at(src),
+            [
+                (TypeErrorKind::NotStorable("never".into()), "&todo"),
+                (
+                    TypeErrorKind::Mismatch {
+                        expected: "never".into(),
+                        found: "i32".into()
+                    },
+                    "1"
+                ),
+            ]
+        );
     }
 
     #[test]

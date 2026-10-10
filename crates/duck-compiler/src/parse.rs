@@ -241,6 +241,9 @@ pub enum TypeKind {
     Qualified(Ident, Box<Type>),
     /// `fn(A, B) -> R`, a pointer to a function. `None` is no result written.
     Fn(Vec<Type>, Option<Box<Type>>),
+    /// `todo`, in place of a type yet to be written. Nothing but a `todo` is
+    /// of it.
+    Todo,
 }
 
 pub type Block = Vec<Stmt>;
@@ -347,6 +350,9 @@ pub enum ExprKind {
     /// `continue`, which has none, as the loop goes on to its next
     /// iteration from where it is.
     Continue,
+    /// `todo`, which has none, as it traps where it is: what is yet to be
+    /// written is in its place.
+    Todo,
 }
 
 /// A call argument, optionally labelled as in `f(name: value)`.
@@ -530,6 +536,7 @@ impl fmt::Display for Type {
                     None => Ok(()),
                 }
             }
+            TypeKind::Todo => write!(f, "todo"),
         }
     }
 }
@@ -1069,6 +1076,10 @@ impl<'a> Parser<'a> {
                 };
                 TypeKind::Fn(params, ret)
             }
+            TokenKind::Todo => {
+                self.bump();
+                TypeKind::Todo
+            }
             _ => return Err(self.unexpected("type")),
         };
         Ok(Type {
@@ -1491,6 +1502,7 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => ExprKind::Name(name.clone()),
             TokenKind::Break => ExprKind::Break,
             TokenKind::Continue => ExprKind::Continue,
+            TokenKind::Todo => ExprKind::Todo,
             TokenKind::LParen => {
                 self.bump();
                 let kind = match self.bracketed(|p| p.parens(Self::expr))? {
@@ -1828,6 +1840,7 @@ fn starts_expr(kind: &TokenKind) -> bool {
             | TokenKind::Return
             | TokenKind::Break
             | TokenKind::Continue
+            | TokenKind::Todo
     )
 }
 
@@ -1935,6 +1948,7 @@ mod tests {
             }
             ExprKind::Break => "break".to_string(),
             ExprKind::Continue => "continue".to_string(),
+            ExprKind::Todo => "todo".to_string(),
             ExprKind::Return(None) => "(return)".to_string(),
             ExprKind::Return(Some(value)) => format!("(return {})", sexpr(value)),
         }
@@ -1957,6 +1971,7 @@ mod tests {
                 let ret = ret.as_ref().map(|ret| format!(" -> {}", render_ty(ret)));
                 format!("fn({}){}", params.join(", "), ret.unwrap_or_default())
             }
+            TypeKind::Todo => "todo".to_string(),
         }
     }
 
@@ -2399,6 +2414,33 @@ mod tests {
             expr("x |> g(_) or break |> f(_)"),
             "(|> (|> x (Or (call g _) break)) (call f _))"
         );
+    }
+
+    #[test]
+    fn todo_is_an_expression() {
+        assert_eq!(expr("a or todo"), "(Or a todo)");
+        assert_eq!(expr("f(todo, x) + todo"), "(Add (call f todo x) todo)");
+        assert_eq!(expr("return todo"), "(return todo)");
+        // It is a keyword, so nothing is named it.
+        assert!(!errors("let todo = 1\n").is_empty());
+    }
+
+    #[test]
+    fn todo_is_a_type() {
+        assert_eq!(expr("x as todo"), "(as x todo)");
+        assert_eq!(
+            expr("x as &var Box(todo, fn(todo) -> todo)"),
+            "(as x &var Box(todo, fn(todo) -> todo))"
+        );
+        let module = parse_src("fn f(a: todo) -> todo:\n    let x: todo = todo\n").unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(f.sig.params[0].ty.kind, TypeKind::Todo);
+        assert_eq!(f.sig.ret.as_ref().unwrap().to_string(), "todo");
+        // It is no name, so it takes no arguments and is in no module.
+        assert!(!errors("let x: todo(i32) = 1\n").is_empty());
+        assert!(!errors("let x: m.todo = 1\n").is_empty());
     }
 
     #[test]

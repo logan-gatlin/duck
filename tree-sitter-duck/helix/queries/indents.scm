@@ -44,6 +44,7 @@
   (expression_statement (pipe_expression body: (return_expression)))
   (expression_statement (break_expression))
   (expression_statement (continue_expression))
+  (expression_statement (todo_expression))
   (pass_statement)
 ] @extend.prevent-once
 

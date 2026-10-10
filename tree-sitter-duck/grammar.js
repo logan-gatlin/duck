@@ -317,6 +317,7 @@ module.exports = grammar({
       $.qualified_type,
       $.pointer_type,
       $.function_type,
+      $.todo_type,
     ),
 
     // The precedence keeps the `(` after `x as Name` as the type's arguments
@@ -351,6 +352,9 @@ module.exports = grammar({
     )),
 
     parameter_types: $ => seq('(', commaSep($._type), ')'),
+
+    // A type yet to be written, which only a `todo` is of.
+    todo_type: _ => 'todo',
 
     // Statements
 
@@ -450,6 +454,7 @@ module.exports = grammar({
       $.return_expression,
       $.break_expression,
       $.continue_expression,
+      $.todo_expression,
       $.assignment_expression,
       $.pipe_expression,
       $.unary_expression,
@@ -505,6 +510,9 @@ module.exports = grammar({
     break_expression: _ => 'break',
 
     continue_expression: _ => 'continue',
+
+    // Nor has this, which traps where it is.
+    todo_expression: _ => 'todo',
 
     // `target = value`, whose value is the one assigned. Groups to the right.
     assignment_expression: $ => prec.right(PREC.assign, seq(

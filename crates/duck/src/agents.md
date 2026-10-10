@@ -56,9 +56,9 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   immutable, and shadowing is allowed. Conditions are `bool`.
 - A parameter anywhere in the list may have a default. Label a later argument
   to skip one: with `fn f(a: i32, b: i32 = 1, c: i32 = 2)`, `f(0, c: 5)`.
-- Keywords: `pub fn let var return if else while for in break continue pass
-  defer match struct enum union extern use module and or not true false as
-  as!`. No item is named `array`, `varray`, `string`, `tuple`, `type`,
+- Keywords: `pub fn let var return if else while for in break continue todo
+  pass defer match struct enum union extern use module and or not true false
+  as as!`. No item is named `array`, `varray`, `string`, `tuple`, `type`,
   `option`, `result` or `never`.
 
 ## Types
@@ -347,11 +347,18 @@ fn log2(n: u32) -> u32:
 - A `break` and a `continue` are expressions as a `return` is, with no value
   to take, and each is a `never`. One in the condition of a `while` is of
   that loop: `while more() or break:`.
+- `todo` is an expression too, and a `never`. It traps where it is, as
+  `module.unreachable()` does, and stands for what is yet to be written: the
+  body of a function, or a value as in `let x: i32 = todo`.
+- `todo` is a type as well, for one yet to be written, and is `never` by
+  another name: `fn area(s: Shape) -> todo`. Only a `todo` is of it, so
+  `fn scale(s: Shape, by: todo)` is called as `scale(s, todo)`, and it is
+  stored nowhere: there is no `&todo` or `array(todo)`.
 - A function with a result ends in a `never` wherever it ends: a `return`,
-  `module.unreachable()` or a call of a function that returns `never`, in a
-  statement that always evaluates it. The right side of `and` and `or` may
-  not be evaluated, so a `return` there ends nothing: `half` needs its last
-  line.
+  `todo`, `module.unreachable()` or a call of a function that returns
+  `never`, in a statement that always evaluates it. The right side of `and`
+  and `or` may not be evaluated, so a `return` there ends nothing: `half`
+  needs its last line.
 
 ```duck
 extern:
@@ -530,9 +537,9 @@ fn sum() -> i32:
   its statement alone, or `pass` after it.
 - A `defer` ends no function: one with results still needs its `return`,
   whatever the body is.
-- **A trap runs no defer.** `module.unreachable()`, an index out of bounds
-  and a division by zero end the program where they are, as does a host
-  function that never returns, like the `exit` of `wasi:cli/exit`.
+- **A trap runs no defer.** `todo`, `module.unreachable()`, an index out of
+  bounds and a division by zero end the program where they are, as does a
+  host function that never returns, like the `exit` of `wasi:cli/exit`.
 
 ## Generics
 

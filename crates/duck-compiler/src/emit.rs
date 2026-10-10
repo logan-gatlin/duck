@@ -1083,6 +1083,12 @@ pub fn f(x: u32) -> u32:
     }
 
     #[test]
+    fn todo_ends_a_function_with_results() {
+        let func = func_wat(&emit_src("pub fn f(x: u32) -> u32:\n    todo\n"), "f");
+        assert!(func.contains("unreachable"), "{func}");
+    }
+
+    #[test]
     fn tuples_are_multiple_values() {
         let src = "\
 extern:

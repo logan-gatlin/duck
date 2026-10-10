@@ -558,6 +558,7 @@ impl Checker {
                 TypeKind::Pointer(*mutability, Box::new(self.type_syntax(pointee)?))
             }
             ExprKind::FnType(ty) => return Some(ty.clone()),
+            ExprKind::Todo => TypeKind::Todo,
             _ => {
                 self.error(TypeErrorKind::NotAType, expr.span);
                 return None;

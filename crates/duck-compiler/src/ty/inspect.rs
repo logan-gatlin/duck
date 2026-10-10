@@ -1831,7 +1831,8 @@ impl<'p> Walk<'p> {
             | ExprKind::Placeholder
             | ExprKind::Dot(_)
             | ExprKind::Break
-            | ExprKind::Continue => false,
+            | ExprKind::Continue
+            | ExprKind::Todo => false,
             ExprKind::Tuple(elems) | ExprKind::List(elems) => {
                 elems.iter().any(|elem| self.expr(elem))
             }
@@ -1892,7 +1893,7 @@ impl<'p> Walk<'p> {
                 params.iter().any(|param| self.ty(param))
                     || ret.as_ref().is_some_and(|ret| self.ty(ret))
             }
-            TypeKind::Qualified(..) => false,
+            TypeKind::Qualified(..) | TypeKind::Todo => false,
         }
     }
 }

@@ -100,6 +100,10 @@
         "named": true
       },
       {
+        "type": "todo_expression",
+        "named": true
+      },
+      {
         "type": "tuple",
         "named": true
       },
@@ -257,6 +261,10 @@
       },
       {
         "type": "qualified_type",
+        "named": true
+      },
+      {
+        "type": "todo_type",
         "named": true
       }
     ]
@@ -1667,6 +1675,16 @@
     }
   },
   {
+    "type": "todo_expression",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "todo_type",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "tuple",
     "named": true,
     "fields": {},
@@ -2279,6 +2297,10 @@
   },
   {
     "type": "struct",
+    "named": false
+  },
+  {
+    "type": "todo",
     "named": false
   },
   {
