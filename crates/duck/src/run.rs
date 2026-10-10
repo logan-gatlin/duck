@@ -152,6 +152,7 @@ fn stopped(error: wasmtime::Error) -> Result<u8, Error> {
 mod tests {
     use duck_compiler::file::{FileId, FileManager, Settings, Wit, WitFile};
     use duck_compiler::world::COMMAND;
+    use wasmtime::component::Val;
     use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 
     use super::*;
@@ -287,13 +288,10 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
     fn the_start_function_runs_with_the_arguments() {
         let src = r#"
 extern "wasi:cli/environment@0.3.0":
-    fn get_arguments(ret: &var array(array(u8)))
-
-let arguments: &var array(array(u8)) = &var []
+    fn get_arguments() -> array(string)
 
 fn main():
-    get_arguments(arguments)
-    for argument in arguments.*:
+    for argument in get_arguments():
         print(argument)
 "#;
         let (status, stdout) = run_with(src, &["out.wasm", "-a", "b c"]);
@@ -406,18 +404,33 @@ fn main():
              is: found `i64`"
         );
 
-        // A list is returned in memory that the module allocates.
+        // A list is returned in memory that the component allocates.
         let unallocated = r#"
 extern "wasi:cli/environment@0.3.0":
-    fn get_arguments(ret: &var array(array(u8)))
-
-let arguments: &var array(array(u8)) = &var []
+    fn get_arguments() -> array(string)
 
 fn main():
-    get_arguments(arguments)
+    let _ = get_arguments()
 "#;
         let e = compile(unallocated, program()).unwrap_err();
-        assert!(e.contains("`cabi_realloc`"), "{e}");
+        assert!(
+            e.starts_with("the host passes a `list<string>` in memory"),
+            "{e}"
+        );
+        assert!(e.contains("`pub fn cabi_realloc("), "{e}");
+
+        // A result is given, and no place for it taken.
+        let lowered = r#"
+extern "wasi:cli/environment@0.3.0":
+    fn get_arguments(ret: &var array(string))
+
+fn main():
+    pass
+"#;
+        assert_eq!(
+            compile(lowered, program()).unwrap_err(),
+            "`get_arguments` takes 0 parameters in the WIT, and 1 here"
+        );
     }
 
     #[test]
@@ -426,11 +439,25 @@ fn main():
 package my:pkg@0.1.0;
 
 interface math {
+    record wide {
+        head: tuple<s64, s64, s64, s64, s64, s64, s64, s64>,
+        tail: tuple<s64, s64, s64, s64, s64, s64, s64, s64>,
+        last: s64,
+    }
+
     add: func(a: s32, b: s32) -> s32;
+    divide: func(a: s32, b: s32) -> tuple<s32, s32>;
+    total: func(w: wide, scale: s64) -> s64;
+    shout: func(text: string) -> string;
 }
 
 interface greeter {
+    use math.{wide};
+
     triple-it: func(n: s32) -> s32;
+    halves: func(n: s32) -> tuple<s32, s32>;
+    greet: func(name: string) -> string;
+    spread: func(w: wide) -> s64;
 }
 
 world app {
@@ -440,18 +467,43 @@ world app {
 }
 "#;
         let src = r#"
+struct Wide:
+    head: tuple(i64, i64, i64, i64, i64, i64, i64, i64)
+    tail: tuple(i64, i64, i64, i64, i64, i64, i64, i64)
+    last: i64
+
 extern "my:pkg/math@0.1.0":
     fn add(a: i32, b: i32) -> i32
+    fn divide(a: i32, b: i32) -> tuple(i32, i32)
+    fn total(w: Wide, scale: i64) -> i64
+    fn shout(text: string) -> string
 
 pub "my:pkg/greeter@0.1.0":
     fn triple_it(n: i32) -> i32:
         return add(n, double(n))
+    fn halves(n: i32) -> tuple(i32, i32):
+        return divide(n, 2)
+    fn greet(name: string) -> string:
+        return shout(name)
+    fn spread(w: Wide) -> i64:
+        # What `total` takes is in memory before `divide` writes there.
+        return total(w, 2) + divide(7, 2).1 as i64
 
 pub fn double(n: i32) -> i32:
     return add(n, n)
 
 fn idle():
     pass
+
+var heap: uint = 0
+
+pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+    if heap == 0:
+        heap = module.grow(1) as uint * module.page_size
+    let at = (heap + align - 1) / align * align
+    heap = at + new_size
+    module.copy(at as! &var u8, old, old_size)
+    return at as! &var u8
 "#;
         let file = WitFile {
             path: "wit/app.wit".to_string(),
@@ -463,26 +515,78 @@ fn idle():
                 package: vec![file.clone()],
                 deps: Vec::new(),
             },
+            // What `total` takes is more than the 128 bytes there are
+            // without it.
+            return_area: Some(144),
             ..Settings::default()
         };
+        let small = Settings {
+            return_area: None,
+            ..settings("app")
+        };
+        assert_eq!(
+            compile(src, small).unwrap_err(),
+            "this passes 144 bytes in memory, and the return area holds 128: `return` under \
+             `[memory]` in Duck.toml gives it more"
+        );
         let component = compile(src, settings("app")).unwrap();
 
-        // Its import is the host's to give, and its export the host's to
-        // call.
+        // Its imports are the host's to give, and its exports the host's
+        // to call, each passing what it takes and gives as the world has it.
         let engine = Engine::default();
         let component = Component::new(&engine, component).unwrap();
         let mut linker = Linker::<()>::new(&engine);
         let mut math = linker.instance("my:pkg/math@0.1.0").unwrap();
+        let int = |value: &Val| match value {
+            Val::S32(n) => i64::from(*n),
+            Val::S64(n) => *n,
+            other => panic!("{other:?}"),
+        };
         let add = |_: wasmtime::StoreContextMut<()>, (a, b): (i32, i32)| Ok((a + b,));
         math.func_wrap("add", add).unwrap();
+        let divide = |_: wasmtime::StoreContextMut<()>, (a, b): (i32, i32)| Ok(((a / b, a % b),));
+        math.func_wrap("divide", divide).unwrap();
+        let total = move |_: wasmtime::StoreContextMut<()>, _, given: &[Val], out: &mut [Val]| {
+            let Val::Record(fields) = &given[0] else {
+                panic!("{given:?}");
+            };
+            let sum = |(_, field): &(String, Val)| match field {
+                Val::Tuple(elems) => elems.iter().map(int).sum(),
+                last => int(last),
+            };
+            let sum: i64 = fields.iter().map(sum).sum();
+            out[0] = Val::S64(sum * int(&given[1]));
+            Ok(())
+        };
+        math.func_new("total", total).unwrap();
+        let shout =
+            |_: wasmtime::StoreContextMut<()>, (text,): (String,)| Ok((text.to_uppercase(),));
+        math.func_wrap("shout", shout).unwrap();
         let mut store = Store::new(&engine, ());
         let instance = linker.instantiate(&mut store, &component).unwrap();
         let double = instance.get_typed_func::<(i32,), (i32,)>(&mut store, "double");
         assert_eq!(double.unwrap().call(&mut store, (21,)).unwrap(), (42,));
         let greeter = instance.get_export_index(&mut store, None, "my:pkg/greeter@0.1.0");
-        let triple = instance.get_export_index(&mut store, greeter.as_ref(), "triple-it");
-        let triple = instance.get_typed_func::<(i32,), (i32,)>(&mut store, triple.unwrap());
-        assert_eq!(triple.unwrap().call(&mut store, (5,)).unwrap(), (15,));
+        let mut call = |name: &str, given: Val| {
+            let export = instance.get_export_index(&mut store, greeter.as_ref(), name);
+            let function = instance.get_func(&mut store, export.unwrap()).unwrap();
+            let mut out = [Val::Bool(false)];
+            function.call(&mut store, &[given], &mut out).unwrap();
+            out.into_iter().next().unwrap()
+        };
+        assert_eq!(call("triple-it", Val::S32(5)), Val::S32(15));
+        let halves = Val::Tuple(vec![Val::S32(3), Val::S32(1)]);
+        assert_eq!(call("halves", Val::S32(7)), halves);
+        let greeted = Val::String("DUCK".to_string());
+        assert_eq!(call("greet", Val::String("duck".to_string())), greeted);
+        let counted = |range: std::ops::Range<i64>| Val::Tuple(range.map(Val::S64).collect());
+        let wide = Val::Record(vec![
+            ("head".to_string(), counted(1..9)),
+            ("tail".to_string(), counted(9..17)),
+            ("last".to_string(), Val::S64(17)),
+        ]);
+        // The numbers to 17 add to 153, and 7 leaves 1 when halved.
+        assert_eq!(call("spread", wide), Val::S64(307));
 
         // A world is named in full where it is another package's.
         assert!(compile(src, settings("my:pkg/app@0.1.0")).is_ok());
@@ -518,7 +622,7 @@ fn idle():
     fn the_working_directory_and_the_root_are_open() {
         let src = r#"
 extern "wasi:filesystem/preopens@0.3.0":
-    fn get_directories(ret: &var array(tuple(i32, array(u8))))
+    fn get_directories() -> array(tuple(i32, string))
 
 union Failure:
     access
@@ -566,21 +670,17 @@ extern "wasi:filesystem/types@0.3.0":
         path: string,
         open_flags: u8,
         flags: u8,
-        ret: &var result(i32, Failure),
-    ) = "[method]descriptor.open-at"
+    ) -> result(i32, Failure) = "[method]descriptor.open-at"
 
-let directories: &var array(tuple(i32, array(u8))) = &var []
-let opened = &var result(i32, Failure).ok(0)
 let manifest = "Cargo.toml"
 let found = "found"
 
 fn main():
-    get_directories(directories)
-    for directory in directories.*:
+    let directories = get_directories()
+    for directory in directories:
         print(directory.1)
     # To read, which is the first of the `descriptor-flags`.
-    open_at(directories.*[0].0, 0, manifest, 0, 1, opened)
-    match opened.*:
+    match open_at(directories[0].0, 0, manifest, 0, 1):
         .ok(_):
             print(found)
         .err(_):
@@ -641,42 +741,32 @@ union Failure:
     other: option(string)
 
 extern "wasi:sockets/ip-name-lookup@0.3.0":
-    fn resolve_addresses(name: string, ret: &var result(array(Ip), Unresolved))
+    fn resolve_addresses(name: string) -> result(array(Ip), Unresolved)
 
 extern "wasi:sockets/types@0.3.0":
-    fn create(family: Family, ret: &var result(i32, Failure)) = "[static]tcp-socket.create"
-    fn bind(
-        socket: i32,
-        address: Address,
-        ret: &var result(tuple(), Failure),
-    ) = "[method]tcp-socket.bind"
+    fn create(family: Family) -> result(i32, Failure) = "[static]tcp-socket.create"
+    fn bind(socket: i32, address: Address) -> result(tuple(), Failure) = "[method]tcp-socket.bind"
 
-let resolved = &var result(array(Ip), Unresolved).ok([])
-let handle = &var result(i32, Failure).ok(0)
-let bound = &var result(tuple(), Failure).ok(())
 let name = "127.0.0.1"
 let resolving = "resolving"
 let binding = "binding"
 
 fn main():
     # An address is its own name, which nothing is asked for.
-    resolve_addresses(name, resolved)
-    match resolved.*:
+    match resolve_addresses(name):
         .ok([.ipv4((127, 0, 0, 1))]):
             print(resolving)
         else:
             pass
-    create(.ipv4, handle)
-    match handle.*:
+    match create(.ipv4):
         .ok(socket):
             # Any port of this machine, which is there without a network.
             let local = Address.ipv4(Ipv4(port: 0, address: (127, 0, 0, 1)))
-            bind(socket, local, bound)
-        .err(_):
-            return
-    match bound.*:
-        .ok(_):
-            print(binding)
+            match bind(socket, local):
+                .ok(_):
+                    print(binding)
+                .err(_):
+                    pass
         .err(_):
             pass
 "#;

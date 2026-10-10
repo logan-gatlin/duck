@@ -28,6 +28,9 @@ start = "main"
 # max = "16MiB"
 # The address literals are placed from. If not given, it is 0.
 # static = { start = "1KiB" }
+# The bytes of the return area, which holds what a function passes the host
+# in memory. If not given, it is 128.
+# return = "256B"
 
 # [const]
 # How long the code that a constant runs may take, counted in wasm
@@ -130,6 +133,7 @@ mod tests {
                 max_pages: None,
                 memory64: false,
                 static_start: 0,
+                return_area: None,
                 fuel: None,
             })
         );

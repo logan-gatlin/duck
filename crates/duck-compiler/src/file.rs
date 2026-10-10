@@ -52,6 +52,9 @@ pub struct Settings {
     /// The WIT of the package, beside that of WASI 0.3, which is always
     /// there.
     pub wit: Wit,
+    /// The bytes of the return area, which holds what a function passes
+    /// the host in memory. `None` is [`crate::ty::DEFAULT_RETURN_AREA`].
+    pub return_area: Option<u32>,
 }
 
 /// The WIT a package has of its own: its `wit` directory.

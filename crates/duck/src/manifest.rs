@@ -52,6 +52,9 @@ pub struct Component {
     pub memory64: bool,
     /// The address literals are placed from.
     pub static_start: u64,
+    /// The bytes of the return area, which holds what a function passes
+    /// the host in memory. `None` is the compiler's own.
+    pub return_area: Option<u32>,
     /// The fuel that the code run to evaluate the constants of one item
     /// has. `None` is the compiler's own.
     pub fuel: Option<u64>,
@@ -168,6 +171,8 @@ struct RawMemory {
     max: Option<String>,
     #[serde(rename = "static")]
     literals: Option<RawStatic>,
+    #[serde(rename = "return")]
+    return_area: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -285,6 +290,7 @@ impl Component {
             fuel: self.fuel,
             world: Some(self.world.clone()),
             wit,
+            return_area: self.return_area,
         }
     }
 
@@ -294,6 +300,7 @@ impl Component {
             min,
             max,
             literals,
+            return_area,
         } = memory;
         if min.is_some() {
             return Err(ManifestError::Min);
@@ -309,6 +316,14 @@ impl Component {
             }
             None => 0,
         };
+        let return_area = return_area
+            .as_deref()
+            .map(|size| {
+                let bytes = bytes("memory.return", size, false)?;
+                let kind = SizeErrorKind::TooLarge { memory64: false };
+                u32::try_from(bytes).map_err(|_| size_error("memory.return", size, kind))
+            })
+            .transpose()?;
         Ok(Self {
             entry: component.entry,
             output: component.output,
@@ -317,6 +332,7 @@ impl Component {
             max_pages,
             memory64,
             static_start,
+            return_area,
             fuel: None,
         })
     }
@@ -336,6 +352,7 @@ impl Library {
             fuel: self.fuel,
             world: None,
             wit,
+            return_area: None,
         }
     }
 }
@@ -599,6 +616,7 @@ mod tests {
                     max_pages: Some(256),
                     memory64: false,
                     static_start: 1025,
+                    return_area: None,
                     fuel: None,
                 }),
                 library: None,
@@ -613,6 +631,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.component.unwrap().start.as_deref(), Some("init"));
+    }
+
+    #[test]
+    fn the_return_area_is_as_large_as_it_is_said_to_be() {
+        let area = |memory: &str| {
+            with_memory(memory).map(|manifest| manifest.component.unwrap().return_area)
+        };
+        assert_eq!(area("").unwrap(), None);
+        assert_eq!(area("return = \"256B\"\n").unwrap(), Some(256));
+        assert_eq!(area("return = \"1KiB\"\n").unwrap(), Some(1024));
+        let settings = |memory: &str| {
+            let component = with_memory(memory).unwrap().component.unwrap();
+            component.settings(Wit::default()).return_area
+        };
+        assert_eq!(settings("return = \"0B\"\n"), Some(0));
+        assert_eq!(settings("max = \"1pgs\"\n"), None);
+        assert_eq!(
+            area("return = \"256\"\n").unwrap_err().to_string(),
+            "memory.return \"256\" is not a number followed by B, KiB, MiB, GiB, TiB, or pgs"
+        );
+        assert!(area("return = \"4GiB\"\n").is_err());
     }
 
     #[test]

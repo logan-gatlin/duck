@@ -1019,25 +1019,39 @@ pub fn helper():                        # only `pub`: the world has no `helper`
 - The host gives every argument. A default is passed by the Duck call that
   leaves it out, so an `extern` function may have them, an exported one has
   them for Duck callers only, and `start` names a function with no parameters.
-- Integers of 32 bits or fewer and `bool` are wasm `i32`, as are `int`,
-  `uint`, pointers and function pointers. `i64`, `f32` and `f64` are
-  themselves, and an enum is its value type. Structs, tuples and arrays are
-  one wasm value per scalar, in field order: `fn f(s: array(u8)) -> Point` is
-  `(i32 ptr, i32 len) -> (f32, f32)`.
-- A union is an `i32` that counts its variants from 0, then the values its
-  variants share, as the Canonical ABI of the component model flattens a
-  variant. Each variant's scalars are held in order from the first, and each
-  shared value is as wide as what any variant has there: an `i32` and an
-  `f32` share an `i32`, and any others that differ an `i64`. `union Shape`
-  with `circle: f32` and `rect: tuple(f32, i64)` is `(i32, f32, i64)`, and
-  `result(i32, f32)` is `(i32, i32)`. `option(f32)` is `(i32, f32)` with 0
-  for `none`, its first variant, so that zeroed memory holds it, and
-  `result(T, E)` has 0 for `ok`.
-- A float held in an integer is its bits, and what is narrower than the
-  `i64` that holds it has zeroes above it, which are ignored when it's read.
-  The values the held variant doesn't use are zero in every value Duck
-  builds and are never read: the host may pass anything in them. A count
-  that no variant has matches no arm, and memory keeps only its low byte.
+
+### What crosses to the host
+
+A function is declared with what it takes and gives, and the compiler passes
+those as the Canonical ABI of the component model has them.
+
+- A value is the wasm values of its scalars, as it is between Duck functions,
+  while there are few enough: parameters of up to 16, and a result of one.
+  More are passed in memory, laid out as Duck lays them out, by a pointer.
+- Nothing is a stack in memory, so what is passed in memory goes through the
+  return area: 128 bytes of the component's memory, placed with its literals
+  the first time anything needs them. A call of an import stores there the
+  parameters that are too many, the host writes its result there, and the
+  call reads it into locals as it returns. An exported function stores its
+  result there as it returns, which the host reads before it calls anything
+  else. So nothing is kept there, and one area serves every call.
+- A function that passes more than the area holds is an error where it is
+  declared, which says how many bytes it passes. `return` under `[memory]`
+  in `Duck.toml` gives the area more. A library is checked with 128.
+- The host allocates what it passes that holds a `list` or a `string`: the
+  result of an import, the parameters of an export, and those of an export
+  that are too many for wasm values. A component whose host does has
+  `pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint)
+  -> &var u8` in its entry file, or a `pub use` of another file's as that
+  name: it is called with `old` and `old_size` as 0, and returns `new_size`
+  bytes at a multiple of `align`. Without one the error is where the host
+  would first need it.
+- What a component passes the host is the component's own to keep or free:
+  the host copies a `list` that an export returns and frees nothing.
+- An integer of 32 bits or fewer, a `bool`, an enum of either and a handle
+  are each a wasm `i32`, as are an `int`, a `uint`, a pointer and a function
+  pointer, which no WIT has. The host may give any `i32` for a narrow one,
+  which is brought into its range.
 - `externref` is an opaque reference of the host of a wasm module, which no
   world has: a component neither takes nor gives one.
 
@@ -1069,7 +1083,7 @@ extern "wasi:cli/stdout@0.3.0":          # an interface, with its version
 	fn future_drop(future: i32) = "[future-drop-readable-1]write-via-stream"
 
 extern "wasi:cli/environment@0.3.0":
-	fn get_arguments(ret: &var array(array(u8)))   # its `list<string>`
+	fn get_arguments() -> array(string)            # a `list<string>`
 
 extern "wasi:cli/exit@0.3.0":
 	fn exit_with_code(status: u8) -> never
@@ -1078,7 +1092,6 @@ let greeting = "Hello,"
 let newline = "\n"
 let event = &var (0, 0)                  # the waitable, and the code it ends with
 let written = &var result(tuple(), u8).ok(())
-let arguments: &var array(array(u8)) = &var []
 var heap: uint = 0
 var end: uint = 0
 
@@ -1119,8 +1132,7 @@ fn main():                               # `start = "main"` in Duck.toml
 	let stream = (ends >> 32) as i32     # the end that writes
 	let future = write_via_stream(ends as i32)  # the host takes the one that reads
 	send(stream, greeting)
-	get_arguments(arguments)             # allocates with `cabi_realloc`
-	for argument in arguments.*:
+	for argument in get_arguments():     # allocated with `cabi_realloc`
 		send(stream, argument)
 	send(stream, newline)
 	stream_drop(stream)                  # only then is the future resolved
@@ -1157,18 +1169,8 @@ fn main():                               # `start = "main"` in Duck.toml
   `[static]tcp-socket.create`, and `[resource-drop]descriptor` drops a
   handle, which takes it.
 - It is declared as the WIT declares it, with the types that those of the
-  WIT are, and lowered as the Canonical ABI lowers it, which is how Duck
-  passes values.
-- A function that returns more than one wasm value takes a `&var` to its
-  result as a last parameter instead, and returns nothing: Duck lays a type
-  out in memory as the Canonical ABI does. `-> i32` stays for a handle, and
-  `ret: &var array(u8)` is for a `string`. Parameters that come to more than
-  16 wasm values are one pointer to a tuple of them.
-- The host returns a `list` or a `string` in memory that it has the module
-  allocate. A module that imports such a function has `pub fn cabi_realloc` in
-  its entry file, as above, or a `pub use` of another file's as that name: it
-  is called with `old` and `old_size` as 0, and returns `new_size` bytes at a
-  multiple of `align`.
+  WIT are: `get_arguments` gives an `array(string)`, which the host has
+  `cabi_realloc` allocate.
 - An `async func` of the WIT is declared and called as any other is, and
   returns when it is done: `[method]descriptor.open-at` blocks until the file
   is open.
@@ -1222,6 +1224,7 @@ world = "wasi:cli/command@0.3.0"  # optional: what it imports and exports
 memory64 = true          # 64-bit addresses, which are 32-bit without it
 max = "16MiB"            # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
 static = { start = "1KiB" }  # where literals go from, which is 0 without it
+return = "256B"          # the return area, which is 128 bytes without it
 
 [const]                  # optional
 fuel = 10000000000       # wasm instructions the constants of one item may run

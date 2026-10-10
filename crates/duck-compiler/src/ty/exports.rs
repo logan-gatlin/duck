@@ -7,13 +7,13 @@
 //! it, which is its own name with a `-` for each `_` unless an `= "name"`
 //! says another.
 
-use crate::ir;
+use crate::ir::{self, FuncId};
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::Ident;
 use crate::world::{REALLOC, RUN_INTERFACE, kebab};
 
-use super::{Checker, Item, TypeError, TypeErrorKind, fn_decls};
+use super::{Checker, FuncSig, Item, Synth, TypeError, TypeErrorKind, fn_decls};
 
 /// A function that may be what the world exports as `name`.
 struct Candidate {
@@ -57,6 +57,7 @@ impl Checker {
 
         let names = exports.functions.iter().map(String::as_str);
         let missing = self.export_each(program, names.chain([REALLOC]), None, &mut top, funcs);
+        let allocates = !missing.iter().any(|name| name == REALLOC);
         let missing: Vec<_> = missing.into_iter().filter(|name| name != REALLOC).collect();
         if !missing.is_empty() {
             self.error_nowhere(TypeErrorKind::MissingExports {
@@ -104,6 +105,9 @@ impl Checker {
         if start && !runs {
             let error = self.world.start_error();
             self.error_nowhere(TypeErrorKind::World(error));
+        }
+        if let (false, Some((span, wit))) = (allocates, self.allocated.clone()) {
+            self.error(TypeErrorKind::NeedsRealloc(wit), span);
         }
     }
 
@@ -202,21 +206,39 @@ impl Checker {
                 continue;
             };
             first.exported = true;
-            let export = match interface {
-                Some(interface) => format!("{interface}#{name}"),
-                None => name.to_string(),
-            };
-            funcs[first.func].exports.push(export);
-            // What allocates for the host is no function of the world's.
-            if let Some(function) = self.world.export(interface, name) {
-                let (_, decl) = fn_decls(program).nth(first.func).expect("it is defined");
-                let sig = self.funcs[self.import_count as usize + first.func].clone();
-                self.check_signature(&decl.sig, &sig, &function, false);
-            }
+            let func = first.func;
             for again in named {
                 again.exported = true;
                 self.error(TypeErrorKind::DuplicateExport(name.to_string()), again.span);
             }
+            let export = match interface {
+                Some(interface) => format!("{interface}#{name}"),
+                None => name.to_string(),
+            };
+            // What allocates for the host is no function of the world's.
+            let Some(function) = self.world.export(interface, name) else {
+                funcs[func].exports.push(export);
+                continue;
+            };
+            let (_, decl) = fn_decls(program).nth(func).expect("it is defined");
+            let target = FuncId(self.import_count + func as u32);
+            let sig = self.funcs[target.0 as usize].clone();
+            self.check_signature(&decl.sig, &sig, &function, false);
+            self.check_fits(&sig, false, decl.sig.name.span);
+            // One that takes or gives more than wasm values hold is called
+            // by a function that passes the rest in memory, as the host has
+            // it.
+            let passing = self.passing(&sig, false);
+            if passing.params.is_none() && passing.result.is_none() {
+                funcs[func].exports.push(export);
+                continue;
+            }
+            self.funcs.push(FuncSig {
+                name: format!("export {}", sig.name),
+                defaults: Vec::new(),
+                ..sig
+            });
+            self.synths.push(Synth::Export(target, export));
         }
         // A function of the world itself that it doesn't export is only
         // `pub`, unless it says what it is exported as.
@@ -559,8 +581,8 @@ fn main():
     fn the_host_knows_a_function_by_its_name_in_wit() {
         let src = "
 extern \"wasi:cli/environment@0.3.0\":
-    fn get_arguments(ret: &var array(array(u8)))
-    fn cwd(ret: &var option(array(u8))) = \"get-initial-cwd\"
+    fn get_arguments() -> array(string)
+    fn cwd() -> option(string) = \"get-initial-cwd\"
 
 extern:
     fn trace_it(code: u32)

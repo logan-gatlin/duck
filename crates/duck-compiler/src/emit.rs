@@ -889,7 +889,8 @@ pub fn g() -> i32:
                 r#"  (export "f" (func $f))"#,
             ]
         );
-        assert!(wat.contains("(type (;1;) (func (param i32 f32 i64) (result f32 i64)))"));
+        // What it gives is more than a wasm value, so it is given where to write it.
+        assert!(wat.contains("(type (;1;) (func (param i32 f32 i64 i32)))"));
         assert!(wat.contains("(func $f (;3;) (type 0)"), "{wat}");
         assert!(wat.contains("(func $g (;4;) (type 2)"), "{wat}");
         let g = func_wat(&bytes, "g");
@@ -1225,7 +1226,7 @@ pub fn f(p: &tuple(u8, f64)) -> tuple(f64, i32):
 ";
         let wat = wat(&emit_src(src));
         for line in [
-            "(type (;0;) (func (param i32 i32) (result i32 i32)))",
+            "(type (;0;) (func (param i32 i32 i32)))",
             "(type (;1;) (func (param i32) (result f64 i32)))",
             r#"(export "w" (global $w))"#,
             r#"(export "h" (global $h))"#,

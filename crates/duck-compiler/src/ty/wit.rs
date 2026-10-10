@@ -46,6 +46,8 @@ impl Checker {
         let mut unknown: Vec<Span> = Vec::new();
         for (index, (block, decl)) in extern_fns(program).enumerate() {
             let own = &decl.sig.name;
+            let sig = self.funcs[index].clone();
+            self.check_fits(&sig, true, own.span);
             let Some(field) = decl.import_name.clone().or_else(|| kebab(&own.name)) else {
                 self.error(TypeErrorKind::NoWitName(own.name.clone()), own.span);
                 continue;
@@ -69,7 +71,6 @@ impl Checker {
             match (found, interface) {
                 (Ok(None), _) => {}
                 (Ok(Some(function)), _) => {
-                    let sig = self.funcs[index].clone();
                     self.check_signature(&decl.sig, &sig, &function, true);
                 }
                 (Err(ImportError::Interface { imported }), Some(interface)) => {
@@ -91,6 +92,17 @@ impl Checker {
                     self.error(kind, own.span);
                 }
             }
+        }
+    }
+
+    /// Reports `sig`, declared at `span`, if it passes more in memory than
+    /// the return area holds, as one that is `imported` or one that is
+    /// exported passes it.
+    pub(super) fn check_fits(&mut self, sig: &FuncSig, imported: bool, span: Span) {
+        let needs = self.passing(sig, imported).size;
+        let has = self.return_area_size;
+        if needs > has {
+            self.error(TypeErrorKind::ReturnArea { needs, has }, span);
         }
     }
 
@@ -122,9 +134,8 @@ impl Checker {
     }
 
     /// Reports where `sig`, which `decl` declares, isn't `function` of the
-    /// WIT. An `imported` one may take a `&var` to its result as a last
-    /// parameter in place of giving it, as the Canonical ABI passes one
-    /// that is more than a wasm value.
+    /// WIT. Notes what the host of one that is `imported`, or of one that
+    /// is exported, passes in memory that it has the component allocate.
     pub(super) fn check_signature(
         &mut self,
         decl: &FnSig,
@@ -133,19 +144,34 @@ impl Checker {
         imported: bool,
     ) {
         let name = &decl.name;
-        let mut params: Vec<_> = (decl.params.iter().zip(&sig.params))
+        let params: Vec<_> = (decl.params.iter().zip(&sig.params))
             .map(|(param, (_, ty))| (param.ty.span, *ty))
             .collect();
-        let mut result = (decl.ret.as_ref().map(|ty| ty.span), sig.ret);
-        let lowered = imported
-            && function.result.is_some()
-            && sig.ret == Ty::Unit
-            && params.len() == function.params.len() + 1;
-        if let (true, Some((span, Ty::Ptr(id)))) = (lowered, params.last().copied())
-            && self.writes(Ty::Ptr(id))
-        {
-            params.pop();
-            result = (Some(span), self.pointee(id));
+        let result = (decl.ret.as_ref().map(|ty| ty.span), sig.ret);
+        let passing = self.passing(sig, imported);
+        // The host allocates what it passes: a list an import returns, or
+        // one an export takes, and parameters of an export that are too
+        // many for wasm values.
+        let given = match imported {
+            true => function.result.iter().zip(result.0).collect::<Vec<_>>(),
+            false => (function.params.iter().map(|(_, wit)| wit))
+                .zip(params.iter().map(|(span, _)| *span))
+                .collect(),
+        };
+        let allocated = given.into_iter().find(|(wit, _)| allocates(wit));
+        let spilled = (!imported && passing.params.is_some()).then(|| {
+            let wit: Vec<_> = function
+                .params
+                .iter()
+                .map(|(_, wit)| wit.to_string())
+                .collect();
+            (name.span, format!("tuple<{}>", wit.join(", ")))
+        });
+        let allocated = allocated
+            .map(|(wit, span)| (span, wit.to_string()))
+            .or(spilled);
+        if self.allocated.is_none() {
+            self.allocated = allocated;
         }
         if params.len() != function.params.len() {
             let kind = TypeErrorKind::WitParams {
@@ -332,6 +358,19 @@ fn nearest(name: &str, interfaces: Vec<String>) -> Vec<String> {
     }
 }
 
+/// Whether a value of `wit` holds what is allocated: a list or a string.
+fn allocates(wit: &WitTy) -> bool {
+    match wit {
+        WitTy::String | WitTy::List(_) => true,
+        WitTy::Tuple(elems) => elems.iter().any(allocates),
+        WitTy::Record { fields, .. } => fields.iter().any(allocates),
+        WitTy::Variant { cases, .. } => cases.iter().flatten().any(allocates),
+        WitTy::Option(inner) => allocates(inner),
+        WitTy::Result(ok, err) => [ok, err].into_iter().flatten().any(|ty| allocates(ty)),
+        _ => false,
+    }
+}
+
 /// Whether a function the host knows as `name` is a built-in of the
 /// component model, which no WIT declares.
 fn is_builtin(name: &str) -> bool {
@@ -395,6 +434,7 @@ fn expected(wit: &WitTy) -> String {
 #[cfg(test)]
 mod tests {
     use crate::file::{DummyManager, FileManager, Settings, Wit, WitFile};
+    use crate::ir::Stmt;
     use crate::lex::tokenize;
     use crate::load::Program;
     use crate::parse;
@@ -431,6 +471,15 @@ world app {
     import trace: func(code: u32);
     export sum: func(a: s32, b: s32) -> s32;
     export host;
+}
+
+world hosted {
+    import host;
+    import trace: func(code: u32);
+}
+
+world counted {
+    export count: func(text: string) -> u32;
 }
 ";
 
@@ -485,12 +534,12 @@ enum(u8) Color:
 extern \"my:pkg/host@0.1.0\":
     fn area(s: Shape) -> f32
     fn paint(at: Point, with: Color, may: u8) -> bool
-    fn measure(what: Sized, ret: &var result(tuple(), array(u8)))
-    fn letter(c: u32, ret: &var array(tuple(u32, array(u8))))
+    fn measure(what: Sized) -> result(tuple(), string)
+    fn letter(c: u32) -> array(tuple(u32, array(u8)))
     fn wait() -> never
     fn pipe(data: i32) -> i32
-    fn read(self: i32, len: u32, ret: &var result(array(u8), Color)) = \"[method]file.read\"
-    fn open(path: string, ret: &var option(i32)) = \"[static]file.open\"
+    fn read(self: i32, len: u32) -> result(array(u8), Color) = \"[method]file.read\"
+    fn open(path: string) -> option(i32) = \"[static]file.open\"
     fn close(file: i32) = \"[resource-drop]file\"
     fn stream_new() -> i64 = \"[stream-new-0]pipe\"
     fn anything(a: f64) -> f64 = \"[async-lower]wait\"
@@ -503,6 +552,9 @@ extern \"$root\":
 
 pub fn sum(a: i32, b: i32) -> i32:
     return a + b
+
+pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+    return 0
 "
         );
         // Only what the world exports is left to define.
@@ -541,11 +593,11 @@ enum(u16) Wide:
 extern \"my:pkg/host@0.1.0\":
     fn area(s: Shape) -> f64
     fn paint(at: tuple(f32, f32), with: Color, may: u16) -> i32
-    fn measure(what: Sized, ret: &var result(i32, varray(u8)))
-    fn letter(c: i32, ret: &var array(tuple(u32, u32)))
+    fn measure(what: Sized) -> result(i32, varray(u8))
+    fn letter(c: i32) -> array(tuple(u32, u32))
     fn pipe(data: i64) -> i32
-    fn read(self: i32, len: u32, ret: &var option(array(u8))) = \"[method]file.read\"
-    fn open(path: string, ret: &var option(Wide)) = \"[static]file.open\"
+    fn read(self: i32, len: u32) -> option(array(u8)) = \"[method]file.read\"
+    fn open(path: string) -> option(Wide) = \"[static]file.open\"
 ";
         let shown: Vec<_> = errors_in(src, None);
         let shown: Vec<_> = shown.iter().map(|(e, at)| (e.as_str(), *at)).collect();
@@ -582,7 +634,7 @@ extern \"my:pkg/host@0.1.0\":
                 ),
                 (
                     "the WIT has `result<_, string>` here, whose `_` is `tuple()`: found `i32`",
-                    "&var result(i32, varray(u8))"
+                    "result(i32, varray(u8))"
                 ),
                 (
                     "the WIT has `char` here, which is `u32`: found `i32`",
@@ -591,7 +643,7 @@ extern \"my:pkg/host@0.1.0\":
                 (
                     "the WIT has `list<tuple<u32, string>>` here, whose `string` is an \
                      `array(u8)`: found `u32`",
-                    "&var array(tuple(u32, u32))"
+                    "array(tuple(u32, u32))"
                 ),
                 (
                     "the WIT has `stream<u8>` here, which is an `i32`, as a handle is: found \
@@ -601,12 +653,12 @@ extern \"my:pkg/host@0.1.0\":
                 (
                     "the WIT has `result<list<u8>, color>` here, which is a `result`: found \
                      `option(array(u8))`",
-                    "&var option(array(u8))"
+                    "option(array(u8))"
                 ),
                 (
                     "the WIT has `option<own<file>>` here, whose `own<file>` is an `i32`, as a \
                      handle is: found `Wide`",
-                    "&var option(Wide)"
+                    "option(Wide)"
                 ),
             ]
         );
@@ -666,6 +718,126 @@ extern \"my:pkg/host@0.1.0\":
                     "i64"
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn what_is_passed_in_memory_goes_through_the_return_area() {
+        let src = "
+struct Wide:
+    a: tuple(u64, u64, u64, u64, u64, u64, u64, u64)
+    b: tuple(u64, u64, u64, u64, u64, u64, u64, u64)
+    c: u64
+
+extern:
+    fn one(n: i32) -> i32
+    fn pair(n: i32) -> tuple(i32, i64)
+    fn many(wide: Wide, last: u8) -> i64
+    fn both(wide: Wide) -> Wide
+
+fn f(wide: Wide) -> i64:
+    let (a, b) = pair(one(1))
+    return many(wide, 2) + b + a as i64 + both(wide).c as i64
+";
+        let entry = DummyManager::new().entry_point();
+        let tokens = tokenize(entry, src).unwrap();
+        let program = Program::single(entry, parse::parse(&tokens).unwrap());
+        let check_with = |return_area| {
+            let settings = Settings {
+                return_area,
+                ..Settings::default()
+            };
+            check(&program, &settings)
+        };
+        let module = check_with(None).unwrap_err();
+        let shown: Vec<_> = module.iter().map(|e| e.kind.to_string()).collect();
+        let at = |e: &TypeError| e.span.map_or("", |span| &src[span.start..span.end]);
+        // What `many` takes is 137 bytes, and what `both` takes and gives is
+        // 272.
+        assert_eq!(
+            shown,
+            [
+                "this passes 137 bytes in memory, and the return area holds 128: `return` under \
+                 `[memory]` in Duck.toml gives it more",
+                "this passes 272 bytes in memory, and the return area holds 128: `return` under \
+                 `[memory]` in Duck.toml gives it more",
+            ]
+        );
+        assert_eq!(module.iter().map(at).collect::<Vec<_>>(), ["many", "both"]);
+
+        let module = check_with(Some(272)).unwrap();
+        let types = |index: usize| {
+            let import = &module.imports[index];
+            (import.params.len(), import.results.len())
+        };
+        // One wasm value is given as it is. More are written where the
+        // host is told to, and more than 16 are read from where it is.
+        assert_eq!(
+            [types(0), types(1), types(2), types(3)],
+            [(1, 1), (2, 0), (1, 1), (2, 0)]
+        );
+        // What is stored for a call is read by it before any other call
+        // writes there: the call of `many` follows what it is passed.
+        let body = &module.funcs[0].body;
+        let is_store = |stmt: &Stmt| matches!(stmt, Stmt::Store { .. });
+        let stored = body
+            .windows(2)
+            .find(|pair| is_store(&pair[0]) && !is_store(&pair[1]));
+        let Some([_, Stmt::Call { func, dests, .. }]) = stored else {
+            panic!("{body:#?}");
+        };
+        assert_eq!(module.imports[func.0 as usize].name, "many");
+        assert_eq!(dests.len(), 1);
+        // The area is memory of the module's, which nothing else is in.
+        assert_eq!(module.memory.min_pages, 1);
+        assert!(module.data.is_empty());
+        assert_eq!(check_with(Some(271)).unwrap_err().len(), 1);
+    }
+
+    #[test]
+    fn what_the_host_allocates_needs_an_allocator() {
+        let needs = "the host passes a `list<tuple<u32, string>>` in memory that it has the \
+                     component allocate: the entry file is to have a `pub fn cabi_realloc(old: \
+                     &u8, old_size: uint, align: uint, new_size: uint) -> &var u8`";
+        let import = "
+extern \"my:pkg/host@0.1.0\":
+    fn letter(c: u32) -> array(tuple(u32, string))
+
+extern:
+    fn trace(code: u32)
+";
+        let errors = errors_in(import, Some("hosted"));
+        assert_eq!(errors, [(needs.to_string(), "array(tuple(u32, string))")]);
+        let allocator = "
+pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+    return 0
+";
+        assert_eq!(
+            errors_in(&format!("{import}{allocator}"), Some("hosted")),
+            []
+        );
+        // What is only taken is the component's own to place.
+        let taken = "
+extern \"my:pkg/host@0.1.0\":
+    fn open(path: string) -> option(i32) = \"[static]file.open\"
+";
+        assert_eq!(errors_in(taken, Some("hosted")), []);
+        // An export is passed what it takes.
+        let export = "
+pub fn count(text: string) -> u32:
+    return text.len as u32
+";
+        let errors = errors_in(export, Some("counted"));
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(
+            errors[0]
+                .0
+                .starts_with("the host passes a `string` in memory")
+        );
+        assert_eq!(errors[0].1, "string");
+        assert_eq!(
+            errors_in(&format!("{export}{allocator}"), Some("counted")),
+            []
         );
     }
 

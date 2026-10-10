@@ -24,6 +24,7 @@ use crate::parse::{
 };
 use crate::world::{ROOT, RUN_EXPORT, World, WorldError, kebab};
 
+pub use canonical::DEFAULT_RETURN_AREA;
 use defaults::DefaultValue;
 use enums::EnumDef;
 use evaluate::Dep;
@@ -31,6 +32,7 @@ use generic::{Arity, Instance, ParamDef, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
+mod canonical;
 mod defaults;
 mod enums;
 mod equality;
@@ -671,6 +673,15 @@ pub enum TypeErrorKind {
         expected: String,
         found: String,
     },
+    /// A function that passes the host more in memory than the return area
+    /// holds.
+    ReturnArea {
+        needs: u32,
+        has: u32,
+    },
+    /// What the host passes in memory that it has the component allocate,
+    /// as the WIT writes it, in a component with nothing that allocates.
+    NeedsRealloc(String),
     /// A `pub "interface":` block in a file that isn't the entry file of a
     /// component.
     ExportOutsideEntry,
@@ -759,6 +770,14 @@ struct Checker {
     entry: FileId,
     /// The world the program is a component of, which says what is.
     world: World,
+    /// How many bytes the return area has, which holds what a function
+    /// passes the host in memory.
+    return_area_size: u32,
+    /// Where the return area is, once anything is passed through it.
+    return_area: Option<u64>,
+    /// Where the host is first passed what it allocates in the component,
+    /// and what that is, as the WIT writes it.
+    allocated: Option<(Span, String)>,
     /// Each function and global that a `pub use` of the entry module names,
     /// and the name it is exported as for that.
     reexports: Vec<(Item, Ident)>,
@@ -1007,6 +1026,9 @@ enum Synth {
     Instance(FnInstance),
     /// Calls this imported function and brings its results into range.
     Wrapper(FuncId),
+    /// Calls this function, which the world exports as the name, taking
+    /// what the host passes in memory and giving what it returns there.
+    Export(FuncId, String),
 }
 
 struct GlobalDef {
@@ -1606,6 +1628,17 @@ impl fmt::Display for TypeErrorKind {
                     false => write!(f, "whose `{within}` is {expected}: found `{found}`"),
                 }
             }
+            Self::ReturnArea { needs, has } => write!(
+                f,
+                "this passes {needs} bytes in memory, and the return area holds {has}: `return` \
+                 under `[memory]` in Duck.toml gives it more"
+            ),
+            Self::NeedsRealloc(wit) => write!(
+                f,
+                "the host passes a `{wit}` in memory that it has the component allocate: the \
+                 entry file is to have a `pub fn cabi_realloc(old: &u8, old_size: uint, align: \
+                 uint, new_size: uint) -> &var u8`"
+            ),
             Self::ExportOutsideEntry => {
                 write!(f, "only the entry file of a component exports an interface")
             }
@@ -2802,6 +2835,7 @@ impl Checker {
             types: records.then(HashMap::new),
             entry: program.entry,
             world,
+            return_area_size: settings.return_area.unwrap_or(DEFAULT_RETURN_AREA),
             max_pages: settings.max_pages,
             memory64: settings.memory64,
             data_end: settings.static_start.into(),
@@ -2880,19 +2914,18 @@ impl Checker {
     fn lower_imports(&self, program: &Program) -> Vec<ir::Import> {
         let imports = extern_fns(program).zip(&self.funcs);
         imports
-            .map(|((block, decl), sig)| ir::Import {
-                name: sig.name.clone(),
-                module: (block.module.as_ref()).map_or(ROOT.to_string(), |m| m.name.clone()),
-                // One with no name in WIT is reported, and keeps its own.
-                field: (decl.import_name.clone())
-                    .or_else(|| kebab(&sig.name))
-                    .unwrap_or_else(|| sig.name.clone()),
-                params: sig
-                    .params
-                    .iter()
-                    .flat_map(|(_, ty)| self.val_types(*ty))
-                    .collect(),
-                results: self.val_types(sig.ret),
+            .map(|((block, decl), sig)| {
+                let (params, results) = self.import_type(sig);
+                ir::Import {
+                    name: sig.name.clone(),
+                    module: (block.module.as_ref()).map_or(ROOT.to_string(), |m| m.name.clone()),
+                    // One with no name in WIT is reported, and keeps its own.
+                    field: (decl.import_name.clone())
+                        .or_else(|| kebab(&sig.name))
+                        .unwrap_or_else(|| sig.name.clone()),
+                    params,
+                    results,
+                }
             })
             .collect()
     }
@@ -2997,6 +3030,10 @@ impl Checker {
                 self.lower_instance(program, id, instance)
             }
             Synth::Wrapper(import) => self.lower_wrapper(id, *import),
+            Synth::Export(target, export) => {
+                let (target, export) = (*target, export.clone());
+                self.lower_export(id, target, &export)
+            }
         }
     }
 
@@ -5978,8 +6015,24 @@ impl<'c> Body<'c> {
         let ret = self.ck.funcs[id.0 as usize].ret;
         let results = self.ck.val_types(ret);
         let mut pre = value.pre;
-        let args = exprs(value.scalars);
-        let mut scalars = if let [result] = results[..] {
+        // What an import takes and gives is passed as the host has it.
+        let (args, written, stored) = match id.0 < self.ck.import_count && !self.ck.open {
+            true => self.import_args(id, value.scalars, &mut pre),
+            false => (exprs(value.scalars), None, false),
+        };
+        if let Some(written) = written {
+            pre.push(Stmt::Call {
+                func: id,
+                args,
+                dests: Vec::new(),
+            });
+            let scalars = self.import_result(written, ret, &mut pre);
+            return (ret, Value { pre, scalars });
+        }
+        // One whose arguments are in the return area is called before
+        // anything else is evaluated, as another call writes there too.
+        let mut scalars = if let ([result], false) = (&results[..], stored) {
+            let result = *result;
             vec![(result, Expr::Call(id, args))]
         } else {
             let dests: Vec<_> = results.iter().map(|vt| self.temp(*vt)).collect();
@@ -8078,7 +8131,7 @@ extern:
             imports,
             vec![
                 ("now", "$root", "Date.now", vec![I32], vec![I32]),
-                ("put", "$root", "put", vec![I32, F32, I64], vec![F32, I64]),
+                ("put", "$root", "put", vec![I32, F32, I64, I32], vec![]),
             ]
         );
         let funcs: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
@@ -8115,8 +8168,9 @@ fn f():
              (set y (I32.Extend16S (call i ))) \
              (set z (I32.Ne (call b ) 0)) \
              (set w (call p )) \
-             (call s [] -> [tmp4 tmp5 tmp6]) \
-             (set v.a (I32.And tmp4 255)) (set v.b tmp5) (set v.c (I32.Ne tmp6 0))"
+             (call s [0] -> []) (set tmp4 (I32.Load8U offset=0 0)) \
+             (set tmp5 (I32.Load offset=4 0)) (set tmp6 (I32.Ne (I32.Load8U offset=8 0) 0)) \
+             (set v.a tmp4) (set v.b tmp5) (set v.c tmp6)"
         );
     }
 
@@ -10049,7 +10103,8 @@ fn f() -> i64:
 ";
         assert_eq!(
             body(&lower(src), "f"),
-            "(call pair [] -> [tmp0 tmp1]) (set a tmp0) (set b tmp1) \
+            "(call pair [0] -> []) (set tmp0 (I32.Load offset=0 0)) (set tmp1 (I64.Load offset=8 0)) \
+             (set a tmp0) (set b tmp1) \
              (set c (call one )) (drop (call one )) (set d (I32.ExtendS 1)) \
              (set e 1) (set g 2) \
              (set e (I32.And (I32.Add e g) 255)) \
@@ -12110,8 +12165,9 @@ fn f(a: array(u8)) -> array(u8):
     return a
 ";
         let module = lower(src);
-        assert_eq!(module.imports[0].params, [ValType::I32, ValType::I32]);
-        assert_eq!(module.imports[0].results, [ValType::I32, ValType::I32]);
+        // The host is given where to write an array, after the one it takes.
+        assert_eq!(module.imports[0].params, [ValType::I32; 3]);
+        assert_eq!(module.imports[0].results, []);
         let f = &module.funcs[0];
         let locals: Vec<_> = f.locals.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(locals, ["a.ptr", "a.len"]);
@@ -14041,7 +14097,9 @@ pub fn f() -> Shape:
     return current
 ";
         let module = lower(src);
-        assert_eq!(module.imports[0].results, [ValType::I32, ValType::F32]);
+        // The host writes one where it is told to, as it is laid out.
+        assert_eq!(module.imports[0].params, [ValType::I32]);
+        assert_eq!(module.imports[0].results, []);
         let globals: Vec<_> = module
             .globals
             .iter()
@@ -14060,12 +14118,14 @@ pub fn f() -> Shape:
         // from every one that a variant does.
         assert_eq!(
             body(&module, "f"),
-            "(call get [] -> [tmp0 tmp1]) (set tmp2 tmp0) (set tmp3 tmp1) \
-             (set @current tmp2) (set @current.0 tmp3) \
+            "(call get [0] -> []) (set tmp0 (I32.Load8U offset=0 0)) (set tmp1 tmp0) \
+             (set tmp2 (if (I32.Eq tmp0 0) (F32.Load offset=4 0) 0f32)) \
+             (set tmp3 tmp1) (set tmp4 tmp2) \
+             (set @current tmp3) (set @current.0 tmp4) \
              (return @current @current.0)"
         );
-        // A leaf that the host gives is brought into the range of what the
-        // variant that is held has in it.
+        // What the host wrote is read as the variant that is held has it,
+        // which is in the range of what that holds.
         let src = "\
 extern:
     fn get() -> result(u8, bool)
@@ -14078,15 +14138,17 @@ fn g() -> result(i16, i64):
         let module = lower(src);
         assert_eq!(
             body(&module, "f"),
-            "(call get [] -> [tmp0 tmp1]) \
-             (return tmp0 (if (I32.Eq tmp0 1) (I32.Ne tmp1 0) \
-             (if (I32.Eq tmp0 0) (I32.And tmp1 255) tmp1)))"
+            "(call get [0] -> []) (set tmp0 (I32.Load8U offset=0 0)) (set tmp1 tmp0) \
+             (set tmp2 (if (I32.Eq tmp0 0) (I32.Load8U offset=1 0) \
+             (if (I32.Eq tmp0 1) (I32.Ne (I32.Load8U offset=1 0) 0) 0))) \
+             (return tmp1 tmp2)"
         );
         assert_eq!(
             body(&module, "g"),
-            "(call wide [] -> [tmp0 tmp1]) \
-             (return tmp0 (if (I32.Eq tmp0 0) \
-             (I32.ExtendU (I32.Extend16S (I64.Wrap tmp1))) tmp1))"
+            "(call wide [0] -> []) (set tmp0 (I32.Load8U offset=0 0)) (set tmp1 tmp0) \
+             (set tmp2 (if (I32.Eq tmp0 0) (I32.ExtendU (I32.Load16S offset=8 0)) \
+             (if (I32.Eq tmp0 1) (I64.Load offset=8 0) 0i64))) \
+             (return tmp1 tmp2)"
         );
     }
 
@@ -15208,7 +15270,8 @@ fn f() -> bool:
         );
         assert_eq!(
             body(&module, "extern small"),
-            "(call small [x] -> [tmp1 tmp2]) (return (I32.And tmp1 255) tmp2)"
+            "(call small [x 0] -> []) (set tmp1 (I32.Load8U offset=0 0)) \
+             (set tmp2 (I64.Load offset=8 0)) (return tmp1 tmp2)"
         );
         assert_eq!(
             body(&module, "f"),
@@ -16718,7 +16781,8 @@ fn call(n: Named, p: &Named) -> i32:
         // What it leaves out is still evaluated.
         assert_eq!(
             body(&module, "made"),
-            "(call make [] -> [tmp0 tmp1 tmp2 tmp3]) (return tmp0 (I32.And tmp1 255))"
+            "(call make [0] -> []) (set tmp0 (I32.Load offset=0 0)) (set tmp1 (I32.Load8U offset=4 0)) \
+             (set tmp2 (I32.Load8U offset=5 0)) (set tmp3 (I64.Load offset=8 0)) (return tmp0 tmp1)"
         );
         // A pointer to it is one to what it starts as, and writes it if it
         // wrote the whole.
