@@ -961,8 +961,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) const MODULE: &str =
-        "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmax = \"16MiB\"\n";
+    pub(crate) const MODULE: &str = "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\nworld = \"wasi:cli/imports@0.3.0\"\n[memory]\nmax = \"16MiB\"\n";
 
     const LIBRARY: &str = "[library]\nentry = \"lib.duck\"\n";
 
@@ -1268,7 +1267,7 @@ pub(crate) mod tests {
     #[test]
     fn memory64_widens_a_module_and_not_the_library_beside_it() {
         let dir = TempDir::new("memory64");
-        let module = "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmemory64 = true\n";
+        let module = "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\nworld = \"wasi:cli/imports@0.3.0\"\n[memory]\nmemory64 = true\n";
         dir.write(&[
             ("app/Duck.toml", &format!("{module}{LIBRARY}")),
             ("app/main.duck", "let far: uint = 4294967296\n"),
@@ -1307,7 +1306,8 @@ pub(crate) mod tests {
     #[test]
     fn errors_no_file_holds_are_placed_in_the_manifest() {
         let dir = TempDir::new("manifest");
-        let start = MODULE.replace("[memory]", "start = \"main\"\n[memory]");
+        // A program, which is what a component is of no other world.
+        let start = MODULE.replace("world = \"wasi:cli/imports@0.3.0\"", "start = \"main\"");
         dir.write(&[("app/Duck.toml", &start), ("app/main.duck", "")]);
         assert_eq!(
             check(&dir, &[]),

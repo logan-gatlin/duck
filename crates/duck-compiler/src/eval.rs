@@ -328,7 +328,6 @@ mod tests {
             globals: Vec::new(),
             imports: Vec::new(),
             funcs,
-            start: None,
         }
     }
 

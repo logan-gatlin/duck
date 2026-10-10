@@ -85,6 +85,58 @@ extern:
     (pass_statement)))
 
 ====================
+Export block
+====================
+
+pub "my:pkg/math@0.1.0":
+    fn add(a: i32) -> i32:
+        return a
+    pub fn double_it() = "double":
+        pass
+pub "wasi:cli/run@0.3.0":
+    pass
+pub fn tick() = "tick-now":
+    pass
+
+---
+
+(source_file
+  (export_block
+    (string
+      (string_content))
+    (function_declaration
+      (identifier)
+      (parameters
+        (parameter
+          (identifier)
+          (named_type
+            (identifier))))
+      (named_type
+        (identifier))
+      (block
+        (expression_statement
+          (return_expression
+            (identifier)))))
+    (function_declaration
+      (identifier)
+      (parameters)
+      (string
+        (string_content))
+      (block
+        (pass_statement))))
+  (export_block
+    (string
+      (string_content))
+    (pass_statement))
+  (function_declaration
+    (identifier)
+    (parameters)
+    (string
+      (string_content))
+    (block
+      (pass_statement))))
+
+====================
 Struct
 ====================
 

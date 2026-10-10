@@ -51,6 +51,13 @@ pub struct UsePath {
 pub struct FnDecl {
     pub sig: FnSig,
     pub body: Block,
+    /// The interface of the `pub "interface":` block the function is in,
+    /// which exports it, as it is written there: with its quotes. Each
+    /// function of a block is an item of its own.
+    pub interface: Option<Ident>,
+    /// The `= "name"` after the signature, which the function is exported
+    /// as in place of its own name, as it is written.
+    pub export_name: Option<Ident>,
 }
 
 /// `fn(A, B) name(params) -> ret`, shared by definitions and imports. The
@@ -406,6 +413,8 @@ pub enum ParseErrorKind {
     OneElementTuple,
     /// A function in an `extern` block with type parameters.
     GenericExtern,
+    /// A function in a `pub "interface":` block with type parameters.
+    GenericExport,
     /// A pipe whose body has no `_` of its own.
     PipeWithoutPlaceholder,
     /// A `|>` after a `return` in the body of a pipe, outside any brackets
@@ -548,6 +557,10 @@ impl fmt::Display for ParseErrorKind {
                     "functions in `extern` blocks cannot have type parameters"
                 )
             }
+            Self::GenericExport => write!(
+                f,
+                "functions that an interface exports cannot have type parameters"
+            ),
             Self::PipeWithoutPlaceholder => {
                 write!(f, "the right side of `|>` must use `_`, e.g. `x |> f(_)`")
             }
@@ -614,6 +627,15 @@ impl<'a> Parser<'a> {
         let mut past_uses = false;
         while !self.at(TokenKind::Eof) {
             let flaws = self.flaws;
+            if self.at(TokenKind::Pub) && matches!(self.peek_second().kind, TokenKind::Str(_)) {
+                past_uses = true;
+                match self.export_block() {
+                    Ok(exported) => items.extend(exported),
+                    Err(e) => self.recover(e),
+                }
+                self.flaws = flaws;
+                continue;
+            }
             match self.item() {
                 Ok(item) => {
                     let is_use = matches!(item.kind, ItemKind::Use(_));
@@ -630,6 +652,40 @@ impl<'a> Parser<'a> {
             self.flaws = flaws;
         }
         Module { items }
+    }
+
+    /// `pub "interface":` and the functions it exports, each an item that
+    /// says which interface it is of.
+    fn export_block(&mut self) -> PResult<Vec<Item>> {
+        self.expect(TokenKind::Pub)?;
+        let interface = self.string_ident()?;
+        let fns = self.indented(|p| {
+            if p.eat(TokenKind::Pass) {
+                p.expect(TokenKind::Newline)?;
+                return Ok(None);
+            }
+            let start = p.peek().span;
+            let is_pub = p.eat(TokenKind::Pub);
+            let mut decl = p.fn_decl()?;
+            let sig = &decl.sig;
+            if let (Some(first), Some(last)) = (sig.type_params.first(), sig.type_params.last()) {
+                let span = Span {
+                    end: last.name.span.end,
+                    ..first.name.span
+                };
+                p.error(ParseErrorKind::GenericExport, span);
+            }
+            for param in sig.params.iter().filter(|param| param.ty.is_type()) {
+                p.error(ParseErrorKind::GenericExport, param.span);
+            }
+            decl.interface = Some(interface.clone());
+            Ok(Some(Item {
+                is_pub,
+                kind: ItemKind::Fn(decl),
+                span: p.span_from(start),
+            }))
+        })?;
+        Ok(fns.into_iter().flatten().collect())
     }
 
     fn item(&mut self) -> PResult<Item> {
@@ -689,12 +745,20 @@ impl<'a> Parser<'a> {
     fn fn_decl(&mut self) -> PResult<FnDecl> {
         let start = self.peek().span;
         let sig = self.fn_sig()?;
-        // `=` would name an import, which only `extern` blocks have.
-        if self.at(TokenKind::Newline) || self.at(TokenKind::Eq) {
+        let export_name = match self.eat(TokenKind::Eq) {
+            true => Some(self.string_ident()?),
+            false => None,
+        };
+        if self.at(TokenKind::Newline) {
             return Err(self.error_from(ParseErrorKind::MissingFnBody, start));
         }
         let body = self.block()?;
-        Ok(FnDecl { sig, body })
+        Ok(FnDecl {
+            sig,
+            body,
+            interface: None,
+            export_name,
+        })
     }
 
     fn fn_sig(&mut self) -> PResult<FnSig> {
@@ -1578,6 +1642,13 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.unexpected("string")),
         }
+    }
+
+    /// A string and where it is written, quotes and all.
+    fn string_ident(&mut self) -> PResult<Ident> {
+        let span = self.peek().span;
+        let name = self.string()?;
+        Ok(Ident { name, span })
     }
 
     fn ident(&mut self) -> PResult<Ident> {
@@ -3103,6 +3174,82 @@ enum(u8) Color:
     }
 
     #[test]
+    fn export_blocks_hold_the_functions_of_an_interface() {
+        let src = "pub \"my:pkg/math@0.1.0\":\n    fn add(a: i32, b: i32) -> i32:\n        \
+                   return a + b\n    pub fn double_it(n: i32) -> i32 = \"double\":\n        \
+                   return n * 2\n\npub fn tick() = \"tick-now\":\n    pass\n\nfn idle():\n    pass\n";
+        let module = parse_src(src).unwrap();
+        // Each function of a block is an item of the file, as any is.
+        let fns = module.items.iter().map(|item| {
+            let ItemKind::Fn(f) = &item.kind else {
+                panic!()
+            };
+            let text =
+                |ident: &Option<Ident>| ident.as_ref().map(|i| &src[i.span.start..i.span.end]);
+            let named = f.export_name.as_ref().map(|name| name.name.as_str());
+            (
+                (item.is_pub, f.sig.name.name.as_str()),
+                (
+                    f.interface.as_ref().map(|i| i.name.as_str()),
+                    text(&f.interface),
+                ),
+                (named, text(&f.export_name)),
+            )
+        });
+        let interface = (Some("my:pkg/math@0.1.0"), Some("\"my:pkg/math@0.1.0\""));
+        assert_eq!(
+            fns.collect::<Vec<_>>(),
+            [
+                ((false, "add"), interface, (None, None)),
+                (
+                    (true, "double_it"),
+                    interface,
+                    (Some("double"), Some("\"double\""))
+                ),
+                (
+                    (true, "tick"),
+                    (None, None),
+                    (Some("tick-now"), Some("\"tick-now\""))
+                ),
+                ((false, "idle"), (None, None), (None, None)),
+            ]
+        );
+        let span = module.items[1].span;
+        assert!(src[span.start..span.end].starts_with("pub fn double_it"));
+        assert!(src[span.start..span.end].ends_with("return n * 2"));
+
+        // A block may hold nothing, as an `extern` block may.
+        let empty = parse_src("pub \"a:b/c\":\n    pass\n").unwrap();
+        assert!(empty.items.is_empty());
+
+        assert_eq!(
+            errors("pub \"a:b/c\":\n    fn(T) f(x: T):\n        pass\n"),
+            vec![ParseErrorKind::GenericExport]
+        );
+        assert_eq!(
+            errors("pub \"a:b/c\":\n    fn f(T: type):\n        pass\n"),
+            vec![ParseErrorKind::GenericExport]
+        );
+        assert_eq!(
+            errors("pub \"a:b/c\":\n    let x = 1\n"),
+            vec![expected("`fn`", TokenKind::Let)]
+        );
+        // Only an `extern` function has no body.
+        assert_eq!(
+            errors("pub \"a:b/c\":\n    fn f()\n"),
+            vec![ParseErrorKind::MissingFnBody]
+        );
+        assert_eq!(
+            errors("fn f() = \"g\"\n"),
+            vec![ParseErrorKind::MissingFnBody]
+        );
+        assert_eq!(
+            errors("use a\nfn f():\n    pass\npub \"a:b/c\":\n    pass\nuse b\n"),
+            vec![ParseErrorKind::UseAfterItem]
+        );
+    }
+
+    #[test]
     fn enums() {
         let src = "\
 pub enum(i8) ReturnCode:
@@ -3305,7 +3452,9 @@ fn h() -> i32:
             .iter()
             .map(|e| &src[e.span.start..e.span.end])
             .collect();
-        assert_eq!(spans, ["fn a()", "let", "e", "pub", "fn g()", "fn g2()"]);
+        // A name after `=` is what a function with a body is exported as.
+        let named = "fn g2() = \"x\"";
+        assert_eq!(spans, ["fn a()", "let", "e", "pub", "fn g()", named]);
     }
 
     #[test]

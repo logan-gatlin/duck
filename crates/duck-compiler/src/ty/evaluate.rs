@@ -235,7 +235,6 @@ impl Checker {
             globals: self.ir_globals.clone(),
             imports: self.lower_imports(program),
             funcs: funcs.chain([thunk]).collect(),
-            start: None,
         }
     }
 

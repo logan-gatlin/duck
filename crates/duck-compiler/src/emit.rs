@@ -18,7 +18,7 @@ use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, HeapType,
     ImportSection, IndirectNameMap, Instruction, MemArg, MemorySection, MemoryType, NameMap,
-    NameSection, RefType, StartSection, TableSection, TableType, TypeSection,
+    NameSection, RefType, TableSection, TableType, TypeSection,
 };
 
 use crate::ir::{
@@ -168,10 +168,6 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
         }
     }
 
-    let start = module.start.filter(|_| !hosted).map(|func| StartSection {
-        function_index: func.0,
-    });
-
     let mut code = CodeSection::new();
     for func in &module.funcs {
         code.function(&function(func, &mut types));
@@ -216,9 +212,6 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
         out.section(&memories).section(&globals);
     }
     out.section(&exports);
-    if let Some(start) = &start {
-        out.section(start);
-    }
     if !elements.is_empty() {
         out.section(&elements);
     }
@@ -680,7 +673,7 @@ mod tests {
     fn example_program() {
         let wat = wat(&emit_src(include_str!("../example.duck")));
         assert!(
-            wat.contains(r#"(import "env" "log_f32" (func $logf (;1;) (type 1)))"#),
+            wat.contains(r#"(import "$root" "log_f32" (func $logf (;1;) (type 1)))"#),
             "{wat}"
         );
         assert!(wat.contains(r#"(export "add" (func $add))"#), "{wat}");
@@ -891,8 +884,8 @@ pub fn g() -> i32:
             lines,
             [
                 r#"  (import "js" "Date.now" (func $now (;0;) (type 0)))"#,
-                r#"  (import "env" "put" (func $put (;1;) (type 1)))"#,
-                r#"  (import "env" "flag" (func $flag (;2;) (type 2)))"#,
+                r#"  (import "$root" "put" (func $put (;1;) (type 1)))"#,
+                r#"  (import "$root" "flag" (func $flag (;2;) (type 2)))"#,
                 r#"  (export "f" (func $f))"#,
             ]
         );
@@ -923,8 +916,8 @@ fn f():
         assert_eq!(
             imports,
             [
-                r#"  (import "env" "log" (func $logi (;0;) (type 0)))"#,
-                r#"  (import "env" "log" (func $logf (;1;) (type 1)))"#,
+                r#"  (import "$root" "log" (func $logi (;0;) (type 0)))"#,
+                r#"  (import "$root" "log" (func $logf (;1;) (type 1)))"#,
             ]
         );
     }
@@ -1031,18 +1024,31 @@ pub fn mem(p: &var u8, q: &u8, n: uint) -> int:
     fn start_function() {
         let settings = Settings {
             start: Some("init".to_string()),
+            world: Some(crate::world::COMMAND.to_string()),
             ..Settings::default()
         };
         let src = "\
-extern:
-    fn log(n: i32)
+extern \"wasi:cli/exit@0.3.0\":
+    fn exit_with_code(status: u8)
 fn init():
-    log(1)
+    exit_with_code(1)
 ";
+        // It is called by the `run` that the world exports, and never as
+        // the module is instantiated.
         let started = wat(&emit_with(src, &settings));
-        assert!(started.contains("(start $init)"), "{started}");
+        let run = r#"(export "wasi:cli/run@0.3.0#run" (func $wasi:cli/run@0.3.0#run))"#;
+        assert!(started.contains(run), "{started}");
+        let body = func_wat(&emit_with(src, &settings), "wasi:cli/run@0.3.0#run");
+        assert!(
+            body.contains("call $init\n    i32.const 0\n    return"),
+            "{body}"
+        );
         let unstarted = wat(&emit_src(src));
-        assert!(!unstarted.contains("(start"), "{unstarted}");
+        assert!(
+            !unstarted.contains("(start") && !started.contains("(start"),
+            "{unstarted}"
+        );
+        assert!(!unstarted.contains("#run"), "{unstarted}");
     }
 
     #[test]

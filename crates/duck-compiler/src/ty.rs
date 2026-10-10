@@ -22,6 +22,7 @@ use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
     PatternKind, StmtKind, StructDecl, TypeKind, UnaryOp, UnionDecl,
 };
+use crate::world::{ROOT, RUN_EXPORT, World, WorldError, kebab};
 
 use defaults::DefaultValue;
 use enums::EnumDef;
@@ -34,6 +35,7 @@ mod defaults;
 mod enums;
 mod equality;
 mod evaluate;
+mod exports;
 mod fn_ptr;
 mod generic;
 mod generic_fn;
@@ -173,9 +175,6 @@ const ARRAY_FIELDS: [&str; 2] = ["ptr", "len"];
 
 /// The fields of a `type`, in order.
 const TYPE_FIELDS: [&str; 2] = ["size", "align"];
-
-/// The module that `extern` blocks without one import from.
-const DEFAULT_IMPORT_MODULE: &str = "env";
 
 /// The most structs and unions that can be nested by value, each a field of
 /// the one before or a variant, or in a tuple or enum of one. Generics can
@@ -631,6 +630,42 @@ pub enum TypeErrorKind {
         ty: String,
         item: String,
     },
+    /// The WIT of the [`Settings`], or what they ask of the world, is no
+    /// world to build a component of.
+    World(WorldError),
+    /// A function that the host is to know by a name, with none in WIT:
+    /// its own is no name there, and it has no `= "name"`.
+    NoWitName(String),
+    /// A `pub "interface":` block in a file that isn't the entry file of a
+    /// component.
+    ExportOutsideEntry,
+    /// A second `pub "interface":` block of the interface.
+    ExportBlockRepeated(String),
+    /// A `pub "interface":` block of an interface the world doesn't export,
+    /// and those it does.
+    UnknownExportInterface {
+        name: String,
+        exported: Vec<String>,
+    },
+    /// A function of a `pub "interface":` block that the interface doesn't
+    /// have, or an `= "name"` that the world exports no function as.
+    UnknownExport {
+        interface: Option<String>,
+        name: String,
+    },
+    /// Functions that the world exports, of an interface or of its own,
+    /// which nothing defines.
+    MissingExports {
+        interface: Option<String>,
+        names: Vec<String>,
+    },
+    /// A second function exported as the name.
+    DuplicateExport(String),
+    /// An `= "name"` on a function that nothing exports.
+    UnexportedName,
+    /// A `run` of `wasi:cli/run` where a start function is named for the
+    /// one the compiler makes to call.
+    StartAndRun,
     /// A start function named in the [`Settings`] that isn't a function.
     UnknownStart(String),
     /// A start function that takes arguments or returns something.
@@ -687,9 +722,11 @@ struct Checker {
     module: FileId,
     /// The module whose `pub` items are exported.
     entry: FileId,
+    /// The world the program is a component of, which says what is.
+    world: World,
     /// Each function and global that a `pub use` of the entry module names,
     /// and the name it is exported as for that.
-    reexports: Vec<(Item, String)>,
+    reexports: Vec<(Item, Ident)>,
     /// Struct declarations in declaration order, then the built-in unions
     /// and the struct that lists are instances of, then instances of
     /// generic ones as they are used.
@@ -1489,6 +1526,70 @@ impl fmt::Display for TypeErrorKind {
                  declare it before the constants that use it"
             ),
             Self::ReservedExport(name) => write!(f, "the export name `{name}` is reserved"),
+            Self::World(e) => e.fmt(f),
+            Self::NoWitName(name) => write!(
+                f,
+                "`{name}` has no name in WIT, where one is words of lowercase letters or of \
+                 capitals joined by `-`: give it one with `= \"name\"`"
+            ),
+            Self::ExportOutsideEntry => {
+                write!(f, "only the entry file of a component exports an interface")
+            }
+            Self::ExportBlockRepeated(name) => write!(
+                f,
+                "another block exports `{name}`: one has every function of an interface"
+            ),
+            Self::UnknownExportInterface { name, exported } => {
+                write!(f, "the world exports no interface `{name}`")?;
+                match exported.as_slice() {
+                    [] => write!(f, ": it exports none"),
+                    exported => write!(f, ": it exports {}", quoted(exported)),
+                }
+            }
+            Self::UnknownExport {
+                interface: Some(interface),
+                name,
+            } => write!(f, "`{interface}` has no function `{name}`"),
+            Self::UnknownExport {
+                interface: None,
+                name,
+            } => write!(f, "the world exports no function `{name}`"),
+            Self::MissingExports {
+                interface: Some(interface),
+                names,
+            } => {
+                let names = quoted(names);
+                write!(
+                    f,
+                    "nothing defines {names} of `{interface}`, which the world exports: "
+                )?;
+                match interface == crate::world::RUN_INTERFACE {
+                    true => write!(
+                        f,
+                        "name a `start` in Duck.toml for it to call, or define it in a \
+                         `pub \"{interface}\":` block"
+                    ),
+                    false => write!(f, "define each in a `pub \"{interface}\":` block"),
+                }
+            }
+            Self::MissingExports {
+                interface: None,
+                names,
+            } => write!(
+                f,
+                "nothing defines {}, which the world exports: each is a `pub fn` of the entry \
+                 file",
+                quoted(names)
+            ),
+            Self::DuplicateExport(name) => write!(f, "another function is exported as `{name}`"),
+            Self::UnexportedName => write!(
+                f,
+                "only a function that is exported has a name to be exported as"
+            ),
+            Self::StartAndRun => write!(
+                f,
+                "`start` in Duck.toml names what a `run` made for it calls, so none is defined"
+            ),
             Self::UnknownStart(name) => write!(f, "no function named `{name}` to start"),
             Self::Private(name) => write!(f, "`{name}` is private"),
             Self::NoItem { module, item } => write!(f, "`{module}` has no item `{item}`"),
@@ -1567,6 +1668,17 @@ impl fmt::Display for Stack<'_> {
     }
 }
 
+impl TypeError {
+    /// An error in no source file: one in what the settings ask.
+    pub fn nowhere(kind: TypeErrorKind) -> Self {
+        Self {
+            kind,
+            span: None,
+            instances: Vec::new(),
+        }
+    }
+}
+
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.span {
@@ -1596,9 +1708,30 @@ impl std::error::Error for TypeError {}
 /// Checking continues past errors, so every error in the program is reported
 /// at once.
 pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
-    let (mut ck, imports, funcs, start) = lower_program(program, settings, false);
+    let (mut ck, imports, mut funcs, start) = lower_program(program, settings, false);
     if !ck.errors.is_empty() {
         return Err(ck.errors);
+    }
+    // The start function is called by the `run` that the world exports, as
+    // no import that reads or writes memory can be called while the module
+    // is instantiated. It returns the `result` of `run`, which is `ok` once
+    // the start function returns: a program that fails exits with a status.
+    if let Some(start) = start {
+        funcs.push(ir::Func {
+            name: RUN_EXPORT.to_string(),
+            exports: vec![RUN_EXPORT.to_string()],
+            params: Vec::new(),
+            results: vec![ValType::I32],
+            locals: Vec::new(),
+            body: vec![
+                Stmt::Call {
+                    func: start,
+                    args: Vec::new(),
+                    dests: Vec::new(),
+                },
+                Stmt::Return(vec![Expr::Const(Const::I32(0))]),
+            ],
+        });
     }
     let min_pages = ck.pages();
     if let Some(eval) = &mut ck.eval {
@@ -1624,7 +1757,6 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
         globals: ck.ir_globals,
         imports,
         funcs,
-        start,
     })
 }
 
@@ -1650,8 +1782,12 @@ fn lower_program(
         .as_ref()
         .and_then(|name| ck.resolve_start(program, name));
     ck.check_generic_fns(program);
+    ck.check_import_names(program);
     let imports = ck.lower_imports(program);
     let mut funcs = ck.lower_funcs(program);
+    // A start function that isn't one is reported as that, and not also
+    // as a `run` that nothing defines.
+    ck.export_funcs(program, &mut funcs, settings.start.is_some());
     funcs.extend(ck.lower_synths(program));
     // An instance may only have an error that checking its declaration
     // missed because of one that is reported.
@@ -1888,7 +2024,7 @@ impl Checker {
         };
         if exported {
             self.check_export(name);
-            self.reexports.push((item, name.name.clone()));
+            self.reexports.push((item, name.clone()));
         }
     }
 
@@ -1912,16 +2048,21 @@ impl Checker {
         }
     }
 
-    /// Whether `item` is exported: it's `pub` and in the entry module.
+    /// Whether `item` is exported by its own name: it's `pub` and in the
+    /// entry module of a library. Nothing says what a library exports, so
+    /// its module has what it would let another file use, for whoever reads
+    /// that module. A component exports what its world does, which
+    /// [`Self::export_funcs`] finds.
     fn exports(&self, item: &parse::Item) -> bool {
-        item.is_pub && item.span.file == self.entry
+        self.world.is_library() && item.is_pub && item.span.file == self.entry
     }
 
-    /// The names `item` is exported as: `own`, if it's a `pub` item of the
-    /// entry module, then each that a `pub use` there gives it.
+    /// The names `item` is exported as by a library: `own`, if it's a `pub`
+    /// item of the entry module, then each that a `pub use` there gives it.
     fn export_names(&self, item: Item, own: Option<&str>) -> Vec<String> {
         let used = self.reexports.iter().filter(|(used, _)| *used == item);
-        let used = used.map(|(_, name)| name.as_str());
+        let used = used.map(|(_, name)| name.name.as_str());
+        let used = used.filter(|_| self.world.is_library());
         own.into_iter().chain(used).map(str::to_string).collect()
     }
 
@@ -2579,9 +2720,14 @@ impl Checker {
     /// Declares and defines every item of `program`, which places its
     /// literals. If it `records`, the type of what is written is kept.
     fn define(program: &Program, settings: &Settings, records: bool) -> Self {
+        let (world, unread) = match World::load(settings) {
+            Ok(world) => (world, None),
+            Err(e) => (World::default(), Some(e)),
+        };
         let mut ck = Self {
             types: records.then(HashMap::new),
             entry: program.entry,
+            world,
             max_pages: settings.max_pages,
             memory64: settings.memory64,
             data_end: settings.static_start.into(),
@@ -2592,6 +2738,9 @@ impl Checker {
             .max_pages
             .map(|pages| pages.saturating_mul(PAGE_SIZE));
         ck.data_limit = max_bytes.map_or(ck.max_addr(), |bytes| bytes.min(ck.max_addr()));
+        if let Some(error) = unread {
+            ck.error_nowhere(TypeErrorKind::World(error));
+        }
         ck.declare(program);
         ck.define_structs(program);
         ck.define_funcs(program);
@@ -2659,11 +2808,11 @@ impl Checker {
         imports
             .map(|((block, decl), sig)| ir::Import {
                 name: sig.name.clone(),
-                module: block
-                    .module
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_IMPORT_MODULE.to_string()),
-                field: decl.import_name.clone().unwrap_or_else(|| sig.name.clone()),
+                module: block.module.clone().unwrap_or_else(|| ROOT.to_string()),
+                // One with no name in WIT is reported, and keeps its own.
+                field: (decl.import_name.clone())
+                    .or_else(|| kebab(&sig.name))
+                    .unwrap_or_else(|| sig.name.clone()),
                 params: sig
                     .params
                     .iter()
@@ -6576,6 +6725,12 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
     }
 }
 
+/// `names`, each quoted as code is, with commas between them.
+fn quoted(names: &[String]) -> String {
+    let names: Vec<_> = names.iter().map(|name| format!("`{name}`")).collect();
+    names.join(", ")
+}
+
 /// `expr` as written, if it's a name or a path of names, like `a.b.c`.
 fn path_text(expr: &parse::Expr) -> String {
     match &expr.kind {
@@ -7044,9 +7199,9 @@ mod tests {
         assert_eq!(
             imports,
             vec![
-                ("logi", "env", "logi"),
-                ("logf", "env", "log_f32"),
-                ("logs", "env", "log_str")
+                ("logi", "$root", "logi"),
+                ("logf", "$root", "log_f32"),
+                ("logs", "$root", "log_str")
             ]
         );
         let main = body(&module, "main");
@@ -7841,7 +7996,7 @@ extern:
             imports,
             vec![
                 ("now", "js", "Date.now", vec![I32], vec![I32]),
-                ("put", "env", "put", vec![I32, F32, I64], vec![F32, I64]),
+                ("put", "$root", "put", vec![I32, F32, I64], vec![F32, I64]),
             ]
         );
         let funcs: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
@@ -9452,12 +9607,24 @@ fn f(a: i32, p: P, pp: &&P):
         );
     }
 
+    /// Checks `src` as a program, whose start function is `start`.
     fn check_start(src: &str, start: &str) -> Result<Module, Vec<TypeError>> {
         let settings = Settings {
             start: Some(start.to_string()),
+            world: Some(crate::world::COMMAND.to_string()),
             ..Settings::default()
         };
         check_with(src, &settings)
+    }
+
+    /// The function that the `run` of `module` calls, if it exports one.
+    fn started(module: &Module) -> Option<FuncId> {
+        let run = |f: &&ir::Func| f.exports == [RUN_EXPORT];
+        let run = module.funcs.iter().find(run)?;
+        match &run.body[..] {
+            [Stmt::Call { func, .. }, Stmt::Return(_)] => Some(*func),
+            body => panic!("{body:?}"),
+        }
     }
 
     #[test]
@@ -9579,11 +9746,11 @@ fn back() -> i32:
 fn generic(T: type):
     pass
 ";
-        let start = |name| check_start(src, name).map(|m| m.start);
+        let start = |name| check_start(src, name).map(|m| started(&m));
         assert_eq!(start("init"), Ok(Some(FuncId(2))));
         assert_eq!(start("ready"), Ok(Some(FuncId(0))));
         assert_eq!(start("give"), Ok(Some(FuncId(4))));
-        assert_eq!(lower(src).start, None);
+        assert_eq!(started(&lower(src)), None);
 
         for name in ["nope", "S", "g"] {
             assert_eq!(

@@ -3236,6 +3236,19 @@ fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
     }
 
     #[test]
+    fn what_an_interface_exports_is_used_by_the_host() {
+        let src = "pub \"my:pkg/math@0.1.0\":\n    fn add(a: i32, b: i32) -> i32:\n        \
+                   return a + b\n\nfn idle():\n    pass\n";
+        let mut files = Memory(vec![("main", src)]);
+        let (program, errors) = load::load_partial(&mut files);
+        assert_eq!(errors, []);
+        let analysis = analyze(program, &Settings::default());
+        let unused = analysis.unused(&mut files);
+        let names: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
+        assert_eq!(names, ["idle"]);
+    }
+
+    #[test]
     fn an_error_is_mended_by_what_it_says_is_missing() {
         let mut files = user();
         let analysis = used(&mut files);

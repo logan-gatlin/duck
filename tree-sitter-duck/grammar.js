@@ -85,6 +85,7 @@ module.exports = grammar({
     _item: $ => choice(
       $.function_declaration,
       $.extern_block,
+      $.export_block,
       $.struct_declaration,
       $.enum_declaration,
       $.union_declaration,
@@ -95,6 +96,7 @@ module.exports = grammar({
     function_declaration: $ => seq(
       optional('pub'),
       $._function_signature,
+      optional(seq('=', field('export_name', $.string))),
       field('body', $.block),
     ),
 
@@ -135,6 +137,17 @@ module.exports = grammar({
       $._newline,
       $._indent,
       repeat1(choice($.extern_function, $.pass_statement)),
+      $._dedent,
+    ),
+
+    // `pub "interface":` and the functions the interface exports.
+    export_block: $ => seq(
+      'pub',
+      field('interface', $.string),
+      ':',
+      $._newline,
+      $._indent,
+      repeat1(choice($.function_declaration, $.pass_statement)),
       $._dedent,
     ),
 

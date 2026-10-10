@@ -4,8 +4,8 @@ use crate::file::FileManager;
 use crate::lex::{LexError, Span};
 use crate::load::UseError;
 use crate::parse::ParseError;
-use crate::ty::{InstanceSite, TypeError};
-use crate::world::{RUN_EXPORT, World, WorldError};
+use crate::ty::{InstanceSite, TypeError, TypeErrorKind};
+use crate::world::{World, WorldError};
 
 pub mod emit;
 mod eval;
@@ -25,9 +25,6 @@ pub enum Error {
     Parse(ParseError),
     Use(UseError),
     Type(TypeError),
-    /// There is no world to build a component of, or none for what the
-    /// [`file::Settings`] ask of it.
-    World(WorldError),
     /// The module is no component of its world: it imports what the world
     /// doesn't have, lacks what it exports, or declares either as the
     /// Canonical ABI doesn't.
@@ -43,7 +40,7 @@ impl Error {
             Self::Parse(e) => Some(e.span),
             Self::Use(e) => Some(e.span),
             Self::Type(e) => e.span,
-            Self::World(_) | Self::Component(_) => None,
+            Self::Component(_) => None,
         }
     }
 
@@ -66,7 +63,6 @@ impl fmt::Display for Error {
             Self::Parse(e) => e.kind.fmt(f),
             Self::Use(e) => e.kind.fmt(f),
             Self::Type(e) => e.kind.fmt(f),
-            Self::World(e) => e.fmt(f),
             Self::Component(e) => write!(f, "cannot make a component of the module: {e}"),
         }
     }
@@ -81,14 +77,18 @@ impl std::error::Error for Error {}
 /// every file counts as one stage.
 pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
     let settings = files.settings();
-    if settings.world.is_none() {
-        return Err(vec![Error::World(WorldError::Library)]);
+    let unbuilt = match (&settings.world, settings.memory64) {
+        (None, _) => Some(WorldError::Library),
+        (Some(_), true) => Some(WorldError::Memory64),
+        (Some(_), false) => None,
+    };
+    if let Some(error) = unbuilt {
+        let error = TypeError::nowhere(TypeErrorKind::World(error));
+        return Err(vec![Error::Type(error)]);
     }
-    if settings.memory64 {
-        return Err(vec![Error::World(WorldError::Memory64)]);
-    }
-    let world = World::load(&settings).map_err(|e| vec![Error::World(e)])?;
-    let module = lower_in(files, &world)?;
+    let module = lower(files)?;
+    // The module has no errors, so the settings name a world.
+    let world = World::load(&settings).expect("the world is read");
     let component = world.encode(emit::emit(&module));
     component.map_err(|e| vec![Error::Component(e)])
 }
@@ -96,56 +96,17 @@ pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
 /// Lowers the entry point of `files`, and every file it uses, to the core
 /// module that [`compile`] makes a component of.
 pub fn lower(files: &mut impl FileManager) -> Result<ir::Module, Vec<Error>> {
-    let world = World::load(&files.settings()).map_err(|e| vec![Error::World(e)])?;
-    lower_in(files, &world)
+    let module = load::load(files)?;
+    ty::check(&module, &files.settings()).map_err(|e| e.into_iter().map(Error::Type).collect())
 }
 
 /// Finds the errors [`compile`] does in the entry point of `files`, and
 /// every file it uses, without making the module of a program that has none.
 pub fn check(files: &mut impl FileManager) -> Result<(), Vec<Error>> {
-    let settings = files.settings();
-    let world = World::load(&settings).map_err(|e| vec![Error::World(e)])?;
     let module = load::load(files)?;
-    let errors = ty::errors(&module, &settings);
-    if !errors.is_empty() {
-        return Err(errors.into_iter().map(Error::Type).collect());
+    let errors = ty::errors(&module, &files.settings());
+    match errors.is_empty() {
+        true => Ok(()),
+        false => Err(errors.into_iter().map(Error::Type).collect()),
     }
-    match settings.start.is_some() && !world.exports_run() {
-        true => Err(vec![Error::World(world.start_error())]),
-        false => Ok(()),
-    }
-}
-
-/// [`lower`] as a component of `world`, whose `run` calls the start
-/// function rather than it running when the module is instantiated: no
-/// import that reads or writes memory can be called until then.
-fn lower_in(files: &mut impl FileManager, world: &World) -> Result<ir::Module, Vec<Error>> {
-    let program = load::load(files)?;
-    let checked = ty::check(&program, &files.settings());
-    let mut module = checked.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
-    let Some(start) = module.start.take() else {
-        return Ok(module);
-    };
-    if !world.exports_run() {
-        return Err(vec![Error::World(world.start_error())]);
-    }
-    // It returns the `result` of `run`, which is `ok` once the start
-    // function returns: a program that fails exits with a status.
-    let ok = ir::Expr::Const(ir::Const::I32(0));
-    module.funcs.push(ir::Func {
-        name: RUN_EXPORT.to_string(),
-        exports: vec![RUN_EXPORT.to_string()],
-        params: Vec::new(),
-        results: vec![ir::ValType::I32],
-        locals: Vec::new(),
-        body: vec![
-            ir::Stmt::Call {
-                func: start,
-                args: Vec::new(),
-                dests: Vec::new(),
-            },
-            ir::Stmt::Return(vec![ok]),
-        ],
-    });
-    Ok(module)
 }

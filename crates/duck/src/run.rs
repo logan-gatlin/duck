@@ -167,7 +167,7 @@ extern "$root":
     fn set_drop(set: i32) = "[waitable-set-drop]"
 
 extern "wasi:cli/stdout@0.3.0":
-    fn write_via_stream(data: i32) -> i32 = "write-via-stream"
+    fn write_via_stream(data: i32) -> i32
     fn stream_new() -> i64 = "[stream-new-0]write-via-stream"
     fn stream_write(stream: i32, bytes: array(u8)) -> i32 = "[async-lower][stream-write-0]write-via-stream"
     fn stream_drop(stream: i32) = "[stream-drop-writable-0]write-via-stream"
@@ -293,7 +293,7 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
     fn the_start_function_runs_with_the_arguments() {
         let src = r#"
 extern "wasi:cli/environment@0.3.0":
-    fn get_arguments(ret: &var array(array(u8))) = "get-arguments"
+    fn get_arguments(ret: &var array(array(u8)))
 
 let arguments: &var array(array(u8)) = &var []
 
@@ -324,14 +324,14 @@ fn main():
     fn a_program_exits_with_its_status() {
         let coded = r#"
 extern "wasi:cli/exit@0.3.0":
-    fn exit(status: u8) = "exit-with-code"
+    fn exit_with_code(status: u8)
 
 let before = "before"
 let after = "after"
 
 fn main():
     print(before)
-    exit(42)
+    exit_with_code(42)
     print(after)
 "#;
         assert_eq!(run_with(coded, &[]), (Ok(42), "before\n".to_string()));
@@ -396,7 +396,7 @@ fn main():
     fn imports_are_those_of_the_world() {
         let foreign = "extern:\n    fn log(n: i32)\n\nfn main():\n    log(1)\n";
         let e = compile(foreign, program()).unwrap_err();
-        assert!(e.contains("`env::log`"), "{e}");
+        assert!(e.contains("`$root::log`"), "{e}");
 
         // As the Canonical ABI lowers it, the function returns an `i32`.
         let mistyped = r#"
@@ -413,7 +413,7 @@ fn main():
         // A list is returned in memory that the module allocates.
         let unallocated = r#"
 extern "wasi:cli/environment@0.3.0":
-    fn get_arguments(ret: &var array(array(u8))) = "get-arguments"
+    fn get_arguments(ret: &var array(array(u8)))
 
 let arguments: &var array(array(u8)) = &var []
 
@@ -433,14 +433,23 @@ interface math {
     add: func(a: s32, b: s32) -> s32;
 }
 
+interface greeter {
+    triple-it: func(n: s32) -> s32;
+}
+
 world app {
     import math;
+    export greeter;
     export double: func(n: s32) -> s32;
 }
 "#;
         let src = r#"
 extern "my:pkg/math@0.1.0":
     fn add(a: i32, b: i32) -> i32
+
+pub "my:pkg/greeter@0.1.0":
+    fn triple_it(n: i32) -> i32:
+        return add(n, double(n))
 
 pub fn double(n: i32) -> i32:
     return add(n, n)
@@ -474,6 +483,10 @@ fn idle():
         let instance = linker.instantiate(&mut store, &component).unwrap();
         let double = instance.get_typed_func::<(i32,), (i32,)>(&mut store, "double");
         assert_eq!(double.unwrap().call(&mut store, (21,)).unwrap(), (42,));
+        let greeter = instance.get_export_index(&mut store, None, "my:pkg/greeter@0.1.0");
+        let triple = instance.get_export_index(&mut store, greeter.as_ref(), "triple-it");
+        let triple = instance.get_typed_func::<(i32,), (i32,)>(&mut store, triple.unwrap());
+        assert_eq!(triple.unwrap().call(&mut store, (5,)).unwrap(), (15,));
 
         // A world is named in full where it is another package's.
         assert!(compile(src, settings("my:pkg/app@0.1.0")).is_ok());
@@ -509,7 +522,7 @@ fn idle():
     fn the_working_directory_and_the_root_are_open() {
         let src = r#"
 extern "wasi:filesystem/preopens@0.3.0":
-    fn get_directories(ret: &var array(tuple(i32, array(u8)))) = "get-directories"
+    fn get_directories(ret: &var array(tuple(i32, array(u8))))
 
 extern "wasi:filesystem/types@0.3.0":
     fn open_at(
@@ -564,7 +577,7 @@ union Ip:
     ipv6: tuple(u16, u16, u16, u16, u16, u16, u16, u16)
 
 extern "wasi:sockets/ip-name-lookup@0.3.0":
-    fn resolve(name: array(u8), ret: &var result(array(Ip), Failure)) = "resolve-addresses"
+    fn resolve_addresses(name: array(u8), ret: &var result(array(Ip), Failure))
 
 extern "wasi:sockets/types@0.3.0":
     fn create(family: u8, ret: &var result(i32, Failure)) = "[static]tcp-socket.create"
@@ -583,7 +596,7 @@ let binding = "binding"
 
 fn main():
     # An address is its own name, which nothing is asked for.
-    resolve(name, resolved)
+    resolve_addresses(name, resolved)
     match resolved.*:
         .ok([.ipv4((127, 0, 0, 1))]):
             print(resolving)

@@ -14,7 +14,7 @@ string operations.
 ## Syntax
 
 ```duck
-extern:                          # host functions, from wasm module "env"
+extern:                          # host functions, which the world imports
 	fn log(n: i32)
 
 pub let LIMIT = 100              # immutable global
@@ -923,34 +923,84 @@ pub use geo.Color                # also reachable as `this.Color`
 
 ## Host
 
-```duck
-extern "js":                               # wasm import module
-	fn print(s: array(u8)) = "print_bytes" # the host's name for it
-	pub fn get() -> externref              # callable from other files
+A component is one of a world, written in WIT, which says what its host gives
+it and what it gives its host. `Duck.toml` names the world.
 
-pub fn tick(dt: f64) -> f64:               # exported as "tick"
-	return dt
+```wit
+package my:pkg@0.1.0;
+
+interface host {
+    print-bytes: func(s: list<u8>);
+    current-time: func() -> u64;
+    poll: func() -> s32;
+}
+
+interface math {
+    add: func(a: s32, b: s32) -> s32;
+    negate-it: func(a: s32) -> s32;
+}
+
+world app {
+    import host;
+    import trace: func(code: u32);
+    export math;
+    export tick-now: func(dt: f64) -> f64;
+}
 ```
 
-- The `pub` functions and globals the entry file defines are the exports,
-  generic functions excepted. Also exported are `memory` and, once any function
-  pointer is taken, `table`: the host calls pointer `i` as
-  `table.get(i)(...)`. No `pub` item is named either.
-- A `pub use` in the entry file exports the function or global it names, from
-  whichever file, as the name it binds: `pub use alloc.realloc as cabi_realloc`
-  exports `cabi_realloc`. One named twice is exported as both. A generic or
-  `extern` function isn't exported, as a `pub` one of the entry file isn't.
+```duck
+extern "my:pkg/host@0.1.0":            # an interface the world imports
+	fn print_bytes(s: array(u8))        # `print-bytes` there
+	fn now() -> u64 = "current-time"    # the name the WIT has for it
+	pub fn poll() -> i32                # callable from other files
+
+extern:                                 # what the world itself imports
+	fn trace(code: u32)
+
+pub "my:pkg/math@0.1.0":                # an interface the world exports
+	fn add(a: i32, b: i32) -> i32:
+		return a + b
+	pub fn negate(a: i32) -> i32 = "negate-it":  # callable from other files
+		return 0 - a
+
+pub fn tick_now(dt: f64) -> f64:        # `tick-now`, which the world exports
+	trace(negate(1) as u32)
+	return dt
+
+pub fn helper():                        # only `pub`: the world has no `helper`
+	pass
+```
+
+- An `extern "interface":` block declares functions of an interface the world
+  imports, which is named in full, with its version, as the WIT names it. A
+  block without a name declares functions the world itself imports. A block
+  declares only the functions that are called.
+- A `pub "interface":` block defines the functions of an interface the world
+  exports. Only the entry file has one, each interface has one block, and the
+  block defines every function of the interface. Its functions are otherwise
+  as any of the file are: called by name, and private to it unless `pub`.
+- A function the world itself exports is a `pub fn` of the entry file with
+  its name, or one that a `pub use` there binds as it: `pub use geo.area`
+  exports `area`. A `pub fn` the world doesn't export is only `pub`.
+- Everything the world exports is defined, and the error names what isn't. A
+  block of an interface the world doesn't export is an error, as is a
+  function in one that the interface doesn't have.
+- A function is named for the host as WIT names it, which is its own name
+  with a `-` for each `_`: `print_bytes` is `print-bytes`. An `= "name"`
+  after the signature gives another, before the `:` of a function with a
+  body. One is needed where the name is none in WIT, whose names are words
+  of lowercase letters or of capitals: `_x`, `a__b` and `getHttp` are errors
+  in an `extern` block and in a `pub "interface":` block.
+- No function of either block is generic, and no generic function is
+  exported.
 - The host gives every argument. A default is passed by the Duck call that
   leaves it out, so an `extern` function may have them, an exported one has
   them for Duck callers only, and `start` names a function with no parameters.
-- Integers of 32 bits or fewer and `bool` are wasm `i32`. So are `int`,
-  `uint`, pointers and function pointers, which are `i64` with `memory64`: a
-  JS host then passes each as a `BigInt`, as in `table.get(1n)`. `i64`,
-  `f32`, `f64` and `externref` are themselves, and an enum is its value type.
-  Structs, tuples and arrays are one wasm value per scalar, in field
-  order: `fn f(s: array(u8)) -> Point` is `(i32 ptr, i32 len) -> (f32, f32)`.
-- An exported aggregate global is one wasm global per scalar, named with
-  dots: `origin.x`, `name.ptr`, `name.len`.
+- Integers of 32 bits or fewer and `bool` are wasm `i32`, as are `int`,
+  `uint`, pointers and function pointers. `i64`, `f32` and `f64` are
+  themselves, and an enum is its value type. Structs, tuples and arrays are
+  one wasm value per scalar, in field order: `fn f(s: array(u8)) -> Point` is
+  `(i32 ptr, i32 len) -> (f32, f32)`.
 - A union is an `i32` that counts its variants from 0, then the values its
   variants share, as the Canonical ABI of the component model flattens a
   variant. Each variant's scalars are held in order from the first, and each
@@ -963,13 +1013,10 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
 - A float held in an integer is its bits, and what is narrower than the
   `i64` that holds it has zeroes above it, which are ignored when it's read.
   The values the held variant doesn't use are zero in every value Duck
-  builds and are never read: the host may pass anything in them.
-  `externref`s share only values of their own, which come after the rest and
-  are null where unused. A count that no variant has matches no arm, and
-  memory keeps only its low byte.
-- A union is returned as these values, not through a pointer as the
-  Canonical ABI returns one.
-- An exported `shape` is the globals `shape`, `shape.0` and `shape.1`.
+  builds and are never read: the host may pass anything in them. A count
+  that no variant has matches no arm, and memory keeps only its low byte.
+- `externref` is an opaque reference of the host of a wasm module, which no
+  world has: a component neither takes nor gives one.
 
 ## WASI
 
@@ -985,7 +1032,7 @@ extern "$root":                          # built-ins of the component model
 	fn set_drop(set: i32) = "[waitable-set-drop]"
 
 extern "wasi:cli/stdout@0.3.0":          # an interface, with its version
-	fn write_via_stream(data: i32) -> i32 = "write-via-stream"
+	fn write_via_stream(data: i32) -> i32          # `write-via-stream`
 	fn stream_new() -> i64 = "[stream-new-0]write-via-stream"
 	fn stream_write(
 		stream: i32,
@@ -999,10 +1046,10 @@ extern "wasi:cli/stdout@0.3.0":          # an interface, with its version
 	fn future_drop(future: i32) = "[future-drop-readable-1]write-via-stream"
 
 extern "wasi:cli/environment@0.3.0":
-	fn get_arguments(ret: &var array(array(u8))) = "get-arguments"  # `list<string>`
+	fn get_arguments(ret: &var array(array(u8)))   # its `list<string>`
 
 extern "wasi:cli/exit@0.3.0":
-	fn exit(status: u8) -> never = "exit-with-code"
+	fn exit_with_code(status: u8) -> never
 
 let greeting = "Hello,"
 let newline = "\n"
@@ -1060,7 +1107,7 @@ fn main():                               # `start = "main"` in Duck.toml
 		.ok(_):
 			pass
 		.err(_):
-			exit(1)
+			exit_with_code(1)
 ```
 
 - `duck run a -b` gives the program the arguments `a` and `-b`, after its own
@@ -1071,17 +1118,20 @@ fn main():                               # `start = "main"` in Duck.toml
 - The `start` function is the program. It is called by the `run` of
   `wasi:cli/run`, once the module is instantiated, so that it may call every
   import, and `duck run` exits with 0 when it returns, or with the status it
-  gives `wasi:cli/exit`. A trap is an error that names the functions that
+  gives `wasi:cli/exit`. A program that defines `run` itself, in a
+  `pub "wasi:cli/run@0.3.0":` block, names no `start`, and exits with 1 when
+  its `run` returns `.err(())`. A trap is an error that names the functions that
   were running. A component of a world that doesn't export `wasi:cli/run`
   doesn't run, nor does one that imports what WASI 0.3 doesn't have: `duck
   build` builds it, for a host that does.
 - An `extern` block names an interface that the world imports, with its
   version: for a program, one of `wasi:cli`, `wasi:clocks`,
   `wasi:filesystem`, `wasi:random` or `wasi:sockets` at `0.3.0`. Nothing else
-  is there to import: an `extern` function of `env` is an error.
-- A function has the name its WIT does: `get-arguments`, a resource's method
-  as `[method]descriptor.open-at`, one that needs no handle as
-  `[static]tcp-socket.create`, and `[resource-drop]descriptor` to drop a
+  is there to import. The built-ins that no interface has are of `"$root"`.
+- A function has the name its WIT does, which `get_arguments` has without
+  being given it. A resource's method is given its own, as in
+  `= "[method]descriptor.open-at"`, one that needs no handle is
+  `[static]tcp-socket.create`, and `[resource-drop]descriptor` drops a
   handle, which takes it.
 - It is declared as the Canonical ABI lowers it, which is how Duck passes
   values. A handle, `own` or `borrow`, is an `i32`, and a `char` a `u32`. A

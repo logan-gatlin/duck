@@ -1209,6 +1209,18 @@ mod tests {
     }
 
     #[test]
+    fn export_blocks_are_laid_out_as_extern_blocks_are() {
+        let src = "pub   \"my:pkg/math@0.1.0\" :\n\tfn add ( a:i32,b:i32 )->i32:\n\t\treturn a+b\n\
+                   \tpub fn double_it(n:i32)->i32=\"double\":\n\t\treturn n*2\nfn idle():\n\tpass\n\
+                   pub fn tick()=\"tick-now\":\n\tpass\n";
+        let expected = "pub \"my:pkg/math@0.1.0\":\n\tfn add(a: i32, b: i32) -> i32:\n\t\treturn a + b\n\
+                        \tpub fn double_it(n: i32) -> i32 = \"double\":\n\t\treturn n * 2\n\n\
+                        fn idle():\n\tpass\n\npub fn tick() = \"tick-now\":\n\tpass\n";
+        assert_eq!(formatted(src), expected);
+        assert_eq!(formatted(expected), expected);
+    }
+
+    #[test]
     fn items_with_blocks_are_set_apart() {
         let src = "use a.b\nlet x = 1\nstruct S:\n\ta: i32\nlet y = 2\nlet z = 3\n# of f\n# and more\nfn f(\n\ta: i32,\n):\n\tpass\n# of nothing\n\n# of g\nfn g():\n\tpass\nextern:\n\tfn h()\n";
         let expected = "use a.b\nlet x = 1\n\nstruct S:\n\ta: i32\n\nlet y = 2\nlet z = 3\n\n# of f\n# and more\nfn f(\n\ta: i32,\n):\n\tpass\n\n# of nothing\n\n# of g\nfn g():\n\tpass\n\nextern:\n\tfn h()\n";

@@ -82,10 +82,11 @@ impl Analysis {
             match &item.kind {
                 ItemKind::Fn(decl) if !item.is_pub => {
                     let name = &decl.sig.name;
-                    // The function a module starts with is run by its host.
+                    // The function a module starts with is run by its host,
+                    // which calls what an interface exports too.
                     let starts = item.span.file == self.program.entry
                         && self.start.as_ref() == Some(&name.name);
-                    if !starts {
+                    if !starts && decl.interface.is_none() {
                         declares(&name.name, name.span, UnusedKind::Function);
                     }
                 }

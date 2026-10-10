@@ -126,6 +126,10 @@
         "named": true
       },
       {
+        "type": "export_block",
+        "named": true
+      },
+      {
         "type": "extern_block",
         "named": true
       },
@@ -809,6 +813,36 @@
     }
   },
   {
+    "type": "export_block",
+    "named": true,
+    "fields": {
+      "interface": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "function_declaration",
+          "named": true
+        },
+        {
+          "type": "pass_statement",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "expression_statement",
     "named": true,
     "fields": {},
@@ -1021,6 +1055,16 @@
         "types": [
           {
             "type": "block",
+            "named": true
+          }
+        ]
+      },
+      "export_name": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "string",
             "named": true
           }
         ]

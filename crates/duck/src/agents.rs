@@ -6,12 +6,12 @@ pub const OVERVIEW: &str = include_str!("agents.md");
 
 #[cfg(test)]
 mod tests {
-    use duck_compiler::file::{FileId, FileManager, Settings};
+    use duck_compiler::file::{FileId, FileManager, Settings, Wit, WitFile};
 
     use super::*;
 
     /// One file, which uses nothing.
-    struct Single(&'static str);
+    struct Single(&'static str, Settings);
 
     impl FileManager for Single {
         fn entry_point(&mut self) -> FileId {
@@ -35,8 +35,15 @@ mod tests {
         }
 
         fn settings(&mut self) -> Settings {
-            Settings::default()
+            self.1.clone()
         }
+    }
+
+    /// The contents of the ```wit block in `markdown`, which has one.
+    fn wit_block(markdown: &'static str) -> &'static str {
+        let (_, body) = markdown.split_once("\n```wit\n").expect("a WIT block");
+        let (body, _) = body.split_once("\n```").expect("unclosed code block");
+        body
     }
 
     /// The contents of every ```duck block in `markdown`.
@@ -56,12 +63,34 @@ mod tests {
     fn examples_compile() {
         let blocks = duck_blocks(OVERVIEW);
         assert!(blocks.len() > 5, "found {} blocks", blocks.len());
+        // The example of a world is a component of the world beside it.
+        let file = WitFile {
+            path: "agents.wit".to_string(),
+            contents: wit_block(OVERVIEW).to_string(),
+        };
+        let app = Settings {
+            world: Some("app".to_string()),
+            wit: Wit {
+                package: vec![file],
+                deps: Vec::new(),
+            },
+            ..Settings::default()
+        };
+        let mut worlds = 0;
         for block in blocks {
-            if let Err(errors) = duck_compiler::check(&mut Single(block)) {
+            let checked = match block.contains("\npub \"") {
+                true => {
+                    worlds += 1;
+                    duck_compiler::compile(&mut Single(block, app.clone())).map(|_| ())
+                }
+                false => duck_compiler::check(&mut Single(block, Settings::default())),
+            };
+            if let Err(errors) = checked {
                 let errors: Vec<_> = errors.iter().map(ToString::to_string).collect();
                 panic!("{block}\n{errors:#?}");
             }
         }
+        assert_eq!(worlds, 1);
     }
 
     #[test]
