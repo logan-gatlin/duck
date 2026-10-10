@@ -75,13 +75,18 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   of `ok: T` and `err: E`. Both are built in, and are unions in every way.
 - `array(T)`: a view of `ptr: &T` and `len: uint` that owns nothing.
   `varray(T)` has a `ptr: &var T`, so its elements are assignable.
-- `string`: an alias of `array(u8)`, which holds UTF-8.
+- `string`: an alias of `array(u8)`, which holds UTF-8. It is built as an
+  array is: `string(ptr: p, len: n)`.
 - `fn(A, B) -> R`: a function pointer. `fn(A)` returns nothing.
 - A type has a `size: uint` and an `align: uint`, as in `Point.size`,
   `(&Point).size` and `i64.align`. It is no value: `type` is only the type of
   a function's parameter, which makes it a type parameter.
 - `externref`: an opaque host reference. It is never stored in memory or
   compared.
+- `never`: the type of what has no value, as a `return` has none. It is
+  accepted as any type, and nothing else is accepted as it, so no value of
+  it is made: a function that returns it never returns. It is never stored
+  in memory, so it has no `size`, and is no type argument of a function.
 - `Name`, `Name(T)`, `mod.Name`: structs, unions and enums, passed by value
   like tuples and arrays.
 - A struct or union holds itself only behind a pointer, whatever its type
@@ -327,14 +332,32 @@ fn log2(n: u32) -> u32:
   where nothing that starts an expression follows, as in `f(return)`.
 - It has no value of its own, as it leaves the function: its type is `never`,
   which is accepted as any type. What is made of a `never` is one too, so
-  `f(return 1)` and `let x = return 1` are accepted, and return 1. `never`
-  is no type to write.
+  `f(return 1)` and `let x = return 1` are accepted, and return 1.
 - A `break` and a `continue` are expressions as a `return` is, with no value
   to take, and each is a `never`. One in the condition of a `while` is of
   that loop: `while more() or break:`.
-- A function with a result ends by a `return` wherever it ends. The right
-  side of `and` and `or` may not be evaluated, so a `return` there ends
-  nothing: `half` needs its last line.
+- A function with a result ends in a `never` wherever it ends: a `return`,
+  `module.unreachable()` or a call of a function that returns `never`, in a
+  statement that always evaluates it. The right side of `and` and `or` may
+  not be evaluated, so a `return` there ends nothing: `half` needs its last
+  line.
+
+```duck
+extern:
+	fn exit(code: i32) -> never  # the host never returns from it
+
+fn fail(code: i32) -> never:     # nor does this: it ends in a `never`
+	exit(code)
+
+fn positive(n: i32) -> i32:
+	if n > 0:
+		return n
+	fail(1)                      # ends the function, as a `return` does
+```
+
+- A function that returns `never` has no `return` but of a `never`, and
+  must end in one. A call of one traps if it does return, as a host
+  function may.
 
 - An assignment is an expression: its value is the one assigned, as the
   target's type. So `a = b = 0` assigns both, and `while (n = next()) != 0:`

@@ -294,6 +294,9 @@ impl Body<'_> {
         self.labels.push(Label::Other);
         let mut block = Vec::new();
         let mut ended = false;
+        // One of them runs, or it traps: nothing follows it if each of them
+        // never reaches its end.
+        let mut left = true;
         for (arm, case) in arms.iter().zip(cases) {
             self.scopes.push(HashMap::new());
             for (name, ty, slots) in case.names {
@@ -314,10 +317,11 @@ impl Body<'_> {
                     }
                 })
             });
-            let mut body = match test {
-                Some(_) => self.labelled(Label::Other, &arm.body),
-                None => self.block(&arm.body),
-            };
+            let (mut body, arm_left) = self.maybe(|lowered| match test {
+                Some(_) => lowered.labelled(Label::Other, &arm.body),
+                None => lowered.block(&arm.body),
+            });
+            left &= arm_left;
             self.scopes.pop();
             // An arm after one that matches every value is never reached.
             if ended {
@@ -344,6 +348,7 @@ impl Body<'_> {
         if !ended {
             block.push(Stmt::Unreachable);
         }
+        self.ended |= left;
         self.labels.pop();
         out.push(Stmt::Block(block));
     }

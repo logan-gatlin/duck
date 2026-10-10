@@ -9,7 +9,7 @@ use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeKind, TypeParam};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Body, Checker, FieldDef, Item, NEVER, OPTION, ParamId, RESULT, StructDef,
+    ARRAY, ARRAY_FIELDS, Body, Checker, FieldDef, Item, OPTION, ParamId, RESULT, StructDef,
     StructId, TUPLE, Ty, TypeErrorKind, VARRAY, Value, Visit, is_builtin_type, module_path,
     path_text,
 };
@@ -143,10 +143,7 @@ impl Checker {
                     TypeErrorKind::DuplicateParam(param.name.clone()),
                     param.span,
                 );
-            } else if is_builtin_type(&param.name)
-                || param.name == NEVER
-                || self.item(&param.name).is_some()
-            {
+            } else if is_builtin_type(&param.name) || self.item(&param.name).is_some() {
                 self.error(TypeErrorKind::DuplicateItem(param.name.clone()), param.span);
             } else {
                 self.type_params.push((param.name.clone(), tys[i]));

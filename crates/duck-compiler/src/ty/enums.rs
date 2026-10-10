@@ -427,7 +427,7 @@ impl Body<'_> {
         self.scopes.push(HashMap::new());
         self.bind(&var.name, ty, false, slots.clone());
         self.labels.push(Label::Break);
-        let body = self.labelled(Label::Continue, body);
+        let (body, _) = self.maybe(|lowered| lowered.labelled(Label::Continue, body));
         self.labels.pop();
         self.scopes.pop();
         let copies = self.ck.enums[id.0 as usize]

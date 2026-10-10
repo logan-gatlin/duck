@@ -501,9 +501,9 @@ impl Body<'_> {
         }
         let mut checked: Vec<_> = args.iter().map(|_| None).collect();
         let type_args = self.type_args_of(generic, args, &binding, &mut checked, span);
-        // An argument that settles one is a `never`, and so is the call:
-        // there is no instance to call.
-        if type_args.contains(&Ty::Never) {
+        // An argument that would settle one is a `never`, and so is the
+        // call: nothing says which instance it would be of.
+        if checked.iter().flatten().any(|(ty, _)| *ty == Ty::Never) {
             let params = sig.params.iter().map(|(p, _)| (p.clone(), Ty::Error));
             let params: Vec<_> = params.collect();
             let value = self.bound_args(&params, &sig.defaults, args, binding, checked);

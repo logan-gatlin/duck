@@ -578,7 +578,9 @@ impl Analysis {
         }
         let type_params = site.type_params.iter().map(|param| param.name.as_str());
         let prims = PRIMS.iter().map(|prim| prim.name());
-        let builtins = [ARRAY, VARRAY, STRING, TUPLE, OPTION, RESULT, EXTERNREF, TYPE];
+        let builtins = [
+            ARRAY, VARRAY, STRING, TUPLE, OPTION, RESULT, EXTERNREF, NEVER, TYPE,
+        ];
         for name in type_params.chain(prims).chain(builtins) {
             names.push(Completion {
                 name: name.to_string(),

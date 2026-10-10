@@ -196,6 +196,10 @@ impl Body<'_> {
             });
             scalars
         };
+        // One that returns a `never` never returns.
+        if ret == Ty::Never {
+            pre.push(Stmt::Unreachable);
+        }
         (ret, Value { pre, scalars })
     }
 }
