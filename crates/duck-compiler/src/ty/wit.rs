@@ -1093,6 +1093,25 @@ fn f(wide: Wide) -> i64:
     }
 
     #[test]
+    fn the_type_of_a_function_is_nothing_of_the_wit() {
+        let src = "
+fn local(c: u32) -> u32:
+    return c
+
+extern \"my:pkg/host@0.1.0\":
+    fn pipe(data: local) -> i32
+";
+        assert_eq!(
+            errors_in(src, None),
+            [(
+                "the WIT has `stream<u8>` here, which is an `i32`, as a handle is: found `local`"
+                    .to_string(),
+                "local"
+            )]
+        );
+    }
+
+    #[test]
     fn a_pointer_to_an_import_passes_as_a_call_of_it_does() {
         let src = "
 extern:

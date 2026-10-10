@@ -449,6 +449,12 @@ impl Checker {
                 continue;
             };
             let bound = self.substitute(bound, args, site);
+            // What a function is called as isn't known until its signature
+            // is resolved, which is after a struct's fields are.
+            if let (Ty::Fn(_), false) = (bound, self.sigs_defined) {
+                self.called_bounds.push((*arg, bound, site));
+                continue;
+            }
             if !self.meets(*arg, bound) {
                 self.bound_error(*arg, bound, site);
                 met = false;
@@ -458,7 +464,7 @@ impl Checker {
     }
 
     /// Reports, at `site`, that a `ty` isn't a type that `bound` bounds.
-    fn bound_error(&mut self, ty: Ty, bound: Ty, site: Span) {
+    pub(super) fn bound_error(&mut self, ty: Ty, bound: Ty, site: Span) {
         if let Ty::Fn(_) = bound {
             // A function is called as the pointers to it are.
             let called = match ty {
@@ -685,7 +691,7 @@ impl Checker {
     }
 
     /// Which lists of type arguments the type `name` takes. `None` for names
-    /// that aren't types.
+    /// that aren't types. A function names its own type.
     pub(super) fn type_arity(&self, name: &str) -> Option<Arity> {
         match self.item(name) {
             _ if name == ARRAY || name == VARRAY || name == OPTION => Some(Arity::Exactly(1)),
@@ -693,19 +699,21 @@ impl Checker {
             _ if name == TUPLE => Some(Arity::Any),
             Some(item @ (Item::Struct(_) | Item::Enum(_))) => self.item_arity(item),
             _ if is_builtin_type(name) => Some(Arity::Plain),
+            Some(item @ (Item::Func(_) | Item::GenericFn(_))) => self.item_arity(item),
             _ => None,
         }
     }
 
     /// Which lists of type arguments `item` takes. `None` for items that
-    /// aren't types.
+    /// aren't types. A function names its own type, which takes none: a
+    /// generic one has none to name, which is reported where it's resolved.
     pub(super) fn item_arity(&self, item: Item) -> Option<Arity> {
         match item {
             Item::Struct(id) => match self.structs[id.0 as usize].params.len() {
                 0 => Some(Arity::Plain),
                 n => Some(Arity::Exactly(n)),
             },
-            Item::Enum(_) => Some(Arity::Plain),
+            Item::Enum(_) | Item::Func(_) | Item::GenericFn(_) => Some(Arity::Plain),
             _ => None,
         }
     }

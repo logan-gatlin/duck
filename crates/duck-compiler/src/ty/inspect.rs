@@ -2889,6 +2889,45 @@ fn(T, A: (lib.Meta, Head, array(T))) f(x: &A) -> u8:
         );
     }
 
+    #[test]
+    fn a_function_named_as_a_type_is_the_function() {
+        let src = "\
+struct(T, R: fn(uint) -> &var T) Pool:
+    make: R
+fn bump(size: uint) -> &var u8:
+    return 8
+fn take(pool: &Pool(u8, bump), again: bump) -> &var u8:
+    again
+    return pool.make(1)
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        // It is declared where the function is, and described as it.
+        let (file, offset) = files.at("main", "bump), again");
+        let bump = analysis.definition(file, offset).unwrap();
+        assert_eq!(
+            src[bump.start..].lines().next().unwrap(),
+            "bump(size: uint) -> &var u8:"
+        );
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(hover.text, "fn bump(size: uint) -> &var u8");
+        // Each place it is written as a type refers to it.
+        let spans = analysis.references(&mut files, file, offset, true);
+        let lines: Vec<_> = spans
+            .iter()
+            .map(|span| src[..span.start].matches('\n').count() + 1)
+            .collect();
+        assert_eq!(lines, [3, 5, 5]);
+        // So one that is only a type is used, and a call of what is of its
+        // type takes what it does.
+        let unused = analysis.unused(&mut files);
+        let unused: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
+        assert_eq!(unused, ["take"]);
+        let (file, offset) = files.at("main", "again\n");
+        let signature = analysis.signature(&mut files, file, offset).unwrap();
+        assert_eq!(signature.label, "fn(uint) -> &var u8");
+    }
+
     /// Where each name is written that stands for what `name` does, in the
     /// first `text` of `main`: the file, its line counted from 1, and the
     /// line from the name on.

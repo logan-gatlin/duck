@@ -893,6 +893,10 @@ fn demo(f: fn(i32) -> i32) -> i32:
   `array(fn(i32) -> i32)`.
 - A `var` bound to a function is of that function's type, and is assigned
   no other: `var g: fn(i32) -> i32 = double` holds a pointer to any.
+- A function's name is its type where a type is written, as `g: double`
+  or `step: lib.double`: what is of it is that function and takes no
+  storage, so a parameter of it is passed nothing. A generic function
+  names no type, as only its instances are functions.
 - A generic function takes a function among its arguments as it does a
   literal, after the others: it is a pointer where they settle `T` as one,
   and where nothing else settles `T`, `T` is the function's own type. So
@@ -919,6 +923,14 @@ fn(T, A: fn(uint) -> &var T) take(pool: &var Pool(T, A)) -> &var T:
 fn wide(x: i32) -> i64:
 	return x as i64
 
+var next: uint = 8
+
+fn bump(size: uint) -> &var u8:
+	next += size
+	return (next - size) as! &var u8
+
+let bytes = &var Pool(u8, bump)(make: bump)   # as wide as its `count`
+
 fn demo(p: fn(i32) -> i64) -> i64:
 	return apply(1, wide) + apply(2, p)
 ```
@@ -942,7 +954,12 @@ fn demo(p: fn(i32) -> i64) -> i64:
   `apply(u8, u8, id(u8))`.
 - A default settles `F` as any does: with `f: F = wide`, a call that leaves
   `f` out is of `wide`.
+- A type argument is written as any type is: `Pool(u8, bump)` for the
+  function `bump`, and `Pool(u8, fn(uint) -> &var u8)` for a pointer to
+  any, which is 4 bytes wider.
 - A function type bounds alone: it is in no list, as `(fn(T) -> U, Head)`.
+- Nothing of the host is of a function's type: no parameter or result of
+  an `extern` function or of one that a world exports.
 
 ## Pipes
 

@@ -664,10 +664,11 @@ impl Body<'_> {
         }
     }
 
-    /// The type `expr` writes, as the argument of a type parameter. The
-    /// error type after reporting that it's a value.
+    /// The type `expr` writes, as the argument of a type parameter: the
+    /// name of a function writes its type there. The error type after
+    /// reporting that it's a value.
     fn type_arg(&mut self, expr: &parse::Expr) -> Ty {
-        if self.is_type_expr(expr) {
+        if self.is_type_expr(expr) || matches!(self.named(expr), Some(Item::Func(_))) {
             return self.expr_type(expr);
         }
         if self.expr(expr, None).0 != Ty::Error {

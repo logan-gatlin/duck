@@ -903,6 +903,36 @@ fn f(m: &Mine) -> u8:
     }
 
     #[test]
+    fn a_function_of_another_module_is_named_as_a_type() {
+        let lib = "\
+pub struct(T, R: fn(uint) -> &var T) Pool:
+    pub make: R
+pub fn bump(size: uint) -> &var u8:
+    return 8
+fn secret(size: uint) -> &var u8:
+    return 8
+";
+        let main = "\
+use lib
+use lib.Pool
+fn f(pool: &Pool(u8, lib.bump)) -> &var u8:
+    return pool.make(1)
+";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        let module = lower(&mut files);
+        assert_eq!(module.table, None);
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        let bump = module.funcs.iter().position(|f| f.name == "bump").unwrap();
+        let called = format!("Call(FuncId({bump})");
+        assert!(format!("{:?}", f.body).contains(&called), "{:?}", f.body);
+
+        // One that its module keeps to itself is no type outside it.
+        let main = "use lib\nfn f(make: lib.secret):\n    pass\n";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        assert_eq!(errors(&mut files), ["main \"secret\": `secret` is private"]);
+    }
+
+    #[test]
     fn functions_of_other_modules_are_pointed_to() {
         let lib = "\
 pub fn inc(x: i32) -> i32:

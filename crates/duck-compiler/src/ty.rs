@@ -395,6 +395,10 @@ pub enum TypeErrorKind {
     /// A generic function instantiated within its instances, or those of
     /// others, too many times over, as recursion with ever larger type
     /// arguments would be.
+    /// A generic function named where a type is written. Only its instances
+    /// are functions, each of a type of its own, and nothing writes one's
+    /// type arguments there.
+    GenericFnType(String),
     /// A type parameter bounded by a type that isn't a struct, a union, an
     /// enum, an array or a function type.
     NotABound(String),
@@ -851,6 +855,13 @@ struct Checker {
     /// Whether every struct's fields are known, so pointer types can be
     /// checked for storability as they are resolved.
     structs_defined: bool,
+    /// Whether the signature of every function that isn't generic is
+    /// resolved, so what the type of one is called as is known.
+    sigs_defined: bool,
+    /// Each type argument that a function type bounds, with the bound and
+    /// where it is written, until the signatures are resolved and it can be
+    /// checked.
+    called_bounds: Vec<(Ty, Ty, Span)>,
     /// Every function, indexed by [`FuncId`]: imports, then definitions,
     /// then the functions in `synths`.
     funcs: Vec<FuncSig>,
@@ -1422,6 +1433,10 @@ impl fmt::Display for TypeErrorKind {
                 "`{name}` holds structs and unions nested more than {MAX_VALUE_DEPTH} deep"
             ),
             Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
+            Self::GenericFnType(name) => write!(
+                f,
+                "`{name}` is generic, so it has no type of its own: only each of its instances has"
+            ),
             Self::NotABound(ty) => write!(
                 f,
                 "`{ty}` can't bound a type parameter; only a struct, a union, an enum, an array \
@@ -2657,6 +2672,12 @@ impl Checker {
             self.funcs[id].defaults = pending_defaults(decl);
             self.funcs[id].ret = ret;
         }
+        self.sigs_defined = true;
+        for (arg, bound, site) in mem::take(&mut self.called_bounds) {
+            if !self.meets(arg, bound) {
+                self.bound_error(arg, bound, site);
+            }
+        }
         self.define_generic_fns(program);
     }
 
@@ -3202,6 +3223,12 @@ impl Checker {
             }
         } else if let Some(Item::Enum(id)) = item {
             Ty::Enum(id)
+        } else if let Some(Item::Func(id)) = item {
+            // The type of the function, which only it is of.
+            Ty::Func(id)
+        } else if let Some(Item::GenericFn(_)) = item {
+            self.error(TypeErrorKind::GenericFnType(name.to_string()), span);
+            Ty::Error
         } else if let Some(prim) = Prim::from_name(name) {
             Ty::Prim(prim)
         } else if name == STRING {
@@ -15455,6 +15482,85 @@ fn g(n: i32):
         assert_eq!(
             not_called("i32", None).to_string(),
             "`i32` isn't called as a `fn(i32) -> i32` is"
+        );
+    }
+
+    #[test]
+    fn a_function_is_named_where_a_type_is_written() {
+        let src = "\
+struct(T, R: fn(uint) -> &var T) Pool:
+    make: R
+    count: uint = 0
+struct Holder:
+    pool: Pool(u8, bump)
+    make: bump
+    n: u8
+fn late(pool: &Pool(u8, after)) -> &var u8:
+    return pool.make(1)
+fn after(size: uint) -> &var u8:
+    return 16
+fn bump(size: uint) -> &var u8:
+    return 8
+fn size_of(T: type) -> uint:
+    return T.size
+fn f(h: &Holder, g: bump, l: &Pool(u8, after)) -> uint:
+    let p = Pool(u8, bump)(make: bump)
+    let q: bump = g
+    let a = h.make(1)
+    let b = q(2)
+    let c = late(l)
+    return Pool(u8, bump).size + Holder.size + size_of(bump)
+";
+        let module = lower(src);
+        assert_eq!(module.table, None);
+        assert_eq!(body(&module, "late"), "(return (call after 1))");
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        // Nothing is passed for a function.
+        assert_eq!(f.params, [ValType::I32, ValType::I32]);
+        let f = body(&module, "f");
+        for part in [
+            "(set p.count 0)",
+            "(set a (call bump 1)) (set b (call bump 2))",
+            "(return (I32.Add (I32.Add 4 8) (call size_of(bump) )))",
+        ] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+        assert_eq!(body(&module, "size_of(bump)"), "(return 0)");
+
+        use TypeErrorKind::*;
+        let src = "\
+struct(T, R: fn(uint) -> &var T) Pool:
+    make: R
+fn(T) id(x: T) -> T:
+    return x
+fn wide(x: i64) -> i64:
+    return x
+fn bump(size: uint) -> &var u8:
+    return 8
+fn f(a: id, b: Pool(u8, wide), c: wide(i32), d: Pool(u8, id)):
+    let e: bump = wide
+    let g: wide = 1
+    let h = Pool(u8, wide)(make: wide)
+";
+        let not_called = NotCalledAs {
+            ty: "wide".into(),
+            called: Some("fn(i64) -> i64".into()),
+            bound: "fn(uint) -> &var u8".into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                GenericFnType("id".into()),
+                NotGeneric("wide".into()),
+                GenericFnType("id".into()),
+                not_called.clone(),
+                mismatch("bump", "wide"),
+                mismatch("wide", "i32"),
+            ]
+        );
+        assert_eq!(
+            GenericFnType("id".into()).to_string(),
+            "`id` is generic, so it has no type of its own: only each of its instances has"
         );
     }
 
