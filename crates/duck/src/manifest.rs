@@ -1,4 +1,4 @@
-//! `Duck.toml`, the metadata of a duck package: the module it builds, the
+//! `Duck.toml`, the metadata of a duck package: the component it builds, the
 //! library it offers other packages, and the packages it depends on.
 
 use std::collections::BTreeMap;
@@ -6,11 +6,12 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use duck_compiler::file::Settings;
+use duck_compiler::file::{Settings, Wit};
 use duck_compiler::lex;
+use duck_compiler::world::COMMAND;
 use serde::Deserialize;
 
-/// The name of the manifest file at the root of every module.
+/// The name of the manifest file at the root of every package.
 pub const MANIFEST: &str = "Duck.toml";
 
 /// The size of a wasm page, which every memory size is a whole number of.
@@ -23,24 +24,27 @@ pub const MAX_PAGES: u64 = 1 << 16;
 /// address.
 pub const MAX_PAGES_64: u64 = 1 << 48;
 
-/// A validated `Duck.toml`. It has a module, a library, or both.
+/// A validated `Duck.toml`. It has a component, a library, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    pub module: Option<Module>,
+    pub component: Option<Component>,
     pub library: Option<Library>,
     /// Each package this one can use, by the name it uses it as.
     pub dependencies: BTreeMap<String, Dependency>,
 }
 
-/// The wasm module a package builds.
+/// The WebAssembly component a package builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Module {
-    /// The file the module is compiled from, relative to the manifest.
+pub struct Component {
+    /// The file the component is compiled from, relative to the manifest.
     pub entry: PathBuf,
-    /// Where the wasm module is written, relative to the manifest.
+    /// Where the component is written, relative to the manifest.
     pub output: PathBuf,
-    /// The function run when the module is instantiated.
+    /// The function that the `run` of `wasi:cli/run` calls, which is the
+    /// program.
     pub start: Option<String>,
+    /// The world the component is one of: [`COMMAND`] where none is named.
+    pub world: String,
     /// The most pages memory may grow to. `None` lets it grow without
     /// limit.
     pub max_pages: Option<u64>,
@@ -101,10 +105,10 @@ pub enum ManifestError {
     Min,
     /// An `end` for the literals, which end where the last is placed.
     StaticEnd,
-    /// Neither a `[module]` nor a `[library]`.
+    /// Neither a `[component]` nor a `[library]`.
     Empty,
-    /// A `[memory]` without a `[module]` to give it to.
-    MemoryWithoutModule,
+    /// A `[memory]` without a `[component]` to give it to.
+    MemoryWithoutComponent,
     /// A dependency named something that can't be used.
     DependencyName(String),
     /// A dependency with neither a `path` nor a `git`.
@@ -136,7 +140,7 @@ pub enum SizeErrorKind {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    module: Option<RawModule>,
+    component: Option<RawComponent>,
     memory: Option<RawMemory>,
     library: Option<RawLibrary>,
     #[serde(default, rename = "const")]
@@ -147,10 +151,11 @@ struct Raw {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawModule {
+struct RawComponent {
     entry: PathBuf,
     output: PathBuf,
     start: Option<String>,
+    world: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -200,19 +205,19 @@ impl Manifest {
     pub fn parse(src: &str) -> Result<Self, ManifestError> {
         let raw: Raw = toml::from_str(src).map_err(ManifestError::Toml)?;
         let fuel = raw.constants.fuel;
-        let module = match (raw.module, raw.memory) {
-            (Some(module), memory) => {
-                let module = Module::parse(module, memory.unwrap_or_default())?;
-                Some(Module { fuel, ..module })
+        let component = match (raw.component, raw.memory) {
+            (Some(component), memory) => {
+                let component = Component::parse(component, memory.unwrap_or_default())?;
+                Some(Component { fuel, ..component })
             }
-            (None, Some(_)) => return Err(ManifestError::MemoryWithoutModule),
+            (None, Some(_)) => return Err(ManifestError::MemoryWithoutComponent),
             (None, None) => None,
         };
         let library = raw.library.map(|library| Library {
             entry: library.entry,
             fuel,
         });
-        if module.is_none() && library.is_none() {
+        if component.is_none() && library.is_none() {
             return Err(ManifestError::Empty);
         }
         let mut dependencies = BTreeMap::new();
@@ -224,7 +229,7 @@ impl Manifest {
             dependencies.insert(name, dependency);
         }
         Ok(Self {
-            module,
+            component,
             library,
             dependencies,
         })
@@ -269,19 +274,21 @@ impl RawDependency {
     }
 }
 
-impl Module {
-    /// How the module is compiled.
-    pub fn settings(&self) -> Settings {
+impl Component {
+    /// How the component is compiled, with `wit` as the WIT of its package.
+    pub fn settings(&self, wit: Wit) -> Settings {
         Settings {
             max_pages: self.max_pages,
             memory64: self.memory64,
             static_start: self.static_start,
             start: self.start.clone(),
             fuel: self.fuel,
+            world: Some(self.world.clone()),
+            wit,
         }
     }
 
-    fn parse(module: RawModule, memory: RawMemory) -> Result<Self, ManifestError> {
+    fn parse(component: RawComponent, memory: RawMemory) -> Result<Self, ManifestError> {
         let RawMemory {
             memory64,
             min,
@@ -303,9 +310,10 @@ impl Module {
             None => 0,
         };
         Ok(Self {
-            entry: module.entry,
-            output: module.output,
-            start: module.start,
+            entry: component.entry,
+            output: component.output,
+            start: component.start,
+            world: component.world.unwrap_or_else(|| COMMAND.to_string()),
             max_pages,
             memory64,
             static_start,
@@ -316,15 +324,18 @@ impl Module {
 
 impl Library {
     /// How the library is checked on its own: with room for any data, as
-    /// the memory is that of whichever module imports it, and with addresses
-    /// 32 bits wide, where an `int` and a `uint` hold the least.
-    pub fn settings(&self) -> Settings {
+    /// the memory is that of whichever component it is built into, with
+    /// addresses 32 bits wide, where an `int` and a `uint` hold the least,
+    /// and as a component of no world, with `wit` as the WIT of its package.
+    pub fn settings(&self, wit: Wit) -> Settings {
         Settings {
             max_pages: None,
             memory64: false,
             static_start: 0,
             start: None,
             fuel: self.fuel,
+            world: None,
+            wit,
         }
     }
 }
@@ -404,8 +415,8 @@ impl fmt::Display for ManifestError {
                 f,
                 "memory.static has no `end`: literals end where the last is placed"
             ),
-            Self::Empty => write!(f, "needs a [module] or [library] table"),
-            Self::MemoryWithoutModule => write!(f, "[memory] needs a [module] table"),
+            Self::Empty => write!(f, "needs a [component] or [library] table"),
+            Self::MemoryWithoutComponent => write!(f, "[memory] needs a [component] table"),
             Self::DependencyName(name) => {
                 write!(f, "dependency name `{name}` is not an identifier")
             }
@@ -451,10 +462,10 @@ impl fmt::Display for SizeErrorKind {
 mod tests {
     use super::*;
 
-    /// A module whose `[memory]` is `memory`.
+    /// A component whose `[memory]` is `memory`.
     fn with_memory(memory: &str) -> Result<Manifest, ManifestError> {
         Manifest::parse(&format!(
-            "[module]\nentry = \"src/main.duck\"\noutput = \"build/out.wasm\"\n\n[memory]\n{memory}"
+            "[component]\nentry = \"src/main.duck\"\noutput = \"build/out.wasm\"\n\n[memory]\n{memory}"
         ))
     }
 
@@ -496,16 +507,16 @@ mod tests {
 
     #[test]
     fn memory64_addresses_more() {
-        let module = |memory: &str| with_memory(memory).map(|manifest| manifest.module.unwrap());
+        let module = |memory: &str| with_memory(memory).map(|manifest| manifest.component.unwrap());
         let wide =
             module("memory64 = true\nmax = \"1TiB\"\nstatic = { start = \"4GiB\" }\n").unwrap();
-        assert!(wide.memory64 && wide.settings().memory64);
+        assert!(wide.memory64 && wide.settings(Wit::default()).memory64);
         assert_eq!(wide.max_pages, Some(1 << 24));
         assert_eq!(wide.static_start, 1 << 32);
         // Neither size is within reach of 32 bits.
         for memory in ["", "memory64 = false\n"] {
             let narrow = module(&format!("{memory}max = \"4GiB\"\n")).unwrap();
-            assert!(!narrow.memory64 && !narrow.settings().memory64);
+            assert!(!narrow.memory64 && !narrow.settings(Wit::default()).memory64);
             assert_eq!(
                 module(&format!("{memory}max = \"8GiB\"\n"))
                     .unwrap_err()
@@ -537,9 +548,9 @@ mod tests {
                 .to_string()
                 .contains("invalid type")
         );
-        // A library is checked alone as the least a module may give it.
+        // A library is checked alone as the least a component may give it.
         let library = Manifest::parse("[library]\nentry = \"lib.duck\"\n").unwrap();
-        assert!(!library.library.unwrap().settings().memory64);
+        assert!(!library.library.unwrap().settings(Wit::default()).memory64);
     }
 
     #[test]
@@ -580,10 +591,11 @@ mod tests {
         assert_eq!(
             manifest,
             Manifest {
-                module: Some(Module {
+                component: Some(Component {
                     entry: "src/main.duck".into(),
                     output: "build/out.wasm".into(),
                     start: None,
+                    world: COMMAND.to_string(),
                     max_pages: Some(256),
                     memory64: false,
                     static_start: 1025,
@@ -594,25 +606,50 @@ mod tests {
             }
         );
         let manifest = with_memory("static.start = \"1KiB\"\n").unwrap();
-        let module = manifest.module.unwrap();
+        let module = manifest.component.unwrap();
         assert_eq!((module.max_pages, module.static_start), (None, 1024));
         let manifest = Manifest::parse(
-            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\nstart = \"init\"\n\n[memory]\nmax = \"1pgs\"\n",
+            "[component]\nentry = \"a.duck\"\noutput = \"a.wasm\"\nstart = \"init\"\n\n[memory]\nmax = \"1pgs\"\n",
         )
         .unwrap();
-        assert_eq!(manifest.module.unwrap().start.as_deref(), Some("init"));
+        assert_eq!(manifest.component.unwrap().start.as_deref(), Some("init"));
     }
 
     #[test]
-    fn fuel_is_given_to_the_module_and_the_library() {
-        let src = "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n\n\
+    fn a_component_is_one_of_the_world_it_names() {
+        let component = |world: &str| {
+            let src = format!("[component]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n{world}");
+            Manifest::parse(&src).unwrap().component.unwrap()
+        };
+        // Without one it is a program, which `duck run` runs.
+        assert_eq!(component("").world, "wasi:cli/command@0.3.0");
+        let named = component("world = \"my:pkg/app\"\n");
+        assert_eq!(named.world, "my:pkg/app");
+        let settings = named.settings(Wit::default());
+        assert_eq!(settings.world.as_deref(), Some("my:pkg/app"));
+
+        // A library is built into the components that use it.
+        let library = Manifest::parse("[library]\nentry = \"lib.duck\"\n").unwrap();
+        let settings = library.library.unwrap().settings(Wit::default());
+        assert_eq!(settings.world, None);
+    }
+
+    #[test]
+    fn fuel_is_given_to_the_component_and_the_library() {
+        let src = "[component]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n\n\
                    [library]\nentry = \"lib.duck\"\n\n[const]\nfuel = 5000\n";
         let manifest = Manifest::parse(src).unwrap();
-        assert_eq!(manifest.module.unwrap().settings().fuel, Some(5000));
-        assert_eq!(manifest.library.unwrap().settings().fuel, Some(5000));
+        assert_eq!(
+            manifest.component.unwrap().settings(Wit::default()).fuel,
+            Some(5000)
+        );
+        assert_eq!(
+            manifest.library.unwrap().settings(Wit::default()).fuel,
+            Some(5000)
+        );
 
         let unset = Manifest::parse("[library]\nentry = \"lib.duck\"\n").unwrap();
-        assert_eq!(unset.library.unwrap().settings().fuel, None);
+        assert_eq!(unset.library.unwrap().settings(Wit::default()).fuel, None);
         let error = |src: &str| Manifest::parse(src).unwrap_err().to_string();
         let library = "[library]\nentry = \"lib.duck\"\n\n[const]\n";
         assert!(error(&format!("{library}fuel = -1\n")).contains("fuel"));
@@ -622,8 +659,8 @@ mod tests {
     #[test]
     fn memory_is_optional() {
         let module = |memory: &str| {
-            let src = format!("[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n{memory}");
-            Manifest::parse(&src).unwrap().module.unwrap()
+            let src = format!("[component]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n{memory}");
+            Manifest::parse(&src).unwrap().component.unwrap()
         };
         for memory in ["", "[memory]\n"] {
             let module = module(memory);
@@ -632,8 +669,8 @@ mod tests {
         }
         let module = module("[memory]\nmax = \"2pgs\"\n");
         assert_eq!(module.max_pages, Some(2));
-        assert_eq!(module.settings().max_pages, Some(2));
-        assert_eq!(module.settings().static_start, 0);
+        assert_eq!(module.settings(Wit::default()).max_pages, Some(2));
+        assert_eq!(module.settings(Wit::default()).static_start, 0);
     }
 
     #[test]
@@ -645,7 +682,7 @@ mod tests {
         assert_eq!(
             manifest,
             Manifest {
-                module: None,
+                component: None,
                 library: Some(Library {
                     entry: "src/lib.duck".into(),
                     fuel: None,
@@ -657,10 +694,10 @@ mod tests {
             }
         );
         let both = Manifest::parse(
-            "[module]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n[memory]\nmax = \"1pgs\"\n[library]\nentry = \"lib.duck\"\n",
+            "[component]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n[memory]\nmax = \"1pgs\"\n[library]\nentry = \"lib.duck\"\n",
         )
         .unwrap();
-        assert!(both.module.is_some() && both.library.is_some());
+        assert!(both.component.is_some() && both.library.is_some());
     }
 
     #[test]
@@ -720,10 +757,10 @@ mod tests {
     #[test]
     fn package_errors() {
         let error = |src: &str| Manifest::parse(src).unwrap_err().to_string();
-        assert_eq!(error(""), "needs a [module] or [library] table");
+        assert_eq!(error(""), "needs a [component] or [library] table");
         assert_eq!(
             error("[library]\nentry = \"a.duck\"\n[memory]\nmax = \"1pgs\"\n"),
-            "[memory] needs a [module] table"
+            "[memory] needs a [component] table"
         );
         assert_eq!(
             error("[library]\nentry = \"a.duck\"\n[dependencies]\nmy-lib = { path = \"x\" }\n"),

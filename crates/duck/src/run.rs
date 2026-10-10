@@ -1,63 +1,31 @@
-//! `duck run`: runs a module in Wasmtime, which gives it WASI 0.3.
+//! `duck run`: runs a component in Wasmtime, which gives it WASI 0.3.
 //!
-//! WASI 0.3 is given to components, so the module is made one: of the world
-//! `wasi:cli/command`. An `extern` block names one of the interfaces it
-//! imports, as in `extern "wasi:cli/stdout@0.3.0"`, and declares its
-//! functions as the Canonical ABI lowers them.
-//!
-//! The module's start function is what runs. A component's imports that read
-//! or write memory can't be called while its module is instantiated, so the
-//! function is called by the `run` that the world exports, once it has been.
-//! That `run` is an `async func`, so what it calls may block: an import that
-//! is one too is called as any other is, and returns when it is done.
+//! The component is one of a world that exports `wasi:cli/run`, as
+//! `wasi:cli/command` does, and its `run` is what runs: it calls the start
+//! function. That `run` is an `async func`, so what it calls may block: an
+//! import that is one too is called as any other is, and returns when it is
+//! done.
 
 use std::fmt;
 
-use duck_compiler::{emit, ir};
+use duck_compiler::world::RUN_EXPORT;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store, Trap, WasmBacktrace};
 use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wit_component::{ComponentEncoder, StringEncoding};
-use wit_parser::{Resolve, WorldId};
-
-/// The WIT of WASI 0.3 as Wasmtime implements it, each package after those
-/// it uses. The packages are copied from `src/p3/wit/deps` of the
-/// `wasmtime-wasi` this crate depends on, and change when it does.
-const WIT: [(&str, &str); 5] = [
-    ("clocks.wit", include_str!("../wit/clocks.wit")),
-    ("random.wit", include_str!("../wit/random.wit")),
-    ("filesystem.wit", include_str!("../wit/filesystem.wit")),
-    ("sockets.wit", include_str!("../wit/sockets.wit")),
-    ("cli.wit", include_str!("../wit/cli.wit")),
-];
-
-/// The world of `wasi:cli`, the last of [`WIT`], that a module is made a
-/// component of.
-const WORLD: &str = "command";
-
-/// The name a module exports the `run` of `wasi:cli/run` as, which calls its
-/// start function. No `pub` item is named it, as it is no identifier.
-const RUN: &str = "wasi:cli/run@0.3.0#run";
 
 /// The directories a program is given, each to read and write under the
 /// path it has here: the working directory, which is the first, and the
 /// root of the file system, which holds every other file.
 const DIRS: [&str; 2] = [".", "/"];
 
-/// Why a module didn't run, or stopped short of its end.
+/// Why a component didn't run, or stopped short of its end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// The module has no start function, so nothing of it runs.
-    NoStart,
-    /// The module addresses memory with 64 bits, as no component does.
-    Memory64,
-    /// The module is no component of the world: it imports what the world
-    /// doesn't have, or declares it as the Canonical ABI doesn't.
-    Component(String),
     /// One of [`DIRS`] that can't be opened.
     Dir { path: &'static str, error: String },
-    /// Wasmtime can't compile or instantiate the component.
+    /// Wasmtime can't compile or instantiate the component, as it can't
+    /// one that imports what WASI doesn't have.
     Invalid(String),
     /// A trap, with the name of each function that was running, innermost
     /// first.
@@ -73,18 +41,11 @@ struct Host {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoStart => write!(
-                f,
-                "nothing to run: the module has no start function, which `start` under \
-                 `[module]` in Duck.toml names"
-            ),
-            Self::Memory64 => write!(
-                f,
-                "cannot run a `memory64` module: WASI 0.3 addresses memory with 32 bits"
-            ),
-            Self::Component(e) => write!(f, "cannot give the module WASI 0.3: {e}"),
             Self::Dir { path, error } => write!(f, "cannot open `{path}`: {error}"),
-            Self::Invalid(e) => write!(f, "cannot run the module: {e}"),
+            Self::Invalid(e) => write!(
+                f,
+                "cannot run the component, which `duck build` still builds: {e}"
+            ),
             Self::Trap { message, stack } => {
                 write!(f, "the program trapped: {message}")?;
                 for name in stack {
@@ -107,14 +68,14 @@ impl WasiView for Host {
     }
 }
 
-/// Runs the start function of `module` with the arguments `args`, the first
-/// of which names the program. It reaches all that this process does: its
-/// standard streams, its environment, its files and the network. Returns
-/// the status it exits with, which is 0 unless it gives another.
-pub fn run(module: ir::Module, args: &[String]) -> Result<u8, Error> {
-    let component = component(module)?;
+/// Runs `component`, one of a world that exports `wasi:cli/run`, with the
+/// arguments `args`, the first of which names the program. It reaches all
+/// that this process does: its standard streams, its environment, its files
+/// and the network. Returns the status it exits with, which is 0 unless it
+/// gives another.
+pub fn run(component: &[u8], args: &[String]) -> Result<u8, Error> {
     let mut ctx = context(args)?;
-    execute(&component, ctx.inherit_stdio().build())
+    execute(component, ctx.inherit_stdio().build())
 }
 
 /// What a program is given but for its standard streams: its arguments,
@@ -133,55 +94,6 @@ fn context(args: &[String]) -> Result<WasiCtxBuilder, Error> {
         })?;
     }
     Ok(ctx)
-}
-
-/// Encodes `module` as a component of [`WORLD`], whose `run` calls its start
-/// function rather than it running when the module is instantiated.
-fn component(mut module: ir::Module) -> Result<Vec<u8>, Error> {
-    let start = module.start.take().ok_or(Error::NoStart)?;
-    if module.memory.memory64 {
-        return Err(Error::Memory64);
-    }
-    // It returns the `result` of `run`, which is `ok` once the start
-    // function returns: a program that fails exits with a status.
-    let ok = ir::Expr::Const(ir::Const::I32(0));
-    module.funcs.push(ir::Func {
-        name: RUN.to_string(),
-        exports: vec![RUN.to_string()],
-        params: Vec::new(),
-        results: vec![ir::ValType::I32],
-        locals: Vec::new(),
-        body: vec![
-            ir::Stmt::Call {
-                func: start,
-                args: Vec::new(),
-                dests: Vec::new(),
-            },
-            ir::Stmt::Return(vec![ok]),
-        ],
-    });
-    let mut bytes = emit::emit(&module);
-    let (resolve, world) = world();
-    let encoded =
-        wit_component::embed_component_metadata(&mut bytes, &resolve, world, StringEncoding::UTF8)
-            .and_then(|()| ComponentEncoder::default().module(&bytes)?.encode());
-    encoded.map_err(|e| {
-        // The causes before the last two say only that the module was read.
-        let causes: Vec<_> = e.chain().map(ToString::to_string).collect();
-        Error::Component(causes[causes.len().saturating_sub(2)..].join(": "))
-    })
-}
-
-/// The WIT a module is run against, and the world of it that it is run as.
-fn world() -> (Resolve, WorldId) {
-    let mut resolve = Resolve::default();
-    let mut package = None;
-    for (path, wit) in WIT {
-        package = Some(resolve.push_str(path, wit).expect("the WIT is valid"));
-    }
-    let package = package.expect("there is WIT");
-    let world = resolve.select_world(&[package], Some(WORLD));
-    (resolve, world.expect("the WIT has the world"))
 }
 
 /// Calls the `run` of `component`, giving its imports `ctx`. Returns the
@@ -225,7 +137,9 @@ fn stopped(error: wasmtime::Error) -> Result<u8, Error> {
     let backtrace = error.downcast_ref::<WasmBacktrace>();
     let frames = backtrace.map_or(&[][..], WasmBacktrace::frames);
     // The last is the function that only calls the start function.
-    let frames = frames.iter().filter(|frame| frame.func_name() != Some(RUN));
+    let frames = frames
+        .iter()
+        .filter(|frame| frame.func_name() != Some(RUN_EXPORT));
     Err(Error::Trap {
         message: message.to_string(),
         stack: frames
@@ -236,7 +150,8 @@ fn stopped(error: wasmtime::Error) -> Result<u8, Error> {
 
 #[cfg(test)]
 mod tests {
-    use duck_compiler::file::{FileId, FileManager, Settings};
+    use duck_compiler::file::{FileId, FileManager, Settings, Wit, WitFile};
+    use duck_compiler::world::COMMAND;
     use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 
     use super::*;
@@ -345,22 +260,22 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
         }
     }
 
-    /// The module of `src` with the settings `settings`.
-    fn lower(src: &str, settings: Settings) -> ir::Module {
+    /// The component of `src` with the settings `settings`, or why it is
+    /// none.
+    fn compile(src: &str, settings: Settings) -> Result<Vec<u8>, String> {
         let contents = src.to_string();
-        duck_compiler::lower(&mut Source { contents, settings }).unwrap()
+        let compiled = duck_compiler::compile(&mut Source { contents, settings });
+        compiled.map_err(|errors| errors[0].to_string())
     }
 
-    /// The module of `src`, which starts with `main`.
-    fn program(src: &str) -> ir::Module {
-        let start = Some("main".to_string());
-        lower(
-            src,
-            Settings {
-                start,
-                ..Settings::default()
-            },
-        )
+    /// How a program is compiled: as one that `duck run` runs, which starts
+    /// with `main`.
+    fn program() -> Settings {
+        Settings {
+            start: Some("main".to_string()),
+            world: Some(COMMAND.to_string()),
+            ..Settings::default()
+        }
     }
 
     /// Runs `src` after [`PRELUDE`] with `args`. Returns its status and what
@@ -368,10 +283,9 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
     fn run_with(src: &str, args: &[&str]) -> (Result<u8, Error>, String) {
         let args: Vec<_> = args.iter().map(|arg| arg.to_string()).collect();
         let stdout = MemoryOutputPipe::new(1 << 16);
-        let status = component(program(&format!("{PRELUDE}{src}"))).and_then(|component| {
-            let mut ctx = context(&args)?;
-            execute(&component, ctx.stdout(stdout.clone()).build())
-        });
+        let component = compile(&format!("{PRELUDE}{src}"), program()).unwrap();
+        let ctx = context(&args).unwrap().stdout(stdout.clone()).build();
+        let status = execute(&component, ctx);
         (status, String::from_utf8(stdout.contents().into()).unwrap())
     }
 
@@ -400,7 +314,7 @@ fn main():
         let (example, _) = example.split_once("\n```").unwrap();
         let args = ["out.wasm", " duck!"].map(str::to_string);
         let stdout = MemoryOutputPipe::new(1 << 16);
-        let component = component(program(example)).unwrap();
+        let component = compile(example, program()).unwrap();
         let ctx = context(&args).unwrap().stdout(stdout.clone()).build();
         assert_eq!(execute(&component, ctx), Ok(0));
         assert_eq!(stdout.contents(), "Hello,out.wasm duck!\n");
@@ -455,24 +369,33 @@ fn main():
     }
 
     #[test]
-    fn only_a_32_bit_module_with_a_start_function_runs() {
+    fn only_a_32_bit_module_with_a_start_function_is_a_program() {
         let src = "fn main():\n    pass\n";
-        let unstarted = lower(src, Settings::default());
-        assert_eq!(component(unstarted), Err(Error::NoStart));
-        let wide = Settings {
-            start: Some("main".to_string()),
-            memory64: true,
-            ..Settings::default()
+        let unstarted = Settings {
+            start: None,
+            ..program()
         };
-        assert_eq!(component(lower(src, wide)), Err(Error::Memory64));
+        let e = compile(src, unstarted).unwrap_err();
+        assert!(e.contains("`wasi:cli/run@0.3.0`"), "{e}");
+        let wide = Settings {
+            memory64: true,
+            ..program()
+        };
+        assert_eq!(
+            compile(src, wide).unwrap_err(),
+            "`memory64` builds no component: one addresses memory with 32 bits"
+        );
+        // A library is built into the components that use it.
+        assert_eq!(
+            compile(src, Settings::default()).unwrap_err(),
+            "a library is no component: it has no world"
+        );
     }
 
     #[test]
     fn imports_are_those_of_the_world() {
         let foreign = "extern:\n    fn log(n: i32)\n\nfn main():\n    log(1)\n";
-        let Err(Error::Component(e)) = component(program(foreign)) else {
-            panic!("`env` is no interface of WASI");
-        };
+        let e = compile(foreign, program()).unwrap_err();
         assert!(e.contains("`env::log`"), "{e}");
 
         // As the Canonical ABI lowers it, the function returns an `i32`.
@@ -483,9 +406,7 @@ extern "wasi:cli/stdout@0.3.0":
 fn main():
     let _ = write_via_stream(0)
 "#;
-        let Err(Error::Component(e)) = component(program(mistyped)) else {
-            panic!("a handle is no `i64`");
-        };
+        let e = compile(mistyped, program()).unwrap_err();
         let mismatch = "type mismatch for function `write-via-stream`";
         assert!(e.contains(mismatch), "{e}");
 
@@ -499,10 +420,89 @@ let arguments: &var array(array(u8)) = &var []
 fn main():
     get_arguments(arguments)
 "#;
-        let Err(Error::Component(e)) = component(program(unallocated)) else {
-            panic!("nothing allocates the arguments");
-        };
+        let e = compile(unallocated, program()).unwrap_err();
         assert!(e.contains("`cabi_realloc`"), "{e}");
+    }
+
+    #[test]
+    fn a_component_is_one_of_the_world_its_package_has() {
+        let wit = r#"
+package my:pkg@0.1.0;
+
+interface math {
+    add: func(a: s32, b: s32) -> s32;
+}
+
+world app {
+    import math;
+    export double: func(n: s32) -> s32;
+}
+"#;
+        let src = r#"
+extern "my:pkg/math@0.1.0":
+    fn add(a: i32, b: i32) -> i32
+
+pub fn double(n: i32) -> i32:
+    return add(n, n)
+
+fn idle():
+    pass
+"#;
+        let file = WitFile {
+            path: "wit/app.wit".to_string(),
+            contents: wit.to_string(),
+        };
+        let settings = |world: &str| Settings {
+            world: Some(world.to_string()),
+            wit: Wit {
+                package: vec![file.clone()],
+                deps: Vec::new(),
+            },
+            ..Settings::default()
+        };
+        let component = compile(src, settings("app")).unwrap();
+
+        // Its import is the host's to give, and its export the host's to
+        // call.
+        let engine = Engine::default();
+        let component = Component::new(&engine, component).unwrap();
+        let mut linker = Linker::<()>::new(&engine);
+        let mut math = linker.instance("my:pkg/math@0.1.0").unwrap();
+        let add = |_: wasmtime::StoreContextMut<()>, (a, b): (i32, i32)| Ok((a + b,));
+        math.func_wrap("add", add).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component).unwrap();
+        let double = instance.get_typed_func::<(i32,), (i32,)>(&mut store, "double");
+        assert_eq!(double.unwrap().call(&mut store, (21,)).unwrap(), (42,));
+
+        // A world is named in full where it is another package's.
+        assert!(compile(src, settings("my:pkg/app@0.1.0")).is_ok());
+        let e = compile(src, settings("missing")).unwrap_err();
+        assert!(e.starts_with("no world `missing`: "), "{e}");
+        // A start function is what the `run` of `wasi:cli/run` calls.
+        let started = Settings {
+            start: Some("idle".to_string()),
+            ..settings("app")
+        };
+        assert_eq!(
+            compile(src, started).unwrap_err(),
+            "`start` needs a world that exports `wasi:cli/run@0.3.0`, whose `run` calls it: \
+             `app` doesn't"
+        );
+        // The WIT of the package is read as it is written.
+        let broken = Settings {
+            wit: Wit {
+                package: vec![WitFile {
+                    path: "wit/app.wit".to_string(),
+                    contents: "package my:pkg;\nworld app { import missing; }\n".to_string(),
+                }],
+                deps: Vec::new(),
+            },
+            ..settings("app")
+        };
+        let e = compile(src, broken).unwrap_err();
+        assert!(e.starts_with("cannot read the WIT of the package: "), "{e}");
+        assert!(e.contains("wit/app.wit:2"), "{e}");
     }
 
     #[test]

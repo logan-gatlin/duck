@@ -44,6 +44,31 @@ pub struct Settings {
     /// The fuel that the code run to evaluate the constants of one item has.
     /// `None` is [`crate::ty::DEFAULT_FUEL`].
     pub fuel: Option<u64>,
+    /// The world the files are built as a component of, as
+    /// [`crate::world::COMMAND`] names one. `None` for a library, which is
+    /// built into the components that use it, and checked as one of no
+    /// world.
+    pub world: Option<String>,
+    /// The WIT of the package, beside that of WASI 0.3, which is always
+    /// there.
+    pub wit: Wit,
+}
+
+/// The WIT a package has of its own: its `wit` directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Wit {
+    /// The files of the package that has its worlds. None if it has no WIT.
+    pub package: Vec<WitFile>,
+    /// The files of each package those use, in any order.
+    pub deps: Vec<Vec<WitFile>>,
+}
+
+/// One file of a WIT package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitFile {
+    /// Where it is, for errors to name.
+    pub path: String,
+    pub contents: String,
 }
 
 pub(crate) struct DummyManager;

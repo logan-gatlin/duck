@@ -1,4 +1,4 @@
-//! `duck new`: the files of a fresh module or library.
+//! `duck new`: the files of a fresh component or library.
 
 use std::fs;
 use std::io;
@@ -8,11 +8,15 @@ use duck::manifest::MANIFEST;
 
 const DEFAULT_MANIFEST: &str = r#"# Build using the `duck` cli
 
-[module]
+[component]
 entry = "src/main.duck"
 output = "build/out.wasm"
-# A function taking and returning nothing, run when the module is instantiated.
+# A function taking and returning nothing, which is the program: the `run` of
+# `wasi:cli/run` calls it, as `duck run` does.
 start = "main"
+# The world the component is one of: of WASI 0.3, or of the WIT in the `wit`
+# directory beside this file. If not given, it is that of a program.
+# world = "wasi:cli/command@0.3.0"
 
 # Sizes are B, KiB, MiB, GiB, TiB, or pgs (64KiB wasm pages).
 # [memory]
@@ -58,8 +62,8 @@ const DEFAULT_GITIGNORE: &str = "/build\n";
 /// What kind of package `duck new` creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// A package that builds a wasm module.
-    Module,
+    /// A package that builds a wasm component.
+    Component,
     /// A package that other packages use, which builds nothing.
     Library,
 }
@@ -73,7 +77,7 @@ pub fn new(path: &Path, kind: Kind) -> io::Result<()> {
     fs::create_dir(path)?;
     fs::create_dir(path.join("src"))?;
     match kind {
-        Kind::Module => {
+        Kind::Component => {
             fs::write(path.join(MANIFEST), DEFAULT_MANIFEST)?;
             fs::write(path.join("src/main.duck"), DEFAULT_MAIN)?;
         }
@@ -90,24 +94,25 @@ pub fn new(path: &Path, kind: Kind) -> io::Result<()> {
 mod tests {
     use super::*;
     use duck::files::Files;
-    use duck::manifest::{Library, Module};
+    use duck::manifest::{Component, Library};
     use duck::package;
 
     #[test]
-    fn new_module_builds() {
+    fn new_component_builds() {
         let dir = std::env::temp_dir().join(format!("duck-new-{}", std::process::id()));
-        let module = dir.join("module");
-        new(&module, Kind::Module).unwrap();
-        let again = new(&module, Kind::Module).unwrap_err();
+        let module = dir.join("component");
+        new(&module, Kind::Component).unwrap();
+        let again = new(&module, Kind::Component).unwrap_err();
 
         let packages = package::resolve(&module, &duck::git::Cache::new(dir.join("cache")));
         let manifest = packages
             .as_ref()
             .map(|packages| packages.root().manifest.clone());
         let files = packages.as_ref().ok().map(|packages| {
-            let module_manifest = packages.root().manifest.module.as_ref().unwrap();
-            let entry = module.join(&module_manifest.entry);
-            let mut files = Files::new(packages, entry, module_manifest.settings()).unwrap();
+            let component = packages.root().manifest.component.as_ref().unwrap();
+            let entry = module.join(&component.entry);
+            let settings = component.settings(duck::files::wit(&module).unwrap());
+            let mut files = Files::new(packages, entry, settings).unwrap();
             duck_compiler::compile(&mut files).map(|_| ())
         });
         let gitignore = fs::read_to_string(module.join(".gitignore")).unwrap();
@@ -116,11 +121,12 @@ mod tests {
         assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
         let manifest = manifest.unwrap();
         assert_eq!(
-            manifest.module,
-            Some(Module {
+            manifest.component,
+            Some(Component {
                 entry: "src/main.duck".into(),
                 output: "build/out.wasm".into(),
                 start: Some("main".to_string()),
+                world: "wasi:cli/command@0.3.0".to_string(),
                 max_pages: None,
                 memory64: false,
                 static_start: 0,
@@ -147,14 +153,14 @@ mod tests {
         let checked = packages.as_ref().ok().map(|packages| {
             let entry = library.join("src/lib.duck");
             let mut files = Files::new(packages, entry, Default::default()).unwrap();
-            duck_compiler::compile(&mut files).map(|_| ())
+            duck_compiler::check(&mut files)
         });
         let gitignore = fs::read_to_string(library.join(".gitignore")).unwrap();
         fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
         let manifest = manifest.unwrap();
-        assert_eq!(manifest.module, None);
+        assert_eq!(manifest.component, None);
         assert_eq!(
             manifest.library,
             Some(Library {

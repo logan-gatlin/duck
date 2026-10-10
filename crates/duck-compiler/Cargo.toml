@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 wasm-encoder = "0.259.0"
 wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "gc", "gc-null", "backtrace", "std"] }
+wit-component = "0.258.3"
+wit-parser = "0.258.3"
 
 [dev-dependencies]
 wasmparser = "0.259.0"

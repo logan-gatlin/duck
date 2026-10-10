@@ -2,12 +2,22 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use duck_compiler::file::{FileId, FileManager, Settings};
+use duck_compiler::file::{FileId, FileManager, Settings, Wit, WitFile};
 
 use crate::package::Packages;
 
 /// What the file of a module is named after the module.
 const EXTENSION: &str = "duck";
+
+/// The directory of a package that holds its WIT, beside its manifest.
+const WIT_DIR: &str = "wit";
+
+/// The directory of [`WIT_DIR`] that holds the packages its WIT uses, each
+/// a file or a directory of them.
+const WIT_DEPS: &str = "deps";
+
+/// What a WIT file is named after.
+const WIT_EXTENSION: &str = "wit";
 
 /// How far down a directory is looked in for the modules that make it one
 /// that a `use` may lead through.
@@ -200,6 +210,58 @@ pub fn sources(path: &Path, sources: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+/// The WIT of the package in `dir`: the files of its [`WIT_DIR`], and those
+/// of each package under [`WIT_DEPS`] there, in order of their names. A
+/// package without the directory has none.
+pub fn wit(dir: &Path) -> io::Result<Wit> {
+    let dir = dir.join(WIT_DIR);
+    if !dir.is_dir() {
+        return Ok(Wit::default());
+    }
+    let mut deps = Vec::new();
+    let deps_dir = dir.join(WIT_DEPS);
+    if deps_dir.is_dir() {
+        let mut entries = fs::read_dir(&deps_dir)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let files = match path.is_dir() {
+                true => wit_files(&path)?,
+                false => wit_file(&path)?.into_iter().collect(),
+            };
+            if !files.is_empty() {
+                deps.push(files);
+            }
+        }
+    }
+    Ok(Wit {
+        package: wit_files(&dir)?,
+        deps,
+    })
+}
+
+/// The WIT files in the directory `dir`, in order of their names.
+fn wit_files(dir: &Path) -> io::Result<Vec<WitFile>> {
+    let mut entries = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    let mut files = Vec::new();
+    for entry in entries {
+        files.extend(wit_file(&entry.path())?);
+    }
+    Ok(files)
+}
+
+/// The file at `path`, if it is a WIT file.
+fn wit_file(path: &Path) -> io::Result<Option<WitFile>> {
+    if !path.is_file() || path.extension().is_none_or(|e| e != WIT_EXTENSION) {
+        return Ok(None);
+    }
+    Ok(Some(WitFile {
+        path: path.display().to_string(),
+        contents: fs::read_to_string(path)?,
+    }))
+}
+
 impl FileManager for Files {
     fn entry_point(&mut self) -> FileId {
         self.files[0].id
@@ -272,5 +334,48 @@ mod tests {
             "src/notes.md",
         ];
         assert_eq!(found, expected.map(|file| dir.join(file)));
+    }
+
+    #[test]
+    fn wit_is_the_wit_files_of_a_package_and_of_those_it_uses() {
+        let dir = std::env::temp_dir().join(format!("duck-wit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let files = [
+            "wit/world.wit",
+            "wit/api.wit",
+            "wit/notes.md",
+            "wit/deps/math/math.wit",
+            "wit/deps/math/more.wit",
+            "wit/deps/single.wit",
+            "wit/deps/empty/readme.md",
+            "src/main.duck",
+        ];
+        for file in files {
+            let path = dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file).unwrap();
+        }
+
+        let found = wit(&dir);
+        let none = wit(&dir.join("src"));
+        fs::remove_dir_all(&dir).unwrap();
+
+        let named = |files: &[&str]| -> Vec<_> {
+            let file = |file: &&str| WitFile {
+                path: dir.join(file).display().to_string(),
+                contents: file.to_string(),
+            };
+            files.iter().map(file).collect()
+        };
+        let expected = Wit {
+            package: named(&["wit/api.wit", "wit/world.wit"]),
+            deps: vec![
+                named(&["wit/deps/math/math.wit", "wit/deps/math/more.wit"]),
+                named(&["wit/deps/single.wit"]),
+            ],
+        };
+        assert_eq!(found.unwrap(), expected);
+        // A package without the directory has no WIT of its own.
+        assert_eq!(none.unwrap(), Wit::default());
     }
 }

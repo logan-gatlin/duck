@@ -1,10 +1,11 @@
 # Duck
 
-Indentation-blocked, statically typed, compiled to one WebAssembly module.
+Indentation-blocked, statically typed, compiled to one WebAssembly component.
 Values live in wasm locals and globals, memory is raw pointers into linear
 memory, and the host supplies all I/O through `extern`. `duck build` compiles
-the package of the nearest `Duck.toml`, and `duck run` runs it with WASI.
-`duck format` lays its files out as the examples here are.
+the package of the nearest `Duck.toml` to a component of the world it names,
+and `duck run` runs it with WASI. `duck format` lays its files out as the
+examples here are.
 
 Absent: allocator, GC, standard library, closures, anonymous functions,
 methods, traits, overloading, varargs, ternary, ranges, exceptions, char type,
@@ -972,8 +973,8 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
 
 ## WASI
 
-`duck run` compiles the module of the nearest `Duck.toml` and runs its `start`
-function in Wasmtime, which gives it WASI 0.3: the interfaces of
+`duck run` compiles the component of the nearest `Duck.toml` and runs its
+`start` function in Wasmtime, which gives it WASI 0.3: the interfaces of
 `wasi:cli/imports@0.3.0`. It writes no file.
 
 ```duck
@@ -1071,12 +1072,13 @@ fn main():                               # `start = "main"` in Duck.toml
   `wasi:cli/run`, once the module is instantiated, so that it may call every
   import, and `duck run` exits with 0 when it returns, or with the status it
   gives `wasi:cli/exit`. A trap is an error that names the functions that
-  were running. A module without a `start` doesn't run, nor does one with
-  `memory64`.
-- An `extern` block names an interface of `wasi:cli`, `wasi:clocks`,
-  `wasi:filesystem`, `wasi:random` or `wasi:sockets` with the version
-  `0.3.0`. Nothing else is there to import: an `extern` function of `env` is
-  an error.
+  were running. A component of a world that doesn't export `wasi:cli/run`
+  doesn't run, nor does one that imports what WASI 0.3 doesn't have: `duck
+  build` builds it, for a host that does.
+- An `extern` block names an interface that the world imports, with its
+  version: for a program, one of `wasi:cli`, `wasi:clocks`,
+  `wasi:filesystem`, `wasi:random` or `wasi:sockets` at `0.3.0`. Nothing else
+  is there to import: an `extern` function of `env` is an error.
 - A function has the name its WIT does: `get-arguments`, a resource's method
   as `[method]descriptor.open-at`, one that needs no handle as
   `[static]tcp-socket.create`, and `[resource-drop]descriptor` to drop a
@@ -1101,8 +1103,8 @@ fn main():                               # `start = "main"` in Duck.toml
 - An `async func` of the WIT is declared and called as any other is, and
   returns when it is done: `[method]descriptor.open-at` blocks until the file
   is open.
-- `duck build` writes the module as it does any other, with these imports
-  for its host to give it.
+- `duck build` writes the component, with these imports for its host to give
+  it.
 
 ### Streams and futures
 
@@ -1137,16 +1139,17 @@ of a function that has the stream or future in its type, and named for it.
 
 ## Duck.toml
 
-`duck new <dir>` creates a module package, and `duck new --lib <dir>` a
+`duck new <dir>` creates a component package, and `duck new --lib <dir>` a
 library.
 
 ```toml
-[module]                 # the wasm module this package builds
+[component]              # the wasm component this package builds
 entry = "src/main.duck"  # relative to Duck.toml
 output = "build/out.wasm"
-start = "main"           # optional: run on instantiation, and by `duck run`
+start = "main"           # optional: the program, which `duck run` runs
+world = "wasi:cli/command@0.3.0"  # optional: what it imports and exports
 
-[memory]                 # optional, as is each key; needs [module]
+[memory]                 # optional, as is each key; needs [component]
 memory64 = true          # 64-bit addresses, which are 32-bit without it
 max = "16MiB"            # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
 static = { start = "1KiB" }  # where literals go from, which is 0 without it
@@ -1162,13 +1165,23 @@ json = { path = "../json" }
 xml = { git = "https://example.com/xml.git", tag = "v1.0" }  # or rev; no branches
 ```
 
+- A component is one of a world, which says what it imports and exports.
+  Without a `world` it is a program, of `wasi:cli/command@0.3.0`: it imports
+  WASI 0.3 and exports the `run` of `wasi:cli/run`, which calls `start`. A
+  `start` is only for a world that exports that `run`.
+- A world of the package's own is written in WIT, in the `.wit` files of the
+  `wit` directory beside `Duck.toml`, and is named as it is there: `app`, or
+  `my:pkg/app@0.1.0` in full. The packages that WIT uses are each a file or a
+  directory of `wit/deps`. WASI 0.3 is always there to use and is never
+  among them.
+- A library has no world: it is built into the components that use it.
 - Memory has no `min`: it starts with the pages below `static.start`, those
   its literals take and those its constants grow it by. For one that starts
   larger, have a constant take the pages with `module.grow`.
-- `memory64` builds a wasm memory64 module, whose memory and table are
-  addressed with 64 bits: sizes may pass 4GiB, and `int`, `uint`, pointers
-  and function pointers are 64 bits wide. A `uint` past 4294967295 is an
-  error without it.
-- A library builds as the module that uses it does, so it keeps addresses and
-  lengths in `uint`, never `u32` or `u64`. On its own it is checked with
+- `memory64` addresses memory and the table with 64 bits: sizes may pass
+  4GiB, and `int`, `uint`, pointers and function pointers are 64 bits wide.
+  A `uint` past 4294967295 is an error without it. It builds no component,
+  as one addresses memory with 32 bits: only a library is checked with it.
+- A library builds as the component that uses it does, so it keeps addresses
+  and lengths in `uint`, never `u32` or `u64`. On its own it is checked with
   32-bit addresses.

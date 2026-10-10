@@ -480,8 +480,6 @@ dependencies = [
  "url",
  "wasmtime",
  "wasmtime-wasi",
- "wit-component",
- "wit-parser",
 ]
 
 [[package]]
@@ -492,6 +490,8 @@ dependencies = [
  "wasmparser 0.259.0",
  "wasmprinter 0.259.0",
  "wasmtime",
+ "wit-component",
+ "wit-parser",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
-use duck::files::Files;
+use duck::files::{self, Files};
 use duck::git::Cache;
 use duck::manifest::{MANIFEST, ManifestError};
 use duck::package::{self, Packages, ResolveError};
@@ -476,7 +476,10 @@ impl Project {
         if let (Some(module), Ok(packages)) = (module, &self.packages) {
             let entered = packages.iter().any(|package| {
                 let manifest = &package.manifest;
-                let module_entry = manifest.module.as_ref().map(|module| &module.entry);
+                let module_entry = manifest
+                    .component
+                    .as_ref()
+                    .map(|component| &component.entry);
                 let library_entry = manifest.library.as_ref().map(|library| &library.entry);
                 let mut entries = module_entry.into_iter().chain(library_entry);
                 entries.any(|entry| canonical(&package.dir.join(entry)) == *module)
@@ -701,9 +704,12 @@ impl Project {
             Err(error) => return (vec![resolve_problem(manifest_path, error)], Vec::new()),
         };
         let manifest = &packages.root().manifest;
-        let module = (manifest.module.as_ref()).map(|module| (&module.entry, module.settings()));
+        // WIT that can't be read is none, which the build says.
+        let wit = files::wit(&self.root).unwrap_or_default();
+        let component = manifest.component.as_ref();
+        let module = component.map(|component| (&component.entry, component.settings(wit.clone())));
         let library = manifest.library.as_ref();
-        let library = library.map(|library| (&library.entry, library.settings()));
+        let library = library.map(|library| (&library.entry, library.settings(wit)));
 
         let mut problems = Vec::new();
         let mut checked = Vec::new();
@@ -956,7 +962,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) const MODULE: &str =
-        "[module]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmax = \"16MiB\"\n";
+        "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmax = \"16MiB\"\n";
 
     const LIBRARY: &str = "[library]\nentry = \"lib.duck\"\n";
 
@@ -1262,8 +1268,7 @@ pub(crate) mod tests {
     #[test]
     fn memory64_widens_a_module_and_not_the_library_beside_it() {
         let dir = TempDir::new("memory64");
-        let module =
-            "[module]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmemory64 = true\n";
+        let module = "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmemory64 = true\n";
         dir.write(&[
             ("app/Duck.toml", &format!("{module}{LIBRARY}")),
             ("app/main.duck", "let far: uint = 4294967296\n"),
@@ -1335,7 +1340,7 @@ pub(crate) mod tests {
         dir.write(&[("app/Duck.toml", "[dependencies]\n")]);
         assert_eq!(
             check(&dir, &[]),
-            ["app/Duck.toml:0:0-0:0: needs a [module] or [library] table"]
+            ["app/Duck.toml:0:0-0:0: needs a [component] or [library] table"]
         );
 
         // A dependency's manifest holds what is wrong with it.

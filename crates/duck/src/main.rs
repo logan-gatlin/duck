@@ -26,11 +26,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Compile the package described by the nearest Duck.toml: build its
-    /// module, or check its library if it has no module
+    /// component, or check its library if it has no component
     Build,
-    /// Compile the module of the package described by the nearest Duck.toml
-    /// and run its `start` function in Wasmtime, which gives it WASI 0.3 and
-    /// with it the files and the network of this machine
+    /// Compile the component of the package described by the nearest
+    /// Duck.toml and run it in Wasmtime, which gives it WASI 0.3 and with it
+    /// the files and the network of this machine
     Run {
         /// The arguments the program is given
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -48,11 +48,11 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Create a new package in a new directory: a module, or a library with --lib
+    /// Create a new package in a new directory: a component, or a library with --lib
     New {
         /// The directory to create
         path: PathBuf,
-        /// Create a library for other packages to use, not a module
+        /// Create a library for other packages to use, not a component
         #[arg(long)]
         lib: bool,
     },
@@ -74,7 +74,7 @@ fn main() -> ExitCode {
             let kind = if lib {
                 new::Kind::Library
             } else {
-                new::Kind::Module
+                new::Kind::Component
             };
             match new::new(&path, kind) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -99,18 +99,22 @@ fn build() -> ExitCode {
     };
     let manifest = &packages.root().manifest;
 
-    // A package without a module is only checked.
-    let (entry, settings) = match (&manifest.module, &manifest.library) {
-        (Some(module), _) => (&module.entry, module.settings()),
-        (None, Some(library)) => (&library.entry, library.settings()),
-        (None, None) => unreachable!("every manifest has a module or a library"),
+    let wit = match files::wit(&root) {
+        Ok(wit) => wit,
+        Err(e) => return fail(format_args!("cannot read the WIT of the package: {e}")),
+    };
+    // A package without a component is only checked.
+    let (entry, settings) = match (&manifest.component, &manifest.library) {
+        (Some(component), _) => (&component.entry, component.settings(wit)),
+        (None, Some(library)) => (&library.entry, library.settings(wit)),
+        (None, None) => unreachable!("every manifest has a component or a library"),
     };
     let entry = root.join(entry);
     let mut files = match Files::new(&packages, &entry, settings) {
         Ok(files) => files,
         Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
     };
-    let compiled = match &manifest.module {
+    let compiled = match &manifest.component {
         Some(_) => duck_compiler::compile(&mut files).map(Some),
         None => duck_compiler::check(&mut files).map(|()| None),
     };
@@ -119,10 +123,10 @@ fn build() -> ExitCode {
         Err(errors) => return report(&errors, &mut files, &root.join(MANIFEST)),
     };
 
-    let (Some(module), Some(bytes)) = (&manifest.module, bytes) else {
+    let (Some(component), Some(bytes)) = (&manifest.component, bytes) else {
         return ExitCode::SUCCESS;
     };
-    let output = root.join(&module.output);
+    let output = root.join(&component.output);
     if let Some(dir) = output.parent()
         && let Err(e) = fs::create_dir_all(dir)
     {
@@ -134,29 +138,35 @@ fn build() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Compiles the module of the nearest package and runs it, writing nothing.
-/// The program is named as the module's output is, before `args`.
+/// Compiles the component of the nearest package and runs it, writing
+/// nothing. The program is named as the component's output is, before `args`.
 fn run(args: Vec<String>) -> ExitCode {
     let (root, packages) = match resolve() {
         Ok(resolved) => resolved,
         Err(code) => return code,
     };
-    let Some(module) = &packages.root().manifest.module else {
-        return fail(format_args!("nothing to run: {MANIFEST} has no [module]"));
+    let Some(component) = &packages.root().manifest.component else {
+        return fail(format_args!(
+            "nothing to run: {MANIFEST} has no [component]"
+        ));
     };
-    let entry = root.join(&module.entry);
-    let mut files = match Files::new(&packages, &entry, module.settings()) {
+    let wit = match files::wit(&root) {
+        Ok(wit) => wit,
+        Err(e) => return fail(format_args!("cannot read the WIT of the package: {e}")),
+    };
+    let entry = root.join(&component.entry);
+    let mut files = match Files::new(&packages, &entry, component.settings(wit)) {
         Ok(files) => files,
         Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
     };
-    let lowered = match duck_compiler::lower(&mut files) {
-        Ok(lowered) => lowered,
+    let compiled = match duck_compiler::compile(&mut files) {
+        Ok(compiled) => compiled,
         Err(errors) => return report(&errors, &mut files, &root.join(MANIFEST)),
     };
-    let name = module.output.file_name().unwrap_or_default();
+    let name = component.output.file_name().unwrap_or_default();
     let name = name.to_string_lossy().into_owned();
     let args: Vec<_> = [name].into_iter().chain(args).collect();
-    match run::run(lowered, &args) {
+    match run::run(&compiled, &args) {
         Ok(status) => ExitCode::from(status),
         Err(e) => fail(e),
     }

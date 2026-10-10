@@ -1,3 +1,4 @@
-[module]
+[component]
 entry = "main.duck"
 output = "build/main.wasm"
+start = "main"

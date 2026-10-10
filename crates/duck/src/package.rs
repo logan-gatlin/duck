@@ -297,8 +297,8 @@ mod tests {
         let library = packages.root().manifest.library.as_ref().unwrap();
         let entry = root.join(&library.entry);
         let mut files = Files::new(&packages, &entry, Settings::default()).unwrap();
-        let errors = match duck_compiler::compile(&mut files) {
-            Ok(_) => return Ok(()),
+        let errors = match duck_compiler::check(&mut files) {
+            Ok(()) => return Ok(()),
             Err(errors) => errors,
         };
         let errors = errors.iter().map(|error| {
@@ -376,7 +376,7 @@ mod tests {
             ("app/Duck.toml", &library("tool = { path = \"../tool\" }\n")),
             (
                 "tool/Duck.toml",
-                "[module]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmax = \"16MiB\"\n",
+                "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\n[memory]\nmax = \"16MiB\"\n",
             ),
         ]);
         let error = resolve(&root, &no_cache(&root)).unwrap_err().to_string();
