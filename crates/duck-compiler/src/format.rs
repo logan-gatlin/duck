@@ -884,6 +884,10 @@ mod tests {
             "let b: varray(u8) = [0; SIZE]\n"
         );
         assert_eq!(
+            formatted("pub let Make:type=fn( uint )->&var u8\nfn(R:Make)f(make:R):\n\tpass\n"),
+            "pub let Make: type = fn(uint) -> &var u8\n\nfn(R: Make) f(make: R):\n\tpass\n"
+        );
+        assert_eq!(
             formatted("use geo . { Point ,len  as length }\n"),
             "use geo.{Point, len as length}\n"
         );

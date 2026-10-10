@@ -933,6 +933,34 @@ fn f(pool: &Pool(u8, lib.bump)) -> &var u8:
     }
 
     #[test]
+    fn a_name_of_a_type_is_used_as_any_item_is() {
+        let lib = "\
+pub let Make: type = fn(uint) -> &var u8
+let Kept: type = i32
+pub fn bump(size: uint) -> &var u8:
+    return 8
+";
+        let main = "\
+use lib
+use lib.Make as Maker
+fn(R: lib.Make) take(make: R) -> &var u8:
+    return make(1)
+fn f(make: Maker) -> &var u8:
+    return take(lib.bump)
+";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        let module = lower(&mut files);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"take(bump)"), "{names:?}");
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.params.len(), 1);
+
+        let main = "use lib\nfn f(n: lib.Kept):\n    pass\n";
+        let mut files = Memory(vec![("main", main), ("lib", lib)]);
+        assert_eq!(errors(&mut files), ["main \"Kept\": `Kept` is private"]);
+    }
+
+    #[test]
     fn functions_of_other_modules_are_pointed_to() {
         let lib = "\
 pub fn inc(x: i32) -> i32:

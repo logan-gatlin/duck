@@ -382,6 +382,10 @@ impl Body<'_> {
     pub(super) fn enum_name(&self, expr: &parse::Expr) -> Option<EnumId> {
         match (self.named(expr), &expr.kind) {
             (Some(Item::Enum(id)), _) => Some(id),
+            (Some(Item::Alias(id)), _) => match self.ck.aliased(id) {
+                Ty::Enum(id) => Some(id),
+                _ => None,
+            },
             (None, ExprKind::Name(name)) if self.lookup(name).is_none() => {
                 match self.ck.type_param(name) {
                     Some(Ty::Enum(id)) => Some(id),

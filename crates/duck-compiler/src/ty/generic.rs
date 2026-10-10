@@ -595,7 +595,7 @@ impl Checker {
 
     /// Reads a type written as an expression, such as the `Box(&i32)` in
     /// `Box(&i32)(value: p)`. `None` after reporting an error.
-    fn type_syntax(&mut self, expr: &parse::Expr) -> Option<parse::Type> {
+    pub(super) fn type_syntax(&mut self, expr: &parse::Expr) -> Option<parse::Type> {
         let kind = match &expr.kind {
             ExprKind::Name(_) | ExprKind::Field(..) => {
                 return self.path_type(expr, None, expr.span);
@@ -699,7 +699,9 @@ impl Checker {
             _ if name == TUPLE => Some(Arity::Any),
             Some(item @ (Item::Struct(_) | Item::Enum(_))) => self.item_arity(item),
             _ if is_builtin_type(name) => Some(Arity::Plain),
-            Some(item @ (Item::Func(_) | Item::GenericFn(_))) => self.item_arity(item),
+            Some(item @ (Item::Func(_) | Item::GenericFn(_) | Item::Alias(_))) => {
+                self.item_arity(item)
+            }
             _ => None,
         }
     }
@@ -713,7 +715,9 @@ impl Checker {
                 0 => Some(Arity::Plain),
                 n => Some(Arity::Exactly(n)),
             },
-            Item::Enum(_) | Item::Func(_) | Item::GenericFn(_) => Some(Arity::Plain),
+            Item::Enum(_) | Item::Func(_) | Item::GenericFn(_) | Item::Alias(_) => {
+                Some(Arity::Plain)
+            }
             _ => None,
         }
     }

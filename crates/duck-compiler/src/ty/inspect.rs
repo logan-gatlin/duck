@@ -1048,6 +1048,10 @@ impl Analysis {
                 };
                 Some(self.global_name(binding, index, item)?.span)
             }
+            Item::Alias(id) => match declared(self.ck.aliases[id].item)? {
+                ItemKind::Binding(binding) => Some(binding.pattern.span),
+                _ => None,
+            },
             Item::Module(file) => Some(Span {
                 file,
                 start: 0,
@@ -1351,6 +1355,16 @@ impl Analysis {
                     false => format!("{keyword} {declared}: {ty} = {value}"),
                 })
             }
+            // A name of a type is as it is written, which is the type.
+            Item::Alias(id) => {
+                let item = self.ck.aliases[id].item;
+                let ItemKind::Binding(binding) = &self.program.items.get(item)?.kind else {
+                    return None;
+                };
+                let declared = src.text(binding.pattern.span);
+                let value = src.text(binding.value.span);
+                Some(format!("let {declared}: type = {value}"))
+            }
             Item::Module(_) => {
                 let mut uses = self.program.uses.iter();
                 let used = uses.find(|used| used.module == site.file && used.name.name == name)?;
@@ -1400,6 +1414,10 @@ impl Analysis {
                 let global = self.ck.globals.get(index).and_then(Option::as_ref);
                 let ty = global.map(|global| self.ck.ty_name(global.ty));
                 (CompletionKind::Variable, ty.unwrap_or_default())
+            }
+            Item::Alias(id) => {
+                let ty = self.ck.ty_name(self.ck.aliased(id));
+                (CompletionKind::Type, ty)
             }
             Item::Module(_) => (CompletionKind::Module, String::new()),
         };
@@ -2926,6 +2944,30 @@ fn take(pool: &Pool(u8, bump), again: bump) -> &var u8:
         let (file, offset) = files.at("main", "again\n");
         let signature = analysis.signature(&mut files, file, offset).unwrap();
         assert_eq!(signature.label, "fn(uint) -> &var u8");
+    }
+
+    #[test]
+    fn a_name_of_a_type_is_declared_where_it_is_bound() {
+        let src = "\
+let Make: type = fn(uint) -> &var u8
+let Unused: type = i32
+fn(R: Make) take(make: R) -> &var u8:
+    return make(1)
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let (file, offset) = files.at("main", "Make) take");
+        let make = analysis.definition(file, offset).unwrap();
+        assert_eq!(
+            src[make.start..].lines().next().unwrap(),
+            "Make: type = fn(uint) -> &var u8"
+        );
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(hover.text, "let Make: type = fn(uint) -> &var u8");
+        // One that nothing names is as unused as any global.
+        let unused = analysis.unused(&mut files);
+        let unused: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
+        assert_eq!(unused, ["Unused", "take"]);
     }
 
     /// Where each name is written that stands for what `name` does, in the

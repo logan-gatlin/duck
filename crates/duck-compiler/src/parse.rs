@@ -501,6 +501,14 @@ impl FnSig {
     }
 }
 
+impl Binding {
+    /// Whether it is typed `type`, as one that names a type is: its value
+    /// is that type, written as an expression.
+    pub fn names_type(&self) -> bool {
+        self.ty.as_ref().is_some_and(Type::is_type)
+    }
+}
+
 impl Type {
     /// Whether it is `type`, which makes a parameter a type parameter.
     pub fn is_type(&self) -> bool {

@@ -598,6 +598,44 @@ fn(T, F: fn(T) -> T) twice(f: F, x: T) -> T:
                   (identifier))))))))))
 
 ====================
+Name of a type
+====================
+
+pub let Make: type = fn(uint) -> &var u8
+
+fn(R: Make) take(make: R):
+    pass
+
+---
+
+(source_file
+  (binding
+    (identifier)
+    (named_type
+      (identifier))
+    (function_type
+      (parameter_types
+        (named_type
+          (identifier)))
+      (pointer_type
+        (named_type
+          (identifier)))))
+  (function_declaration
+    (type_parameters
+      (bounded_type_parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (block
+      (pass_statement))))
+
+====================
 Generic function
 ====================
 

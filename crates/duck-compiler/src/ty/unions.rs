@@ -325,7 +325,11 @@ impl Body<'_> {
             }
             _ => self.named(expr),
         };
-        matches!(item, Some(Item::Struct(id)) if self.ck.structs[id.0 as usize].union)
+        match item {
+            Some(Item::Struct(id)) => self.ck.structs[id.0 as usize].union,
+            Some(Item::Alias(id)) => self.ck.union_id(self.ck.aliased(id)).is_some(),
+            _ => false,
+        }
     }
 
     /// `U.name` or `U.name(args)`, where `U` is a union if it

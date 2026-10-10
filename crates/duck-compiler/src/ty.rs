@@ -24,6 +24,7 @@ use crate::parse::{
 };
 use crate::world::{ROOT, RUN_EXPORT, RUN_INTERFACE, World, WorldError, kebab};
 
+use alias::AliasDef;
 use defaults::DefaultValue;
 use enums::EnumDef;
 use evaluate::Dep;
@@ -31,6 +32,7 @@ use generic::{Arity, Instance, ParamDef, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
+mod alias;
 mod canonical;
 mod defaults;
 mod enums;
@@ -335,6 +337,8 @@ pub enum TypeErrorKind {
     RecursiveEnum(String),
     /// A union that contains itself by value.
     RecursiveUnion(String),
+    /// A name of a type that is written with itself, which no type is.
+    RecursiveAlias(String),
     DuplicateVariant(String),
     /// A union with more variants than its tag tells apart.
     TooManyVariants(String),
@@ -831,6 +835,8 @@ struct Checker {
     type_params: Vec<(String, Ty)>,
     /// Enum declarations in declaration order.
     enums: Vec<EnumDef>,
+    /// The names of types, in declaration order.
+    aliases: Vec<AliasDef>,
     /// Instances whose fields wait on every generic struct's being defined.
     pending: Vec<StructId>,
     /// Where a struct that holds others nested too deep is reported, which
@@ -977,6 +983,8 @@ enum Item {
     Struct(StructId),
     Enum(EnumId),
     Global(usize),
+    /// A name of a type, which a `let` of type `type` declares.
+    Alias(usize),
     /// A module, by the name it's used as.
     Module(FileId),
 }
@@ -1382,6 +1390,12 @@ impl fmt::Display for TypeErrorKind {
             Self::RecursiveStruct(name) => write!(f, "struct `{name}` contains itself"),
             Self::RecursiveEnum(name) => write!(f, "enum `{name}` contains itself"),
             Self::RecursiveUnion(name) => write!(f, "union `{name}` contains itself"),
+            Self::RecursiveAlias(name) => {
+                write!(
+                    f,
+                    "`{name}` names a type that is written with `{name}` itself"
+                )
+            }
             Self::DuplicateVariant(name) => write!(f, "duplicate variant `{name}`"),
             Self::TooManyVariants(name) => write!(
                 f,
@@ -1491,7 +1505,9 @@ impl fmt::Display for TypeErrorKind {
             ),
             Self::TypeOutsideParam => write!(
                 f,
-                "`type` is only the type of a function's parameter, which it makes a type parameter"
+                "`type` is only the type of a function's parameter, which it makes a type \
+                 parameter, and of a global `let` of one name, which it makes a name of the type \
+                 it is bound to"
             ),
             Self::TypeParamDefault(name) => {
                 write!(f, "type parameter `{name}` can't have a default")
@@ -2042,6 +2058,8 @@ impl Checker {
             let (id, state) = match &item.kind {
                 ItemKind::Struct(_) => (self.structs.len(), Visit::New),
                 ItemKind::Enum(_) => (self.enums.len(), Visit::New),
+                // A name of a type has no constant.
+                ItemKind::Binding(b) if b.names_type() => (0, Visit::Done),
                 ItemKind::Binding(_) => (self.globals.len(), Visit::New),
                 // The defaults of its parameters.
                 ItemKind::Fn(f) if !has_default(&f.sig) => (0, Visit::Done),
@@ -2090,6 +2108,10 @@ impl Checker {
                         }
                         next_import += 1;
                     }
+                    continue;
+                }
+                ItemKind::Binding(b) if b.names_type() => {
+                    self.declare_alias(item, index, b);
                     continue;
                 }
                 ItemKind::Binding(b) => {
@@ -2324,6 +2346,7 @@ impl Checker {
         for id in 0..self.structs.len() {
             self.check_instance_bounds(StructId(id as u32));
         }
+        self.define_aliases(program);
     }
 
     /// How many structs and unions nest by value in struct `id`, itself
@@ -3223,6 +3246,8 @@ impl Checker {
             }
         } else if let Some(Item::Enum(id)) = item {
             Ty::Enum(id)
+        } else if let Some(Item::Alias(id)) = item {
+            self.alias_ty(id, span)
         } else if let Some(Item::Func(id)) = item {
             // The type of the function, which only it is of.
             Ty::Func(id)
@@ -5546,7 +5571,7 @@ impl<'c> Body<'c> {
                 None => (Ty::Error, Value::default()),
             },
             // Struct and enum names are types, which `expr` makes values.
-            Item::Struct(_) | Item::Enum(_) | Item::Module(_) => {
+            Item::Struct(_) | Item::Enum(_) | Item::Alias(_) | Item::Module(_) => {
                 self.error(TypeErrorKind::NotAValue(name.to_string()), span);
                 (Ty::Error, Value::default())
             }
@@ -5588,11 +5613,14 @@ impl<'c> Body<'c> {
     fn is_type_expr(&self, expr: &parse::Expr) -> bool {
         match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.item(name) {
-                Some(item) => matches!(item, Item::Struct(_) | Item::Enum(_)),
+                Some(item) => matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Alias(_)),
                 None => is_builtin_type(name) || self.ck.type_param(name).is_some(),
             },
             ExprKind::Field(..) => {
-                matches!(self.named(expr), Some(Item::Struct(_) | Item::Enum(_)))
+                matches!(
+                    self.named(expr),
+                    Some(Item::Struct(_) | Item::Enum(_) | Item::Alias(_))
+                )
             }
             ExprKind::Call(callee, args) => self.names_type(callee, args),
             ExprKind::AddrOf(_, pointee) => self.is_type_expr(pointee),
@@ -6152,6 +6180,10 @@ impl<'c> Body<'c> {
             }
             Ok(Item::GenericFn(generic)) => self.generic_fn_call(generic, args, span),
             Ok(Item::Struct(id)) => self.construct(Ty::Struct(id), args, span),
+            Ok(Item::Alias(id)) => {
+                let ty = self.ck.alias_ty(id, callee.span);
+                self.construct(ty, args, span)
+            }
             Ok(Item::Global(_)) => self.call_value(callee, args, span),
             Ok(Item::Enum(_) | Item::Module(_)) | Err(_) => {
                 let error = match item {
@@ -12009,7 +12041,8 @@ fn f(T: type):
         );
         assert_eq!(
             TypeOutsideParam.to_string(),
-            "`type` is only the type of a function's parameter, which it makes a type parameter"
+            "`type` is only the type of a function's parameter, which it makes a type parameter, \
+             and of a global `let` of one name, which it makes a name of the type it is bound to"
         );
     }
 
@@ -15561,6 +15594,107 @@ fn f(a: id, b: Pool(u8, wide), c: wide(i32), d: Pool(u8, id)):
         assert_eq!(
             GenericFnType("id".into()).to_string(),
             "`id` is generic, so it has no type of its own: only each of its instances has"
+        );
+    }
+
+    #[test]
+    fn a_let_of_type_type_names_a_type() {
+        let src = "\
+let Realloc: type = fn(&var u8, uint) -> &var u8
+let Bytes: type = array(u8)
+let Shade: type = Color
+let Maker: type = bump
+pub let Pair: type = tuple(Realloc, Shade)
+let Q: type = P
+let Grown: type = Vec(u8, Maker)
+pub enum(u8) Color:
+    red
+    green
+struct P:
+    x: i32
+struct(T, R: Realloc) Vec:
+    realloc: R
+    cap: uint = 0
+fn bump(old: &var u8, size: uint) -> &var u8:
+    return old
+fn(R: Realloc) grow(realloc: R, old: &var u8) -> &var u8:
+    return realloc(old, 8)
+fn size_of(T: type) -> uint:
+    return T.size
+fn f(p: Realloc, b: Bytes, m: Maker, at: &var u8) -> uint:
+    let q = Q(x: 1)
+    let c = Shade.green
+    let v: Grown = Grown(realloc: m)
+    let a = grow(bump, at)
+    let d = grow(p, at)
+    var n = 0
+    for shade in Shade:
+        n += 1
+    return Realloc.size + Pair.size + size_of(Grown) + (b.len as! Realloc) as uint
+";
+        let module = lower(src);
+        // It is the type it names, and no global.
+        assert!(module.globals.is_empty());
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        for instance in [
+            "grow(bump)",
+            "grow(fn(&var u8, uint) -> &var u8)",
+            "size_of(Vec(u8, bump))",
+        ] {
+            assert!(names.contains(&instance), "{instance} in {names:?}");
+        }
+        let f = body(&module, "f");
+        for part in [
+            "(set q.x 1) (set c 1) (set v.cap 0)",
+            "(set a (call grow(bump) at))",
+            "(set d (call grow(fn(&var u8, uint) -> &var u8) p at))",
+            "(I32.Add (I32.Add 4 8) (call size_of(Vec(u8, bump)) ))",
+        ] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+
+        use TypeErrorKind::*;
+        let src = "\
+struct Hidden:
+    x: i32
+let A: type = B
+let B: type = &A
+let C: type = 5
+var D: type = i32
+let (E, F): type = i32
+let G: type = Nope
+pub let H: type = &Hidden
+let I: type = i32
+fn f(c: C):
+    let x = I
+    let y: I = true
+    I = 2
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                NotAType,
+                TypeOutsideParam,
+                TypeOutsideParam,
+                RecursiveAlias("A".into()),
+                UnknownType("Nope".into()),
+                PrivateInPublic {
+                    ty: "Hidden".into(),
+                    item: "H".into()
+                },
+                NotAValue("i32".into()),
+                mismatch("i32", "bool"),
+                NotAssignable,
+            ]
+        );
+        assert_eq!(
+            RecursiveAlias("A".into()).to_string(),
+            "`A` names a type that is written with `A` itself"
+        );
+        assert_eq!(
+            TypeOutsideParam.to_string(),
+            "`type` is only the type of a function's parameter, which it makes a type parameter, \
+             and of a global `let` of one name, which it makes a name of the type it is bound to"
         );
     }
 

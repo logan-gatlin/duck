@@ -83,7 +83,14 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - `fn(A, B) -> R`: a function pointer. `fn(A)` returns nothing.
 - A type has a `size: uint` and an `align: uint`, as in `Point.size`,
   `(&Point).size` and `i64.align`. It is no value: `type` is only the type of
-  a function's parameter, which makes it a type parameter.
+  a function's parameter, which makes it a type parameter, and of a global
+  `let` that names a type.
+- `let Step: type = fn(i32) -> i32`: a global `let` of one name, typed
+  `type`, names the type it is bound to. `Step` is that type wherever a
+  type is written, and no type of its own: an error says `fn(i32) -> i32`.
+  It may be `pub`, is used from another module as any item is, and is no
+  global: nothing of it is in the module. It takes no type parameters, and
+  is not written with itself.
 - `never`: the type of what has no value, as a `return` has none. It is
   accepted as any type, and nothing else is accepted as it, so no value of
   it is made: a function that returns it never returns. It is never stored
@@ -919,6 +926,11 @@ struct(T, A: fn(uint) -> &var T) Pool:
 fn(T, A: fn(uint) -> &var T) take(pool: &var Pool(T, A)) -> &var T:
 	pool.count += 1
 	return pool.make(T.size)
+
+let Step: type = fn(i32) -> i32      # a name for a bound, as for any type
+
+fn(F: Step) twice(x: i32, f: F) -> i32:
+	return f(f(x))
 
 fn wide(x: i32) -> i64:
 	return x as i64
