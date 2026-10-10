@@ -1286,7 +1286,7 @@ impl Analysis {
                 Some(match block {
                     Some(block) => {
                         let module = block.module.as_ref();
-                        let module = module.map(|module| format!(" {module:?}"));
+                        let module = module.map(|module| format!(" {:?}", module.name));
                         format!("extern{}:\n\t{sig}", module.unwrap_or_default())
                     }
                     None => sig,
@@ -2173,7 +2173,7 @@ fn hidden():
     const MAIN: &str = "\
 use geo
 use geo.Point
-extern \"js\":
+extern \"$root\":
     fn log(n: i32) = \"log_int\"
 enum(u8) Color:
     red
@@ -2333,7 +2333,7 @@ fn bytes(T: type, count: uint) -> uint:
         assert_eq!(hover("main", "geo.len(p"), described("geo", "use geo"));
         assert_eq!(
             hover("main", "log(c"),
-            described("log", "extern \"js\":\n\tfn log(n: i32)")
+            described("log", "extern \"$root\":\n\tfn log(n: i32)")
         );
         assert_eq!(
             hover("main", "LIMIT + 1"),

@@ -991,6 +991,29 @@ pub fn helper():                        # only `pub`: the world has no `helper`
   body. One is needed where the name is none in WIT, whose names are words
   of lowercase letters or of capitals: `_x`, `a__b` and `getHttp` are errors
   in an `extern` block and in a `pub "interface":` block.
+- A function of either block is checked against the WIT: it has as many
+  parameters as the WIT gives it, each of the type that the WIT's is, and
+  gives what the WIT has it give, or nothing. An `-> never` is for one that
+  gives nothing and never returns.
+- A type of Duck is one of WIT by its shape, whatever it and what it holds
+  are named. A `record` is a struct with as many fields, each the type of
+  the field it is in order, and a `variant` a union with as many variants,
+  each holding what its case does. An `enum` is an `enum(u8)` with as many
+  members, counted from 0, so none is given a value: an `enum(u16)` past
+  256 of them. `flags` are the narrowest of `u8`, `u16` and `u32` with a
+  bit for each, from the lowest. A `list<T>` is an `array(T)` and a
+  `string` an `array(u8)`, which `string` names. `tuple`, `option` and
+  `result` are Duck's own, with `tuple()` for a `_`. A `char` is a `u32`,
+  `s8` to `s64` are `i8` to `i64`, and a handle is an `i32`: an `own` or a
+  `borrow` of a resource, a `stream` or a `future`.
+- The error is at the type that differs, and says what the WIT has there
+  and which type within it isn't matched. A pointer, a function pointer, an
+  `int` and a `uint` are types of no WIT.
+- An interface that isn't there to import is an error at the block that
+  names it, as is a function that its interface doesn't have. A library
+  imports from any interface of WASI 0.3 or of the WIT in its `wit`
+  directory, and the component it is built into has a world that imports
+  each of them.
 - No function of either block is generic, and no generic function is
   exported.
 - The host gives every argument. A default is passed by the Duck call that
@@ -1133,13 +1156,9 @@ fn main():                               # `start = "main"` in Duck.toml
   `= "[method]descriptor.open-at"`, one that needs no handle is
   `[static]tcp-socket.create`, and `[resource-drop]descriptor` drops a
   handle, which takes it.
-- It is declared as the Canonical ABI lowers it, which is how Duck passes
-  values. A handle, `own` or `borrow`, is an `i32`, and a `char` a `u32`. A
-  `list<T>` is an `array(T)` and a `string` an `array(u8)`. A `record` is a
-  struct, a `variant` a union, an `enum` an `enum(u8)`, and `tuple`, `option`
-  and `result` are Duck's own, each with its fields, variants or members in
-  order. `flags` are the narrowest of `u8`, `u16` and `u32` with a bit for
-  each, from the lowest. A `_` is `tuple()`.
+- It is declared as the WIT declares it, with the types that those of the
+  WIT are, and lowered as the Canonical ABI lowers it, which is how Duck
+  passes values.
 - A function that returns more than one wasm value takes a `&var` to its
   result as a last parameter instead, and returns nothing: Duck lays a type
   out in memory as the Canonical ABI does. `-> i32` stays for a handle, and

@@ -86,7 +86,8 @@ pub struct TypeParam {
 /// optional.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternBlock {
-    pub module: Option<String>,
+    /// The module as it is written: with its quotes.
+    pub module: Option<Ident>,
     pub fns: Vec<ExternFn>,
 }
 
@@ -783,7 +784,7 @@ impl<'a> Parser<'a> {
     fn extern_block(&mut self) -> PResult<ExternBlock> {
         self.expect(TokenKind::Extern)?;
         let module = if matches!(self.peek().kind, TokenKind::Str(_)) {
-            Some(self.string()?)
+            Some(self.string_ident()?)
         } else {
             None
         };
@@ -3401,7 +3402,8 @@ extern \"\":
                 _ => panic!(),
             })
             .collect();
-        assert_eq!(blocks[0].module.as_deref(), Some("js"));
+        let module = |block: &ExternBlock| block.module.as_ref().map(|m| m.name.clone());
+        assert_eq!(module(blocks[0]).as_deref(), Some("js"));
         let [now, log] = &blocks[0].fns[..] else {
             panic!()
         };
@@ -3415,9 +3417,9 @@ extern \"\":
             &src[log.span.start..log.span.end],
             "fn log(p: &u8, len: i32) = \"console.log\""
         );
-        assert_eq!(blocks[1].module, None);
+        assert_eq!(module(blocks[1]), None);
         assert!(blocks[1].fns.is_empty());
-        assert_eq!(blocks[2].module.as_deref(), Some(""));
+        assert_eq!(module(blocks[2]).as_deref(), Some(""));
         assert_eq!(blocks[2].fns[0].import_name.as_deref(), Some(""));
     }
 

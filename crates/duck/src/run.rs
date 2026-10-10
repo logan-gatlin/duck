@@ -174,12 +174,6 @@ extern "wasi:cli/stdout@0.3.0":
     fn future_read(future: i32, ret: &var result(tuple(), u8)) -> i32 = "[async-lower][future-read-1]write-via-stream"
     fn future_drop(future: i32) = "[future-drop-readable-1]write-via-stream"
 
-# An `error-code` of `wasi:filesystem` or `wasi:sockets` as it is laid out: a
-# variant, the last of which holds an `option<string>`.
-struct Failure:
-    code: u8
-    message: option(array(u8))
-
 let newline = "\n"
 let event = &var (0, 0)
 let written = &var result(tuple(), u8).ok(())
@@ -396,7 +390,7 @@ fn main():
     fn imports_are_those_of_the_world() {
         let foreign = "extern:\n    fn log(n: i32)\n\nfn main():\n    log(1)\n";
         let e = compile(foreign, program()).unwrap_err();
-        assert!(e.contains("`$root::log`"), "{e}");
+        assert_eq!(e, "the world imports no function `log`");
 
         // As the Canonical ABI lowers it, the function returns an `i32`.
         let mistyped = r#"
@@ -406,9 +400,11 @@ extern "wasi:cli/stdout@0.3.0":
 fn main():
     let _ = write_via_stream(0)
 "#;
-        let e = compile(mistyped, program()).unwrap_err();
-        let mismatch = "type mismatch for function `write-via-stream`";
-        assert!(e.contains(mismatch), "{e}");
+        assert_eq!(
+            compile(mistyped, program()).unwrap_err(),
+            "the WIT has `future<result<_, error-code>>` here, which is an `i32`, as a handle \
+             is: found `i64`"
+        );
 
         // A list is returned in memory that the module allocates.
         let unallocated = r#"
@@ -524,11 +520,50 @@ fn idle():
 extern "wasi:filesystem/preopens@0.3.0":
     fn get_directories(ret: &var array(tuple(i32, array(u8))))
 
+union Failure:
+    access
+    already
+    bad_descriptor
+    busy
+    deadlock
+    quota
+    exist
+    file_too_large
+    illegal_byte_sequence
+    in_progress
+    interrupted
+    invalid
+    io
+    is_directory
+    loop
+    too_many_links
+    message_size
+    name_too_long
+    no_device
+    no_entry
+    no_lock
+    insufficient_memory
+    insufficient_space
+    not_directory
+    not_empty
+    not_recoverable
+    unsupported
+    no_tty
+    no_such_device
+    overflow
+    not_permitted
+    pipe
+    read_only
+    invalid_seek
+    text_file_busy
+    cross_device
+    other: option(string)
+
 extern "wasi:filesystem/types@0.3.0":
     fn open_at(
         dir: i32,
         path_flags: u8,
-        path: array(u8),
+        path: string,
         open_flags: u8,
         flags: u8,
         ret: &var result(i32, Failure),
@@ -576,18 +611,47 @@ union Ip:
     ipv4: tuple(u8, u8, u8, u8)
     ipv6: tuple(u16, u16, u16, u16, u16, u16, u16, u16)
 
+enum(u8) Family:
+    ipv4
+    ipv6
+
+union Unresolved:
+    access_denied
+    invalid_argument
+    name_unresolvable
+    temporary_resolver_failure
+    permanent_resolver_failure
+    other: option(string)
+
+union Failure:
+    access_denied
+    not_supported
+    invalid_argument
+    out_of_memory
+    timeout
+    invalid_state
+    address_not_bindable
+    address_in_use
+    remote_unreachable
+    connection_refused
+    connection_broken
+    connection_reset
+    connection_aborted
+    datagram_too_large
+    other: option(string)
+
 extern "wasi:sockets/ip-name-lookup@0.3.0":
-    fn resolve_addresses(name: array(u8), ret: &var result(array(Ip), Failure))
+    fn resolve_addresses(name: string, ret: &var result(array(Ip), Unresolved))
 
 extern "wasi:sockets/types@0.3.0":
-    fn create(family: u8, ret: &var result(i32, Failure)) = "[static]tcp-socket.create"
+    fn create(family: Family, ret: &var result(i32, Failure)) = "[static]tcp-socket.create"
     fn bind(
         socket: i32,
         address: Address,
         ret: &var result(tuple(), Failure),
     ) = "[method]tcp-socket.bind"
 
-let resolved = &var result(array(Ip), Failure).ok([])
+let resolved = &var result(array(Ip), Unresolved).ok([])
 let handle = &var result(i32, Failure).ok(0)
 let bound = &var result(tuple(), Failure).ok(())
 let name = "127.0.0.1"
@@ -602,7 +666,7 @@ fn main():
             print(resolving)
         else:
             pass
-    create(0, handle)
+    create(.ipv4, handle)
     match handle.*:
         .ok(socket):
             # Any port of this machine, which is there without a network.

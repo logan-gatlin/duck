@@ -8,7 +8,10 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use wit_component::{ComponentEncoder, StringEncoding};
-use wit_parser::{PackageId, Resolve, SourceMap, UnresolvedPackageGroup, WorldId, WorldItem};
+use wit_parser::{
+    Function, InterfaceId, PackageId, Resolve, SourceMap, Type, TypeDefKind,
+    UnresolvedPackageGroup, WorldId, WorldItem,
+};
 
 use crate::file::{Settings, WitFile};
 
@@ -86,6 +89,73 @@ pub struct InterfaceExport {
     pub functions: Vec<String>,
 }
 
+/// The shape of a type of WIT: what a type of Duck is to have to be it.
+/// Names are of no account, but to say what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitTy {
+    Bool,
+    S8,
+    U8,
+    S16,
+    U16,
+    S32,
+    U32,
+    S64,
+    U64,
+    F32,
+    F64,
+    Char,
+    String,
+    List(Box<WitTy>),
+    Tuple(Vec<WitTy>),
+    /// The types of its fields, in order.
+    Record {
+        name: String,
+        fields: Vec<WitTy>,
+    },
+    /// What each of its cases holds, in order.
+    Variant {
+        name: String,
+        cases: Vec<Option<WitTy>>,
+    },
+    /// How many cases it has.
+    Enum {
+        name: String,
+        cases: usize,
+    },
+    /// How many flags it has.
+    Flags {
+        name: String,
+        flags: usize,
+    },
+    Option(Box<WitTy>),
+    /// What it holds where it is `ok`, and where it is `err`: nothing for a
+    /// `_`.
+    Result(Option<Box<WitTy>>, Option<Box<WitTy>>),
+    /// An `own` or a `borrow` of a resource, a `stream`, a `future` or an
+    /// `error-context`, as it is written.
+    Handle(String),
+    /// A type that Duck has none for yet, as it is written.
+    Unsupported(String),
+}
+
+/// A function of WIT: the shape of what it takes and gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitFunc {
+    /// Each parameter, with its name.
+    pub params: Vec<(String, WitTy)>,
+    pub result: Option<WitTy>,
+}
+
+/// Why a function isn't there to import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportError {
+    /// No such interface is imported, but these are.
+    Interface { imported: Vec<String> },
+    /// The interface, or the world itself, has no such function.
+    Function,
+}
+
 /// WASI 0.3, resolved once, and the package of it that has
 /// [`COMMAND`].
 static BASE: LazyLock<(Resolve, PackageId)> = LazyLock::new(|| {
@@ -117,6 +187,42 @@ impl fmt::Display for WorldError {
 }
 
 impl std::error::Error for WorldError {}
+
+/// Displays the type as WIT writes it, one that is declared by its name.
+impl fmt::Display for WitTy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let of = |ty: &Option<Box<WitTy>>| ty.as_ref().map_or("_".to_string(), |ty| ty.to_string());
+        match self {
+            Self::Bool => write!(f, "bool"),
+            Self::S8 => write!(f, "s8"),
+            Self::U8 => write!(f, "u8"),
+            Self::S16 => write!(f, "s16"),
+            Self::U16 => write!(f, "u16"),
+            Self::S32 => write!(f, "s32"),
+            Self::U32 => write!(f, "u32"),
+            Self::S64 => write!(f, "s64"),
+            Self::U64 => write!(f, "u64"),
+            Self::F32 => write!(f, "f32"),
+            Self::F64 => write!(f, "f64"),
+            Self::Char => write!(f, "char"),
+            Self::String => write!(f, "string"),
+            Self::List(elem) => write!(f, "list<{elem}>"),
+            Self::Tuple(elems) => {
+                let elems: Vec<_> = elems.iter().map(ToString::to_string).collect();
+                write!(f, "tuple<{}>", elems.join(", "))
+            }
+            Self::Record { name, .. }
+            | Self::Variant { name, .. }
+            | Self::Enum { name, .. }
+            | Self::Flags { name, .. } => write!(f, "{name}"),
+            Self::Option(inner) => write!(f, "option<{inner}>"),
+            Self::Result(None, None) => write!(f, "result"),
+            Self::Result(ok, None) => write!(f, "result<{}>", of(ok)),
+            Self::Result(ok, err) => write!(f, "result<{}, {}>", of(ok), of(err)),
+            Self::Handle(written) | Self::Unsupported(written) => write!(f, "{written}"),
+        }
+    }
+}
 
 /// The world of a library: none, with WASI 0.3 as its only WIT.
 impl Default for World {
@@ -186,6 +292,204 @@ impl World {
             }
         }
         exports
+    }
+
+    /// The function `name` that the world imports from `interface`, or of
+    /// its own where that is `None`. A library imports what any interface
+    /// of its WIT has, and nothing says what its world would give it, so a
+    /// function of the world itself is `Ok(None)` there: one to take as it
+    /// is declared.
+    pub fn import(
+        &self,
+        interface: Option<&str>,
+        name: &str,
+    ) -> Result<Option<WitFunc>, ImportError> {
+        let Some(interface) = interface else {
+            let Some(world) = self.world else {
+                return Ok(None);
+            };
+            let imports = self.resolve.worlds[world].imports.values();
+            let mut functions = imports.filter_map(|item| match item {
+                WorldItem::Function(function) => Some(function),
+                _ => None,
+            });
+            let function = functions.find(|function| function.name == name);
+            return function
+                .map(|f| Some(self.func(f)))
+                .ok_or(ImportError::Function);
+        };
+        let Some(id) = self.imported_interface(interface) else {
+            return Err(ImportError::Interface {
+                imported: self.imported_interfaces(),
+            });
+        };
+        let function = self.resolve.interfaces[id].functions.get(name);
+        function
+            .map(|f| Some(self.func(f)))
+            .ok_or(ImportError::Function)
+    }
+
+    /// Whether `interface`, which is imported, has the resource `name`.
+    pub fn imports_resource(&self, interface: &str, name: &str) -> bool {
+        let Some(id) = self.imported_interface(interface) else {
+            return false;
+        };
+        let ty = self.resolve.interfaces[id].types.get(name);
+        ty.is_some_and(|ty| matches!(self.resolve.types[*ty].kind, TypeDefKind::Resource))
+    }
+
+    /// The function `name` that the world exports from `interface`, or of
+    /// its own where that is `None`.
+    pub fn export(&self, interface: Option<&str>, name: &str) -> Option<WitFunc> {
+        let exports = &self.resolve.worlds[self.world?].exports;
+        let function = exports
+            .iter()
+            .find_map(|(key, item)| match (item, interface) {
+                (WorldItem::Function(function), None) => {
+                    (function.name == name).then_some(function)
+                }
+                (WorldItem::Interface { id, .. }, Some(interface)) => {
+                    let named = self.resolve.name_world_key(key) == interface;
+                    let functions = &self.resolve.interfaces[*id].functions;
+                    named.then(|| functions.get(name)).flatten()
+                }
+                _ => None,
+            });
+        function.map(|function| self.func(function))
+    }
+
+    /// The interface named `name` in full, if it is there to import: one
+    /// the world imports, or for a library any of its WIT.
+    fn imported_interface(&self, name: &str) -> Option<InterfaceId> {
+        let Some(world) = self.world else {
+            let mut interfaces = self.resolve.interfaces.iter();
+            let named = |id: &InterfaceId| self.resolve.id_of(*id).as_deref() == Some(name);
+            return interfaces.find_map(|(id, _)| named(&id).then_some(id));
+        };
+        let mut imports = self.resolve.worlds[world].imports.iter();
+        imports.find_map(|(key, item)| match item {
+            WorldItem::Interface { id, .. } => {
+                (self.resolve.name_world_key(key) == name).then_some(*id)
+            }
+            _ => None,
+        })
+    }
+
+    /// The name in full of each interface that is there to import.
+    fn imported_interfaces(&self) -> Vec<String> {
+        let Some(world) = self.world else {
+            let interfaces = self.resolve.interfaces.iter();
+            return interfaces
+                .filter_map(|(id, _)| self.resolve.id_of(id))
+                .collect();
+        };
+        let imports = self.resolve.worlds[world].imports.iter();
+        let named = imports.filter(|(_, item)| matches!(item, WorldItem::Interface { .. }));
+        named
+            .map(|(key, _)| self.resolve.name_world_key(key))
+            .collect()
+    }
+
+    /// The shape of `function`.
+    fn func(&self, function: &Function) -> WitFunc {
+        let params = function.params.iter();
+        WitFunc {
+            params: params.map(|p| (p.name.clone(), self.ty(&p.ty))).collect(),
+            result: function.result.as_ref().map(|ty| self.ty(ty)),
+        }
+    }
+
+    /// The shape of `ty`.
+    fn ty(&self, ty: &Type) -> WitTy {
+        let id = match ty {
+            Type::Bool => return WitTy::Bool,
+            Type::S8 => return WitTy::S8,
+            Type::U8 => return WitTy::U8,
+            Type::S16 => return WitTy::S16,
+            Type::U16 => return WitTy::U16,
+            Type::S32 => return WitTy::S32,
+            Type::U32 => return WitTy::U32,
+            Type::S64 => return WitTy::S64,
+            Type::U64 => return WitTy::U64,
+            Type::F32 => return WitTy::F32,
+            Type::F64 => return WitTy::F64,
+            Type::Char => return WitTy::Char,
+            Type::String => return WitTy::String,
+            Type::ErrorContext => return WitTy::Handle("error-context".to_string()),
+            Type::Id(id) => *id,
+        };
+        let def = &self.resolve.types[id];
+        let name = || {
+            def.name
+                .clone()
+                .unwrap_or_else(|| def.kind.as_str().to_string())
+        };
+        let boxed = |ty: &Type| Box::new(self.ty(ty));
+        let of = |ty: &Option<Type>| {
+            ty.as_ref()
+                .map_or("_".to_string(), |ty| self.ty(ty).to_string())
+        };
+        match &def.kind {
+            TypeDefKind::Type(ty) => self.ty(ty),
+            TypeDefKind::List(elem) => WitTy::List(boxed(elem)),
+            TypeDefKind::Tuple(tuple) => {
+                WitTy::Tuple(tuple.types.iter().map(|ty| self.ty(ty)).collect())
+            }
+            TypeDefKind::Record(record) => WitTy::Record {
+                name: name(),
+                fields: record
+                    .fields
+                    .iter()
+                    .map(|field| self.ty(&field.ty))
+                    .collect(),
+            },
+            TypeDefKind::Variant(variant) => {
+                let cases = variant.cases.iter();
+                WitTy::Variant {
+                    name: name(),
+                    cases: cases
+                        .map(|case| case.ty.as_ref().map(|ty| self.ty(ty)))
+                        .collect(),
+                }
+            }
+            TypeDefKind::Enum(cases) => WitTy::Enum {
+                name: name(),
+                cases: cases.cases.len(),
+            },
+            TypeDefKind::Flags(flags) => WitTy::Flags {
+                name: name(),
+                flags: flags.flags.len(),
+            },
+            TypeDefKind::Option(inner) => WitTy::Option(boxed(inner)),
+            TypeDefKind::Result(result) => WitTy::Result(
+                result.ok.as_ref().map(boxed),
+                result.err.as_ref().map(boxed),
+            ),
+            TypeDefKind::Handle(wit_parser::Handle::Own(resource)) => {
+                let resource = self.resolve.types[*resource]
+                    .name
+                    .clone()
+                    .unwrap_or_default();
+                WitTy::Handle(format!("own<{resource}>"))
+            }
+            TypeDefKind::Handle(wit_parser::Handle::Borrow(resource)) => {
+                let resource = self.resolve.types[*resource]
+                    .name
+                    .clone()
+                    .unwrap_or_default();
+                WitTy::Handle(format!("borrow<{resource}>"))
+            }
+            TypeDefKind::Resource => WitTy::Handle(name()),
+            TypeDefKind::Stream(elem) => WitTy::Handle(format!("stream<{}>", of(elem))),
+            TypeDefKind::Future(value) => WitTy::Handle(format!("future<{}>", of(value))),
+            TypeDefKind::Map(key, value) => {
+                WitTy::Unsupported(format!("map<{}, {}>", self.ty(key), self.ty(value)))
+            }
+            TypeDefKind::FixedLengthList(elem, len) => {
+                WitTy::Unsupported(format!("list<{}, {len}>", self.ty(elem)))
+            }
+            TypeDefKind::Unknown => WitTy::Unsupported(name()),
+        }
     }
 
     /// Whether the world exports [`RUN_INTERFACE`], whose `run` is what

@@ -42,6 +42,7 @@ mod generic_fn;
 mod inspect;
 mod patterns;
 mod unions;
+mod wit;
 
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
@@ -636,6 +637,40 @@ pub enum TypeErrorKind {
     /// A function that the host is to know by a name, with none in WIT:
     /// its own is no name there, and it has no `= "name"`.
     NoWitName(String),
+    /// An `extern` block of an interface that isn't there to import, and
+    /// those that are.
+    UnknownImportInterface {
+        name: String,
+        imported: Vec<String>,
+    },
+    /// An `extern` function that its interface doesn't have, or that the
+    /// world itself doesn't import.
+    UnknownImport {
+        interface: Option<String>,
+        name: String,
+    },
+    /// A function declared with another number of parameters than the WIT
+    /// gives it.
+    WitParams {
+        name: String,
+        wit: usize,
+        found: usize,
+    },
+    /// A function that gives something where the WIT has it give nothing,
+    /// or nothing where the WIT has it give this.
+    WitResult {
+        name: String,
+        wit: Option<String>,
+    },
+    /// A type that isn't the one of the WIT it is declared for: the type of
+    /// the WIT there, the one `within` it that differs, what that is in
+    /// Duck and what was found for it.
+    WitMismatch {
+        wit: String,
+        within: String,
+        expected: String,
+        found: String,
+    },
     /// A `pub "interface":` block in a file that isn't the entry file of a
     /// component.
     ExportOutsideEntry,
@@ -1532,6 +1567,45 @@ impl fmt::Display for TypeErrorKind {
                 "`{name}` has no name in WIT, where one is words of lowercase letters or of \
                  capitals joined by `-`: give it one with `= \"name\"`"
             ),
+            Self::UnknownImportInterface { name, imported } => {
+                write!(f, "no interface `{name}` is there to import")?;
+                match imported.as_slice() {
+                    [] => write!(f, ": none is"),
+                    imported => write!(f, ": there is {}", quoted(imported)),
+                }
+            }
+            Self::UnknownImport {
+                interface: Some(interface),
+                name,
+            } => write!(f, "`{interface}` has no function `{name}`"),
+            Self::UnknownImport {
+                interface: None,
+                name,
+            } => write!(f, "the world imports no function `{name}`"),
+            Self::WitParams { name, wit, found } => write!(
+                f,
+                "`{name}` takes {wit} in the WIT, and {found} here",
+                wit = counted(*wit, "parameter"),
+            ),
+            Self::WitResult {
+                name,
+                wit: Some(wit),
+            } => write!(f, "`{name}` gives a `{wit}` in the WIT, and nothing here"),
+            Self::WitResult { name, wit: None } => {
+                write!(f, "`{name}` gives nothing in the WIT")
+            }
+            Self::WitMismatch {
+                wit,
+                within,
+                expected,
+                found,
+            } => {
+                write!(f, "the WIT has `{wit}` here, ")?;
+                match wit == within {
+                    true => write!(f, "which is {expected}: found `{found}`"),
+                    false => write!(f, "whose `{within}` is {expected}: found `{found}`"),
+                }
+            }
             Self::ExportOutsideEntry => {
                 write!(f, "only the entry file of a component exports an interface")
             }
@@ -1782,7 +1856,7 @@ fn lower_program(
         .as_ref()
         .and_then(|name| ck.resolve_start(program, name));
     ck.check_generic_fns(program);
-    ck.check_import_names(program);
+    ck.check_imports(program);
     let imports = ck.lower_imports(program);
     let mut funcs = ck.lower_funcs(program);
     // A start function that isn't one is reported as that, and not also
@@ -2808,7 +2882,7 @@ impl Checker {
         imports
             .map(|((block, decl), sig)| ir::Import {
                 name: sig.name.clone(),
-                module: block.module.clone().unwrap_or_else(|| ROOT.to_string()),
+                module: (block.module.as_ref()).map_or(ROOT.to_string(), |m| m.name.clone()),
                 // One with no name in WIT is reported, and keeps its own.
                 field: (decl.import_name.clone())
                     .or_else(|| kebab(&sig.name))
@@ -6725,6 +6799,14 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
     }
 }
 
+/// `count` of what `noun` names, as it is said: "1 parameter".
+fn counted(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("1 {noun}"),
+        count => format!("{count} {noun}s"),
+    }
+}
+
 /// `names`, each quoted as code is, with commas between them.
 fn quoted(names: &[String]) -> String {
     let names: Vec<_> = names.iter().map(|name| format!("`{name}`")).collect();
@@ -7969,7 +8051,7 @@ struct P:
     y: i64
 fn first() -> i32:
     return now(scale: 2) + second()
-extern \"js\":
+extern \"$root\":
     fn now(scale: i32) -> i32 = \"Date.now\"
 fn second() -> i32:
     return 0
@@ -7995,7 +8077,7 @@ extern:
         assert_eq!(
             imports,
             vec![
-                ("now", "js", "Date.now", vec![I32], vec![I32]),
+                ("now", "$root", "Date.now", vec![I32], vec![I32]),
                 ("put", "$root", "put", vec![I32, F32, I64], vec![F32, I64]),
             ]
         );
@@ -9607,11 +9689,21 @@ fn f(a: i32, p: P, pp: &&P):
         );
     }
 
-    /// Checks `src` as a program, whose start function is `start`.
+    /// Checks `src` as a program, whose start function is `start`, in a
+    /// world that gives it `ready` and `get`.
     fn check_start(src: &str, start: &str) -> Result<Module, Vec<TypeError>> {
+        let wit = "package test:start;\nworld program {\n  import ready: func();\n  \
+                   import get: func() -> s32;\n  export wasi:cli/run@0.3.0;\n}\n";
         let settings = Settings {
             start: Some(start.to_string()),
-            world: Some(crate::world::COMMAND.to_string()),
+            world: Some("program".to_string()),
+            wit: crate::file::Wit {
+                package: vec![crate::file::WitFile {
+                    path: "start.wit".to_string(),
+                    contents: wit.to_string(),
+                }],
+                deps: Vec::new(),
+            },
             ..Settings::default()
         };
         check_with(src, &settings)

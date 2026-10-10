@@ -863,7 +863,7 @@ struct P:
     y: i64
 pub fn f(a: i32) -> i32:
     return a
-extern \"js\":
+extern \"$root\":
     fn now(scale: i32) -> i32 = \"Date.now\"
 extern:
     fn put(p: &P, v: P) -> P
@@ -883,7 +883,7 @@ pub fn g() -> i32:
         assert_eq!(
             lines,
             [
-                r#"  (import "js" "Date.now" (func $now (;0;) (type 0)))"#,
+                r#"  (import "$root" "Date.now" (func $now (;0;) (type 0)))"#,
                 r#"  (import "$root" "put" (func $put (;1;) (type 1)))"#,
                 r#"  (import "$root" "flag" (func $flag (;2;) (type 2)))"#,
                 r#"  (export "f" (func $f))"#,

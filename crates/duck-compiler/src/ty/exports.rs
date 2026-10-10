@@ -13,7 +13,7 @@ use crate::load::Program;
 use crate::parse::Ident;
 use crate::world::{REALLOC, RUN_INTERFACE, kebab};
 
-use super::{Checker, Item, TypeError, TypeErrorKind, extern_fns, fn_decls};
+use super::{Checker, Item, TypeError, TypeErrorKind, fn_decls};
 
 /// A function that may be what the world exports as `name`.
 struct Candidate {
@@ -33,17 +33,6 @@ impl Checker {
     /// Reports an error in no source file: one in what the settings ask.
     pub(super) fn error_nowhere(&mut self, kind: TypeErrorKind) {
         self.errors.push(TypeError::nowhere(kind));
-    }
-
-    /// Reports each `extern` function with no name for the host to know it
-    /// by: one whose own is no name in WIT, without an `= "name"`.
-    pub(super) fn check_import_names(&mut self, program: &Program) {
-        for (_, decl) in extern_fns(program) {
-            let name = &decl.sig.name;
-            if decl.import_name.is_none() && kebab(&name.name).is_none() {
-                self.error(TypeErrorKind::NoWitName(name.name.clone()), name.span);
-            }
-        }
     }
 
     /// Names each of `funcs`, the functions the source defines in order,
@@ -67,7 +56,7 @@ impl Checker {
         let exports = self.world.exports();
 
         let names = exports.functions.iter().map(String::as_str);
-        let missing = self.export_each(names.chain([REALLOC]), None, &mut top, funcs);
+        let missing = self.export_each(program, names.chain([REALLOC]), None, &mut top, funcs);
         let missing: Vec<_> = missing.into_iter().filter(|name| name != REALLOC).collect();
         if !missing.is_empty() {
             self.error_nowhere(TypeErrorKind::MissingExports {
@@ -95,7 +84,8 @@ impl Checker {
                 self.error(TypeErrorKind::StartAndRun, span);
             }
             let names = interface.functions.iter().map(String::as_str);
-            let missing = self.export_each(names, Some(&interface.name), candidates, funcs);
+            let named = Some(interface.name.as_str());
+            let missing = self.export_each(program, names, named, candidates, funcs);
             if !missing.is_empty() {
                 let interface = Some(interface.name.clone());
                 let names = missing;
@@ -192,11 +182,13 @@ impl Checker {
     }
 
     /// Exports the candidate of each of `names`, the functions of
-    /// `interface` or of the world itself, and reports another of the same
-    /// name, and one that says a name the world doesn't have. Returns the
-    /// names that no candidate has.
+    /// `interface` or of the world itself, and reports one that isn't
+    /// declared as the WIT declares it, another of the same name, and one
+    /// that says a name the world doesn't have. Returns the names that no
+    /// candidate has.
     fn export_each<'a>(
         &mut self,
+        program: &Program,
         names: impl Iterator<Item = &'a str>,
         interface: Option<&str>,
         candidates: &mut [Candidate],
@@ -215,6 +207,12 @@ impl Checker {
                 None => name.to_string(),
             };
             funcs[first.func].exports.push(export);
+            // What allocates for the host is no function of the world's.
+            if let Some(function) = self.world.export(interface, name) {
+                let (_, decl) = fn_decls(program).nth(first.func).expect("it is defined");
+                let sig = self.funcs[self.import_count as usize + first.func].clone();
+                self.check_signature(&decl.sig, &sig, &function, false);
+            }
             for again in named {
                 again.exported = true;
                 self.error(TypeErrorKind::DuplicateExport(name.to_string()), again.span);
@@ -264,6 +262,11 @@ world app {
 }
 
 world bare {
+}
+
+world hosted {
+    include wasi:cli/imports@0.3.0;
+    import trace-it: func(code: u32);
 }
 ";
 
@@ -565,7 +568,7 @@ extern:
 pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     return 0
 ";
-        let module = check_in(src, "bare", None).unwrap();
+        let module = check_in(src, "hosted", None).unwrap();
         let imports = module.imports.iter();
         let imports: Vec<_> = imports
             .map(|i| (i.module.as_str(), i.field.as_str()))
@@ -581,8 +584,8 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
         // What allocates for the host has one name, which is no WIT's.
         assert_eq!(exported(&module), [("cabi_realloc", vec!["cabi_realloc"])]);
 
-        let unnamed = "extern:\n    fn getArgs()\n    fn _private()\n    fn fine()\n";
-        let errors = errors_in(unnamed, "bare", None);
+        let unnamed = "extern:\n    fn getArgs()\n    fn _private()\n    fn trace_it(code: u32)\n";
+        let errors = errors_in(unnamed, "hosted", None);
         let at: Vec<_> = errors.iter().map(|(_, at)| *at).collect();
         assert_eq!(at, ["getArgs", "_private"]);
     }
