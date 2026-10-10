@@ -973,33 +973,40 @@ pub fn tick(dt: f64) -> f64:               # exported as "tick"
 ## WASI
 
 `duck run` compiles the module of the nearest `Duck.toml` and runs its `start`
-function in Wasmtime, which gives it WASI 0.2: the interfaces of
-`wasi:cli/imports@0.2.12`. It writes no file.
+function in Wasmtime, which gives it WASI 0.3: the interfaces of
+`wasi:cli/imports@0.3.0`. It writes no file.
 
 ```duck
-union StreamError:                       # `variant stream-error`
-	last_operation_failed: i32           # holds an `own<error>`, a handle
-	closed
+extern "$root":                          # built-ins of the component model
+	fn set_new() -> i32 = "[waitable-set-new]"
+	fn join(waitable: i32, set: i32) = "[waitable-join]"
+	fn wait(set: i32, event: &var tuple(i32, i32)) -> i32 = "[waitable-set-wait]"
+	fn set_drop(set: i32) = "[waitable-set-drop]"
 
-extern "wasi:cli/stdout@0.2.12":         # an interface, with its version
-	fn get_stdout() -> i32 = "get-stdout"  # an `own<output-stream>`
+extern "wasi:cli/stdout@0.3.0":          # an interface, with its version
+	fn write_via_stream(data: i32) -> i32 = "write-via-stream"
+	fn stream_new() -> i64 = "[stream-new-0]write-via-stream"
+	fn stream_write(
+		stream: i32,
+		bytes: array(u8),                # a `list<u8>`
+	) -> i32 = "[async-lower][stream-write-0]write-via-stream"
+	fn stream_drop(stream: i32) = "[stream-drop-writable-0]write-via-stream"
+	fn future_read(
+		future: i32,
+		ret: &var result(tuple(), u8),   # its `result<_, error-code>`
+	) -> i32 = "[async-lower][future-read-1]write-via-stream"
+	fn future_drop(future: i32) = "[future-drop-readable-1]write-via-stream"
 
-extern "wasi:io/streams@0.2.12":
-	fn write(
-		stream: i32,                     # the `borrow<output-stream>` of a method
-		contents: array(u8),             # a `list<u8>`
-		ret: &var result(tuple(), StreamError),  # its `result<_, stream-error>`
-	) = "[method]output-stream.blocking-write-and-flush"
-
-extern "wasi:cli/environment@0.2.12":
+extern "wasi:cli/environment@0.3.0":
 	fn get_arguments(ret: &var array(array(u8))) = "get-arguments"  # `list<string>`
 
-extern "wasi:cli/exit@0.2.12":
-	fn exit(status: u8) = "exit-with-code"
+extern "wasi:cli/exit@0.3.0":
+	fn exit(status: u8) -> never = "exit-with-code"
 
 let greeting = "Hello,"
 let newline = "\n"
-let written = &var result(tuple(), StreamError).ok(())
+let event = &var (0, 0)                  # the waitable, and the code it ends with
+let written = &var result(tuple(), u8).ok(())
 let arguments: &var array(array(u8)) = &var []
 var heap: uint = 0
 var end: uint = 0
@@ -1017,13 +1024,37 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
 	module.copy(at as! &var u8, old, old_size)
 	return at as! &var u8
 
+fn settle(waitable: i32, code: i32) -> i32:  # the code an operation ends with
+	if code != -1:                       # -1: it is not done yet
+		return code
+	let set = set_new()
+	join(waitable, set)
+	let _ = wait(set, event)             # blocks until it is
+	join(waitable, 0)                    # leaves the set, which is then dropped
+	set_drop(set)
+	return event.*.1
+
+fn send(stream: i32, bytes: array(u8)):
+	var rest = bytes
+	while rest.len > 0:
+		let code = settle(stream, stream_write(stream, rest))
+		let count = (code as u32 >> 4) as uint  # how many bytes were taken
+		rest = array(u8)(ptr: (rest.ptr as uint + count) as! &u8, len: rest.len - count)
+		if code & 15 != 0:               # the host dropped its end
+			return
+
 fn main():                               # `start = "main"` in Duck.toml
-	let out = get_stdout()
-	write(out, greeting, written)
+	let ends = stream_new()              # a `stream<u8>`: both of its ends
+	let stream = (ends >> 32) as i32     # the end that writes
+	let future = write_via_stream(ends as i32)  # the host takes the one that reads
+	send(stream, greeting)
 	get_arguments(arguments)             # allocates with `cabi_realloc`
 	for argument in arguments.*:
-		write(out, argument, written)
-	write(out, newline, written)
+		send(stream, argument)
+	send(stream, newline)
+	stream_drop(stream)                  # only then is the future resolved
+	let _ = settle(future, future_read(future, written))
+	future_drop(future)
 	match written.*:
 		.ok(_):
 			pass
@@ -1036,17 +1067,19 @@ fn main():                               # `start = "main"` in Duck.toml
   environment variables, the network, and every file.
 - `wasi:filesystem/preopens` gives two directories to open paths in, each to
   read and write: `.`, the directory `duck run` is in, and then `/`.
-- The `start` function is the program. It runs once the module is
-  instantiated, so that it may call every import, and `duck run` exits with 0
-  when it returns, or with the status it gives `wasi:cli/exit`. A trap is an
-  error that names the functions that were running. A module without a
-  `start` doesn't run, nor does one with `memory64`.
-- An `extern` block names an interface of `wasi:cli`, `wasi:io`,
-  `wasi:clocks`, `wasi:filesystem`, `wasi:random` or `wasi:sockets` with the
-  version `0.2.12`, or an earlier `0.2` one that it stands for. Nothing else
-  is there to import: an `extern` function of `env` is an error.
-- A function has the name its WIT does: `get-stdout`, a resource's method as
-  `[method]output-stream.write`, and `[resource-drop]output-stream` to drop a
+- The `start` function is the program. It is called by the `run` of
+  `wasi:cli/run`, once the module is instantiated, so that it may call every
+  import, and `duck run` exits with 0 when it returns, or with the status it
+  gives `wasi:cli/exit`. A trap is an error that names the functions that
+  were running. A module without a `start` doesn't run, nor does one with
+  `memory64`.
+- An `extern` block names an interface of `wasi:cli`, `wasi:clocks`,
+  `wasi:filesystem`, `wasi:random` or `wasi:sockets` with the version
+  `0.3.0`. Nothing else is there to import: an `extern` function of `env` is
+  an error.
+- A function has the name its WIT does: `get-arguments`, a resource's method
+  as `[method]descriptor.open-at`, one that needs no handle as
+  `[static]tcp-socket.create`, and `[resource-drop]descriptor` to drop a
   handle, which takes it.
 - It is declared as the Canonical ABI lowers it, which is how Duck passes
   values. A handle, `own` or `borrow`, is an `i32`, and a `char` a `u32`. A
@@ -1065,8 +1098,42 @@ fn main():                               # `start = "main"` in Duck.toml
   its entry file, as above, or a `pub use` of another file's as that name: it
   is called with `old` and `old_size` as 0, and returns `new_size` bytes at a
   multiple of `align`.
+- An `async func` of the WIT is declared and called as any other is, and
+  returns when it is done: `[method]descriptor.open-at` blocks until the file
+  is open.
 - `duck build` writes the module as it does any other, with these imports
   for its host to give it.
+
+### Streams and futures
+
+A `stream<T>` and a `future<T>` of the WIT are handles, each an `i32`. No
+interface has their functions: they are built-ins, imported from the interface
+of a function that has the stream or future in its type, and named for it.
+
+- The name ends with that function's, after the built-in and a number:
+  `[stream-new-0]write-via-stream`. The number counts the streams and futures
+  of the function's type, its parameters before its result, so the
+  `stream<u8>` that `write-via-stream` takes is 0 and the `future` it returns
+  is 1.
+- `[stream-new-N]` gives both ends of a new stream as an `i64`: the end that
+  reads is its low half, and the end that writes its high half. A function
+  that takes a stream takes the end that reads, which is then the host's.
+- `[async-lower][stream-write-N]` takes the end that writes and an `array(T)`,
+  and `[async-lower][stream-read-N]` the end that reads and a `varray(T)` to
+  fill. Each gives a code: the count of elements it took or gave, shifted
+  left by 4, and in the low 4 bits 0, or 1 once the other end is dropped.
+- `[async-lower][future-read-N]` takes a future and a `&var T` to write its
+  value to, and gives a code that is 0 once it has.
+- A code of -1 says that it isn't done. Its handle is then joined to a set of
+  `$root`, with `[waitable-join]`, and `[waitable-set-wait]` blocks until one
+  of the set is done, writing that handle and its code to a
+  `&var tuple(i32, i32)`. A handle leaves its set by joining the set 0, as it
+  must before the set is dropped.
+- A future that says how a stream ended is resolved only once the end that
+  writes is dropped, with `[stream-drop-writable-N]`: reading it before
+  blocks for ever.
+- `[stream-drop-readable-N]`, `[future-drop-readable-N]` and the others drop
+  a handle, which takes it.
 
 ## Duck.toml
 

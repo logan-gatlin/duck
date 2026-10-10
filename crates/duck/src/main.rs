@@ -29,7 +29,7 @@ enum Command {
     /// module, or check its library if it has no module
     Build,
     /// Compile the module of the package described by the nearest Duck.toml
-    /// and run its `start` function in Wasmtime, which gives it WASI 0.2 and
+    /// and run its `start` function in Wasmtime, which gives it WASI 0.3 and
     /// with it the files and the network of this machine
     Run {
         /// The arguments the program is given

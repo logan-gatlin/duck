@@ -1,44 +1,44 @@
-//! `duck run`: runs a module in Wasmtime, which gives it WASI 0.2.
+//! `duck run`: runs a module in Wasmtime, which gives it WASI 0.3.
 //!
-//! WASI 0.2 is given to components, so the module is made one: of the world
-//! `program` in `wit/duck.wit`, whose imports are those of `wasi:cli/imports`.
-//! An `extern` block names one of its interfaces, as in
-//! `extern "wasi:cli/stdout@0.2.12"`, and declares its functions as the
-//! Canonical ABI lowers them.
+//! WASI 0.3 is given to components, so the module is made one: of the world
+//! `wasi:cli/command`. An `extern` block names one of the interfaces it
+//! imports, as in `extern "wasi:cli/stdout@0.3.0"`, and declares its
+//! functions as the Canonical ABI lowers them.
 //!
 //! The module's start function is what runs. A component's imports that read
 //! or write memory can't be called while its module is instantiated, so the
-//! function is exported and called once it has been.
+//! function is called by the `run` that the world exports, once it has been.
+//! That `run` is an `async func`, so what it calls may block: an import that
+//! is one too is called as any other is, and returns when it is done.
 
 use std::fmt;
 
 use duck_compiler::{emit, ir};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store, Trap, WasmBacktrace};
+use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{Resolve, WorldId};
 
-/// The WIT of WASI 0.2 as Wasmtime implements it, each package after those
-/// it uses, and then of the world a module is run as. The packages are
-/// copied from `src/p2/wit/deps` of the `wasmtime-wasi` this crate depends
-/// on, and change when it does.
-const WIT: [(&str, &str); 7] = [
-    ("io.wit", include_str!("../wit/io.wit")),
+/// The WIT of WASI 0.3 as Wasmtime implements it, each package after those
+/// it uses. The packages are copied from `src/p3/wit/deps` of the
+/// `wasmtime-wasi` this crate depends on, and change when it does.
+const WIT: [(&str, &str); 5] = [
     ("clocks.wit", include_str!("../wit/clocks.wit")),
     ("random.wit", include_str!("../wit/random.wit")),
     ("filesystem.wit", include_str!("../wit/filesystem.wit")),
     ("sockets.wit", include_str!("../wit/sockets.wit")),
     ("cli.wit", include_str!("../wit/cli.wit")),
-    ("duck.wit", include_str!("../wit/duck.wit")),
 ];
 
-/// The world of `wit/duck.wit` that a module is made a component of.
-const WORLD: &str = "program";
+/// The world of `wasi:cli`, the last of [`WIT`], that a module is made a
+/// component of.
+const WORLD: &str = "command";
 
-/// The name that world exports the start function as. No `pub` item is
-/// named it, as it is no identifier.
-const START: &str = "start-function";
+/// The name a module exports the `run` of `wasi:cli/run` as, which calls its
+/// start function. No `pub` item is named it, as it is no identifier.
+const RUN: &str = "wasi:cli/run@0.3.0#run";
 
 /// The directories a program is given, each to read and write under the
 /// path it has here: the working directory, which is the first, and the
@@ -80,9 +80,9 @@ impl fmt::Display for Error {
             ),
             Self::Memory64 => write!(
                 f,
-                "cannot run a `memory64` module: WASI 0.2 addresses memory with 32 bits"
+                "cannot run a `memory64` module: WASI 0.3 addresses memory with 32 bits"
             ),
-            Self::Component(e) => write!(f, "cannot give the module WASI 0.2: {e}"),
+            Self::Component(e) => write!(f, "cannot give the module WASI 0.3: {e}"),
             Self::Dir { path, error } => write!(f, "cannot open `{path}`: {error}"),
             Self::Invalid(e) => write!(f, "cannot run the module: {e}"),
             Self::Trap { message, stack } => {
@@ -135,26 +135,30 @@ fn context(args: &[String]) -> Result<WasiCtxBuilder, Error> {
     Ok(ctx)
 }
 
-/// Encodes `module` as a component of [`WORLD`], which exports its start
-/// function as [`START`] rather than running it when it is instantiated.
+/// Encodes `module` as a component of [`WORLD`], whose `run` calls its start
+/// function rather than it running when the module is instantiated.
 fn component(mut module: ir::Module) -> Result<Vec<u8>, Error> {
     let start = module.start.take().ok_or(Error::NoStart)?;
     if module.memory.memory64 {
         return Err(Error::Memory64);
     }
-    // A function of the module's own calls it, as the start function may
-    // be an imported one, which has no export of its own.
+    // It returns the `result` of `run`, which is `ok` once the start
+    // function returns: a program that fails exits with a status.
+    let ok = ir::Expr::Const(ir::Const::I32(0));
     module.funcs.push(ir::Func {
-        name: START.to_string(),
-        exports: vec![START.to_string()],
+        name: RUN.to_string(),
+        exports: vec![RUN.to_string()],
         params: Vec::new(),
-        results: Vec::new(),
+        results: vec![ir::ValType::I32],
         locals: Vec::new(),
-        body: vec![ir::Stmt::Call {
-            func: start,
-            args: Vec::new(),
-            dests: Vec::new(),
-        }],
+        body: vec![
+            ir::Stmt::Call {
+                func: start,
+                args: Vec::new(),
+                dests: Vec::new(),
+            },
+            ir::Stmt::Return(vec![ok]),
+        ],
     });
     let mut bytes = emit::emit(&module);
     let (resolve, world) = world();
@@ -180,25 +184,31 @@ fn world() -> (Resolve, WorldId) {
     (resolve, world.expect("the WIT has the world"))
 }
 
-/// Calls [`START`] of `component`, giving its imports `ctx`. Returns the
+/// Calls the `run` of `component`, giving its imports `ctx`. Returns the
 /// status the program exits with.
 fn execute(component: &[u8], ctx: WasiCtx) -> Result<u8, Error> {
     let invalid = |e: wasmtime::Error| Error::Invalid(format!("{e:#}"));
     let engine = Engine::default();
     let component = Component::new(&engine, component).map_err(invalid)?;
     let mut linker = Linker::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(invalid)?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(invalid)?;
     let host = Host {
         ctx,
         table: ResourceTable::new(),
     };
     let mut store = Store::new(&engine, host);
-    let instance = linker.instantiate(&mut store, &component);
-    let instance = instance.map_err(invalid)?;
-    let start = instance.get_typed_func::<(), ()>(&mut store, START);
-    match start.map_err(invalid)?.call(&mut store, ()) {
-        Ok(()) => Ok(0),
-        Err(e) => stopped(e),
+    // The calls are async so that the program may block, and are polled by
+    // the Tokio runtime that `wasmtime-wasi` keeps, which its imports need.
+    let returned = wasmtime_wasi::runtime::in_tokio(async {
+        let command = Command::instantiate_async(&mut store, &component, &linker);
+        let command = command.await.map_err(invalid)?;
+        let run = async |store: &_| command.wasi_cli_run().call_run(store).await;
+        Ok(store.run_concurrent(run).await)
+    })?;
+    match returned {
+        Ok(Ok(Ok(()))) => Ok(0),
+        Ok(Ok(Err(()))) => Ok(1),
+        Ok(Err(e)) | Err(e) => stopped(e),
     }
 }
 
@@ -215,9 +225,7 @@ fn stopped(error: wasmtime::Error) -> Result<u8, Error> {
     let backtrace = error.downcast_ref::<WasmBacktrace>();
     let frames = backtrace.map_or(&[][..], WasmBacktrace::frames);
     // The last is the function that only calls the start function.
-    let frames = frames
-        .iter()
-        .filter(|frame| frame.func_name() != Some(START));
+    let frames = frames.iter().filter(|frame| frame.func_name() != Some(RUN));
     Err(Error::Trap {
         message: message.to_string(),
         stack: frames
@@ -233,31 +241,63 @@ mod tests {
 
     use super::*;
 
-    /// What every program that writes has: `print`, and the allocator that
-    /// the host returns lists through.
+    /// What every program that writes has: `print`, which waits for what
+    /// it writes to be written, and the allocator that the host returns
+    /// lists through.
     const PRELUDE: &str = r#"
-union StreamError:
-    last_operation_failed: i32
-    closed
+extern "$root":
+    fn set_new() -> i32 = "[waitable-set-new]"
+    fn join(waitable: i32, set: i32) = "[waitable-join]"
+    fn wait(set: i32, event: &var tuple(i32, i32)) -> i32 = "[waitable-set-wait]"
+    fn set_drop(set: i32) = "[waitable-set-drop]"
 
-extern "wasi:cli/stdout@0.2.12":
-    fn get_stdout() -> i32 = "get-stdout"
+extern "wasi:cli/stdout@0.3.0":
+    fn write_via_stream(data: i32) -> i32 = "write-via-stream"
+    fn stream_new() -> i64 = "[stream-new-0]write-via-stream"
+    fn stream_write(stream: i32, bytes: array(u8)) -> i32 = "[async-lower][stream-write-0]write-via-stream"
+    fn stream_drop(stream: i32) = "[stream-drop-writable-0]write-via-stream"
+    fn future_read(future: i32, ret: &var result(tuple(), u8)) -> i32 = "[async-lower][future-read-1]write-via-stream"
+    fn future_drop(future: i32) = "[future-drop-readable-1]write-via-stream"
 
-extern "wasi:io/streams@0.2.12":
-    fn write(
-        stream: i32,
-        bytes: array(u8),
-        ret: &var result(tuple(), StreamError),
-    ) = "[method]output-stream.blocking-write-and-flush"
+# An `error-code` of `wasi:filesystem` or `wasi:sockets` as it is laid out: a
+# variant, the last of which holds an `option<string>`.
+struct Failure:
+    code: u8
+    message: option(array(u8))
 
 let newline = "\n"
-let written = &var result(tuple(), StreamError).ok(())
+let event = &var (0, 0)
+let written = &var result(tuple(), u8).ok(())
 var heap: uint = 0
 
+fn settle(waitable: i32, code: i32) -> i32:
+    if code != -1:
+        return code
+    let set = set_new()
+    join(waitable, set)
+    let _ = wait(set, event)
+    join(waitable, 0)
+    set_drop(set)
+    return event.*.1
+
+fn send(stream: i32, bytes: array(u8)):
+    var rest = bytes
+    while rest.len > 0:
+        let code = settle(stream, stream_write(stream, rest))
+        let count = (code as u32 >> 4) as uint
+        rest = array(u8)(ptr: (rest.ptr as uint + count) as! &u8, len: rest.len - count)
+        if code & 15 != 0:
+            return
+
 fn print(line: array(u8)):
-    let out = get_stdout()
-    write(out, line, written)
-    write(out, newline, written)
+    let ends = stream_new()
+    let stream = (ends >> 32) as i32
+    let future = write_via_stream(ends as i32)
+    send(stream, line)
+    send(stream, newline)
+    stream_drop(stream)
+    let _ = settle(future, future_read(future, written))
+    future_drop(future)
 
 pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     if heap == 0:
@@ -338,7 +378,7 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
     #[test]
     fn the_start_function_runs_with_the_arguments() {
         let src = r#"
-extern "wasi:cli/environment@0.2.12":
+extern "wasi:cli/environment@0.3.0":
     fn get_arguments(ret: &var array(array(u8))) = "get-arguments"
 
 let arguments: &var array(array(u8)) = &var []
@@ -369,7 +409,7 @@ fn main():
     #[test]
     fn a_program_exits_with_its_status() {
         let coded = r#"
-extern "wasi:cli/exit@0.2.12":
+extern "wasi:cli/exit@0.3.0":
     fn exit(status: u8) = "exit-with-code"
 
 let before = "before"
@@ -382,9 +422,8 @@ fn main():
 "#;
         assert_eq!(run_with(coded, &[]), (Ok(42), "before\n".to_string()));
 
-        // An interface is imported at any version that this one stands for.
         let failed = r#"
-extern "wasi:cli/exit@0.2.0":
+extern "wasi:cli/exit@0.3.0":
     fn exit(status: result(tuple(), tuple()))
 
 fn main():
@@ -438,20 +477,21 @@ fn main():
 
         // As the Canonical ABI lowers it, the function returns an `i32`.
         let mistyped = r#"
-extern "wasi:cli/stdout@0.2.12":
-    fn get_stdout() -> i64 = "get-stdout"
+extern "wasi:cli/stdout@0.3.0":
+    fn write_via_stream(data: i32) -> i64 = "write-via-stream"
 
 fn main():
-    let _ = get_stdout()
+    let _ = write_via_stream(0)
 "#;
         let Err(Error::Component(e)) = component(program(mistyped)) else {
             panic!("a handle is no `i64`");
         };
-        assert!(e.contains("type mismatch for function `get-stdout`"), "{e}");
+        let mismatch = "type mismatch for function `write-via-stream`";
+        assert!(e.contains(mismatch), "{e}");
 
         // A list is returned in memory that the module allocates.
         let unallocated = r#"
-extern "wasi:cli/environment@0.2.12":
+extern "wasi:cli/environment@0.3.0":
     fn get_arguments(ret: &var array(array(u8))) = "get-arguments"
 
 let arguments: &var array(array(u8)) = &var []
@@ -468,21 +508,21 @@ fn main():
     #[test]
     fn the_working_directory_and_the_root_are_open() {
         let src = r#"
-extern "wasi:filesystem/preopens@0.2.12":
+extern "wasi:filesystem/preopens@0.3.0":
     fn get_directories(ret: &var array(tuple(i32, array(u8)))) = "get-directories"
 
-extern "wasi:filesystem/types@0.2.12":
+extern "wasi:filesystem/types@0.3.0":
     fn open_at(
         dir: i32,
         path_flags: u8,
         path: array(u8),
         open_flags: u8,
         flags: u8,
-        ret: &var result(i32, u8),
+        ret: &var result(i32, Failure),
     ) = "[method]descriptor.open-at"
 
 let directories: &var array(tuple(i32, array(u8))) = &var []
-let opened = &var result(i32, u8).ok(0)
+let opened = &var result(i32, Failure).ok(0)
 let manifest = "Cargo.toml"
 let found = "found"
 
@@ -519,44 +559,42 @@ union Address:
     ipv4: Ipv4
     ipv6: Ipv6
 
-extern "wasi:sockets/instance-network@0.2.12":
-    fn instance_network() -> i32 = "instance-network"
+union Ip:
+    ipv4: tuple(u8, u8, u8, u8)
+    ipv6: tuple(u16, u16, u16, u16, u16, u16, u16, u16)
 
-extern "wasi:sockets/ip-name-lookup@0.2.12":
-    fn resolve(network: i32, name: array(u8), ret: &var result(i32, u8)) = "resolve-addresses"
+extern "wasi:sockets/ip-name-lookup@0.3.0":
+    fn resolve(name: array(u8), ret: &var result(array(Ip), Failure)) = "resolve-addresses"
 
-extern "wasi:sockets/tcp-create-socket@0.2.12":
-    fn create(family: u8, ret: &var result(i32, u8)) = "create-tcp-socket"
-
-extern "wasi:sockets/tcp@0.2.12":
-    fn start_bind(
+extern "wasi:sockets/types@0.3.0":
+    fn create(family: u8, ret: &var result(i32, Failure)) = "[static]tcp-socket.create"
+    fn bind(
         socket: i32,
-        network: i32,
         address: Address,
-        ret: &var result(tuple(), u8),
-    ) = "[method]tcp-socket.start-bind"
+        ret: &var result(tuple(), Failure),
+    ) = "[method]tcp-socket.bind"
 
-let handle = &var result(i32, u8).ok(0)
-let bound = &var result(tuple(), u8).ok(())
+let resolved = &var result(array(Ip), Failure).ok([])
+let handle = &var result(i32, Failure).ok(0)
+let bound = &var result(tuple(), Failure).ok(())
 let name = "127.0.0.1"
 let resolving = "resolving"
 let binding = "binding"
 
 fn main():
-    let network = instance_network()
     # An address is its own name, which nothing is asked for.
-    resolve(network, name, handle)
-    match handle.*:
-        .ok(_):
+    resolve(name, resolved)
+    match resolved.*:
+        .ok([.ipv4((127, 0, 0, 1))]):
             print(resolving)
-        .err(_):
+        else:
             pass
     create(0, handle)
     match handle.*:
         .ok(socket):
             # Any port of this machine, which is there without a network.
             let local = Address.ipv4(Ipv4(port: 0, address: (127, 0, 0, 1)))
-            start_bind(socket, network, local, bound)
+            bind(socket, local, bound)
         .err(_):
             return
     match bound.*:
