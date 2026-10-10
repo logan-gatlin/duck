@@ -77,7 +77,7 @@ impl Checker {
                     self.push_parts(member, bits, &held, when, out);
                 }
             }
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Func(_) | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 

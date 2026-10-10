@@ -365,6 +365,17 @@ impl Checker {
                     }
                 }
             }
+            // A function is a pointer to itself where one is expected.
+            (Ty::Fn(_), Ty::Func(id)) => {
+                let (mut a, ret) = self.func_shape(id);
+                a.push(ret);
+                let p = self.components(pattern);
+                if p.len() == a.len() {
+                    for (p, a) in p.into_iter().zip(a) {
+                        self.unify(p, a, bound);
+                    }
+                }
+            }
             (Ty::Ptr(_), Ty::Ptr(_))
             | (Ty::Tuple(_), Ty::Tuple(_))
             | (Ty::Array(_), Ty::Array(_))
@@ -624,9 +635,11 @@ impl Body<'_> {
     /// The type arguments of a call of generic function `generic`, from the
     /// `args` that `binding` matches with its parameters: the types given
     /// to its parameters of type `type`, and those inferred from the other
-    /// arguments. Of those, the ones that aren't literals or `.name`s go
-    /// first, so that those take the types they settle, and those naming
-    /// generic functions are left for last. The arguments it checks are
+    /// arguments. Of those, the ones that aren't literals, `.name`s or the
+    /// names of functions go first, so that those take the types they
+    /// settle: a function is a pointer where they settle on one, and is
+    /// otherwise of its own type. Those naming generic functions are left
+    /// for last. The arguments it checks are
     /// kept in `checked`. Type parameters that no argument settles are
     /// reported at `span`, and given the error type.
     fn type_args_of(
@@ -664,9 +677,10 @@ impl Body<'_> {
                 };
                 // A generic function's instance is picked by its parameter's
                 // type, so it settles nothing.
-                let named = matches!(self.named(&arg.value), Some(Item::GenericFn(_)));
-                if named
-                    || is_typed_by_other(&arg.value) != literals
+                let named = self.named(&arg.value);
+                let late = is_typed_by_other(&arg.value) || matches!(named, Some(Item::Func(_)));
+                if matches!(named, Some(Item::GenericFn(_)))
+                    || late != literals
                     || !self.ck.has_unbound(patterns[i], &bound)
                 {
                     continue;

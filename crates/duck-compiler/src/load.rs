@@ -918,7 +918,7 @@ fn secret(x: i32) -> i32:
 use lib
 use lib.id
 fn f() -> i32:
-    let a = lib.inc
+    let a: fn(i32) -> i32 = lib.inc
     let b: fn(u8) -> u8 = id
     return lib.hidden()(1) + lib.inc(2) + a(3)
 ";

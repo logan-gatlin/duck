@@ -861,7 +861,7 @@ fn demo() -> i32:
   of them are equal when they have the same `ptr`, whatever is there. The
   patterns `[x, y]` and `"text"` match arrays only: `match v as array(u8)`.
 
-## Function pointers
+## Functions as values
 
 ```duck
 fn double(x: i32) -> i32:
@@ -873,12 +873,31 @@ fn(T) id(x: T) -> T:
 let steps: array(fn(i32) -> i32) = [double, id]
 
 fn demo(f: fn(i32) -> i32) -> i32:
-	let g = double                 # a function's name is its pointer
+	let g = double                 # `double` itself: `g(1)` calls it
+	let p: fn(i32) -> i32 = double # a pointer to it, where one is expected
 	let h: fn(u8) -> u8 = id       # a generic one needs the type expected of it
-	return f(g(1)) + steps[0](2) + h(3) as i32
+	return f(g(1)) + p(2) + steps[0](3) + h(4) as i32
 ```
 
-- A call through a pointer takes every argument, positionally. Defaults
+- A function is a value of a type of its own, which only it is of, and
+  which is named as the function is. Nothing is stored of one, as which
+  function it is is known as the program is compiled: `g` above takes no
+  local, and `g(1)` is the call `double(1)`.
+- A function is a pointer to itself where one is expected: as an argument,
+  a field, an element, a result, or what is bound to a name typed as one.
+  A pointer is an index into the module's table, as wide as an address, and
+  a call through one is a `call_indirect`.
+- It is a pointer too where only its address serves: `double == f`,
+  `double as uint`. And functions of one signature in an array literal are
+  held as pointers to them: `[double, halve]` is an
+  `array(fn(i32) -> i32)`.
+- A `var` bound to a function is of that function's type, and is assigned
+  no other: `var g: fn(i32) -> i32 = double` holds a pointer to any.
+- A generic function takes a function among its arguments as it does a
+  literal, after the others: it is a pointer where they settle `T` as one,
+  and where nothing else settles `T`, `T` is the function's own type. So
+  `id(double)` is the instance `id(double)`, which holds nothing.
+- A call through a value takes every argument, positionally. Defaults
   belong to the function's name: `double` with one would still be only a
   `fn(i32) -> i32`.
 - `extern` functions have pointers too. Calling a zeroed pointer traps.

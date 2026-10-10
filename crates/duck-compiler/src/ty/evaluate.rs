@@ -1019,7 +1019,7 @@ let t = stamp()
         let src = "\
 extern:
     fn flag() -> bool
-let f = flag
+let f: fn() -> bool = flag
 let b = f()
 ";
         let called = "constant evaluation calls the extern function `flag`, \
@@ -1034,7 +1034,7 @@ let b = f()
         let src = "\
 fn hidden() -> i32:
     return 1
-let table = [hidden]
+let table: array(fn() -> i32) = [hidden]
 fn sneak() -> i32:
     let f = (0 as uint) as! &fn() -> i32
     return f.*()

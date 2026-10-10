@@ -268,6 +268,12 @@ pub enum Ty {
     /// `fn(A) -> R`, a pointer to a function, stored as its index in the
     /// module's table, which is as wide as an address.
     Fn(FnId),
+    /// The type of a function itself, which only that function is of. Its
+    /// values have no scalars, as which function it is is known as the
+    /// program is compiled, so a call of one is a call of the function. It
+    /// is made a [`Ty::Fn`], a pointer to the function, where one is
+    /// expected.
+    Func(FuncId),
     /// `type`, the type of a type written where a value belongs, as in
     /// `malloc(Point)`, and of the parameter it is given to, which is a type
     /// parameter. Its values have no scalars: a type is known as the
@@ -496,6 +502,13 @@ pub enum TypeErrorKind {
     /// A pointer to a type holding a `never`, which nothing in memory is.
     NotStorable(String),
     ImmutableAssign(String),
+    /// Another function, or a pointer to one, assigned to the variable
+    /// `name`, which is of the type of the function it was bound to.
+    /// `pointer` is the type of the pointers to that function.
+    OneFunction {
+        name: String,
+        pointer: String,
+    },
     /// A write to memory behind `ty`, a `&T` or `array(T)`, which only read
     /// it. `needs` is the type that writes, and `element` is whether `ty` is
     /// the array.
@@ -526,8 +539,9 @@ pub enum TypeErrorKind {
         expected: usize,
         found: usize,
     },
-    /// An argument given a label in a call through a function pointer,
-    /// whose parameters have no names.
+    /// An argument given a label in a call through a value: a function
+    /// pointer, whose parameters have no names, or a function held as a
+    /// value, which is called as a pointer to it is.
     LabelledPointerArg,
     MissingReturn(String),
     BreakOutsideLoop,
@@ -1503,6 +1517,11 @@ impl fmt::Display for TypeErrorKind {
             Self::NotAddressable => write!(f, "only memory behind a pointer has an address"),
             Self::NotStorable(ty) => write!(f, "`{ty}` can't be stored in memory"),
             Self::ImmutableAssign(name) => write!(f, "can't assign to immutable `{name}`"),
+            Self::OneFunction { name, pointer } => write!(
+                f,
+                "`{name}` is of the type of one function, so no other is assigned to it: \
+                 declare it as `{name}: {pointer}` to hold a pointer to any"
+            ),
             Self::ReadOnlyWrite { ty, needs, element } => {
                 let through = if *element {
                     "to an element of"
@@ -1536,10 +1555,7 @@ impl fmt::Display for TypeErrorKind {
                 write!(f, "expected {expected} arguments, found {found}")
             }
             Self::LabelledPointerArg => {
-                write!(
-                    f,
-                    "arguments of a call through a function pointer can't be labelled"
-                )
+                write!(f, "arguments of a call through a value can't be labelled")
             }
             Self::MissingReturn(name) => write!(f, "`{name}` can finish without returning"),
             Self::BreakOutsideLoop => write!(f, "`break` outside of a loop"),
@@ -3208,8 +3224,9 @@ impl Checker {
                 .all(|member| self.storable(member)),
             // A type argument is storable.
             Ty::Param(_) => true,
-            // Only the index of a function is stored, whatever it takes.
-            Ty::Fn(_) => true,
+            // Only the index of a function is stored, whatever it takes,
+            // and nothing is of one that is its own type.
+            Ty::Fn(_) | Ty::Func(_) => true,
             // A type is in no value.
             Ty::Type => false,
             Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Unit | Ty::Error => true,
@@ -3448,6 +3465,7 @@ impl Checker {
                 };
                 format!("fn({}){ret}", params.join(", "))
             }
+            Ty::Func(id) => self.funcs[id.0 as usize].name.clone(),
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
             Ty::Type => TYPE.to_string(),
             Ty::Unit => format!("{TUPLE}()"),
@@ -3493,7 +3511,7 @@ impl Checker {
                     self.push_leaves(member, format!("{name}.{field}"), out);
                 }
             }
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Func(_) | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -3806,7 +3824,7 @@ impl Checker {
             }
             // Never in memory, but a struct holding one still has a layout
             // that `field` asks for.
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
+            Ty::Func(_) | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
         }
     }
 
@@ -3886,7 +3904,7 @@ impl Checker {
                     self.push_cells(member, offset + member_offset, &held, &when, out);
                 }
             }
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Func(_) | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -4089,6 +4107,12 @@ impl<'c> Body<'c> {
         if self.ck.fits(found, want) || unchecked {
             return;
         }
+        // A function that is no pointer of the type expected is found as
+        // the pointer that it would be.
+        let found = match want {
+            Ty::Fn(_) => self.ck.pointed(found),
+            _ => found,
+        };
         let kind = TypeErrorKind::Mismatch {
             expected: self.ck.ty_name(want),
             found: self.ck.ty_name(found),
@@ -4375,7 +4399,7 @@ impl<'c> Body<'c> {
             self.error(kind, target.span);
         }
         let mut value = match op {
-            None => self.check(value, place.ty),
+            None => self.assigned_value(value, &place),
             Some(op) => {
                 let current = self.read_place(&place);
                 let rhs = self.check(value, place.ty);
@@ -4401,6 +4425,28 @@ impl<'c> Body<'c> {
             false => Ty::Error,
         };
         (ty, Value { pre, scalars })
+    }
+
+    /// `value` as it is assigned to `place`, whose type it is to be of. A
+    /// variable bound to a function is of that function's type, which is no
+    /// type of another function or of a pointer.
+    fn assigned_value(&mut self, value: &parse::Expr, place: &Place) -> Value {
+        let Ty::Func(_) = place.ty else {
+            return self.check(value, place.ty);
+        };
+        let (ty, lowered) = self.expr(value, Some(place.ty));
+        match ty {
+            Ty::Func(_) | Ty::Fn(_) if ty != place.ty => {
+                let pointer = self.ck.pointed(place.ty);
+                let kind = TypeErrorKind::OneFunction {
+                    name: place.name.clone(),
+                    pointer: self.ck.ty_name(pointer),
+                };
+                self.error(kind, value.span);
+            }
+            _ => self.expect(ty, place.ty, value.span),
+        }
+        lowered
     }
 
     /// `for var in iter`, which copies each element of the array `iter`, or
@@ -4825,6 +4871,7 @@ impl<'c> Body<'c> {
             self.ck.record(expr.span, expected);
         }
         let (ty, value) = self.infer(expr, expected);
+        let (ty, value) = self.pointing(ty, value, expected);
         self.ck.record(expr.span, ty);
         // Nothing after it is reached, as it has no value to go on with.
         self.ended |= ty == Ty::Never;
@@ -5255,7 +5302,26 @@ impl<'c> Body<'c> {
         };
         let mut consts = Vec::new();
         for item in items {
-            let (ty, value) = self.expr(item, elem);
+            let (mut ty, mut value) = self.expr(item, elem);
+            // Functions of one signature are held as pointers to them, as
+            // each is of a type of its own.
+            if let (Some(Ty::Func(first)), Ty::Func(_)) = (elem, ty)
+                && elem != Some(ty)
+                && self.ck.pointed(ty) == self.ck.pointer_ty(first)
+            {
+                let pointer = self.ck.pointer_ty(first);
+                consts = consts
+                    .into_iter()
+                    .map(|held: Result<Vec<Const>, Value>| {
+                        // One that folded had nothing to evaluate.
+                        let held = held.err().unwrap_or_default();
+                        let value = self.pointer(first, held);
+                        self.constant(value, span)
+                    })
+                    .collect();
+                elem = Some(pointer);
+                (ty, value) = self.pointing(ty, value, elem);
+            }
             let want = *elem.get_or_insert(ty);
             self.expect(ty, want, item.span);
             let item_consts = self.constant(value, item.span);
@@ -5630,11 +5696,11 @@ impl<'c> Body<'c> {
         // `.name`, as in `.red == c`.
         let (ty, lhs, rhs) = if is_typed_by_other(lhs) && !is_typed_by_other(rhs) {
             let (ty, rhs) = self.expr(rhs, expected);
-            let ty = self.compared(op, ty);
+            let (ty, rhs) = self.compared(op, ty, rhs);
             (ty, self.operand(lhs, ty), rhs)
         } else {
             let (ty, lhs) = self.expr(lhs, expected);
-            let ty = self.compared(op, ty);
+            let (ty, lhs) = self.compared(op, ty, lhs);
             (ty, lhs, self.operand(rhs, ty))
         };
         self.binary_values(op, ty, lhs, rhs, span)
@@ -5650,13 +5716,17 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// The type both operands of `op` have when one is a `ty`. Comparing
-    /// writes nothing, so a `&var T` compares as a `&T`, with either, and a
-    /// `varray(T)` as an `array(T)`.
-    fn compared(&mut self, op: BinOp, ty: Ty) -> Ty {
+    /// The type both operands of `op` have when one is `value`, a `ty`, and
+    /// that operand as one of it. Comparing writes nothing, so a `&var T`
+    /// compares as a `&T`, with either, and a `varray(T)` as an `array(T)`.
+    /// A function compares as the pointer to it.
+    fn compared(&mut self, op: BinOp, ty: Ty, value: Value) -> (Ty, Value) {
         match is_comparison(op) {
-            true => self.ck.with_writes(ty, false),
-            false => ty,
+            true => {
+                let (ty, value) = self.pointer_of(ty, value);
+                (self.ck.with_writes(ty, false), value)
+            }
+            false => (ty, value),
         }
     }
 
@@ -5797,6 +5867,11 @@ impl<'c> Body<'c> {
         if from == Ty::Error || to == Ty::Error {
             return (Ty::Error, Value::default());
         }
+        // A function casts as the pointer to it does.
+        let (from, value) = match from == to {
+            true => (from, value),
+            false => self.pointer_of(from, value),
+        };
         // A bounded type parameter casts as its bound does, which every
         // type argument casts to.
         let written = from;
@@ -6226,6 +6301,7 @@ impl<'c> Body<'c> {
                 Some(i) => {
                     let value = match checked {
                         Some((ty, value)) => {
+                            let (ty, value) = self.pointing(ty, value, Some(params[i].1));
                             self.expect(ty, params[i].1, arg.value.span);
                             value
                         }
@@ -8409,7 +8485,8 @@ fn field(p: &P) -> &i32:
             body(&module, "unit"),
             "(call nothing [] -> []) (return (call take 1))"
         );
-        assert_eq!(body(&module, "callee"), "(return (call_indirect 1 3))");
+        // A function piped is the function itself, which is called.
+        assert_eq!(body(&module, "callee"), "(return (call double 3))");
         assert_eq!(body(&module, "field"), "(return (I32.Add p 4))");
     }
 
@@ -14992,7 +15069,7 @@ fn dec(x: i32) -> i32:
 fn apply(f: fn(i32) -> i32, x: i32) -> i32:
     return f(x)
 fn main() -> i32:
-    var g = dec
+    var g: fn(i32) -> i32 = dec
     g = inc
     return apply(g, 1) + apply(dec, 2) + apply(inc, 3)
 ";
@@ -15021,6 +15098,161 @@ fn main() -> i32:
     }
 
     #[test]
+    fn a_function_is_a_value_of_its_own_type_called_directly() {
+        let src = "\
+extern:
+    fn log(n: i32)
+fn inc(x: i32) -> i32:
+    return x + 1
+fn pair(x: i32) -> tuple(i32, i32):
+    return (x, x)
+let held = inc
+fn main() -> i32:
+    let f = inc
+    let (a, b) = pair |> _(2)
+    let g = log
+    g(a)
+    return f(1) + held(b)
+fn size() -> uint:
+    let f = inc
+    let t = (f, 1 as u8)
+    return t.1 as uint
+";
+        let module = lower(src);
+        // No pointer is taken, so nothing is in the table.
+        assert_eq!(module.table, None);
+        assert_eq!(
+            body(&module, "main"),
+            "(call pair [2] -> [tmp0 tmp1]) (set a tmp0) (set b tmp1) \
+             (call log [a] -> []) \
+             (return (I32.Add (call inc 1) (call inc b)))"
+        );
+        // A function's own type has no scalars: it takes no storage.
+        let func = module.funcs.iter().find(|f| f.name == "size").unwrap();
+        let names: Vec<_> = func.locals.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["t.1"]);
+    }
+
+    #[test]
+    fn a_function_settles_a_type_parameter_after_what_is_no_function() {
+        let src = "\
+fn(T) id(x: T) -> T:
+    return x
+fn(T) pick(a: T, b: T) -> T:
+    return b
+fn(T, U) apply(x: T, f: fn(T) -> U) -> U:
+    return f(x)
+fn double(x: i32) -> i64:
+    return x as i64 * 2
+fn f(p: fn(i32) -> i64) -> i64:
+    let own = id(double)
+    let q = pick(double, p)
+    let r = pick(p, double)
+    return apply(1, double) + own(2) + q(3)
+";
+        let module = lower(src);
+        // Only where a pointer is expected is one taken.
+        assert_eq!(table(&module), ["double"]);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        for instance in ["id(double)", "pick(fn(i32) -> i64)", "apply(i32, i64)"] {
+            assert!(names.contains(&instance), "{instance} in {names:?}");
+        }
+        assert_eq!(names.iter().filter(|n| n.starts_with("pick")).count(), 1);
+        assert_eq!(
+            body(&module, "f"),
+            "(call id(double) [] -> []) \
+             (set q (call pick(fn(i32) -> i64) 1 p)) \
+             (set r (call pick(fn(i32) -> i64) p 1)) \
+             (return (I64.Add (I64.Add (call apply(i32, i64) 1 1) \
+             (call double 2)) (call_indirect q 3)))"
+        );
+        // A function is of its own type alone.
+        let src = "\
+fn(T) pick(a: T, b: T) -> T:
+    return b
+fn inc(x: i32) -> i32:
+    return x + 1
+fn dec(x: i32) -> i32:
+    return x - 1
+fn f():
+    pick(inc, dec)
+";
+        assert_eq!(errors(src), vec![mismatch("inc", "dec")]);
+    }
+
+    #[test]
+    fn a_function_is_a_pointer_where_its_address_is_needed() {
+        let src = "\
+fn inc(x: i32) -> i32:
+    return x + 1
+fn dec(x: i32) -> i32:
+    return x - 1
+fn f(g: fn(i32) -> i32) -> bool:
+    let i = inc as uint
+    let p = dec as fn(i32) -> i32
+    let both = [dec, inc, dec]
+    let q = both[1]
+    return inc == g or g != dec or inc == dec or q == p
+";
+        let module = lower(src);
+        assert_eq!(table(&module), ["inc", "dec"]);
+        // Functions of one signature are held as pointers to them.
+        assert_eq!(
+            data(&module),
+            [(0, &[2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0][..])]
+        );
+        let f = body(&module, "f");
+        for part in [
+            "(set i 1) (set p 2)",
+            "(I32.Eq 1 g)",
+            "(I32.Ne g 2)",
+            "(I32.Eq 1 2)",
+            "(I32.Eq q p)",
+        ] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+
+        use TypeErrorKind::*;
+        let src = "\
+fn inc(x: i32) -> i32:
+    return x + 1
+fn dec(x: i32) -> i32:
+    return x - 1
+fn wide(x: i64) -> i64:
+    return x
+fn f(g: fn(i32) -> i32):
+    var h = inc
+    h = dec
+    h = g
+    h = inc
+    let a = [inc, wide]
+    let b = inc < dec
+    let c: fn(i64) -> i64 = inc
+    let d = inc == wide
+";
+        let one = OneFunction {
+            name: "h".into(),
+            pointer: "fn(i32) -> i32".into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                one.clone(),
+                one.clone(),
+                mismatch("inc", "wide"),
+                invalid_operand("<", "fn(i32) -> i32"),
+                mismatch("fn(i64) -> i64", "fn(i32) -> i32"),
+                mismatch("fn(i32) -> i32", "fn(i64) -> i64"),
+            ]
+        );
+        assert_eq!(
+            one.to_string(),
+            "`h` is of the type of one function, so no other is assigned to it: \
+             declare it as `h: fn(i32) -> i32` to hold a pointer to any"
+        );
+    }
+
+    #[test]
     fn any_function_pointer_can_be_called() {
         let src = "\
 struct S:
@@ -15034,7 +15266,7 @@ fn pair(x: i32) -> tuple(i32, i32):
     return (x, x)
 fn pick() -> fn(i32) -> i32:
     return inc
-var handler = inc
+var handler: fn(i32) -> i32 = inc
 fn field(s: S) -> i32:
     s.done()
     return s.run(1)
@@ -15083,7 +15315,7 @@ fn cast(i: uint) -> i32:
     fn callees_are_evaluated_before_arguments() {
         let src = "\
 var count = 0
-var handler = inc
+var handler: fn(i32) -> i32 = inc
 fn inc(x: i32) -> i32:
     return x + 1
 fn pick() -> fn(i32) -> i32:
@@ -15128,10 +15360,10 @@ extern:
     fn flag() -> bool
     fn small(x: i32) -> tuple(u8, i64)
 fn f() -> bool:
-    let a = log
-    let b = flag
-    let c = small
-    let d = flag
+    let a: fn(i32) = log
+    let b: fn() -> bool = flag
+    let c: fn(i32) -> tuple(u8, i64) = small
+    let d: fn() -> bool = flag
     return b()
 ";
         let module = lower(src);
@@ -15251,7 +15483,7 @@ fn inc(x: i32) -> i32:
     return x + 1
 fn dec(x: i32) -> i32:
     return x - 1
-pub let first = dec
+pub let first: fn(i32) -> i32 = dec
 pub var current: fn(i32) -> i32 = inc
 let handlers: array(fn(i32) -> i32) = [inc, dec, inc]
 enum(fn(i32) -> i32) Op:
@@ -15351,7 +15583,7 @@ fn f(g: fn(i32) -> i32, n: i32, h: fn(i32)):
         );
         assert_eq!(
             LabelledPointerArg.to_string(),
-            "arguments of a call through a function pointer can't be labelled"
+            "arguments of a call through a value can't be labelled"
         );
     }
 

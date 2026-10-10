@@ -1,8 +1,12 @@
-//! Function pointers: values of the types `fn(A) -> R`, which are indices
-//! into the module's table, as wide as an address. A function is given an
-//! index the first time its pointer is taken, so pointers are constants.
-//! Calls through them are `call_indirect`s, which trap on a function of
-//! another wasm type.
+//! Functions as values. A function is a value of a type of its own, which
+//! only it is of: nothing is stored of it, and a call of one is a call of
+//! the function.
+//!
+//! Where a pointer is expected, the function is one: a value of a type
+//! `fn(A) -> R`, which is an index into the module's table, as wide as an
+//! address. A function is given an index the first time its pointer is
+//! taken, so pointers are constants. Calls through them are
+//! `call_indirect`s, which trap on a function of another wasm type.
 
 use crate::ir::{self, Expr, FuncId, Stmt};
 use crate::lex::Span;
@@ -10,7 +14,7 @@ use crate::parse::{self, Arg};
 
 use super::{
     Body, Checker, Dep, FnId, FuncSig, Synth, Ty, TypeErrorKind, Value, exprs, is_pure, is_stable,
-    path_text, scalar, split1,
+    path_text, split1,
 };
 
 impl Checker {
@@ -22,6 +26,31 @@ impl Checker {
             self.fn_tys.push((params, ret));
         }
         Ty::Fn(id)
+    }
+
+    /// The parameter types and result type of the pointers to function
+    /// `id`.
+    pub(super) fn func_shape(&self, id: FuncId) -> (Vec<Ty>, Ty) {
+        let sig = &self.funcs[id.0 as usize];
+        // A type parameter of an instance is no parameter of its pointer.
+        let params = sig.params.iter().map(|(_, ty)| *ty);
+        (params.filter(|ty| *ty != Ty::Type).collect(), sig.ret)
+    }
+
+    /// The type of the pointers to function `id`.
+    pub(super) fn pointer_ty(&mut self, id: FuncId) -> Ty {
+        let (params, ret) = self.func_shape(id);
+        self.fn_of(params, ret)
+    }
+
+    /// The type that a `ty` is where a pointer to a function is needed: that
+    /// of the pointers to the function, if it's the type of one, and
+    /// otherwise itself.
+    pub(super) fn pointed(&mut self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Func(id) => self.pointer_ty(id),
+            _ => ty,
+        }
     }
 
     /// The table index of function `id`, which is the next one free the
@@ -103,23 +132,44 @@ impl Checker {
 }
 
 impl Body<'_> {
-    /// A pointer to function `id`.
+    /// Function `id` itself, a value of its own type.
     pub(super) fn func_value(&mut self, id: FuncId) -> (Ty, Value) {
-        let sig = &self.ck.funcs[id.0 as usize];
-        // A type parameter of an instance is no parameter of its pointer.
-        let params = sig.params.iter().map(|(_, ty)| *ty);
-        let params: Vec<_> = params.filter(|ty| *ty != Ty::Type).collect();
-        let ret = sig.ret;
+        let (params, ret) = self.ck.func_shape(id);
         // A signature that failed to resolve is already reported.
         if params.contains(&Ty::Error) || ret == Ty::Error {
             return (Ty::Error, Value::default());
         }
+        (Ty::Func(id), Value::default())
+    }
+
+    /// A `ty` as it is where a `want` is expected, if anything is: a
+    /// function is a pointer to itself where a pointer of its type is.
+    /// Any other is what it was. `value` is evaluated first.
+    pub(super) fn pointing(&mut self, ty: Ty, value: Value, want: Option<Ty>) -> (Ty, Value) {
+        match (ty, want) {
+            (Ty::Func(id), Some(want @ Ty::Fn(_))) if self.ck.pointer_ty(id) == want => {
+                (want, self.pointer(id, value))
+            }
+            _ => (ty, value),
+        }
+    }
+
+    /// A function as the pointer to it, where only its address serves: it
+    /// is compared, or cast. Any other is what it was.
+    pub(super) fn pointer_of(&mut self, ty: Ty, value: Value) -> (Ty, Value) {
+        let want = self.ck.pointed(ty);
+        self.pointing(ty, value, Some(want))
+    }
+
+    /// A pointer to function `id`, once `value` is evaluated, which is the
+    /// function itself.
+    pub(super) fn pointer(&mut self, id: FuncId, value: Value) -> Value {
         let index = self.ck.table_index(id);
         let index = Expr::Const(self.ck.addr_const(index.into()));
-        (
-            self.ck.fn_of(params, ret),
-            scalar(self.ck.addr_type(), index),
-        )
+        Value {
+            pre: value.pre,
+            scalars: vec![(self.ck.addr_type(), index)],
+        }
     }
 
     /// A call of `callee`, a value rather than the name of a function, with
@@ -134,16 +184,19 @@ impl Body<'_> {
         if ty == Ty::Never {
             return (ty, callee_value);
         }
-        let Ty::Fn(id) = ty else {
-            if ty != Ty::Error {
-                self.error(TypeErrorKind::NotCallable(path_text(callee)), callee.span);
+        let (params, ret) = match ty {
+            Ty::Fn(id) => self.ck.fn_tys[id.0 as usize].clone(),
+            Ty::Func(id) => self.ck.func_shape(id),
+            _ => {
+                if ty != Ty::Error {
+                    self.error(TypeErrorKind::NotCallable(path_text(callee)), callee.span);
+                }
+                for arg in args {
+                    self.expr(&arg.value, None);
+                }
+                return (Ty::Error, Value::default());
             }
-            for arg in args {
-                self.expr(&arg.value, None);
-            }
-            return (Ty::Error, Value::default());
         };
-        let (params, ret) = self.ck.fn_tys[id.0 as usize].clone();
         let (expected, found) = (params.len(), args.len());
         if found > expected {
             self.error(TypeErrorKind::TooManyArgs { expected, found }, span);
@@ -161,6 +214,13 @@ impl Body<'_> {
                     self.expr(&arg.value, None);
                 }
             }
+        }
+        // A function itself is called as it is by name, and nothing is
+        // evaluated of it but what led to it.
+        if let Ty::Func(id) = ty {
+            values.insert(0, callee_value);
+            let args = self.seq(values);
+            return self.call_func(id, args);
         }
         let args = self.seq(values);
         let (mut pre, mut index) = split1(callee_value);

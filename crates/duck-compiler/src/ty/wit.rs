@@ -1099,7 +1099,7 @@ extern:
     fn pair(n: i32) -> tuple(i32, i64)
     fn one(n: i32) -> i32
 
-let pointers = (pair, one)
+let pointers: tuple(fn(i32) -> tuple(i32, i64), fn(i32) -> i32) = (pair, one)
 ";
         // What is called through a pointer takes and gives wasm values, as
         // every function of the source does.

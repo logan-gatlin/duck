@@ -707,14 +707,15 @@ impl Analysis {
             let holds = (None, self.ck.ty_name(variant.ty));
             return Some(signature(head, vec![holds], ""));
         }
-        let Ty::Fn(id) = self.ty_at(expr.span)? else {
-            return None;
+        let (params, ret) = match self.ty_at(expr.span)? {
+            Ty::Fn(id) => self.ck.fn_tys[id.0 as usize].clone(),
+            Ty::Func(id) => self.ck.func_shape(id),
+            _ => return None,
         };
-        let (params, ret) = &self.ck.fn_tys[id.0 as usize];
         let params = params.iter().map(|param| (None, self.ck.ty_name(*param)));
         let tail = match ret {
             Ty::Unit => String::new(),
-            ret => format!(" -> {}", self.ck.ty_name(*ret)),
+            ret => format!(" -> {}", self.ck.ty_name(ret)),
         };
         Some(signature("fn".to_string(), params.collect(), &tail))
     }

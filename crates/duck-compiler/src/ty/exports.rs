@@ -377,7 +377,7 @@ fn private():
         );
         // Neither a global nor the table is exported, as no world has one.
         let globals = "pub let limit = 1\npub var count = 0\nfn f():\n    count = limit\n\
-                       let pointer = f\n";
+                       let pointer: fn() = f\n";
         let module = check_in(globals, "bare", None).unwrap();
         assert!(module.globals.iter().all(|g| g.exports.is_empty()));
         assert_eq!(module.table.unwrap().export, None);
