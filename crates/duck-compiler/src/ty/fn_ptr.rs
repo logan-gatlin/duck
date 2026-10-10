@@ -184,18 +184,14 @@ impl Body<'_> {
         if ty == Ty::Never {
             return (ty, callee_value);
         }
-        let (params, ret) = match ty {
-            Ty::Fn(id) => self.ck.fn_tys[id.0 as usize].clone(),
-            Ty::Func(id) => self.ck.func_shape(id),
-            _ => {
-                if ty != Ty::Error {
-                    self.error(TypeErrorKind::NotCallable(path_text(callee)), callee.span);
-                }
-                for arg in args {
-                    self.expr(&arg.value, None);
-                }
-                return (Ty::Error, Value::default());
+        let Some((params, ret)) = self.ck.called_as(ty) else {
+            if ty != Ty::Error {
+                self.error(TypeErrorKind::NotCallable(path_text(callee)), callee.span);
             }
+            for arg in args {
+                self.expr(&arg.value, None);
+            }
+            return (Ty::Error, Value::default());
         };
         let (expected, found) = (params.len(), args.len());
         if found > expected {
@@ -221,6 +217,14 @@ impl Body<'_> {
             values.insert(0, callee_value);
             let args = self.seq(values);
             return self.call_func(id, args);
+        }
+        // A type parameter is called only where a generic function is
+        // checked as declared, which calls nothing.
+        if let Ty::Param(_) = ty {
+            values.insert(0, callee_value);
+            let pre = self.seq(values).pre;
+            let scalars = self.blank(ret).scalars;
+            return (ret, Value { pre, scalars });
         }
         let args = self.seq(values);
         let (mut pre, mut index) = split1(callee_value);

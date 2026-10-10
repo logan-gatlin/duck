@@ -34,8 +34,9 @@ pub(super) struct ParamDef {
     pub(super) index: usize,
     /// What its type arguments [meet](Checker::meets), once it is
     /// resolved, if the type parameter is bounded: a struct, a union, an
-    /// enum, an array, or a [list](Checker::list_of) of the types that a
-    /// struct uses.
+    /// enum, an array, a [list](Checker::list_of) of the types that a
+    /// struct uses, or a function type, which they are
+    /// [called as](Checker::called_as).
     pub(super) bound: Option<Ty>,
 }
 
@@ -146,9 +147,10 @@ impl Checker {
 
     /// Resolves the bound of each of a declaration's type parameters
     /// `params` that has one, whose types are `tys`. A bound is a struct, a
-    /// union, an enum or an array, or a list of structs and arrays, and of
-    /// `params` it names only those before its own, so that no bound leads
-    /// back to itself. Any other is reported and bounds nothing.
+    /// union, an enum, an array or a function type, or a list of structs
+    /// and arrays, and of `params` it names only those before its own, so
+    /// that no bound leads back to itself. Any other is reported and bounds
+    /// nothing.
     pub(super) fn resolve_bounds(&mut self, params: &[TypeParam], tys: &[Ty]) {
         for (i, (param, ty)) in params.iter().zip(tys).enumerate() {
             let (Some(first), Some(last), Ty::Param(id)) =
@@ -165,7 +167,7 @@ impl Checker {
                     let bound = self.resolve_ty(written);
                     if !matches!(
                         bound,
-                        Ty::Struct(_) | Ty::Enum(_) | Ty::Array(_) | Ty::Error
+                        Ty::Struct(_) | Ty::Enum(_) | Ty::Array(_) | Ty::Fn(_) | Ty::Error
                     ) {
                         self.error(TypeErrorKind::NotABound(self.ty_name(bound)), span);
                         continue;
@@ -277,11 +279,32 @@ impl Checker {
     /// What is known of `ty` where it is declared: the bound of a bounded
     /// type parameter, which its type arguments are laid out as where the
     /// body of a generic function is checked as declared. Any other type
-    /// is itself.
+    /// is itself, and so is a type parameter bounded by a function type,
+    /// which says how a type argument is called and nothing of what it
+    /// holds.
     pub(super) fn known(&self, ty: Ty) -> Ty {
         match ty {
-            Ty::Param(id) => self.params[id.0 as usize].bound.unwrap_or(ty),
+            Ty::Param(id) => match self.params[id.0 as usize].bound {
+                Some(Ty::Fn(_)) | None => ty,
+                Some(bound) => bound,
+            },
             _ => ty,
+        }
+    }
+
+    /// The parameter types and result type that a value of `ty` is called
+    /// with and gives, if it is called: those of a function type, of the
+    /// function that `ty` is the type of, or of the function type that
+    /// bounds a type parameter.
+    pub(super) fn called_as(&self, ty: Ty) -> Option<(Vec<Ty>, Ty)> {
+        match ty {
+            Ty::Fn(id) => Some(self.fn_tys[id.0 as usize].clone()),
+            Ty::Func(id) => Some(self.func_shape(id)),
+            Ty::Param(id) => match self.params[id.0 as usize].bound {
+                Some(bound @ Ty::Fn(_)) => self.called_as(bound),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -299,9 +322,16 @@ impl Checker {
     ///
     /// Nothing else relates the two: not what they hold, however alike.
     ///
+    /// A function type bounds what is [called as](Self::called_as) it is:
+    /// the type itself, whose values are pointers, and the type of each
+    /// function that a pointer of it points to.
+    ///
     /// A type parameter is bounded by what its own bound is.
     pub(super) fn meets(&self, ty: Ty, bound: Ty) -> bool {
-        self.starts_like(ty, bound, false)
+        match bound {
+            Ty::Fn(_) => ty == Ty::Error || self.called_as(ty) == self.called_as(bound),
+            _ => self.starts_like(ty, bound, false),
+        }
     }
 
     /// Whether a `ty` [meets] `bound`. If `exact`, it is also typed just as
@@ -429,6 +459,19 @@ impl Checker {
 
     /// Reports, at `site`, that a `ty` isn't a type that `bound` bounds.
     fn bound_error(&mut self, ty: Ty, bound: Ty, site: Span) {
+        if let Ty::Fn(_) = bound {
+            // A function is called as the pointers to it are.
+            let called = match ty {
+                Ty::Func(_) => Some(self.pointed(ty)),
+                _ => None,
+            };
+            let kind = TypeErrorKind::NotCalledAs {
+                ty: self.ty_name(ty),
+                called: called.map(|called| self.ty_name(called)),
+                bound: self.ty_name(bound),
+            };
+            return self.error(kind, site);
+        }
         let kind = self.not_used(ty, bound).unwrap_or_else(|| {
             let sum = self.is_sum(bound);
             let (ty, bound) = (self.ty_name(ty), self.ty_name(bound));

@@ -421,8 +421,9 @@ impl Checker {
     /// Settles the type parameters of generic function `generic` that
     /// `bound` leaves out, where the bound of one that it has names them:
     /// they are what makes the bound a type that the type argument starts
-    /// as, or for a union or an enum, one that starts as the type argument.
-    /// A bound names only type parameters before its own, so the last is
+    /// as, or for a union or an enum, one that starts as the type argument,
+    /// or for a function type, one that the type argument is called as. A
+    /// bound names only type parameters before its own, so the last is
     /// taken first.
     pub(super) fn settle_by_bounds(&self, generic: GenericFnId, bound: &mut [Option<Ty>]) {
         let params = &self.generic_fns[generic.0 as usize].params;
@@ -434,6 +435,19 @@ impl Checker {
                 continue;
             };
             if !self.has_unbound(want, bound) {
+                continue;
+            }
+            if let Ty::Fn(_) = want {
+                let Some((mut have, ret)) = self.called_as(arg) else {
+                    continue;
+                };
+                have.push(ret);
+                let want = self.components(want);
+                if want.len() == have.len() {
+                    for (want, have) in want.into_iter().zip(have) {
+                        self.unify(want, have, bound);
+                    }
+                }
                 continue;
             }
             let have = self.known(arg);
@@ -563,13 +577,38 @@ impl Body<'_> {
         }
     }
 
-    /// A pointer to the instance of generic function `generic`, named at
-    /// `span`, that has the function type `expected`. Nothing else gives
-    /// its type parameters their types.
+    /// The instance of generic function `generic`, named at `span`, whose
+    /// pointers have the function type `expected`. Nothing else gives its
+    /// type parameters their types.
     pub(super) fn generic_fn_value(
         &mut self,
         generic: GenericFnId,
         expected: Option<Ty>,
+        span: Span,
+    ) -> (Ty, Value) {
+        // An expected type that failed to resolve is already reported.
+        if expected == Some(Ty::Error) {
+            return (Ty::Error, Value::default());
+        }
+        let called = match expected {
+            Some(Ty::Fn(id)) => {
+                let (takes, gives) = self.ck.fn_tys[id.0 as usize].clone();
+                Some((takes, Some(gives)))
+            }
+            _ => None,
+        };
+        self.generic_fn_called(generic, called, span)
+    }
+
+    /// The instance of generic function `generic`, named at `span`, that is
+    /// `called` with what it takes and, where that is known too, for what
+    /// it gives. It is of its own type, as any function is, and where a
+    /// generic function is checked as declared, which has no instance, of
+    /// the type of the pointers to it.
+    fn generic_fn_called(
+        &mut self,
+        generic: GenericFnId,
+        called: Option<(Vec<Ty>, Option<Ty>)>,
         span: Span,
     ) -> (Ty, Value) {
         let def = &self.ck.generic_fns[generic.0 as usize];
@@ -577,15 +616,20 @@ impl Body<'_> {
         let (params, ret) = (def.sig.params.iter().map(|(_, ty)| *ty), def.sig.ret);
         // A type parameter is no parameter of an instance's pointer.
         let params: Vec<_> = params.filter(|ty| *ty != Ty::Type).collect();
-        // A signature or expected type that failed to resolve is already
-        // reported.
-        if params.contains(&Ty::Error) || ret == Ty::Error || expected == Some(Ty::Error) {
+        // A signature that failed to resolve is already reported.
+        if params.contains(&Ty::Error) || ret == Ty::Error {
             return (Ty::Error, Value::default());
         }
         let mut bound = vec![None; type_params.len()];
-        if let Some(expected @ Ty::Fn(_)) = expected {
-            let pattern = self.ck.fn_of(params, ret);
-            self.ck.unify(pattern, expected, &mut bound);
+        if let Some((takes, gives)) = called
+            && takes.len() == params.len()
+        {
+            for (param, taken) in params.iter().zip(takes) {
+                self.ck.unify(*param, taken, &mut bound);
+            }
+            if let Some(gives) = gives {
+                self.ck.unify(ret, gives, &mut bound);
+            }
             self.ck.settle_by_bounds(generic, &mut bound);
         }
         for (param, ty) in type_params.iter().zip(&bound) {
@@ -692,6 +736,38 @@ impl Body<'_> {
                 self.ck.settle_by_bounds(generic, &mut bound);
                 checked[k] = Some((ty, value));
             }
+        }
+        // A generic function is the instance that its parameter's type is
+        // called as: the type parameter that a function type bounds, once
+        // the other arguments settle what that takes.
+        for (k, (arg, param)) in args.iter().zip(binding).enumerate() {
+            let (Some(i), Some(Item::GenericFn(named))) = (*param, self.named(&arg.value)) else {
+                continue;
+            };
+            let Ty::Param(id) = patterns[i] else {
+                continue;
+            };
+            let def = &self.ck.params[id.0 as usize];
+            let (index, Some(want @ Ty::Fn(_))) = (def.index, def.bound) else {
+                continue;
+            };
+            let Some((takes, _)) = self.ck.called_as(want) else {
+                continue;
+            };
+            let unsettled = takes.iter().any(|ty| self.ck.has_unbound(*ty, &bound));
+            if bound[index].is_some() || unsettled {
+                continue;
+            }
+            let settled: Vec<_> = bound.iter().map(|ty| ty.unwrap_or(Ty::Error)).collect();
+            let takes = takes
+                .into_iter()
+                .map(|ty| self.ck.substitute(ty, &settled, span))
+                .collect();
+            let (ty, value) = self.generic_fn_called(named, Some((takes, None)), arg.value.span);
+            self.ck.record(arg.value.span, ty);
+            bound[index] = Some(ty);
+            self.ck.settle_by_bounds(generic, &mut bound);
+            checked[k] = Some((ty, value));
         }
         if checked.iter().flatten().any(|(ty, _)| *ty == Ty::Never) {
             bound.fill(Some(Ty::Never));

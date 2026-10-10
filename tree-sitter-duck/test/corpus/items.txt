@@ -554,6 +554,50 @@ fn(T: mod.Head) id(T: type, x: &T) -> i32:
             (identifier)))))))
 
 ====================
+Type parameter bounded by a function type
+====================
+
+fn(T, F: fn(T) -> T) twice(f: F, x: T) -> T:
+    return f(f(x))
+
+---
+
+(source_file
+  (function_declaration
+    (type_parameters
+      (identifier)
+      (bounded_type_parameter
+        (identifier)
+        (function_type
+          (parameter_types
+            (named_type
+              (identifier)))
+          (named_type
+            (identifier)))))
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier)))
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (named_type
+      (identifier))
+    (block
+      (expression_statement
+        (return_expression
+          (call_expression
+            (identifier)
+            (arguments
+              (call_expression
+                (identifier)
+                (arguments
+                  (identifier))))))))))
+
+====================
 Generic function
 ====================
 

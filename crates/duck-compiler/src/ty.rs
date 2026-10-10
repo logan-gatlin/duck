@@ -396,7 +396,7 @@ pub enum TypeErrorKind {
     /// others, too many times over, as recursion with ever larger type
     /// arguments would be.
     /// A type parameter bounded by a type that isn't a struct, a union, an
-    /// enum or an array.
+    /// enum, an array or a function type.
     NotABound(String),
     /// A type that a bound lists which isn't a struct or an array.
     NotListed(String),
@@ -432,6 +432,14 @@ pub enum TypeErrorKind {
     /// does.
     BoundNotMet {
         ty: String,
+        bound: String,
+    },
+    /// A type argument that isn't called as `bound` is, the function type
+    /// that bounds its type parameter. `called` is the function type that a
+    /// function is called as.
+    NotCalledAs {
+        ty: String,
+        called: Option<String>,
         bound: String,
     },
     /// A default with a type of its own, which isn't the type that its
@@ -1416,7 +1424,8 @@ impl fmt::Display for TypeErrorKind {
             Self::NotGeneric(name) => write!(f, "`{name}` has no type parameters"),
             Self::NotABound(ty) => write!(
                 f,
-                "`{ty}` can't bound a type parameter; only a struct, a union, an enum or an array can"
+                "`{ty}` can't bound a type parameter; only a struct, a union, an enum, an array \
+                 or a function type can"
             ),
             Self::NotListed(ty) => write!(
                 f,
@@ -1444,6 +1453,17 @@ impl fmt::Display for TypeErrorKind {
             ),
             Self::BoundNotMet { ty, bound } => {
                 write!(f, "`{ty}` doesn't start as `{bound}` does")
+            }
+            Self::NotCalledAs {
+                ty,
+                called: Some(called),
+                bound,
+            } => write!(
+                f,
+                "`{ty}` is called as a `{called}` is, and not as a `{bound}`"
+            ),
+            Self::NotCalledAs { ty, bound, .. } => {
+                write!(f, "`{ty}` isn't called as a `{bound}` is")
             }
             Self::DefaultMismatch {
                 param,
@@ -11378,7 +11398,8 @@ fn f(io: IoError, r: ReadError, s: Swapped, t: Retyped, h: Held, m: More, k: Clo
         );
         assert_eq!(
             NotABound("i32".into()).to_string(),
-            "`i32` can't bound a type parameter; only a struct, a union, an enum or an array can"
+            "`i32` can't bound a type parameter; only a struct, a union, an enum, an array \
+             or a function type can"
         );
     }
 
@@ -15249,6 +15270,191 @@ fn f(g: fn(i32) -> i32):
             one.to_string(),
             "`h` is of the type of one function, so no other is assigned to it: \
              declare it as `h: fn(i32) -> i32` to hold a pointer to any"
+        );
+    }
+
+    #[test]
+    fn a_function_type_bounds_what_is_called_as_it_is() {
+        let src = "\
+fn(F: fn(i32) -> i32) twice(f: F, x: i32) -> i32:
+    return f(f(x))
+fn inc(x: i32) -> i32:
+    return x + 1
+fn main(p: fn(i32) -> i32) -> i32:
+    return twice(inc, 1) + twice(p, 2)
+";
+        let module = lower(src);
+        // The instance of a function calls it, and takes nothing for it.
+        assert_eq!(module.table, None);
+        assert_eq!(
+            body(&module, "twice(inc)"),
+            "(return (call inc (call inc x)))"
+        );
+        // That of a pointer is called through it.
+        assert_eq!(
+            body(&module, "twice(fn(i32) -> i32)"),
+            "(return (call_indirect f (call_indirect f x)))"
+        );
+        assert_eq!(
+            body(&module, "main"),
+            "(return (I32.Add (call twice(inc) 1) (call twice(fn(i32) -> i32) p 2)))"
+        );
+    }
+
+    #[test]
+    fn a_struct_holds_what_its_bound_calls() {
+        let src = "\
+struct(T, R: fn(uint) -> &var T) Pool:
+    make: R
+    count: uint = 0
+fn bump(size: uint) -> &var u8:
+    return 8
+fn(T, R: fn(uint) -> &var T) take(pool: &var Pool(T, R)) -> &var T:
+    pool.count += 1
+    return pool.make(T.size)
+fn(T, R: fn(uint) -> &var T) pool(make: R) -> Pool(T, R):
+    return Pool(T, R)(make: make)
+let own = &var pool(bump)
+fn f(any: &var Pool(u8, fn(uint) -> &var u8)) -> &var u8:
+    let a = take(own)
+    return take(any)
+";
+        let module = lower(src);
+        assert_eq!(module.table, None);
+        // The function is no part of what holds it.
+        assert_eq!(
+            body(&module, "take(u8, bump)"),
+            "(I32.Store offset=0 pool (I32.Add (I32.Load offset=0 pool) 1)) \
+             (return (call bump 1))"
+        );
+        assert_eq!(
+            body(&module, "take(u8, fn(uint) -> &var u8)"),
+            "(I32.Store offset=4 pool (I32.Add (I32.Load offset=4 pool) 1)) \
+             (return (call_indirect (I32.Load offset=0 pool) 1))"
+        );
+        assert_eq!(
+            body(&module, "f"),
+            "(set a (call take(u8, bump) 0)) \
+             (return (call take(u8, fn(uint) -> &var u8) any))"
+        );
+    }
+
+    #[test]
+    fn what_a_bound_calls_settles_the_types_it_names() {
+        let src = "\
+fn(T, U, F: fn(T) -> U) map(x: T, f: F) -> U:
+    return f(x)
+fn(T) id(x: T) -> T:
+    return x
+fn(T, F: fn(T) -> T) both(x: T, f: F) -> T:
+    return map(map(x, f), id)
+fn(F: fn(i32) -> i32) run(x: i32, f: F = inc) -> i32:
+    return f(x)
+fn inc(x: i32) -> i32:
+    return x + 1
+fn wide(x: i32) -> i64:
+    return x as i64
+fn f() -> i64:
+    let a = map(1, wide)
+    let b = map(2 as u8, id)
+    let c = both(3, inc)
+    return a + b as i64 + (c + run(4) + run(5, id)) as i64
+";
+        let module = lower(src);
+        assert_eq!(module.table, None);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        for instance in [
+            "map(i32, i64, wide)",
+            "map(u8, u8, id(u8))",
+            "both(i32, inc)",
+            "map(i32, i32, inc)",
+            "map(i32, i32, id(i32))",
+            "run(inc)",
+            "run(id(i32))",
+        ] {
+            assert!(names.contains(&instance), "{instance} in {names:?}");
+        }
+        assert_eq!(
+            body(&module, "map(u8, u8, id(u8))"),
+            "(return (call id(u8) x))"
+        );
+        assert_eq!(
+            body(&module, "both(i32, inc)"),
+            "(return (call map(i32, i32, id(i32)) (call map(i32, i32, inc) x)))"
+        );
+        assert_eq!(body(&module, "run(inc)"), "(return (call inc x))");
+    }
+
+    #[test]
+    fn a_value_of_a_bounded_type_is_only_called_and_held() {
+        use TypeErrorKind::*;
+        let src = "\
+struct Head:
+    x: i32
+fn(F: fn(i32) -> i32) twice(f: F, x: i32) -> i32:
+    let g = f
+    let p: fn(i32) -> i32 = f
+    let same = f == f
+    let i = f as uint
+    f(x: 1)
+    let s = F.size
+    return f(x, 2)
+fn(F: (fn(i32) -> i32, Head)) listed(f: F):
+    pass
+fn(T, U, F: fn(T) -> U) map(x: T, f: F) -> U:
+    return f(x)
+fn(T) id(x: T) -> T:
+    return x
+fn wide(x: i64) -> i64:
+    return x
+fn g(n: i32):
+    twice(wide, 1)
+    twice(n, 1)
+    map(id, id)
+";
+        let not_called = |ty: &str, called: Option<&str>| NotCalledAs {
+            ty: ty.into(),
+            called: called.map(str::to_string),
+            bound: "fn(i32) -> i32".into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                NotListed("fn(i32) -> i32".into()),
+                mismatch("fn(i32) -> i32", "F"),
+                invalid_operand("==", "F"),
+                InvalidCast {
+                    from: "F".into(),
+                    to: "uint".into()
+                },
+                LabelledPointerArg,
+                TooManyArgs {
+                    expected: 1,
+                    found: 2
+                },
+                not_called("wide", Some("fn(i64) -> i64")),
+                not_called("i32", None),
+                CannotInfer {
+                    func: "map".into(),
+                    param: "T".into()
+                },
+                CannotInfer {
+                    func: "map".into(),
+                    param: "U".into()
+                },
+                CannotInfer {
+                    func: "map".into(),
+                    param: "F".into()
+                },
+            ]
+        );
+        assert_eq!(
+            not_called("wide", Some("fn(i64) -> i64")).to_string(),
+            "`wide` is called as a `fn(i64) -> i64` is, and not as a `fn(i32) -> i32`"
+        );
+        assert_eq!(
+            not_called("i32", None).to_string(),
+            "`i32` isn't called as a `fn(i32) -> i32` is"
         );
     }
 

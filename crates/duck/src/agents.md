@@ -902,6 +902,48 @@ fn demo(f: fn(i32) -> i32) -> i32:
   `fn(i32) -> i32`.
 - `extern` functions have pointers too. Calling a zeroed pointer traps.
 
+### Generic over a function
+
+```duck
+fn(T, U, F: fn(T) -> U) apply(x: T, f: F) -> U:
+	return f(x)                      # a call of the function that `F` is of
+
+struct(T, A: fn(uint) -> &var T) Pool:
+	make: A                          # nothing, where `A` is a function's type
+	count: uint = 0
+
+fn(T, A: fn(uint) -> &var T) take(pool: &var Pool(T, A)) -> &var T:
+	pool.count += 1
+	return pool.make(T.size)
+
+fn wide(x: i32) -> i64:
+	return x as i64
+
+fn demo(p: fn(i32) -> i64) -> i64:
+	return apply(1, wide) + apply(2, p)
+```
+
+- `fn(F: fn(A) -> R)`, `struct(F: fn(A) -> R)`: `F` is bounded by a function
+  type, so a type argument is called as that type is. It is the type of a
+  function whose pointers are of the bound, parameter for parameter, or it
+  is the bound itself, whose values are pointers.
+- An instance is of the function: `apply(i32, i64, wide)` calls `wide`, and
+  takes nothing for `f`. That of a pointer type, `apply(i32, i64, fn(i32) ->
+  i64)`, takes the pointer and calls through it. A parameter typed
+  `f: fn(T) -> U` is a pointer always, with one instance for every function.
+- In the body an `F` is called, with every argument and positionally, and
+  is otherwise as any `T` is: bound, passed, returned and held. It isn't
+  compared, cast, or made a pointer, as not every type argument could be:
+  `f == g`, `f as uint` and `let p: fn(T) -> U = f` are errors.
+- A call that settles `F` takes from it the type parameters that the bound
+  names: `U` is `i64` for `wide`. A generic function given for an `F` is
+  the instance that takes what the bound does, once the other arguments
+  settle that: with `fn(T) id(x: T) -> T`, `apply(1 as u8, id)` is
+  `apply(u8, u8, id(u8))`.
+- A default settles `F` as any does: with `f: F = wide`, a call that leaves
+  `f` out is of `wide`.
+- A function type bounds alone: it is in no list, as `(fn(T) -> U, Head)`.
+
 ## Pipes
 
 ```duck
