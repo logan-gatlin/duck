@@ -521,13 +521,15 @@ impl Project {
     /// `path`, which holds `text`: the names in scope, with the labels that
     /// an argument there may have and what a `use` would bring; after a
     /// `.`, what the value, type or module before it has, or the type
-    /// expected there; and in a `use`, what its path may go on with.
+    /// expected there; and in a `use`, what its path may go on with. Only
+    /// that last, if nothing but what is `used` is asked for.
     pub fn complete(
         &self,
         buffers: Buffers<'_>,
         path: &Path,
         text: &str,
         position: Position,
+        used: bool,
     ) -> Suggested {
         let at = offset(text, position);
         let plain = |completion| Suggestion {
@@ -535,7 +537,9 @@ impl Project {
             insert: None,
             import: None,
         };
-        let completions = match cursor::completing(text, at) {
+        let completing = cursor::completing(text, at)
+            .filter(|completing| !used || matches!(completing, Completing::Used(..)));
+        let completions = match completing {
             None => Vec::new(),
             Some(Completing::Module) => ty::module_members(),
             Some(Completing::Members(cursor)) => {
@@ -1142,7 +1146,7 @@ pub(crate) mod tests {
         let complete = |src: &str, text: &str| {
             let buffers = |path: &Path| (path == main).then_some(src);
             let position = position(src, src.find(text).unwrap() + text.len());
-            let suggested = project.complete(&buffers, &main, src, position);
+            let suggested = project.complete(&buffers, &main, src, position, false);
             let kind = match suggested.names {
                 true => "names",
                 false => "members",

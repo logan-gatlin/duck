@@ -676,19 +676,23 @@ impl Server<'_> {
 
     /// What can be written at a place in a file the editor has open: the
     /// names in scope there and the words of the language, or what follows
-    /// the `.` before it.
+    /// the `.` before it. Asked by something typed that isn't a `.`, only
+    /// what the path of a `use` goes on with there, which is all that it
+    /// asks for.
     fn complete(&mut self, params: CompletionParams) -> Vec<CompletionItem> {
         let TextDocumentPositionParams {
             text_document,
             position,
         } = params.text_document_position;
+        let typed = params.context.and_then(|context| context.trigger_character);
+        let used = typed.is_some_and(|typed| typed != ".");
         let Some((path, root)) = self.package_of(&text_document.uri) else {
             return Vec::new();
         };
         let (project, documents) = (&self.projects[&root], &self.documents);
         let buffers = |path: &Path| Some(documents.get(path)?.text.as_str());
         let text = &documents[&path].text;
-        let suggested = project.complete(&buffers, &path, text, position);
+        let suggested = project.complete(&buffers, &path, text, position, used);
         let suggestions = suggested.suggestions.into_iter().enumerate();
         let item = |(index, suggestion): (usize, Suggestion)| {
             let Suggestion {
@@ -1010,7 +1014,8 @@ fn capabilities() -> ServerCapabilities {
         document_formatting_provider: Some(OneOf::Left(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
-            trigger_characters: triggers(&["."]),
+            // All but the `.` go on with the path of a `use`, in a group.
+            trigger_characters: triggers(&[".", "{", ",", " "]),
             ..CompletionOptions::default()
         }),
         signature_help_provider: Some(SignatureHelpOptions {
@@ -1821,7 +1826,7 @@ mod tests {
         assert_eq!(some["signatures"][0]["label"], "option(i32).some(i32)");
 
         // The path of a `use`: what is there to use, and what it has.
-        let mut used = |line: &str, editor: &mut Editor| {
+        let mut used = |line: &str, typed: Option<&str>, editor: &mut Editor| {
             version += 1;
             let text = PICK.replacen("use kit\n", &format!("use kit\n{line}\n"), 1);
             editor.change(&main, version, &text);
@@ -1829,16 +1834,32 @@ mod tests {
                 panic!("not the diagnostics of the change")
             };
             let at = json!({ "line": 1, "character": line.len() });
-            let params = json!({ "textDocument": { "uri": uri(&main) }, "position": at });
+            let context = match typed {
+                Some(typed) => json!({ "triggerKind": 2, "triggerCharacter": typed }),
+                None => json!({ "triggerKind": 1 }),
+            };
+            let params = json!({
+                "textDocument": { "uri": uri(&main) },
+                "position": at,
+                "context": context,
+            });
             labels(&editor.request(Completion::METHOD, params))
         };
-        assert_eq!(used("use ", &mut editor), ["deep", "kit", "main"]);
-        assert_eq!(used("use deep.", &mut editor), ["nest"]);
-        assert_eq!(used("use kit.", &mut editor), ["Color", "Point", "len"]);
-        assert_eq!(
-            used("use kit.{Point, ", &mut editor),
-            ["Color", "Point", "len"]
-        );
+        assert_eq!(used("use ", None, &mut editor), ["deep", "kit", "main"]);
+        assert_eq!(used("use deep.", Some("."), &mut editor), ["nest"]);
+        let kit = ["Color", "Point", "len"];
+        assert_eq!(used("use kit.", Some("."), &mut editor), kit);
+        assert_eq!(used("use kit.{Point, ", None, &mut editor), kit);
+        // In a group it is asked for by what is typed there, which asks
+        // for nothing anywhere else. Each line leaves its bracket open at
+        // another place than the last, for the diagnostics to change.
+        assert_eq!(used("use deep.{", Some("{"), &mut editor), ["nest"]);
+        assert_eq!(used("use kit.{Point, ", Some(" "), &mut editor), kit);
+        assert_eq!(used("use deep.{nest,", Some(","), &mut editor), ["nest"]);
+        let none: [&str; 0] = [];
+        assert_eq!(used("let far = (1, ", Some(" "), &mut editor), none);
+        assert_eq!(used("let near = (1,", Some(","), &mut editor), none);
+        assert!(!used("let far = (1, ", None, &mut editor).is_empty());
         editor.stop();
     }
 
@@ -1983,7 +2004,7 @@ mod tests {
         assert_eq!(capabilities["referencesProvider"], true);
         assert_eq!(
             capabilities["completionProvider"]["triggerCharacters"],
-            json!(["."])
+            json!([".", "{", ",", " "])
         );
         assert_eq!(
             capabilities["signatureHelpProvider"]["triggerCharacters"],

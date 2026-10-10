@@ -649,6 +649,7 @@ mod tests {
         );
         // In a group, the names before it and those before in it.
         assert_eq!(used("use geo.{Point, @\n"), path("geo", Some("use @geo\n")));
+        assert_eq!(used("use geo.{ @ }\n"), path("geo", Some("use @geo\n")));
         assert_eq!(
             used("use a.{b.{c, d}, e.f.@\n"),
             path("a.e.f", Some("use a.e.@f\n"))
