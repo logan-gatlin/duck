@@ -69,6 +69,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   count bytes and elements, and are types of their own: `uint + u32` is an
   error too.
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
+  A tuple of one is `tuple(A)`, built `(a,)`: the comma makes it one, as
+  `(a)` is only `a` in brackets.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
   addresses, which `as!` makes of any address. There is no null: `0` is an
   address like any other.
@@ -440,7 +442,9 @@ fn view(p: &i32, len: uint) -> array(i32):
 - Layout follows C, and `bool` is 1 byte. A pointer, a function pointer, an
   `int` and a `uint` are each 4 bytes.
 - The only runtime checks are array bounds and division by zero, which trap.
-- Literals are placed from address 0, or from `static.start` in `Duck.toml`.
+- Literals are placed from address 0, or from `static.start` in `Duck.toml`,
+  after the return area of a component that passes its host anything in
+  memory.
   Memory starts as the fewest pages that hold them, which is none without
   literals, and those its constants grew it by.
 - A page is yours only if `module.grow` gave it: its result is the first of
@@ -1000,23 +1004,69 @@ pub fn helper():                        # only `pub`: the world has no `helper`
   members, counted from 0, so none is given a value: an `enum(u16)` past
   256 of them. `flags` are the narrowest of `u8`, `u16` and `u32` with a
   bit for each, from the lowest. A `list<T>` is an `array(T)` and a
-  `string` an `array(u8)`, which `string` names. `tuple`, `option` and
+  `string` an `array(u8)`, which `string` names. A `map<K, V>` is an
+  `array(tuple(K, V))`, each key with its value, as it is passed: nothing
+  says that no key is there twice, and a host has the type only where it is
+  asked for, as Wasmtime does with `wasm_component_model_map`. `tuple`, `option` and
   `result` are Duck's own, with `tuple()` for a `_`. A `char` is a `u32`,
   `s8` to `s64` are `i8` to `i64`, and a handle is an `i32`: an `own` or a
   `borrow` of a resource, a `stream` or a `future`.
+- A struct with one field is also what its field is, as it is laid out and
+  passed as that. So `struct Descriptor` with `handle: i32` is a handle,
+  and no function that takes one takes a `Socket` declared the same way:
+  the two are types of their own. Nothing says which resource either is a
+  handle of, as names are of no account.
+- A tuple of one is what it holds too, of Duck or of the WIT: a
+  `tuple<u32>` is a `tuple(u32)` or a `u32`, and a `u32` is a `u32` or a
+  `tuple(u32)`.
 - The error is at the type that differs, and says what the WIT has there
   and which type within it isn't matched. A pointer, a function pointer, an
   `int` and a `uint` are types of no WIT.
 - An interface that isn't there to import is an error at the block that
   names it, as is a function that its interface doesn't have. A library
-  imports from any interface of WASI 0.3 or of the WIT in its `wit`
-  directory, and the component it is built into has a world that imports
-  each of them.
+  imports from any interface of WASI 0.3, of the WIT in its `wit` directory
+  or of that of a library it depends on, and the component it is built into
+  has a world that imports each of them: the error says which it doesn't.
 - No function of either block is generic, and no generic function is
   exported.
 - The host gives every argument. A default is passed by the Duck call that
   leaves it out, so an `extern` function may have them, an exported one has
   them for Duck callers only, and `start` names a function with no parameters.
+
+### Generated declarations
+
+`duck wit-bindgen` prints the declarations of interfaces of WIT, for a library
+to have: `duck wit-bindgen wasi:filesystem@0.3.0 > src/lib.duck`.
+
+- It is given interfaces, each named in full, or packages, for every
+  interface of one that a component may import: one that worlds only export,
+  as `wasi:cli/run` is, is declared only where it is named itself. Without
+  any, it declares what the world of the package imports. The WIT is that of
+  WASI 0.3, with that of the nearest `Duck.toml` and of what it depends on.
+- All that is named is one module. A `record` is a struct, a `variant` a
+  union and an `enum` an enum, each named as `DescriptorStat` is for
+  `descriptor-stat`. A resource is a struct that holds its `handle: i32`, so
+  that a `Descriptor` is taken for no other handle. `flags` are an integer,
+  with a constant for each, as `OPEN_FLAGS_CREATE` is. A type that only
+  names another, as `filesize` names `u64`, is that type.
+- A function is named as `get_arguments` is for `get-arguments`. One of a
+  resource has the resource's name first: `descriptor_open_at` is its
+  method, `tcp_socket_create` its static function, `file_new` its
+  constructor, and `descriptor_drop` drops a handle.
+- Two of a name are each named for their interface too, and for their
+  package where that still doesn't tell them apart: `stdout_write_via_stream`
+  and `stderr_write_via_stream`, `FilesystemTypesErrorCode`. A name that is a
+  word of Duck's has a `_` after it.
+- A function that takes or gives a stream or a future is followed by the
+  built-ins of each, named for it and for the number of the stream or
+  future: `stdout_write_via_stream_stream0_new`, `_read`, `_write`,
+  `_drop_readable` and `_drop_writable`, and the same of a `future1`. The
+  built-ins of `$root` that wait are of no interface, and are not generated.
+- Everything is `pub`, and has the documentation of the WIT as its comment.
+  A function that takes or gives a type Duck has none for yet is a comment
+  that says so. What a world exports is not generated.
+- Every function that a file declares is imported by the component, called
+  or not, so its world imports each of their interfaces.
 
 ### What crosses to the host
 
@@ -1027,15 +1077,17 @@ those as the Canonical ABI of the component model has them.
   while there are few enough: parameters of up to 16, and a result of one.
   More are passed in memory, laid out as Duck lays them out, by a pointer.
 - Nothing is a stack in memory, so what is passed in memory goes through the
-  return area: 128 bytes of the component's memory, placed with its literals
-  the first time anything needs them. A call of an import stores there the
+  return area: memory of the component's own, before its literals, as large
+  as the most that any function it declares passes. One that passes nothing
+  in memory has none. A call of an import stores there the
   parameters that are too many, the host writes its result there, and the
   call reads it into locals as it returns. An exported function stores its
   result there as it returns, which the host reads before it calls anything
   else. So nothing is kept there, and one area serves every call.
-- A function that passes more than the area holds is an error where it is
-  declared, which says how many bytes it passes. `return` under `[memory]`
-  in `Duck.toml` gives the area more. A library is checked with 128.
+- `return` under `[memory]` in `Duck.toml` says how large the area is
+  instead. A function that passes more than that is then an error where it
+  is declared, which says how many bytes it passes. The size is that of
+  what is declared, whether or not it is called.
 - The host allocates what it passes that holds a `list` or a `string`: the
   result of an import, the parameters of an export, and those of an export
   that are too many for wasm values. A component whose host does has
@@ -1204,6 +1256,52 @@ of a function that has the stream or future in its type, and named for it.
 - `[stream-drop-readable-N]`, `[future-drop-readable-N]` and the others drop
   a handle, which takes it.
 
+## Graphics
+
+`duck run` gives a program what draws, beside WASI 0.3: `wasi:webgpu` at
+`0.3.0-rc.2`, and the surface and the frame buffer of `wasi-gfx` at `0.2.0`,
+as the `wasi-gfx-runtime` of this repository implements them. Their WIT is
+always there, as that of WASI 0.3 is, so a world only names them.
+
+```wit
+package my:app;
+
+world app {
+    include wasi:cli/command@0.3.0;
+    // A surface, and WebGPU to draw on it with.
+    include wasi-gfx:surface/webgpu-imports@0.2.0;
+    // A surface, and its pixels to write.
+    include wasi-gfx:surface/frame-buffer-imports@0.2.0;
+}
+```
+
+- `duck wit-bindgen wasi:webgpu@0.3.0-rc.2 wasi-gfx:surface@0.2.0
+  wasi-gfx:frame-buffer@0.2.0` declares them, for a library to have. A
+  program that only computes on a GPU has `wasi:webgpu/imports@0.3.0-rc.2`
+  alone.
+- A surface is a window, made by its constructor. What happens to it is a
+  stream of each kind: `on-frame` about 60 times a second, `on-resize`, and
+  those of its pointer and its keys. Each is read as any stream is, by its
+  built-ins, and several are waited for at once by joining them to one set.
+- Its pixels are written through the context of `surface-frame-buffer`: the
+  buffer that `get-current-buffer` gives takes 4 bytes for each, by
+  `set-with-copy`, and `present` shows them where there are as many as the
+  window has by then.
+- WebGPU draws on it through the context of `surface-webgpu`, which
+  `configure` gives a device: `get-current-texture` is what a frame is
+  drawn to, as large as the window is by then, and `present` shows it.
+- A program with a surface runs as any does, and `duck run` ends when it
+  ends, with its status. A window that is asked to close ends each stream
+  of its surface, which is how the program is told: one that goes on is
+  ended, with 1, when its window is asked again. Where there is no display
+  to open a window on, it doesn't run.
+- What a list points to is aligned as its elements are, or the call traps:
+  a value that `&var` places is, and bytes of a `varray(u8)` that are cast
+  to another type may not be.
+- A handle is dropped by the function that drops it, as any is: a texture
+  and its view after `present`, each frame.
+- A `duck` built without its `gfx` feature gives none of this.
+
 ## Duck.toml
 
 `duck new <dir>` creates a component package, and `duck new --lib <dir>` a
@@ -1219,7 +1317,7 @@ world = "wasi:cli/command@0.3.0"  # optional: what it imports and exports
 [memory]                 # optional, as is each key; needs [component]
 max = "16MiB"            # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
 static = { start = "1KiB" }  # where literals go from, which is 0 without it
-return = "256B"          # the return area, which is 128 bytes without it
+return = "256B"          # the return area, which is as large as is needed without it
 
 [const]                  # optional
 fuel = 10000000000       # wasm instructions the constants of one item may run
@@ -1240,8 +1338,13 @@ xml = { git = "https://example.com/xml.git", tag = "v1.0" }  # or rev; no branch
   `wit` directory beside `Duck.toml`, and is named as it is there: `app`, or
   `my:pkg/app@0.1.0` in full. The packages that WIT uses are each a file or a
   directory of `wit/deps`. WASI 0.3 is always there to use and is never
-  among them.
-- A library has no world: it is built into the components that use it.
+  among them: a copy of one of its packages is an error.
+- A library has no world: it is built into the components that use it. The
+  WIT of the interfaces its `extern` blocks name is in its own `wit`
+  directory, and is there for every package that depends on it, which has
+  no copy to keep. Its world still says that the component imports them:
+  `import my:pkg/math@0.1.0;`. A package of WIT that two libraries have is
+  there once, and is an error if the two differ.
 - Memory has no `min`: it starts with the pages below `static.start`, those
   its literals take and those its constants grow it by. For one that starts
   larger, have a constant take the pages with `module.grow`.

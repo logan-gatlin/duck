@@ -286,6 +286,70 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn the_wit_a_library_needs_is_the_librarys_own() {
+        let dir = TempDir::new("wit");
+        let math =
+            "package my:pkg@0.1.0;\ninterface math {\n  add: func(a: s32, b: s32) -> s32;\n}\n";
+        let world = |imports: &str| {
+            format!(
+                "package my:app;\nworld app {{\n  include wasi:cli/command@0.3.0;\n{imports}}}\n"
+            )
+        };
+        dir.write(&[
+            (
+                "app/Duck.toml",
+                "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\nstart = \"main\"\n\
+                 world = \"app\"\n[dependencies]\nmath = { path = \"../math\" }\n",
+            ),
+            (
+                "app/main.duck",
+                "use math\nfn main():\n    let _ = math.sum(1, 2)\n",
+            ),
+            ("app/wit/app.wit", &world("  import my:pkg/math@0.1.0;\n")),
+            (
+                "math/Duck.toml",
+                "[library]\nentry = \"lib.duck\"\n[dependencies]\ndeep = { path = \"../deep\" }\n",
+            ),
+            (
+                "math/lib.duck",
+                "use deep\nextern \"my:pkg/math@0.1.0\":\n    fn add(a: i32, b: i32) -> i32\n\
+                 pub fn sum(a: i32, b: i32) -> i32:\n    return add(a, b) + deep.zero()\n",
+            ),
+            ("math/wit/math.wit", math),
+            ("deep/Duck.toml", "[library]\nentry = \"lib.duck\"\n"),
+            (
+                "deep/lib.duck",
+                "extern \"my:deep/base\":\n    pub fn zero() -> i32\n",
+            ),
+            (
+                "deep/wit/base.wit",
+                "package my:deep;\ninterface base {\n  zero: func() -> s32;\n}\n",
+            ),
+            // Another package that a library's WIT uses is beside it.
+            ("deep/wit/deps/math.wit", math),
+        ]);
+        let build = |dir: &TempDir| {
+            let root = dir.0.join("app");
+            let packages = resolve(&root, &Cache::new(dir.0.join("no-cache"))).unwrap();
+            let component = packages.root().manifest.component.as_ref().unwrap();
+            let settings = component.settings(crate::files::wit(&packages).unwrap());
+            let mut files = Files::new(&packages, root.join(&component.entry), settings).unwrap();
+            let built = duck_compiler::compile(&mut files);
+            built.map(|_| ()).map_err(|errors| errors[0].to_string())
+        };
+        // Only the world says that the component imports what its
+        // libraries do.
+        assert_eq!(
+            build(&dir).unwrap_err(),
+            "the world `app` doesn't import `my:deep/base`, which the WIT has: one that does \
+             has `import my:deep/base;`"
+        );
+        let both = world("  import my:pkg/math@0.1.0;\n  import my:deep/base;\n");
+        dir.write(&[("app/wit/app.wit", &both)]);
+        assert_eq!(build(&dir), Ok(()));
+    }
+
     /// Compiles the library of the package in `root`, giving each error as
     /// `path: message`, with the path relative to `root`.
     fn check(root: &Path) -> Result<(), Vec<String>> {

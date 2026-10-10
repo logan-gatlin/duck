@@ -288,7 +288,12 @@ module.exports = grammar({
 
     discard: _ => '_',
 
-    tuple_pattern: $ => seq('(', optional(commaSep2($._pattern)), ')'),
+    // A comma makes a tuple of one pattern too: `(a,)`.
+    tuple_pattern: $ => seq(
+      '(',
+      optional(choice(seq($._pattern, ','), commaSep2($._pattern))),
+      ')',
+    ),
 
     parenthesized_pattern: $ => seq('(', $._pattern, ')'),
 
@@ -462,7 +467,12 @@ module.exports = grammar({
 
     unit: _ => seq('(', ')'),
 
-    tuple: $ => seq('(', commaSep2($._expression), ')'),
+    // A comma makes a tuple of one element too: `(a,)`.
+    tuple: $ => seq(
+      '(',
+      choice(seq($._expression, ','), commaSep2($._expression)),
+      ')',
+    ),
 
     list: $ => seq('[', commaSep($._expression), ']'),
 

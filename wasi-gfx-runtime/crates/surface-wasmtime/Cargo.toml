@@ -1,0 +1,26 @@
+[package]
+name = "surface-wasmtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wasmtime host implementation of the wasi-gfx surface API"
+
+[features]
+default = []
+surface-webgpu = ["wasi-webgpu-wasmtime"]
+surface-frame-buffer = ["frame-buffer-wasmtime", "softbuffer"]
+
+[dependencies]
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+raw-window-handle.workspace = true
+async-broadcast.workspace = true
+oneshot.workspace = true
+winit = { workspace = true, optional = true }
+futures.workspace = true
+wasi-webgpu-wasmtime = { workspace = true, optional = true }
+frame-buffer-wasmtime = { workspace = true, optional = true }
+shared.workspace = true
+softbuffer = { workspace = true, optional = true }
+bytemuck = { workspace = true, features = ["extern_crate_std"] }

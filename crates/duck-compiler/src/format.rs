@@ -357,13 +357,17 @@ impl<'a> Formatter<'a> {
         let mut group = frame.group;
         group.close = close;
         group.trailing_comma = trailing_comma;
-        if group.opened.is_empty() && !group.trailing_comma {
+        // The comma of a tuple of one is what makes it one, and so is no
+        // comma that asks for a line each.
+        let single = trailing_comma && group.open == "(" && !group.list && group.items.len() == 1;
+        if group.opened.is_empty() && (!group.trailing_comma || single) {
             let items = group.items.iter().map(|item| match item.after.is_empty() {
                 true => item.flat.as_deref(),
                 false => None,
             });
             let items: Option<Vec<_>> = items.collect();
-            group.flat = items.map(|items| [group.open, &items.join(", "), close].concat());
+            let comma = if single { "," } else { "" };
+            group.flat = items.map(|items| [group.open, &items.join(", "), comma, close].concat());
         }
         self.item().push(Piece {
             spaced: frame.spaced,
@@ -1008,6 +1012,17 @@ mod tests {
     }
 
     #[test]
+    fn a_tuple_of_one_keeps_its_comma_on_its_line() {
+        let src = "let x = ( a , )\nlet (b,):tuple( i32 )=((1,),).0\nlet y = f((a,), (b))\n";
+        let expected = "let x = (a,)\nlet (b,): tuple(i32) = ((1,),).0\nlet y = f((a,), (b))\n";
+        assert_eq!(formatted(src), expected);
+        assert_eq!(formatted(expected), expected);
+        // It is broken as any brackets are where it is too long, and is a
+        // tuple still.
+        assert_eq!(within(12, "let x = (first,)\n"), "let x = (\n\tfirst,\n)\n");
+    }
+
+    #[test]
     fn a_trailing_comma_keeps_brackets_broken() {
         let src = "let x = f(a, g(b, c,), d)\n";
         let expected = "let x = f(\n\ta,\n\tg(\n\t\tb,\n\t\tc,\n\t),\n\td,\n)\n";
@@ -1243,7 +1258,7 @@ mod tests {
             [Error::Lex(e)] if e.kind == LexErrorKind::UnterminatedString
         ));
 
-        let errors = format("fn f()\nlet x = 1 +\nlet y = (2,)\n").unwrap_err();
+        let errors = format("fn f()\nlet x = 1 +\n").unwrap_err();
         let kinds: Vec<_> = errors
             .iter()
             .map(|error| match error {
@@ -1256,7 +1271,6 @@ mod tests {
             [
                 Some(ParseErrorKind::MissingFnBody),
                 Some(ParseErrorKind::Expected { .. }),
-                Some(ParseErrorKind::OneElementTuple),
             ]
         ));
     }

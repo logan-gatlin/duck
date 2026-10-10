@@ -13,11 +13,19 @@
 //! and the call reads it into locals before anything else runs. An export
 //! stores its result there as it returns, which the host reads before it
 //! calls anything else of the module. Nothing else is ever there, so it is
-//! only as large as the most that one function passes through it.
+//! as large as the most that one function passes through it, which every
+//! signature says before anything is lowered: it is placed then, before
+//! the literals. The [`Settings`] may say how large it is instead, and then
+//! a function that passes more is an error.
+//!
+//! [`Settings`]: crate::file::Settings
 
 use crate::ir::{self, Expr, FuncId, Stmt, ValType};
+use crate::load::Program;
 
-use super::{Body, Checker, FuncSig, Place, Slots, Ty, Value, exprs, is_simple, scalar};
+use super::{
+    Body, Checker, FuncSig, Item, Place, Slots, Ty, Value, exprs, fn_decls, is_simple, scalar,
+};
 
 /// The most wasm values that the parameters of a function are, before they
 /// are passed in memory.
@@ -26,11 +34,6 @@ const MAX_FLAT_PARAMS: usize = 16;
 /// The most wasm values that the result of a function is, before it is
 /// passed in memory.
 const MAX_FLAT_RESULTS: usize = 1;
-
-/// The bytes of the return area where the [`Settings`] give no size.
-///
-/// [`Settings`]: crate::file::Settings
-pub const DEFAULT_RETURN_AREA: u32 = 128;
 
 /// What the return area is aligned to: the most that any type is.
 const RETURN_AREA_ALIGN: u32 = 8;
@@ -122,15 +125,37 @@ impl Checker {
         (params, results)
     }
 
-    /// The address of the return area, which is given memory the first time
-    /// anything is passed through it.
-    fn return_area(&mut self) -> u64 {
-        if let Some(area) = self.return_area {
-            return area;
+    /// Gives the return area memory, if any function of `program` passes
+    /// anything through it: as much as `size`, or as the most that one
+    /// passes where that is `None`. Every signature is resolved by now, and
+    /// nothing is lowered yet.
+    pub(super) fn place_return_area(&mut self, program: &Program, size: Option<u32>) {
+        let imports = (0..self.import_count).map(|id| self.import_passing(FuncId(id)).size);
+        // What a component may export: a `pub` function of the entry
+        // module, one that a `pub use` there names, and one of a block of
+        // an interface. A library exports nothing through it.
+        let entry = fn_decls(program).enumerate().filter(|(_, (item, decl))| {
+            item.span.file == self.entry && (item.is_pub || decl.interface.is_some())
+        });
+        let entry = entry.map(|(index, _)| self.import_count as usize + index);
+        let used = self.reexports.iter().filter_map(|(item, _)| match item {
+            Item::Func(id) => Some(id.0 as usize),
+            _ => None,
+        });
+        let exports = entry.chain(used).filter(|_| !self.world.is_library());
+        let exports = exports.map(|id| self.passing(&self.funcs[id], false).size);
+        let passed = imports.chain(exports).max().unwrap_or(0);
+        self.return_area_size = size.unwrap_or(passed);
+        if passed > 0 {
+            let area = self.reserve_data(self.return_area_size.into(), RETURN_AREA_ALIGN);
+            self.return_area = Some(area);
         }
-        let area = self.reserve_data(self.return_area_size.into(), RETURN_AREA_ALIGN);
-        self.return_area = Some(area);
-        area
+    }
+
+    /// The address of the return area.
+    fn return_area(&self) -> u64 {
+        self.return_area
+            .expect("it is placed where anything passes through it")
     }
 
     /// Lowers function `id`, which the world exports as `export`: one that

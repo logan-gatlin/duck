@@ -1,8 +1,10 @@
 //! The WIT a component is made of: the world that says what it imports and
 //! exports, and the packages that world is written in.
 //!
-//! WASI 0.3 is always among the packages. A package adds its own, and those
-//! they use, in [`Settings::wit`].
+//! WASI 0.3 is always among the packages, as with the `gfx` feature are
+//! `wasi:webgpu` and the surface and the frame buffer of `wasi-gfx`: what
+//! `duck run` gives a program. A package adds its own, and those they use,
+//! in [`Settings::wit`].
 
 use std::fmt;
 use std::sync::LazyLock;
@@ -42,6 +44,19 @@ const WASI: [(&str, &str); 5] = [
     ("wasi/filesystem.wit", include_str!("../wit/filesystem.wit")),
     ("wasi/sockets.wit", include_str!("../wit/sockets.wit")),
     ("wasi/cli.wit", include_str!("../wit/cli.wit")),
+];
+
+/// The WIT of what the `wasi-gfx-runtime` that `duck run` depends on gives a
+/// program, each package after those it uses. The packages are copied from
+/// `wit/deps` of its `surface-wasmtime`, and change when it does.
+#[cfg(feature = "gfx")]
+const GFX: [(&str, &str); 3] = [
+    ("gfx/webgpu.wit", include_str!("../wit/gfx/webgpu.wit")),
+    (
+        "gfx/frame-buffer.wit",
+        include_str!("../wit/gfx/frame-buffer.wit"),
+    ),
+    ("gfx/surface.wit", include_str!("../wit/gfx/surface.wit")),
 ];
 
 /// Why there is no world to make a component of.
@@ -105,6 +120,9 @@ pub enum WitTy {
     Char,
     String,
     List(Box<WitTy>),
+    /// What its keys are and what its values are: it is passed as a list
+    /// of each key with its value.
+    Map(Box<WitTy>, Box<WitTy>),
     Tuple(Vec<WitTy>),
     /// The types of its fields, in order.
     Record {
@@ -148,19 +166,26 @@ pub struct WitFunc {
 /// Why a function isn't there to import.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportError {
-    /// No such interface is imported, but these are.
+    /// The WIT has no such interface, but these are there to import.
     Interface { imported: Vec<String> },
+    /// The WIT has the interface, and the world, as it is named, doesn't
+    /// import it.
+    Unimported { world: String },
     /// The interface, or the world itself, has no such function.
     Function,
 }
 
-/// WASI 0.3, resolved once, and the package of it that has
+/// What is always there, resolved once, and the package of it that has
 /// [`COMMAND`].
 static BASE: LazyLock<(Resolve, PackageId)> = LazyLock::new(|| {
     let mut resolve = Resolve::default();
     let mut main = None;
     for (path, contents) in WASI {
         main = Some(resolve.push_str(path, contents).expect("WASI is valid"));
+    }
+    #[cfg(feature = "gfx")]
+    for (path, contents) in GFX {
+        resolve.push_str(path, contents).expect("wasi-gfx is valid");
     }
     (resolve, main.expect("WASI has packages"))
 });
@@ -201,6 +226,7 @@ impl fmt::Display for WitTy {
             Self::Char => write!(f, "char"),
             Self::String => write!(f, "string"),
             Self::List(elem) => write!(f, "list<{elem}>"),
+            Self::Map(key, value) => write!(f, "map<{key}, {value}>"),
             Self::Tuple(elems) => {
                 let elems: Vec<_> = elems.iter().map(ToString::to_string).collect();
                 write!(f, "tuple<{}>", elems.join(", "))
@@ -234,15 +260,42 @@ impl World {
     /// world it names.
     pub fn load(settings: &Settings) -> Result<Self, WorldError> {
         let (mut resolve, mut main) = BASE.clone();
-        if !settings.wit.package.is_empty() {
-            let package = group(&settings.wit.package)?;
-            let deps = settings.wit.deps.iter().map(|dep| group(dep));
-            let deps = deps.collect::<Result<_, _>>()?;
-            let pushed = resolve.push_groups(package, deps);
+        let wit = &settings.wit;
+        let package = Some(&wit.package).filter(|files| !files.is_empty());
+        // The package with the worlds, if there is one, and then those it
+        // uses, each once however many libraries have it.
+        let mut groups: Vec<(&Vec<WitFile>, UnresolvedPackageGroup)> = Vec::new();
+        for files in package.into_iter().chain(&wit.deps) {
+            let group = group(files)?;
+            let name = &group.main.name;
+            let path = files.first().map_or("", |file| file.path.as_str());
+            if resolve.package_names.contains_key(name) {
+                return Err(WorldError::Wit(format!(
+                    "`{name}` is always there, as `duck run` gives it: `{path}` has it again"
+                )));
+            }
+            match groups.iter().find(|(_, other)| other.main.name == *name) {
+                Some((first, _)) if same(first, files) => {}
+                Some((first, _)) => {
+                    let first = first.first().map_or("", |file| file.path.as_str());
+                    return Err(WorldError::Wit(format!(
+                        "`{name}` is in `{first}` and in `{path}`, which differ"
+                    )));
+                }
+                None => groups.push((files, group)),
+            }
+        }
+        let mut groups = groups.into_iter().map(|(_, group)| group);
+        if let Some(first) = groups.next() {
+            let pushed = resolve.push_groups(first, groups.collect());
             // Where in the WIT the error is, which only the files it has
             // read say.
             let located = |e: wit_parser::ResolveError| e.render(&resolve.source_map);
-            main = pushed.map_err(|e| WorldError::Wit(located(e)))?;
+            let pushed = pushed.map_err(|e| WorldError::Wit(located(e)))?;
+            // Only a package of its own has the worlds of a package.
+            if package.is_some() {
+                main = pushed;
+            }
         }
         let world = match &settings.world {
             Some(name) => {
@@ -259,6 +312,16 @@ impl World {
             world,
             name: settings.world.clone(),
         })
+    }
+
+    /// The packages of the WIT, resolved.
+    pub(crate) fn resolve(&self) -> &Resolve {
+        &self.resolve
+    }
+
+    /// What the world imports. `None` for a library, which has no world.
+    pub(crate) fn imports(&self) -> Option<impl Iterator<Item = &WorldItem>> {
+        Some(self.resolve.worlds[self.world?].imports.values())
     }
 
     /// Whether there is no world, as there is none for a library.
@@ -313,8 +376,16 @@ impl World {
                 .ok_or(ImportError::Function);
         };
         let Some(id) = self.imported_interface(interface) else {
-            return Err(ImportError::Interface {
-                imported: self.imported_interfaces(),
+            let mut interfaces = self.resolve.interfaces.iter();
+            let known =
+                interfaces.any(|(id, _)| self.resolve.id_of(id).as_deref() == Some(interface));
+            return Err(match (&self.name, known) {
+                (Some(world), true) => ImportError::Unimported {
+                    world: world.clone(),
+                },
+                _ => ImportError::Interface {
+                    imported: self.imported_interfaces(),
+                },
             });
         };
         let function = self.resolve.interfaces[id].functions.get(name);
@@ -394,7 +465,7 @@ impl World {
     }
 
     /// The shape of `ty`.
-    fn ty(&self, ty: &Type) -> WitTy {
+    pub(crate) fn ty(&self, ty: &Type) -> WitTy {
         let id = match ty {
             Type::Bool => return WitTy::Bool,
             Type::S8 => return WitTy::S8,
@@ -476,9 +547,7 @@ impl World {
             TypeDefKind::Resource => WitTy::Handle(name()),
             TypeDefKind::Stream(elem) => WitTy::Handle(format!("stream<{}>", of(elem))),
             TypeDefKind::Future(value) => WitTy::Handle(format!("future<{}>", of(value))),
-            TypeDefKind::Map(key, value) => {
-                WitTy::Unsupported(format!("map<{}, {}>", self.ty(key), self.ty(value)))
-            }
+            TypeDefKind::Map(key, value) => WitTy::Map(boxed(key), boxed(value)),
             TypeDefKind::FixedLengthList(elem, len) => {
                 WitTy::Unsupported(format!("list<{}, {len}>", self.ty(elem)))
             }
@@ -518,6 +587,17 @@ impl World {
                 causes[causes.len().saturating_sub(2)..].join(": ")
             })
     }
+}
+
+/// Whether the files `a` and `b` are the same package: they hold the same
+/// text, wherever they are.
+fn same(a: &[WitFile], b: &[WitFile]) -> bool {
+    let contents = |files: &[WitFile]| {
+        let mut contents: Vec<_> = files.iter().map(|file| file.contents.as_str()).collect();
+        contents.sort_unstable();
+        contents.concat()
+    };
+    contents(a) == contents(b)
 }
 
 /// The WIT package that `files` are, before it is resolved.
@@ -574,6 +654,54 @@ mod tests {
         for (name, expected) in names {
             assert_eq!(kebab(name).as_deref(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn a_package_is_in_the_wit_once() {
+        let file = |path: &str, contents: &str| WitFile {
+            path: path.to_string(),
+            contents: contents.to_string(),
+        };
+        let math =
+            "package my:pkg@0.1.0;\ninterface math {\n  add: func(a: s32, b: s32) -> s32;\n}\n";
+        let load = |deps: Vec<Vec<WitFile>>| {
+            let wit = crate::file::Wit {
+                package: Vec::new(),
+                deps,
+            };
+            World::load(&Settings {
+                wit,
+                ..Settings::default()
+            })
+        };
+        let shown = |loaded: Result<World, WorldError>| loaded.unwrap_err().to_string();
+        // What the libraries of a package have is there without any WIT of
+        // its own.
+        let world = load(vec![vec![file("a/wit/math.wit", math)]]).unwrap();
+        assert!(world.import(Some("my:pkg/math@0.1.0"), "add").is_ok());
+        // Two that have the same package have it once.
+        let twice = vec![
+            vec![file("a/wit/math.wit", math)],
+            vec![file("b/wit/deps/math.wit", math)],
+        ];
+        assert!(load(twice).is_ok());
+        let other = math.replace("s32, b: s32", "s64, b: s64");
+        let differing = vec![
+            vec![file("a/wit/math.wit", math)],
+            vec![file("b/wit/deps/math.wit", &other)],
+        ];
+        assert_eq!(
+            shown(load(differing)),
+            "cannot read the WIT of the package: `my:pkg@0.1.0` is in `a/wit/math.wit` and in \
+             `b/wit/deps/math.wit`, which differ"
+        );
+        // WASI 0.3 is always there, so no package has it again.
+        let (_, random) = WASI[1];
+        assert_eq!(
+            shown(load(vec![vec![file("a/wit/deps/random.wit", random)]])),
+            "cannot read the WIT of the package: `wasi:random@0.3.0` is always there, as \
+             `duck run` gives it: `a/wit/deps/random.wit` has it again"
+        );
     }
 
     #[test]

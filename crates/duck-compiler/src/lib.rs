@@ -7,6 +7,7 @@ use crate::parse::ParseError;
 use crate::ty::{InstanceSite, TypeError, TypeErrorKind};
 use crate::world::{World, WorldError};
 
+pub mod bindgen;
 pub mod emit;
 mod eval;
 pub mod file;

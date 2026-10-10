@@ -1,0 +1,11 @@
+[package]
+name = "frame-buffer-wasmtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wasmtime host implementation of the wasi-gfx frame-buffer API"
+
+[dependencies]
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true

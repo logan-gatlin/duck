@@ -705,7 +705,7 @@ impl Project {
         };
         let manifest = &packages.root().manifest;
         // WIT that can't be read is none, which the build says.
-        let wit = files::wit(&self.root).unwrap_or_default();
+        let wit = files::wit(packages).unwrap_or_default();
         let component = manifest.component.as_ref();
         let module = component.map(|component| (&component.entry, component.settings(wit.clone())));
         let library = manifest.library.as_ref();

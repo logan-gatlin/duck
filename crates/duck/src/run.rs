@@ -1,4 +1,5 @@
-//! `duck run`: runs a component in Wasmtime, which gives it WASI 0.3.
+//! `duck run`: runs a component in Wasmtime, which gives it WASI 0.3, and
+//! with the `gfx` feature what draws: see [`gfx`].
 //!
 //! The component is one of a world that exports `wasi:cli/run`, as
 //! `wasi:cli/command` does, and its `run` is what runs: it calls the start
@@ -13,6 +14,9 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store, Trap, WasmBacktrace};
 use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+#[cfg(feature = "gfx")]
+mod gfx;
 
 /// The directories a program is given, each to read and write under the
 /// path it has here: the working directory, which is the first, and the
@@ -30,12 +34,17 @@ pub enum Error {
     /// A trap, with the name of each function that was running, innermost
     /// first.
     Trap { message: String, stack: Vec<String> },
+    /// A program that has a surface, with no display to open a window on.
+    #[cfg(feature = "gfx")]
+    NoDisplay,
 }
 
-/// What the host functions of WASI keep for one program.
+/// What the host functions keep for one program.
 struct Host {
     ctx: WasiCtx,
     table: ResourceTable,
+    #[cfg(feature = "gfx")]
+    gfx: gfx::Gfx,
 }
 
 impl fmt::Display for Error {
@@ -53,11 +62,28 @@ impl fmt::Display for Error {
                 }
                 Ok(())
             }
+            #[cfg(feature = "gfx")]
+            Self::NoDisplay => write!(
+                f,
+                "the program has a surface, and there is no display to open a window on"
+            ),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl Host {
+    /// What a program is given `ctx` keeps, with nothing of its own yet.
+    fn new(ctx: WasiCtx, #[cfg(feature = "gfx")] gfx: gfx::Gfx) -> Self {
+        Self {
+            ctx,
+            table: ResourceTable::new(),
+            #[cfg(feature = "gfx")]
+            gfx,
+        }
+    }
+}
 
 impl WasiView for Host {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -96,23 +122,45 @@ fn context(args: &[String]) -> Result<WasiCtxBuilder, Error> {
     Ok(ctx)
 }
 
-/// Calls the `run` of `component`, giving its imports `ctx`. Returns the
-/// status the program exits with.
+/// Runs `component`, giving its imports `ctx`. Returns the status the
+/// program exits with. One that may open a window takes this thread for the
+/// event loop of windows, and ends the process when it ends: see [`gfx`].
 fn execute(component: &[u8], ctx: WasiCtx) -> Result<u8, Error> {
-    let invalid = |e: wasmtime::Error| Error::Invalid(format!("{e:#}"));
     let engine = Engine::default();
     let component = Component::new(&engine, component).map_err(invalid)?;
-    let mut linker = Linker::new(&engine);
-    wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(invalid)?;
-    let host = Host {
+    let linker = linker(&engine)?;
+    #[cfg(feature = "gfx")]
+    if gfx::opens_windows(&component, &engine) {
+        return gfx::run_windowed(engine, component, linker, ctx);
+    }
+    let host = Host::new(
         ctx,
-        table: ResourceTable::new(),
-    };
-    let mut store = Store::new(&engine, host);
+        #[cfg(feature = "gfx")]
+        gfx::Gfx::default(),
+    );
+    start(&mut Store::new(&engine, host), &component, &linker)
+}
+
+/// Everything a program may import.
+fn linker(engine: &Engine) -> Result<Linker<Host>, Error> {
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(invalid)?;
+    #[cfg(feature = "gfx")]
+    gfx::add_to_linker(&mut linker).map_err(invalid)?;
+    Ok(linker)
+}
+
+/// Calls the `run` of `component` in `store`, with the imports of `linker`.
+/// Returns the status the program exits with.
+fn start(
+    store: &mut Store<Host>,
+    component: &Component,
+    linker: &Linker<Host>,
+) -> Result<u8, Error> {
     // The calls are async so that the program may block, and are polled by
     // the Tokio runtime that `wasmtime-wasi` keeps, which its imports need.
     let returned = wasmtime_wasi::runtime::in_tokio(async {
-        let command = Command::instantiate_async(&mut store, &component, &linker);
+        let command = Command::instantiate_async(&mut *store, component, linker);
         let command = command.await.map_err(invalid)?;
         let run = async |store: &_| command.wasi_cli_run().call_run(store).await;
         Ok(store.run_concurrent(run).await)
@@ -122,6 +170,11 @@ fn execute(component: &[u8], ctx: WasiCtx) -> Result<u8, Error> {
         Ok(Ok(Err(()))) => Ok(1),
         Ok(Err(e)) | Err(e) => stopped(e),
     }
+}
+
+/// Why Wasmtime can't compile or instantiate a component.
+fn invalid(error: wasmtime::Error) -> Error {
+    Error::Invalid(format!("{error:#}"))
 }
 
 /// The status of a program that `error` stopped, if it asked to exit.
@@ -313,6 +366,160 @@ fn main():
     }
 
     #[test]
+    fn what_is_generated_for_wasi_is_what_a_program_imports() {
+        // Every function and built-in that is generated for the package is
+        // imported, so each is what Wasmtime has for it.
+        let names = ["wasi:cli@0.3.0".to_string()];
+        let bindings = duck_compiler::bindgen::bindgen(&program(), &names).unwrap();
+        let src = r#"
+extern "$root":
+    fn set_new() -> i32 = "[waitable-set-new]"
+    fn join(waitable: i32, set: i32) = "[waitable-join]"
+    fn wait(set: i32, event: &var tuple(i32, i32)) -> i32 = "[waitable-set-wait]"
+    fn set_drop(set: i32) = "[waitable-set-drop]"
+
+let event = &var (0, 0)
+let written = &var result(tuple(), ErrorCode).ok(())
+let newline = "\n"
+var heap: uint = 0
+
+pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+    if heap == 0:
+        heap = module.grow(1) as uint * module.page_size
+    let at = (heap + align - 1) / align * align
+    heap = at + new_size
+    module.copy(at as! &var u8, old, old_size)
+    return at as! &var u8
+
+fn settle(waitable: i32, code: i32) -> i32:
+    if code != -1:
+        return code
+    let set = set_new()
+    join(waitable, set)
+    let _ = wait(set, event)
+    join(waitable, 0)
+    set_drop(set)
+    return event.*.1
+
+fn main():
+    let ends = stdout_write_via_stream_stream0_new()
+    let stream = (ends >> 32) as i32
+    let future = stdout_write_via_stream(ends as i32)
+    for argument in get_arguments():
+        let _ = settle(stream, stdout_write_via_stream_stream0_write(stream, argument))
+    let _ = settle(stream, stdout_write_via_stream_stream0_write(stream, newline))
+    stdout_write_via_stream_stream0_drop_writable(stream)
+    let _ = settle(future, stdout_write_via_stream_future1_read(future, written))
+    stdout_write_via_stream_future1_drop_readable(future)
+    match written.*:
+        .ok(_):
+            exit_with_code(7)
+        .err(_):
+            exit_with_code(1)
+"#;
+        let component = compile(&format!("{bindings}{src}"), program()).unwrap();
+        let args = ["generated", " bindings"].map(str::to_string);
+        let stdout = MemoryOutputPipe::new(1 << 16);
+        let ctx = context(&args).unwrap().stdout(stdout.clone()).build();
+        assert_eq!(execute(&component, ctx), Ok(7));
+        assert_eq!(stdout.contents(), "generated bindings\n");
+    }
+
+    /// What allocates for the host, and a `main` that does nothing.
+    #[cfg(feature = "gfx")]
+    const IDLE: &str = r#"
+var heap: uint = 0
+
+pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+    if heap == 0:
+        heap = module.grow(1) as uint * module.page_size
+    let at = (heap + align - 1) / align * align
+    heap = at + new_size
+    module.copy(at as! &var u8, old, old_size)
+    return at as! &var u8
+"#;
+
+    /// How a program that draws is compiled: as one of a world that
+    /// imports what `includes` name beside what a program does.
+    #[cfg(feature = "gfx")]
+    fn drawing(includes: &[&str]) -> Settings {
+        let includes: String = includes
+            .iter()
+            .map(|i| format!("  include {i};\n"))
+            .collect();
+        let world = format!(
+            "package my:app;\nworld app {{\n  include wasi:cli/command@0.3.0;\n{includes}}}\n"
+        );
+        Settings {
+            world: Some("app".to_string()),
+            wit: Wit {
+                package: vec![WitFile {
+                    path: "wit/app.wit".to_string(),
+                    contents: world,
+                }],
+                deps: Vec::new(),
+            },
+            ..program()
+        }
+    }
+
+    #[cfg(feature = "gfx")]
+    #[test]
+    fn what_is_generated_to_draw_with_is_what_a_program_is_given() {
+        // Every function and built-in that is generated for the three
+        // packages is imported, and each is what the host has for it.
+        let packages = [
+            "wasi:webgpu@0.3.0-rc.2",
+            "wasi-gfx:frame-buffer@0.2.0",
+            "wasi-gfx:surface@0.2.0",
+        ];
+        let bindings = duck_compiler::bindgen::bindgen(&program(), &packages.map(str::to_string));
+        let src = format!("{}{IDLE}\nfn main():\n    pass\n", bindings.unwrap());
+        let worlds = [
+            "wasi:webgpu/imports@0.3.0-rc.2",
+            "wasi-gfx:surface/webgpu-imports@0.2.0",
+            "wasi-gfx:surface/frame-buffer-imports@0.2.0",
+        ];
+        let component = compile(&src, drawing(&worlds)).unwrap();
+        let engine = Engine::default();
+        let component = Component::new(&engine, component).unwrap();
+        let linker = linker(&engine).unwrap();
+        linker.instantiate_pre(&component).unwrap();
+        // One that has a surface opens a window, so the event loop of
+        // those is what the thread it starts on runs.
+        assert!(gfx::opens_windows(&component, &engine));
+    }
+
+    #[cfg(feature = "gfx")]
+    #[test]
+    fn a_program_that_only_computes_runs_where_it_starts() {
+        let names = ["wasi:webgpu@0.3.0-rc.2".to_string()];
+        let bindings = duck_compiler::bindgen::bindgen(&program(), &names).unwrap();
+        // Whether there is an adapter is the machine's to say.
+        let main = r#"
+extern "wasi:cli/exit@0.3.0":
+    fn exit_with_code(status: u8)
+
+fn main():
+    let gpu = get_gpu()
+    match gpu_request_adapter(gpu, .none):
+        .some(adapter):
+            gpu_adapter_drop(adapter)
+        .none:
+            pass
+    gpu_drop(gpu)
+    exit_with_code(9)
+"#;
+        let src = format!("{bindings}{IDLE}{main}");
+        let component = compile(&src, drawing(&["wasi:webgpu/imports@0.3.0-rc.2"])).unwrap();
+        let engine = Engine::default();
+        let compiled = Component::new(&engine, &component).unwrap();
+        assert!(!gfx::opens_windows(&compiled, &engine));
+        let ctx = context(&[]).unwrap().build();
+        assert_eq!(execute(&component, ctx), Ok(9));
+    }
+
+    #[test]
     fn a_program_exits_with_its_status() {
         let coded = r#"
 extern "wasi:cli/exit@0.3.0":
@@ -441,6 +648,8 @@ interface math {
     divide: func(a: s32, b: s32) -> tuple<s32, s32>;
     total: func(w: wide, scale: s64) -> s64;
     shout: func(text: string) -> string;
+    lengths: func(words: list<string>) -> map<string, u32>;
+    wrap: func(n: s32) -> tuple<s32>;
 }
 
 interface greeter {
@@ -450,6 +659,9 @@ interface greeter {
     halves: func(n: s32) -> tuple<s32, s32>;
     greet: func(name: string) -> string;
     spread: func(w: wide) -> s64;
+    longest: func(lengths: map<string, u32>) -> u32;
+    measure: func(words: list<string>) -> map<string, u32>;
+    rewrap: func(one: tuple<s32>) -> tuple<s32>;
 }
 
 world app {
@@ -469,6 +681,8 @@ extern "my:pkg/math@0.1.0":
     fn divide(a: i32, b: i32) -> tuple(i32, i32)
     fn total(w: Wide, scale: i64) -> i64
     fn shout(text: string) -> string
+    fn lengths(words: array(string)) -> array(tuple(string, u32))
+    fn wrap(n: i32) -> tuple(i32)
 
 pub "my:pkg/greeter@0.1.0":
     fn triple_it(n: i32) -> i32:
@@ -480,6 +694,18 @@ pub "my:pkg/greeter@0.1.0":
     fn spread(w: Wide) -> i64:
         # What `total` takes is in memory before `divide` writes there.
         return total(w, 2) + divide(7, 2).1 as i64
+    fn longest(lengths: array(tuple(string, u32))) -> u32:
+        var most: u32 = 0
+        for entry in lengths:
+            if entry.1 > most:
+                most = entry.1
+        return most
+    fn measure(words: array(string)) -> array(tuple(string, u32)):
+        return lengths(words)
+    fn rewrap(one: i32) -> tuple(i32):
+        # What a tuple of one holds stands for it.
+        let (wrapped,) = wrap(one)
+        return (wrapped * 2,)
 
 pub fn double(n: i32) -> i32:
     return add(n, n)
@@ -507,25 +733,27 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
                 package: vec![file.clone()],
                 deps: Vec::new(),
             },
-            // What `total` takes is more than the 128 bytes there are
-            // without it.
-            return_area: Some(144),
             ..Settings::default()
         };
+        // What `total` takes is 144 bytes, which the return area holds
+        // unless it is said to hold fewer.
         let small = Settings {
-            return_area: None,
+            return_area: Some(128),
             ..settings("app")
         };
         assert_eq!(
             compile(src, small).unwrap_err(),
-            "this passes 144 bytes in memory, and the return area holds 128: `return` under \
-             `[memory]` in Duck.toml gives it more"
+            "this passes 144 bytes in memory, and `return` under `[memory]` in Duck.toml gives \
+             the return area 128: without it the area holds as many as are passed"
         );
         let component = compile(src, settings("app")).unwrap();
 
         // Its imports are the host's to give, and its exports the host's
         // to call, each passing what it takes and gives as the world has it.
-        let engine = Engine::default();
+        // A `map` is one that Wasmtime has only where it is asked for.
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model_map(true);
+        let engine = Engine::new(&config).unwrap();
         let component = Component::new(&engine, component).unwrap();
         let mut linker = Linker::<()>::new(&engine);
         let mut math = linker.instance("my:pkg/math@0.1.0").unwrap();
@@ -554,6 +782,20 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
         let shout =
             |_: wasmtime::StoreContextMut<()>, (text,): (String,)| Ok((text.to_uppercase(),));
         math.func_wrap("shout", shout).unwrap();
+        let lengths = move |_: wasmtime::StoreContextMut<()>, _, given: &[Val], out: &mut [Val]| {
+            let Val::List(words) = &given[0] else {
+                panic!("{given:?}");
+            };
+            let length = |word: &Val| match word {
+                Val::String(word) => (Val::String(word.clone()), Val::U32(word.len() as u32)),
+                other => panic!("{other:?}"),
+            };
+            out[0] = Val::Map(words.iter().map(length).collect());
+            Ok(())
+        };
+        math.func_new("lengths", lengths).unwrap();
+        let wrap = |_: wasmtime::StoreContextMut<()>, (n,): (i32,)| Ok(((n + 1,),));
+        math.func_wrap("wrap", wrap).unwrap();
         let mut store = Store::new(&engine, ());
         let instance = linker.instantiate(&mut store, &component).unwrap();
         let double = instance.get_typed_func::<(i32,), (i32,)>(&mut store, "double");
@@ -579,6 +821,17 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
         ]);
         // The numbers to 17 add to 153, and 7 leaves 1 when halved.
         assert_eq!(call("spread", wide), Val::S64(307));
+        // A map is each key with its value, as a list of them is.
+        let word = |word: &str| Val::String(word.to_string());
+        let entry = |key: &str, value: u32| (word(key), Val::U32(value));
+        let map = Val::Map(vec![entry("duck", 4), entry("goose", 5), entry("a", 1)]);
+        assert_eq!(call("longest", map), Val::U32(5));
+        let measured = Val::Map(vec![entry("duck", 4), entry("goose", 5)]);
+        let words = Val::List(vec![word("duck"), word("goose")]);
+        assert_eq!(call("measure", words), measured);
+        // A tuple of one is what it holds, with nothing beside it.
+        let one = |n: i32| Val::Tuple(vec![Val::S32(n)]);
+        assert_eq!(call("rewrap", one(4)), one(10));
 
         // A world is named in full where it is another package's.
         assert!(compile(src, settings("my:pkg/app@0.1.0")).is_ok());
@@ -613,8 +866,12 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
     #[test]
     fn the_working_directory_and_the_root_are_open() {
         let src = r#"
+# A handle of a directory or a file, which is no other `i32`.
+struct Descriptor:
+    handle: i32
+
 extern "wasi:filesystem/preopens@0.3.0":
-    fn get_directories() -> array(tuple(i32, string))
+    fn get_directories() -> array(tuple(Descriptor, string))
 
 union Failure:
     access
@@ -657,12 +914,12 @@ union Failure:
 
 extern "wasi:filesystem/types@0.3.0":
     fn open_at(
-        dir: i32,
+        dir: Descriptor,
         path_flags: u8,
         path: string,
         open_flags: u8,
         flags: u8,
-    ) -> result(i32, Failure) = "[method]descriptor.open-at"
+    ) -> result(Descriptor, Failure) = "[method]descriptor.open-at"
 
 let manifest = "Cargo.toml"
 let found = "found"

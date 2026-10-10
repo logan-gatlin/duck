@@ -58,8 +58,8 @@ pub(super) enum Arity {
     Plain,
     /// A list of exactly this many.
     Exactly(usize),
-    /// A list that is empty or has at least this many.
-    NoneOrAtLeast(usize),
+    /// A list of any number.
+    Any,
 }
 
 /// A field of a struct, by position.
@@ -88,13 +88,6 @@ impl Arity {
                 Some(TypeErrorKind::TypeArgCount {
                     name,
                     expected,
-                    found,
-                })
-            }
-            (Self::NoneOrAtLeast(at_least), Some(found)) if found != 0 && found < at_least => {
-                Some(TypeErrorKind::TooFewTypeArgs {
-                    name,
-                    at_least,
                     found,
                 })
             }
@@ -653,7 +646,7 @@ impl Checker {
         match self.item(name) {
             _ if name == ARRAY || name == VARRAY || name == OPTION => Some(Arity::Exactly(1)),
             _ if name == RESULT => Some(Arity::Exactly(2)),
-            _ if name == TUPLE => Some(Arity::NoneOrAtLeast(2)),
+            _ if name == TUPLE => Some(Arity::Any),
             Some(item @ (Item::Struct(_) | Item::Enum(_))) => self.item_arity(item),
             _ if is_builtin_type(name) => Some(Arity::Plain),
             _ => None,

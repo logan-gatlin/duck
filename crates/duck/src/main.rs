@@ -14,7 +14,7 @@ use duck::files::{self, Files};
 use duck::manifest::{MANIFEST, Manifest};
 use duck::package::Packages;
 use duck::{git, package};
-use duck_compiler::file::FileManager;
+use duck_compiler::file::{FileManager, Settings};
 use duck_compiler::world::{RUN_INTERFACE, World};
 
 #[derive(Parser)]
@@ -31,7 +31,8 @@ enum Command {
     Build,
     /// Compile the component of the package described by the nearest
     /// Duck.toml and run it in Wasmtime, which gives it WASI 0.3 and with it
-    /// the files and the network of this machine
+    /// the files and the network of this machine, and what draws: windows,
+    /// their pixels and WebGPU
     Run {
         /// The arguments the program is given
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -56,6 +57,16 @@ enum Command {
         /// Create a library for other packages to use, not a component
         #[arg(long)]
         lib: bool,
+    },
+    /// Print the declarations in duck of interfaces of WIT, for a library to
+    /// have: of WASI 0.3, or of the WIT of the package described by the
+    /// nearest Duck.toml and of those it depends on
+    WitBindgen {
+        /// The interfaces to declare, each named in full as
+        /// `wasi:cli/stdout@0.3.0` is, or packages, as `wasi:cli@0.3.0` is,
+        /// for all that a component may import of one. Without any, what
+        /// the world of the package imports
+        names: Vec<String>,
     },
     /// Print an overview of the duck language for coding agents
     Agents,
@@ -85,6 +96,7 @@ fn main() -> ExitCode {
                 Err(e) => fail(format_args!("cannot create {}: {e}", path.display())),
             }
         }
+        Command::WitBindgen { names } => wit_bindgen(&names),
         Command::Agents => {
             print!("{}", agents::OVERVIEW);
             ExitCode::SUCCESS
@@ -100,7 +112,7 @@ fn build() -> ExitCode {
     };
     let manifest = &packages.root().manifest;
 
-    let wit = match files::wit(&root) {
+    let wit = match files::wit(&packages) {
         Ok(wit) => wit,
         Err(e) => return fail(format_args!("cannot read the WIT of the package: {e}")),
     };
@@ -151,7 +163,7 @@ fn run(args: Vec<String>) -> ExitCode {
             "nothing to run: {MANIFEST} has no [component]"
         ));
     };
-    let wit = match files::wit(&root) {
+    let wit = match files::wit(&packages) {
         Ok(wit) => wit,
         Err(e) => return fail(format_args!("cannot read the WIT of the package: {e}")),
     };
@@ -178,6 +190,38 @@ fn run(args: Vec<String>) -> ExitCode {
     let args: Vec<_> = [name].into_iter().chain(args).collect();
     match run::run(&compiled, &args) {
         Ok(status) => ExitCode::from(status),
+        Err(e) => fail(e),
+    }
+}
+
+/// Prints the declarations of what `names` name in the WIT of the nearest
+/// package, or in that of WASI 0.3 alone where there is no package.
+fn wit_bindgen(names: &[String]) -> ExitCode {
+    let settings = match Manifest::find() {
+        Ok(Some(_)) => {
+            let (_, packages) = match resolve() {
+                Ok(resolved) => resolved,
+                Err(code) => return code,
+            };
+            let wit = match files::wit(&packages) {
+                Ok(wit) => wit,
+                Err(e) => return fail(format_args!("cannot read the WIT of the package: {e}")),
+            };
+            let manifest = &packages.root().manifest;
+            match (&manifest.component, &manifest.library) {
+                (Some(component), _) => component.settings(wit),
+                (None, Some(library)) => library.settings(wit),
+                (None, None) => unreachable!("every manifest has a component or a library"),
+            }
+        }
+        Ok(None) => Settings::default(),
+        Err(e) => return fail(format_args!("cannot find {MANIFEST}: {e}")),
+    };
+    match duck_compiler::bindgen::bindgen(&settings, names) {
+        Ok(source) => {
+            print!("{source}");
+            ExitCode::SUCCESS
+        }
         Err(e) => fail(e),
     }
 }

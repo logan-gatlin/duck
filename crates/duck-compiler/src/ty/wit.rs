@@ -4,10 +4,16 @@
 //! A type of Duck is one of WIT by its shape: a `record` is a struct with
 //! as many fields, each the type of the field it is in order, a `variant` a
 //! union so, and an `enum` an enum with as many members, counted from 0.
-//! Names are of no account. A `list<T>` is an `array(T)` and a `string` an
-//! `array(u8)`, `tuple`, `option` and `result` are Duck's own, `flags` are
+//! Names are of no account. A `list<T>` is an `array(T)`, a `string` an
+//! `array(u8)` and a `map<K, V>` an `array(tuple(K, V))`, as the Canonical
+//! ABI passes one. `tuple`, `option` and `result` are Duck's own, `flags` are
 //! the narrowest unsigned integer with a bit for each, a `char` is a `u32`,
 //! and a handle of any kind is an `i32`.
+//!
+//! A struct with one field is also what its field is, as it is laid out and
+//! passed as that: one that holds an `i32` is a handle, which no other
+//! struct that holds one is taken for by the source. So is a tuple of one
+//! element, and what a `tuple` of one of the WIT holds is that tuple.
 
 use crate::ir::{Const, FuncId};
 use crate::lex::Span;
@@ -74,13 +80,24 @@ impl Checker {
                 (Ok(Some(function)), _) => {
                     self.check_signature(&decl.sig, &sig, &function, true);
                 }
-                (Err(ImportError::Interface { imported }), Some(interface)) => {
+                (
+                    Err(error @ (ImportError::Interface { .. } | ImportError::Unimported { .. })),
+                    Some(interface),
+                ) => {
                     // Each block is reported once, where it is named.
                     if !unknown.contains(&interface.span) {
                         unknown.push(interface.span);
                         let name = interface.name.clone();
-                        let imported = nearest(&name, imported);
-                        let kind = TypeErrorKind::UnknownImportInterface { name, imported };
+                        let kind = match error {
+                            ImportError::Unimported { world } => {
+                                TypeErrorKind::UnimportedInterface { name, world }
+                            }
+                            ImportError::Interface { imported } => {
+                                let imported = nearest(&name, imported);
+                                TypeErrorKind::UnknownImportInterface { name, imported }
+                            }
+                            ImportError::Function => unreachable!("it is of an interface"),
+                        };
                         self.error(kind, interface.span);
                     }
                 }
@@ -212,8 +229,38 @@ impl Checker {
         }
     }
 
-    /// Where `ty` isn't `wit`, if it isn't.
+    /// Where `ty` isn't `wit`, if it isn't. What holds one thing and
+    /// nothing else is laid out and passed as that thing is, so it is that
+    /// too: a struct with one field, and a tuple of one element, of Duck
+    /// or of the WIT.
     fn mismatch(&self, ty: Ty, wit: &WitTy) -> Option<Mismatch> {
+        let own = self.mismatch_as_declared(ty, wit)?;
+        if let WitTy::Tuple(elems) = wit
+            && let [held] = &elems[..]
+            && self.mismatch(ty, held).is_none()
+        {
+            return None;
+        }
+        let fields = self.declared(ty, false);
+        let held = match (ty, fields.as_deref()) {
+            (_, Some([(field, _)])) => *field,
+            (Ty::Tuple(id), _) => match self.tuples[id.0 as usize][..] {
+                [elem] => elem,
+                _ => return Some(own),
+            },
+            _ => return Some(own),
+        };
+        let held = self.mismatch(held, wit)?;
+        // A `record` is a struct and a `tuple` a tuple, so `ty` itself is
+        // what isn't one.
+        Some(match wit {
+            WitTy::Record { .. } | WitTy::Tuple(_) => own,
+            _ => held,
+        })
+    }
+
+    /// Where `ty` itself isn't `wit`, if it isn't.
+    fn mismatch_as_declared(&self, ty: Ty, wit: &WitTy) -> Option<Mismatch> {
         let differs = || {
             Some(Mismatch {
                 wit: wit.to_string(),
@@ -254,6 +301,17 @@ impl Checker {
             },
             WitTy::List(elem) => match ty {
                 Ty::Array(id) if !self.writes(ty) => self.mismatch(self.element(id), elem),
+                _ => differs(),
+            },
+            WitTy::Map(key, value) => match ty {
+                Ty::Array(id) if !self.writes(ty) => match self.element(id) {
+                    Ty::Tuple(entry) => match self.tuples[entry.0 as usize][..] {
+                        [found_key, found_value] => (self.mismatch(found_key, key))
+                            .or_else(|| self.mismatch(found_value, value)),
+                        _ => differs(),
+                    },
+                    _ => differs(),
+                },
                 _ => differs(),
             },
             WitTy::Tuple(elems) => match ty {
@@ -360,7 +418,7 @@ fn nearest(name: &str, interfaces: Vec<String>) -> Vec<String> {
 /// Whether a value of `wit` holds what is allocated: a list or a string.
 fn allocates(wit: &WitTy) -> bool {
     match wit {
-        WitTy::String | WitTy::List(_) => true,
+        WitTy::String | WitTy::List(_) | WitTy::Map(..) => true,
         WitTy::Tuple(elems) => elems.iter().any(allocates),
         WitTy::Record { fields, .. } => fields.iter().any(allocates),
         WitTy::Variant { cases, .. } => cases.iter().flatten().any(allocates),
@@ -417,6 +475,7 @@ fn expected(wit: &WitTy) -> String {
         }
         WitTy::String => "an `array(u8)`".to_string(),
         WitTy::List(_) => "an `array` of its elements".to_string(),
+        WitTy::Map(..) => "an `array` of a `tuple` of each key and its value".to_string(),
         WitTy::Tuple(elems) => format!("a `tuple` of {}", elems.len()),
         WitTy::Record { fields, .. } => format!("a struct of {} fields", fields.len()),
         WitTy::Variant { cases, .. } => format!("a union of {} variants", cases.len()),
@@ -459,6 +518,8 @@ interface host {
     letter: func(c: char) -> list<tuple<u32, string>>;
     wait: func();
     pipe: func(data: stream<u8>) -> future<bool>;
+    count: func(words: map<string, u32>) -> map<u32, point>;
+    single: func(one: tuple<u32>, pair: list<tuple<point>>) -> tuple<tuple<f32>>;
 }
 
 interface unused {
@@ -482,9 +543,9 @@ world counted {
 }
 ";
 
-    /// Each error of `src` as a component of `world`, one of [`WIT`] or
-    /// none for a library, as it is shown, with what it is reported at.
-    fn errors_in<'a>(src: &'a str, world: Option<&str>) -> Vec<(String, &'a str)> {
+    /// Checks `src` as a component of `world`, one of [`WIT`] or none for
+    /// a library.
+    fn check_in(src: &str, world: Option<&str>) -> Result<crate::ir::Module, Vec<TypeError>> {
         let settings = Settings {
             world: world.map(str::to_string),
             wit: Wit {
@@ -499,7 +560,13 @@ world counted {
         let entry = DummyManager::new().entry_point();
         let tokens = tokenize(entry, src).unwrap();
         let program = Program::single(entry, parse::parse(&tokens).unwrap());
-        let errors = check(&program, &settings).err().unwrap_or_default();
+        check(&program, &settings)
+    }
+
+    /// Each error of `src` as a component of `world`, as [`check_in`]
+    /// checks it, as it is shown, with what it is reported at.
+    fn errors_in<'a>(src: &'a str, world: Option<&str>) -> Vec<(String, &'a str)> {
+        let errors = check_in(src, world).err().unwrap_or_default();
         let at = |e: &TypeError| e.span.map_or("", |span| &src[span.start..span.end]);
         errors.iter().map(|e| (e.kind.to_string(), at(e))).collect()
     }
@@ -664,6 +731,176 @@ extern \"my:pkg/host@0.1.0\":
     }
 
     #[test]
+    fn a_struct_of_one_field_is_what_its_field_is() {
+        let types = "
+struct File:
+    handle: i32
+
+struct Stream:
+    of: File
+
+struct Meters:
+    value: f32
+
+struct Path:
+    text: string
+
+struct Held:
+    shape: Shape
+
+struct Wrong:
+    handle: i64
+
+struct Two:
+    a: i32
+    b: i32
+";
+        let src = format!(
+            "{TYPES}{types}
+extern \"my:pkg/host@0.1.0\":
+    fn read(self: File, len: u32) -> result(array(u8), Color) = \"[method]file.read\"
+    fn open(path: Path) -> option(File) = \"[static]file.open\"
+    fn close(file: File) = \"[resource-drop]file\"
+    fn pipe(data: Stream) -> File
+    fn area(s: Held) -> Meters
+"
+        );
+        assert_eq!(errors_in(&src, None), []);
+        // It is passed as its field is.
+        let module = check_in(&src, None).unwrap();
+        let pipe = module
+            .imports
+            .iter()
+            .find(|import| import.name == "pipe")
+            .unwrap();
+        assert_eq!((pipe.params.len(), pipe.results.len()), (1, 1));
+
+        let src = format!(
+            "{TYPES}{types}
+extern \"my:pkg/host@0.1.0\":
+    fn pipe(data: Wrong) -> Two
+    fn wait() -> Meters
+"
+        );
+        let errors = errors_in(&src, None);
+        let shown: Vec<_> = errors.iter().map(|(e, at)| (e.as_str(), *at)).collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "the WIT has `stream<u8>` here, which is an `i32`, as a handle is: found \
+                     `i64`",
+                    "Wrong"
+                ),
+                (
+                    "the WIT has `future<bool>` here, which is an `i32`, as a handle is: found \
+                     `Two`",
+                    "Two"
+                ),
+                ("`wait` gives nothing in the WIT", "Meters"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tuple_of_one_is_what_it_holds() {
+        // As the WIT has it, and with either in place of the other: the
+        // two are laid out and passed alike.
+        for (one, pair, gives) in [
+            ("tuple(u32)", "array(tuple(Point))", "tuple(tuple(f32))"),
+            ("u32", "array(Point)", "f32"),
+            ("u32", "array(tuple(Point))", "tuple(f32)"),
+            (
+                "tuple(tuple(u32))",
+                "array(Point)",
+                "tuple(tuple(tuple(f32)))",
+            ),
+        ] {
+            let src = format!(
+                "{TYPES}
+extern \"my:pkg/host@0.1.0\":
+    fn single(one: {one}, pair: {pair}) -> {gives}
+    fn area(s: tuple(Shape)) -> tuple(f32)
+"
+            );
+            assert_eq!(errors_in(&src, None), [], "{one} {pair} {gives}");
+        }
+        let src = format!(
+            "{TYPES}
+extern \"my:pkg/host@0.1.0\":
+    fn single(one: tuple(i32), pair: array(tuple(Point, Point))) -> tuple(f32, f32)
+"
+        );
+        let errors = errors_in(&src, None);
+        let shown: Vec<_> = errors.iter().map(|(e, at)| (e.as_str(), *at)).collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "the WIT has `tuple<u32>` here, whose `u32` is `u32`: found `i32`",
+                    "tuple(i32)"
+                ),
+                (
+                    "the WIT has `list<tuple<point>>` here, whose `tuple<point>` is a `tuple` \
+                     of 1: found `tuple(Point, Point)`",
+                    "array(tuple(Point, Point))"
+                ),
+                (
+                    "the WIT has `tuple<tuple<f32>>` here, which is a `tuple` of 1: found \
+                     `tuple(f32, f32)`",
+                    "tuple(f32, f32)"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_map_is_an_array_of_each_key_with_its_value() {
+        let src = format!(
+            "{TYPES}
+struct Words:
+    of: array(tuple(string, u32))
+
+extern \"my:pkg/host@0.1.0\":
+    fn count(words: Words) -> array(tuple(u32, Point))
+"
+        );
+        assert_eq!(errors_in(&src, None), []);
+        // The host allocates one that it gives, as it does a list.
+        let hosted = format!("{src}\nextern:\n    fn trace(code: u32)\n");
+        let errors = errors_in(&hosted, Some("hosted"));
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(
+            errors[0]
+                .0
+                .starts_with("the host passes a `map<u32, point>` in memory")
+        );
+
+        let src = format!(
+            "{TYPES}
+extern \"my:pkg/host@0.1.0\":
+    fn count(words: array(tuple(string, i32))) -> array(u32)
+"
+        );
+        let errors = errors_in(&src, None);
+        let shown: Vec<_> = errors.iter().map(|(e, at)| (e.as_str(), *at)).collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "the WIT has `map<string, u32>` here, whose `u32` is `u32`: found `i32`",
+                    "array(tuple(string, i32))"
+                ),
+                (
+                    "the WIT has `map<u32, point>` here, which is an `array` of a `tuple` of each \
+                     key and its value: found `array(u32)`",
+                    "array(u32)"
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn a_function_takes_and_gives_as_much_as_the_wit_says() {
         let src = "
 extern \"my:pkg/host@0.1.0\":
@@ -734,9 +971,11 @@ extern:
     fn many(wide: Wide, last: u8) -> i64
     fn both(wide: Wide) -> Wide
 
+let text = \"text\"
+
 fn f(wide: Wide) -> i64:
     let (a, b) = pair(one(1))
-    return many(wide, 2) + b + a as i64 + both(wide).c as i64
+    return many(wide, 2) + b + a as i64 + both(wide).c as i64 + text.len as i64
 ";
         let entry = DummyManager::new().entry_point();
         let tokens = tokenize(entry, src).unwrap();
@@ -748,23 +987,34 @@ fn f(wide: Wide) -> i64:
             };
             check(&program, &settings)
         };
-        let module = check_with(None).unwrap_err();
-        let shown: Vec<_> = module.iter().map(|e| e.kind.to_string()).collect();
-        let at = |e: &TypeError| e.span.map_or("", |span| &src[span.start..span.end]);
         // What `many` takes is 137 bytes, and what `both` takes and gives is
-        // 272.
+        // 272. An area that is said to hold fewer holds neither.
+        let errors = check_with(Some(128)).unwrap_err();
+        let shown: Vec<_> = errors.iter().map(|e| e.kind.to_string()).collect();
+        let at = |e: &TypeError| e.span.map_or("", |span| &src[span.start..span.end]);
         assert_eq!(
             shown,
             [
-                "this passes 137 bytes in memory, and the return area holds 128: `return` under \
-                 `[memory]` in Duck.toml gives it more",
-                "this passes 272 bytes in memory, and the return area holds 128: `return` under \
-                 `[memory]` in Duck.toml gives it more",
+                "this passes 137 bytes in memory, and `return` under `[memory]` in Duck.toml \
+                 gives the return area 128: without it the area holds as many as are passed",
+                "this passes 272 bytes in memory, and `return` under `[memory]` in Duck.toml \
+                 gives the return area 128: without it the area holds as many as are passed",
             ]
         );
-        assert_eq!(module.iter().map(at).collect::<Vec<_>>(), ["many", "both"]);
+        assert_eq!(errors.iter().map(at).collect::<Vec<_>>(), ["many", "both"]);
+        assert_eq!(check_with(Some(271)).unwrap_err().len(), 1);
+        assert!(check_with(Some(272)).is_ok());
 
-        let module = check_with(Some(272)).unwrap();
+        // Without one it holds the most that any function passes, and is
+        // before every literal.
+        let module = check_with(None).unwrap();
+        assert_eq!(module.data.len(), 1);
+        assert_eq!(
+            (module.data[0].offset, &module.data[0].bytes[..]),
+            (272, &b"text"[..])
+        );
+        let larger = check_with(Some(512)).unwrap();
+        assert_eq!(larger.data[0].offset, 512);
         let types = |index: usize| {
             let import = &module.imports[index];
             (import.params.len(), import.results.len())
@@ -789,8 +1039,12 @@ fn f(wide: Wide) -> i64:
         assert_eq!(dests.len(), 1);
         // The area is memory of the module's, which nothing else is in.
         assert_eq!(module.memory.min_pages, 1);
-        assert!(module.data.is_empty());
-        assert_eq!(check_with(Some(271)).unwrap_err().len(), 1);
+        // A module that passes nothing in memory has none.
+        let direct = "extern:\n    fn one(n: i32) -> i32\nlet text = \"text\"\n";
+        let tokens = tokenize(entry, direct).unwrap();
+        let program = Program::single(entry, parse::parse(&tokens).unwrap());
+        let module = check(&program, &Settings::default()).unwrap();
+        assert_eq!(module.data[0].offset, 0);
     }
 
     /// The module of `src`, a library.
@@ -976,8 +1230,8 @@ pub \"my:pkg/host@0.1.0\":
             shown[..7],
             [
                 (
-                    "no interface `my:pkg/unused@0.1.0` is there to import: there is \
-                     `my:pkg/host@0.1.0`",
+                    "the world `app` doesn't import `my:pkg/unused@0.1.0`, which the WIT has: \
+                     one that does has `import my:pkg/unused@0.1.0;`",
                     "\"my:pkg/unused@0.1.0\""
                 ),
                 (

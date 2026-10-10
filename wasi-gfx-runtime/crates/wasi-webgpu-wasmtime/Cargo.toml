@@ -1,0 +1,35 @@
+[package]
+name = "wasi-webgpu-wasmtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wasmtime host implementation of the wasi:webgpu API"
+
+[dependencies]
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+wgpu-types.workspace = true
+callback-future.workspace = true
+shared.workspace = true
+async-broadcast.workspace = true
+log.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "vulkan", "noop"]
+
+[target.'cfg(target_os = "windows")'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "dx12", "noop"]
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "metal", "noop"]
+
+[target.'cfg(all(not(target_os = "linux"), not(target_os = "android"), not(target_os = "windows"), not(target_os = "macos"), not(target_os = "ios")))'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "gles", "noop"]
+
+[dev-dependencies]
+pastey = "0.2"

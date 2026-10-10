@@ -629,7 +629,11 @@ pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &v
 
     #[test]
     fn a_world_that_is_not_there_is_an_error_in_no_file() {
-        let errors = errors_in("fn f():\n    pass\n", "missing", None);
+        // Nothing is checked against a world that isn't there.
+        let src = "extern \"my:pkg/math@0.1.0\":\n    fn add(a: i32, b: i32) -> i32\n\
+                   pub \"my:pkg/math@0.1.0\":\n    fn neg(a: i32) -> i32:\n        return a\n\
+                   fn main():\n    pass\n";
+        let errors = errors_in(src, "missing", Some("main"));
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
             errors[0].0.starts_with("no world `missing`: "),

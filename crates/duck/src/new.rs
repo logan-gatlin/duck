@@ -26,7 +26,8 @@ start = "main"
 # The address literals are placed from. If not given, it is 0.
 # static = { start = "1KiB" }
 # The bytes of the return area, which holds what a function passes the host
-# in memory. If not given, it is 128.
+# in memory. If not given, it is as many as the most that one passes, and
+# if it is, a function that passes more is an error.
 # return = "256B"
 
 # [const]
@@ -111,7 +112,7 @@ mod tests {
         let files = packages.as_ref().ok().map(|packages| {
             let component = packages.root().manifest.component.as_ref().unwrap();
             let entry = module.join(&component.entry);
-            let settings = component.settings(duck::files::wit(&module).unwrap());
+            let settings = component.settings(duck::files::wit(packages).unwrap());
             let mut files = Files::new(packages, entry, settings).unwrap();
             duck_compiler::compile(&mut files).map(|_| ())
         });

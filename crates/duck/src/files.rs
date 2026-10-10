@@ -210,10 +210,25 @@ pub fn sources(path: &Path, sources: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+/// The WIT of `packages`: that of the package being built, which has its
+/// worlds, and as packages for it to use, that of each package it depends
+/// on, with what each of them uses. So the WIT a library needs is the
+/// library's own to have.
+pub fn wit(packages: &Packages) -> io::Result<Wit> {
+    let mut wit = wit_in(&packages.root().dir)?;
+    for package in packages.iter().skip(1) {
+        let Wit { package, deps } = wit_in(&package.dir)?;
+        wit.deps
+            .extend(Some(package).filter(|files| !files.is_empty()));
+        wit.deps.extend(deps);
+    }
+    Ok(wit)
+}
+
 /// The WIT of the package in `dir`: the files of its [`WIT_DIR`], and those
 /// of each package under [`WIT_DEPS`] there, in order of their names. A
 /// package without the directory has none.
-pub fn wit(dir: &Path) -> io::Result<Wit> {
+fn wit_in(dir: &Path) -> io::Result<Wit> {
     let dir = dir.join(WIT_DIR);
     if !dir.is_dir() {
         return Ok(Wit::default());
@@ -356,8 +371,8 @@ mod tests {
             fs::write(path, file).unwrap();
         }
 
-        let found = wit(&dir);
-        let none = wit(&dir.join("src"));
+        let found = wit_in(&dir);
+        let none = wit_in(&dir.join("src"));
         fs::remove_dir_all(&dir).unwrap();
 
         let named = |files: &[&str]| -> Vec<_> {

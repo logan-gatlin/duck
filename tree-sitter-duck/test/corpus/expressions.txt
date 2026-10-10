@@ -264,6 +264,7 @@ Tuples and unit
 
 let _ = ()
 let _ = (a)
+let _ = (a,)
 let _ = (a, (b, c),)
 let _ = t.0.1
 let _ = f(x).10
@@ -277,6 +278,10 @@ let _ = f(x).10
   (binding
     (discard)
     (parenthesized_expression
+      (identifier)))
+  (binding
+    (discard)
+    (tuple
       (identifier)))
   (binding
     (discard)

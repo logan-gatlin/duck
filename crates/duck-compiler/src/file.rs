@@ -49,7 +49,7 @@ pub struct Settings {
     /// there.
     pub wit: Wit,
     /// The bytes of the return area, which holds what a function passes
-    /// the host in memory. `None` is [`crate::ty::DEFAULT_RETURN_AREA`].
+    /// the host in memory. `None` is as many as the most that one passes.
     pub return_area: Option<u32>,
 }
 

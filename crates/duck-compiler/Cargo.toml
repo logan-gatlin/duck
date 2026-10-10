@@ -3,6 +3,11 @@ name = "duck-compiler"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# The WIT of `wasi:webgpu` and of the surface and the frame buffer of
+# `wasi-gfx`, which `duck run` gives a program beside WASI 0.3.
+gfx = []
+
 [dependencies]
 wasm-encoder = "0.259.0"
 wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "gc", "gc-null", "backtrace", "std"] }

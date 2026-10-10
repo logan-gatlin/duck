@@ -1,0 +1,43 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+anyhow.workspace = true
+winit.workspace = true
+wgpu-types.workspace = true
+raw-window-handle.workspace = true
+rand.workspace = true
+futures.workspace = true
+tokio.workspace = true
+softbuffer.workspace = true
+env_logger.workspace = true
+log.workspace = true
+async-broadcast.workspace = true
+oneshot.workspace = true
+surface-wasmtime = { path = "../../crates/surface-wasmtime", features = ["winit", "surface-webgpu", "surface-frame-buffer"]}
+frame-buffer-wasmtime = { path = "../../crates/frame-buffer-wasmtime" }
+wasi-webgpu-wasmtime = { path = "../../crates/wasi-webgpu-wasmtime" }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "vulkan"]
+
+[target.'cfg(target_os = "windows")'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "dx12"]
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "metal"]
+
+[target.'cfg(all(not(target_os = "linux"), not(target_os = "android"), not(target_os = "windows"), not(target_os = "macos"), not(target_os = "ios")))'.dependencies.wgpu-core]
+workspace = true
+features = ["wgsl", "gles"]

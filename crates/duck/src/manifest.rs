@@ -47,7 +47,7 @@ pub struct Component {
     /// The address literals are placed from.
     pub static_start: u64,
     /// The bytes of the return area, which holds what a function passes
-    /// the host in memory. `None` is the compiler's own.
+    /// the host in memory. `None` is as many as the most that one passes.
     pub return_area: Option<u32>,
     /// The fuel that the code run to evaluate the constants of one item
     /// has. `None` is the compiler's own.

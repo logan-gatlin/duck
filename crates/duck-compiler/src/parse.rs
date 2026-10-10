@@ -410,8 +410,6 @@ pub enum ParseErrorKind {
     UseAfterItem,
     /// A `use` after a field, variant or member of the declaration's own.
     UseAfterEntry,
-    /// `(x,)`, which would be a tuple of one element.
-    OneElementTuple,
     /// A function in an `extern` block with type parameters.
     GenericExtern,
     /// A function in a `pub "interface":` block with type parameters.
@@ -460,7 +458,7 @@ enum Parens<T> {
     Empty,
     /// `(x)`
     Group(T),
-    /// `(x, y)`
+    /// `(x, y)`, or `(x,)`: a comma makes a tuple of even one.
     Tuple(Vec<T>),
 }
 
@@ -551,7 +549,6 @@ impl fmt::Display for ParseErrorKind {
                 f,
                 "`use` must come before the fields, variants or members of the declaration's own"
             ),
-            Self::OneElementTuple => write!(f, "tuples must have at least two elements"),
             Self::GenericExtern => {
                 write!(
                     f,
@@ -1024,7 +1021,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.bump();
-                match self.parens(token.span, Self::pattern)? {
+                match self.parens(Self::pattern)? {
                     Parens::Empty => PatternKind::Tuple(Vec::new()),
                     Parens::Group(inner) => inner.kind,
                     Parens::Tuple(items) => PatternKind::Tuple(items),
@@ -1231,7 +1228,7 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(_) => return self.pattern(),
             TokenKind::LParen => {
                 self.bump();
-                match self.parens(token.span, Self::arm_pattern)? {
+                match self.parens(Self::arm_pattern)? {
                     Parens::Empty => PatternKind::Tuple(Vec::new()),
                     Parens::Group(inner) => inner.kind,
                     Parens::Tuple(items) => PatternKind::Tuple(items),
@@ -1496,7 +1493,7 @@ impl<'a> Parser<'a> {
             TokenKind::Continue => ExprKind::Continue,
             TokenKind::LParen => {
                 self.bump();
-                let kind = match self.bracketed(|p| p.parens(token.span, Self::expr))? {
+                let kind = match self.bracketed(|p| p.parens(Self::expr))? {
                     Parens::Empty => ExprKind::Unit,
                     Parens::Group(inner) => inner.kind,
                     Parens::Tuple(items) => ExprKind::Tuple(items),
@@ -1573,13 +1570,9 @@ impl<'a> Parser<'a> {
         result
     }
 
-    /// Parses the rest of a parenthesized list after the `(` at `start`. A
-    /// trailing comma makes a tuple, except after a single item.
-    fn parens<T>(
-        &mut self,
-        start: Span,
-        mut item: impl FnMut(&mut Self) -> PResult<T>,
-    ) -> PResult<Parens<T>> {
+    /// Parses the rest of a parenthesized list after its `(`. A comma makes
+    /// a tuple, of one item too.
+    fn parens<T>(&mut self, mut item: impl FnMut(&mut Self) -> PResult<T>) -> PResult<Parens<T>> {
         if self.eat(TokenKind::RParen) {
             return Ok(Parens::Empty);
         }
@@ -1590,10 +1583,6 @@ impl<'a> Parser<'a> {
         }
         let mut items = vec![first];
         items.extend(self.comma_list(TokenKind::RParen, &mut item)?);
-        if items.len() == 1 {
-            self.error(ParseErrorKind::OneElementTuple, self.span_from(start));
-            return Ok(Parens::Group(items.pop().unwrap()));
-        }
         Ok(Parens::Tuple(items))
     }
 
@@ -2296,10 +2285,18 @@ mod tests {
             "tuple(i32, tuple())"
         );
         assert_eq!(stmt_kinds(&f.body), vec!["assign"]);
-        assert_eq!(
-            errors("let _ = (1,)\n"),
-            vec![ParseErrorKind::OneElementTuple]
-        );
+        // A comma after one element makes a tuple of it, as only brackets
+        // around it don't.
+        let value = |src: &str| {
+            let module = parse_src(src).unwrap();
+            let ItemKind::Binding(binding) = &module.items[0].kind else {
+                panic!()
+            };
+            sexpr(&binding.value)
+        };
+        assert_eq!(value("let _ = (1,)\n"), "(tuple 1)");
+        assert_eq!(value("let _ = (1)\n"), "1");
+        assert_eq!(value("let _ = ((1,),)\n"), "(tuple (tuple 1))");
         assert_eq!(
             errors("fn f():\n    (a, b) = (b, a)\n"),
             vec![ParseErrorKind::InvalidAssignTarget]
@@ -2322,10 +2319,8 @@ mod tests {
         assert_eq!(render(&pattern("let ((a, b), (c)) = t\n")), "((a b) c)");
         assert_eq!(render(&pattern("let () = t\n")), "()");
         assert_eq!(render(&pattern("let (a, b): tuple(u8, u8) = t\n")), "(a b)");
-        assert_eq!(
-            errors("let (a,) = t\n"),
-            vec![ParseErrorKind::OneElementTuple]
-        );
+        assert_eq!(render(&pattern("let (a,) = t\n")), "(a)");
+        assert_eq!(render(&pattern("let ((a,), b) = t\n")), "((a) b)");
         assert_eq!(
             errors("let 1 = t\n"),
             vec![expected("pattern", TokenKind::Int(1))]
@@ -2863,7 +2858,7 @@ fn f():
             errors(&arm("[a; 2]")),
             vec![expected("`]`", TokenKind::Semi)]
         );
-        assert_eq!(errors(&arm("(.a,)")), vec![ParseErrorKind::OneElementTuple]);
+        assert!(parse_src(&arm("(.a,)")).is_ok());
         assert_eq!(
             errors(&arm("(a, T.b)")),
             vec![ParseErrorKind::QualifiedPattern]

@@ -617,6 +617,7 @@ Patterns
 let _ = 1
 var (a, _) = t
 let ((a, b), (c)) = t
+let (a,) = t
 let () = t
 
 ---
@@ -637,6 +638,10 @@ let () = t
         (identifier))
       (parenthesized_pattern
         (identifier)))
+    (identifier))
+  (binding
+    (tuple_pattern
+      (identifier))
     (identifier))
   (binding
     (tuple_pattern)

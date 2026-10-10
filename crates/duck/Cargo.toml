@@ -3,6 +3,20 @@ name = "duck"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["gfx"]
+# What draws, which `duck run` gives a program beside WASI 0.3: `wasi:webgpu`
+# and the surface and the frame buffer of `wasi-gfx`, as `wasi-gfx-runtime`
+# implements them over wgpu, winit and softbuffer.
+gfx = [
+    "duck-compiler/gfx",
+    "dep:frame-buffer-wasmtime",
+    "dep:surface-wasmtime",
+    "dep:wasi-webgpu-wasmtime",
+    "dep:wgpu-core",
+    "dep:wgpu-types",
+]
+
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 duck-compiler = { path = "../duck-compiler" }
@@ -14,3 +28,23 @@ toml = "1.1.6"
 url = "2.5.8"
 wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "component-model", "backtrace", "std"] }
 wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p3"] }
+# `wasi-gfx-runtime` as this repository has it: a copy of its v0.4.0, of
+# https://github.com/wasi-gfx/wasi-gfx-runtime at fc20a04, with what it left
+# undone written and what it got wrong put right.
+frame-buffer-wasmtime = { path = "../../wasi-gfx-runtime/crates/frame-buffer-wasmtime", optional = true }
+surface-wasmtime = { path = "../../wasi-gfx-runtime/crates/surface-wasmtime", optional = true, features = ["winit", "surface-webgpu", "surface-frame-buffer"] }
+wasi-webgpu-wasmtime = { path = "../../wasi-gfx-runtime/crates/wasi-webgpu-wasmtime", optional = true }
+wgpu-types = { version = "29", optional = true }
+
+# The GPU of each platform, as `wasi-gfx-runtime` has its own runner ask for.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+wgpu-core = { version = "29", optional = true, features = ["wgsl", "vulkan"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu-core = { version = "29", optional = true, features = ["wgsl", "dx12"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+wgpu-core = { version = "29", optional = true, features = ["wgsl", "metal"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows", target_os = "macos", target_os = "ios")))'.dependencies]
+wgpu-core = { version = "29", optional = true, features = ["wgsl", "gles"] }

@@ -45,7 +45,6 @@ mod patterns;
 mod unions;
 mod wit;
 
-pub use canonical::DEFAULT_RETURN_AREA;
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
     Action, Analysis, Completion, CompletionKind, Hint, HintKind, Hover, Parameter, Signature,
@@ -455,13 +454,6 @@ pub enum TypeErrorKind {
         expected: usize,
         found: usize,
     },
-    /// A type that takes an empty list of type arguments, or one with at
-    /// least some number, given too few.
-    TooFewTypeArgs {
-        name: String,
-        at_least: usize,
-        found: usize,
-    },
     Mismatch {
         expected: String,
         found: String,
@@ -638,6 +630,12 @@ pub enum TypeErrorKind {
         name: String,
         imported: Vec<String>,
     },
+    /// An `extern` block of an interface that the WIT has and the world,
+    /// as it is named, doesn't import.
+    UnimportedInterface {
+        name: String,
+        world: String,
+    },
     /// An `extern` function that its interface doesn't have, or that the
     /// world itself doesn't import.
     UnknownImport {
@@ -666,8 +664,8 @@ pub enum TypeErrorKind {
         expected: String,
         found: String,
     },
-    /// A function that passes the host more in memory than the return area
-    /// holds.
+    /// A function that passes the host more in memory than the settings
+    /// say the return area holds.
     ReturnArea {
         needs: u32,
         has: u32,
@@ -766,10 +764,14 @@ struct Checker {
     entry: FileId,
     /// The world the program is a component of, which says what is.
     world: World,
+    /// Whether the world couldn't be read, which is reported: nothing is
+    /// then checked against the one that stands in for it.
+    unread: bool,
     /// How many bytes the return area has, which holds what a function
-    /// passes the host in memory.
+    /// passes the host in memory: as many as the most that one passes,
+    /// unless the settings say.
     return_area_size: u32,
-    /// Where the return area is, once anything is passed through it.
+    /// Where the return area is, if anything is passed through it.
     return_area: Option<u64>,
     /// Where the host is first passed what it allocates in the component,
     /// and what that is, as the WIT writes it.
@@ -1471,14 +1473,6 @@ impl fmt::Display for TypeErrorKind {
                     "`{name}` takes {expected} type argument{s}, found {found}"
                 )
             }
-            Self::TooFewTypeArgs {
-                name,
-                at_least,
-                found,
-            } => write!(
-                f,
-                "`{name}` takes 0 or at least {at_least} type arguments, found {found}"
-            ),
             Self::Mismatch { expected, found } => {
                 write!(f, "expected `{expected}`, found `{found}`")
             }
@@ -1595,6 +1589,11 @@ impl fmt::Display for TypeErrorKind {
                     imported => write!(f, ": there is {}", quoted(imported)),
                 }
             }
+            Self::UnimportedInterface { name, world } => write!(
+                f,
+                "the world `{world}` doesn't import `{name}`, which the WIT has: one that does \
+                 has `import {name};`"
+            ),
             Self::UnknownImport {
                 interface: Some(interface),
                 name,
@@ -1629,8 +1628,8 @@ impl fmt::Display for TypeErrorKind {
             }
             Self::ReturnArea { needs, has } => write!(
                 f,
-                "this passes {needs} bytes in memory, and the return area holds {has}: `return` \
-                 under `[memory]` in Duck.toml gives it more"
+                "this passes {needs} bytes in memory, and `return` under `[memory]` in Duck.toml \
+                 gives the return area {has}: without it the area holds as many as are passed"
             ),
             Self::NeedsRealloc(wit) => write!(
                 f,
@@ -1891,12 +1890,16 @@ fn lower_program(
         .as_ref()
         .and_then(|name| ck.resolve_start(program, name));
     ck.check_generic_fns(program);
-    ck.check_imports(program);
+    if !ck.unread {
+        ck.check_imports(program);
+    }
     let imports = ck.lower_imports(program);
     let mut funcs = ck.lower_funcs(program);
     // A start function that isn't one is reported as that, and not also
     // as a `run` that nothing defines.
-    ck.export_funcs(program, &mut funcs, settings.start.is_some());
+    if !ck.unread {
+        ck.export_funcs(program, &mut funcs, settings.start.is_some());
+    }
     funcs.extend(ck.lower_synths(program));
     // An instance may only have an error that checking its declaration
     // missed because of one that is reported.
@@ -2837,7 +2840,6 @@ impl Checker {
             types: records.then(HashMap::new),
             entry: program.entry,
             world,
-            return_area_size: settings.return_area.unwrap_or(DEFAULT_RETURN_AREA),
             max_pages: settings.max_pages,
             data_end: settings.static_start.into(),
             fuel_limit: settings.fuel.unwrap_or(DEFAULT_FUEL),
@@ -2848,11 +2850,13 @@ impl Checker {
             .map(|pages| pages.saturating_mul(PAGE_SIZE));
         ck.data_limit = max_bytes.map_or(ck.max_addr(), |bytes| bytes.min(ck.max_addr()));
         if let Some(error) = unread {
+            ck.unread = true;
             ck.error_nowhere(TypeErrorKind::World(error));
         }
         ck.declare(program);
         ck.define_structs(program);
         ck.define_funcs(program);
+        ck.place_return_area(program, settings.return_area);
         ck.define_globals(program);
         ck.check_lists();
         ck.place_pattern_strings(program);
@@ -11661,7 +11665,42 @@ fn(T) g(s: S(T)) -> uint:
     }
 
     #[test]
-    fn tuple_types_take_none_or_at_least_two_type_arguments() {
+    fn a_tuple_has_any_number_of_elements() {
+        let src = "\
+struct(T) Box:
+    value: T
+fn one(x: i32) -> tuple(i32):
+    return (x,)
+fn f(t: tuple(i64), p: &tuple(u8)) -> i64:
+    let (a,) = t
+    let b: tuple(tuple(i32)) = ((7,),)
+    let c = Box(tuple(u8))(value: (1,))
+    let d = one(2) == (2,)
+    match p.*:
+        (0,):
+            return 0
+        (n,):
+            return a + t.0 + (b.0.0 + c.value.0 as i32 + n as i32) as i64
+";
+        let module = lower(src);
+        // It is its element, with nothing beside it.
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.params, [ValType::I64, ValType::I32]);
+        let one = module.funcs.iter().find(|f| f.name == "one").unwrap();
+        assert_eq!(one.results, [ValType::I32]);
+        assert_eq!(body(&module, "one"), "(return x)");
+        assert_eq!(
+            errors("fn f(t: tuple(i32)) -> i32:\n    return t\n"),
+            vec![mismatch("i32", "tuple(i32)")]
+        );
+        assert_eq!(
+            errors("let t: tuple(i32) = 1\nlet u: i32 = (1,)\n"),
+            vec![mismatch("tuple(i32)", "i32"), mismatch("i32", "tuple(i32)")]
+        );
+    }
+
+    #[test]
+    fn tuple_types_take_a_list_of_type_arguments() {
         use TypeErrorKind::*;
         let src = "\
 struct tuple:
@@ -11681,17 +11720,11 @@ fn f(a: tuple(i32), b: tuple(), c: tuple) -> tuple():
     let l = Box(())(value: ())
     return c
 ";
-        let count = |found| TooFewTypeArgs {
-            name: "tuple".into(),
-            at_least: 2,
-            found,
-        };
         assert_eq!(
             errors(src),
             vec![
                 DuplicateItem("tuple".into()),
                 DuplicateItem("tuple".into()),
-                count(1),
                 MissingTypeArgs("tuple".into()),
                 NotAType,
                 NotCallable("tuple(i32, u8)".into()),
@@ -11700,10 +11733,6 @@ fn f(a: tuple(i32), b: tuple(), c: tuple) -> tuple():
                 mismatch("Box(tuple(u8, bool))", "Box(tuple(i32, u8))"),
                 NotAType,
             ]
-        );
-        assert_eq!(
-            count(1).to_string(),
-            "`tuple` takes 0 or at least 2 type arguments, found 1"
         );
     }
 
