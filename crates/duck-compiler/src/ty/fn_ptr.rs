@@ -43,13 +43,18 @@ impl Checker {
     }
 
     /// The function that pointers to function `id` call: `id` itself,
-    /// unless the host supplies it and may give it a narrow integer or
-    /// `bool` out of range. Then it's a function that calls `id` and brings
-    /// its results into range, created the first time it's asked for and
-    /// lowered by [`Self::lower_wrapper`].
+    /// unless the host supplies it and a call of it doesn't pass wasm
+    /// values as they are: the host may give a narrow integer or `bool` out
+    /// of range, or takes or gives what it does in memory. Then it's a
+    /// function that calls `id` as any call does, created the first time
+    /// it's asked for and lowered by [`Self::lower_wrapper`].
     fn pointer_target(&mut self, id: FuncId) -> FuncId {
         let sig = &self.funcs[id.0 as usize];
-        if id.0 >= self.import_count || self.ranged(sig.ret).is_empty() {
+        let passes = |ck: &Self| {
+            let passing = ck.import_passing(id);
+            passing.params.is_none() && passing.result.is_none()
+        };
+        if id.0 >= self.import_count || (self.ranged(sig.ret).is_empty() && passes(self)) {
             return id;
         }
         if let Some(wrapper) = self.wrappers.get(&id) {

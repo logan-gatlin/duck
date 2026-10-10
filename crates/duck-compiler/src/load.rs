@@ -1022,17 +1022,18 @@ fn f() -> i32:
     }
 
     #[test]
-    fn a_use_exports_as_no_reserved_name() {
-        // A module is no export, so it is named as it likes.
+    fn a_use_exports_nothing_as_the_memory_is_named() {
+        // The module of a library exports its memory by that name, so what
+        // a `pub use` binds as it is only a name. A module is no export.
         let mut files = Memory(vec![
-            ("main", "pub use a.g as memory\npub use a.table\n"),
+            (
+                "main",
+                "pub use a.g as memory\npub use a.g as other\npub use a.table\n",
+            ),
             ("a", "pub fn g():\n    pass\n"),
             ("a.table", "pub let one = 1\n"),
         ]);
-        assert_eq!(
-            type_errors(&mut files),
-            [TypeErrorKind::ReservedExport("memory".into())]
-        );
+        assert_eq!(exports(&lower(&mut files)), ["other"]);
     }
 
     #[test]

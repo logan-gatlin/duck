@@ -88,10 +88,24 @@ impl Checker {
         }
     }
 
-    /// The wasm type of the import that `sig` is: what it takes, and what
-    /// it gives.
-    pub(super) fn import_type(&self, sig: &FuncSig) -> (Vec<ValType>, Vec<ValType>) {
-        let passing = self.passing(sig, true);
+    /// How the import `id` is passed. A built-in of the component model is
+    /// passed the wasm values of what it is declared with, whatever they
+    /// are: no WIT says what it takes.
+    pub(super) fn import_passing(&self, id: FuncId) -> Passing {
+        match self.builtins.contains(&id) {
+            true => Passing {
+                params: None,
+                result: None,
+                size: 0,
+            },
+            false => self.passing(&self.funcs[id.0 as usize], true),
+        }
+    }
+
+    /// The wasm type of the import `id`: what it takes, and what it gives.
+    pub(super) fn import_type(&self, id: FuncId) -> (Vec<ValType>, Vec<ValType>) {
+        let sig = &self.funcs[id.0 as usize];
+        let passing = self.import_passing(id);
         let mut params = match passing.params {
             Some(_) => vec![self.addr_type()],
             None => (sig.params.iter())
@@ -192,7 +206,7 @@ impl Body<'_> {
         pre: &mut Vec<Stmt>,
     ) -> (Vec<Expr>, Option<Expr>, bool) {
         let sig = self.ck.funcs[id.0 as usize].clone();
-        let passing = self.ck.passing(&sig, true);
+        let passing = self.ck.import_passing(id);
         if passing.params.is_none() && passing.result.is_none() {
             return (exprs(scalars), None, false);
         }
@@ -201,7 +215,9 @@ impl Body<'_> {
         let mut args = match &passing.params {
             Some(offsets) => {
                 let params = sig.params.iter().filter(|(_, ty)| *ty != Ty::Type);
-                let mut scalars = scalars.into_iter();
+                // Every argument is evaluated before any is stored, as
+                // what one calls may write there too.
+                let mut scalars = self.kept(scalars, pre).into_iter();
                 for ((_, ty), offset) in params.zip(offsets) {
                     let leaves = self.ck.val_types(*ty).len();
                     let held = scalars.by_ref().take(leaves).collect();
@@ -236,6 +252,24 @@ impl Body<'_> {
         kept
     }
 
+    /// `scalars`, each evaluated after `out` and kept in a local, unless
+    /// it is as cheap to read again.
+    fn kept(&mut self, scalars: Vec<(ValType, Expr)>, out: &mut Vec<Stmt>) -> Vec<(ValType, Expr)> {
+        let mut kept = Vec::new();
+        for (leaf, expr) in scalars {
+            let expr = match is_simple(&expr) {
+                true => expr,
+                false => {
+                    let local = self.temp(leaf);
+                    out.push(Stmt::SetLocal(local, expr));
+                    Expr::Local(local)
+                }
+            };
+            kept.push((leaf, expr));
+        }
+        kept
+    }
+
     /// Writes `scalars`, those of a `ty`, at `offset` bytes past `addr`,
     /// after `out`. Each is evaluated once, before any is written.
     fn store_at(
@@ -246,17 +280,7 @@ impl Body<'_> {
         scalars: Vec<(ValType, Expr)>,
         out: &mut Vec<Stmt>,
     ) {
-        let mut held = Vec::new();
-        for (leaf, expr) in scalars {
-            held.push(match is_simple(&expr) {
-                true => expr,
-                false => {
-                    let local = self.temp(leaf);
-                    out.push(Stmt::SetLocal(local, expr));
-                    Expr::Local(local)
-                }
-            });
-        }
+        let held = exprs(self.kept(scalars, out));
         let place = Place {
             name: String::new(),
             ty,

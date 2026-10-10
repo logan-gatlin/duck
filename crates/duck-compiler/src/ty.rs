@@ -22,9 +22,8 @@ use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
     PatternKind, StmtKind, StructDecl, TypeKind, UnaryOp, UnionDecl,
 };
-use crate::world::{ROOT, RUN_EXPORT, World, WorldError, kebab};
+use crate::world::{ROOT, RUN_EXPORT, RUN_INTERFACE, World, WorldError, kebab};
 
-pub use canonical::DEFAULT_RETURN_AREA;
 use defaults::DefaultValue;
 use enums::EnumDef;
 use evaluate::Dep;
@@ -46,6 +45,7 @@ mod patterns;
 mod unions;
 mod wit;
 
+pub use canonical::DEFAULT_RETURN_AREA;
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
     Action, Analysis, Completion, CompletionKind, Hint, HintKind, Hover, Parameter, Signature,
@@ -675,6 +675,9 @@ pub enum TypeErrorKind {
     /// What the host passes in memory that it has the component allocate,
     /// as the WIT writes it, in a component with nothing that allocates.
     NeedsRealloc(String),
+    /// A `cabi_realloc` that the host couldn't call: it doesn't take four
+    /// addresses or counts and give an address.
+    Realloc,
     /// A `pub "interface":` block in a file that isn't the entry file of a
     /// component.
     ExportOutsideEntry,
@@ -835,8 +838,13 @@ struct Checker {
     table: Vec<FuncId>,
     table_indices: HashMap<FuncId, u32>,
     /// The function that pointers to each imported function call it
-    /// through, for those whose results the host may give out of range.
+    /// through, for those that a call doesn't pass wasm values as they
+    /// are: the host may give a result out of range, or takes or gives
+    /// one in memory.
     wrappers: HashMap<FuncId, FuncId>,
+    /// The imported functions that are built-ins of the component model,
+    /// which no WIT declares: each is passed what it is declared with.
+    builtins: HashSet<FuncId>,
     /// Generic function declarations, indexed by [`GenericFnId`].
     generic_fns: Vec<GenericFn>,
     /// Each instance of a generic function by its declaration and type
@@ -1630,6 +1638,11 @@ impl fmt::Display for TypeErrorKind {
                  entry file is to have a `pub fn cabi_realloc(old: &u8, old_size: uint, align: \
                  uint, new_size: uint) -> &var u8`"
             ),
+            Self::Realloc => write!(
+                f,
+                "`cabi_realloc` is called by the host as a `fn(old: &u8, old_size: uint, align: \
+                 uint, new_size: uint) -> &var u8`"
+            ),
             Self::ExportOutsideEntry => {
                 write!(f, "only the entry file of a component exports an interface")
             }
@@ -1661,7 +1674,7 @@ impl fmt::Display for TypeErrorKind {
                     f,
                     "nothing defines {names} of `{interface}`, which the world exports: "
                 )?;
-                match interface == crate::world::RUN_INTERFACE {
+                match interface == RUN_INTERFACE {
                     true => write!(
                         f,
                         "name a `start` in Duck.toml for it to call, or define it in a \
@@ -1896,6 +1909,11 @@ fn lower_program(
 }
 
 impl Checker {
+    /// Reports an error in no source file: one in what the settings ask.
+    fn error_nowhere(&mut self, kind: TypeErrorKind) {
+        self.errors.push(TypeError::nowhere(kind));
+    }
+
     /// Reports an error at `span`. In an instance of a generic function it
     /// is reported at the call that led to the instance, with `span` as
     /// where in the instance it is.
@@ -2002,6 +2020,9 @@ impl Checker {
                     for f in &block.fns {
                         self.func_items[next_import as usize] = index;
                         self.declare_name(&f.sig.name, Item::Func(FuncId(next_import)), f.is_pub);
+                        if f.import_name.as_deref().is_some_and(wit::is_builtin) {
+                            self.builtins.insert(FuncId(next_import));
+                        }
                         next_import += 1;
                     }
                     continue;
@@ -2101,12 +2122,9 @@ impl Checker {
         declared
     }
 
-    /// Declares a name defined by `item`, which may export it.
+    /// Declares a name defined by `item`.
     fn declare_item(&mut self, item: &parse::Item, name: &Ident, entry: Item) {
         self.declare_name(name, entry, item.is_pub);
-        if self.exports(item) {
-            self.check_export(name);
-        }
     }
 
     /// Exports `item` as `name` too, which a `pub use` of the entry module
@@ -2119,15 +2137,7 @@ impl Checker {
             _ => false,
         };
         if exported {
-            self.check_export(name);
             self.reexports.push((item, name.clone()));
-        }
-    }
-
-    /// Reports `name`, which is exported, if the module takes it itself.
-    fn check_export(&mut self, name: &Ident) {
-        if [MEMORY_EXPORT, TABLE_EXPORT].contains(&name.name.as_str()) {
-            self.error(TypeErrorKind::ReservedExport(name.name.clone()), name.span);
         }
     }
 
@@ -2159,7 +2169,10 @@ impl Checker {
         let used = self.reexports.iter().filter(|(used, _)| *used == item);
         let used = used.map(|(_, name)| name.name.as_str());
         let used = used.filter(|_| self.world.is_library());
-        own.into_iter().chain(used).map(str::to_string).collect()
+        // The module exports its memory and its table by their names.
+        let own = own.into_iter().chain(used);
+        let free = own.filter(|name| ![MEMORY_EXPORT, TABLE_EXPORT].contains(name));
+        free.map(str::to_string).collect()
     }
 
     /// The item `name` names in the current module.
@@ -2902,8 +2915,9 @@ impl Checker {
     fn lower_imports(&self, program: &Program) -> Vec<ir::Import> {
         let imports = extern_fns(program).zip(&self.funcs);
         imports
-            .map(|((block, decl), sig)| {
-                let (params, results) = self.import_type(sig);
+            .enumerate()
+            .map(|(index, ((block, decl), sig))| {
+                let (params, results) = self.import_type(FuncId(index as u32));
                 ir::Import {
                     name: sig.name.clone(),
                     module: (block.module.as_ref()).map_or(ROOT.to_string(), |m| m.name.clone()),
@@ -9618,23 +9632,23 @@ fn generic(T: type):
     }
 
     #[test]
-    fn memory_export_name_is_reserved() {
+    fn an_item_may_be_named_as_the_memory_is() {
         let src = "\
 pub fn memory():
     pass
-pub let memory = 1
+pub let table = 1
+pub fn other():
+    pass
 let hidden = 2
 fn f():
     let memory = 3
 ";
-        assert_eq!(
-            errors(src),
-            vec![
-                TypeErrorKind::ReservedExport("memory".into()),
-                TypeErrorKind::DuplicateItem("memory".into()),
-                TypeErrorKind::ReservedExport("memory".into()),
-            ]
-        );
+        // The module of a library exports its memory and its table by those
+        // names, and so no item by either.
+        let module = lower(src);
+        let exports: Vec<_> = module.funcs.iter().flat_map(|f| &f.exports).collect();
+        assert_eq!(exports, ["other"]);
+        assert!(module.globals.iter().all(|g| g.exports.is_empty()));
     }
 
     #[test]
@@ -15083,7 +15097,6 @@ fn g(f: fn(&Host)):
         assert_eq!(
             errors(src),
             vec![
-                ReservedExport("table".into()),
                 ExpansiveRecursion("Grow".into()),
                 PrivateInPublic {
                     ty: "Hidden".into(),

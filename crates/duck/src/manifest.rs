@@ -331,9 +331,8 @@ impl Component {
 
 impl Library {
     /// How the library is checked on its own: with room for any data, as
-    /// the memory is that of whichever component it is built into, with
-    /// addresses 32 bits wide, where an `int` and a `uint` hold the least,
-    /// and as a component of no world, with `wit` as the WIT of its package.
+    /// the memory is that of whichever component it is built into, and as
+    /// a component of no world, with `wit` as the WIT of its package.
     pub fn settings(&self, wit: Wit) -> Settings {
         Settings {
             max_pages: None,

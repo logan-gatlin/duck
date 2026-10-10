@@ -13,7 +13,7 @@ use crate::load::Program;
 use crate::parse::Ident;
 use crate::world::{REALLOC, RUN_INTERFACE, kebab};
 
-use super::{Checker, FuncSig, Item, MEMORY_EXPORT, Synth, TypeError, TypeErrorKind, fn_decls};
+use super::{Checker, FuncSig, Item, MEMORY_EXPORT, Synth, TypeErrorKind, fn_decls};
 
 /// A function that may be what the world exports as `name`.
 struct Candidate {
@@ -30,11 +30,6 @@ struct Candidate {
 }
 
 impl Checker {
-    /// Reports an error in no source file: one in what the settings ask.
-    pub(super) fn error_nowhere(&mut self, kind: TypeErrorKind) {
-        self.errors.push(TypeError::nowhere(kind));
-    }
-
     /// Names each of `funcs`, the functions the source defines in order,
     /// as the world exports it, and reports what the world exports that
     /// none is, and what is to be exported that the world doesn't. With a
@@ -221,20 +216,26 @@ impl Checker {
                 let kind = TypeErrorKind::ReservedExport(export.clone());
                 self.error(kind, span.expect("it is a candidate"));
             }
-            // What allocates for the host is no function of the world's.
-            let Some(function) = self.world.export(interface, name) else {
-                funcs[func].exports.push(export);
-                continue;
-            };
             let (_, decl) = fn_decls(program).nth(func).expect("it is defined");
             let target = FuncId(self.import_count + func as u32);
             let sig = self.funcs[target.0 as usize].clone();
+            // What allocates for the host is no function of the world's,
+            // and is called with four wasm values for one.
+            let Some(function) = self.world.export(interface, name) else {
+                let address = [self.addr_type()];
+                let taken = sig.params.iter().flat_map(|(_, ty)| self.val_types(*ty));
+                if !taken.eq(address.repeat(4)) || self.val_types(sig.ret) != address {
+                    self.error(TypeErrorKind::Realloc, decl.sig.name.span);
+                }
+                funcs[func].exports.push(export);
+                continue;
+            };
             self.check_signature(&decl.sig, &sig, &function, false);
-            self.check_fits(&sig, false, decl.sig.name.span);
+            let passing = self.passing(&sig, false);
+            self.check_fits(passing.size, decl.sig.name.span);
             // One that takes or gives more than wasm values hold is called
             // by a function that passes the rest in memory, as the host has
             // it.
-            let passing = self.passing(&sig, false);
             if passing.params.is_none() && passing.result.is_none() {
                 funcs[func].exports.push(export);
                 continue;
@@ -380,6 +381,12 @@ fn private():
         let module = check_in(globals, "bare", None).unwrap();
         assert!(module.globals.iter().all(|g| g.exports.is_empty()));
         assert_eq!(module.table.unwrap().export, None);
+        // So a `pub` item is named as the module's own exports are.
+        let named = "pub fn table():\n    pass\npub let memory = 1\npub fn tick_now():\n    pass\n\
+                     pub fn poll() -> i32:\n    return memory\n";
+        let named = format!("{named}{}", APP.split("pub fn tick_now").next().unwrap());
+        let module = check_in(&named, "app", None).unwrap();
+        assert_eq!(exported(&module).len(), 4);
     }
 
     #[test]

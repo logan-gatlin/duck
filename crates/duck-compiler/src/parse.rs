@@ -631,7 +631,8 @@ impl<'a> Parser<'a> {
             if self.at(TokenKind::Pub) && matches!(self.peek_second().kind, TokenKind::Str(_)) {
                 past_uses = true;
                 match self.export_block() {
-                    Ok(exported) => items.extend(exported),
+                    Ok(exported) if self.flaws == flaws => items.extend(exported),
+                    Ok(_) => {}
                     Err(e) => self.recover(e),
                 }
                 self.flaws = flaws;

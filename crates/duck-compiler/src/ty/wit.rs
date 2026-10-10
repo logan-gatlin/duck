@@ -9,7 +9,7 @@
 //! the narrowest unsigned integer with a bit for each, a `char` is a `u32`,
 //! and a handle of any kind is an `i32`.
 
-use crate::ir::Const;
+use crate::ir::{Const, FuncId};
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::FnSig;
@@ -47,7 +47,8 @@ impl Checker {
         for (index, (block, decl)) in extern_fns(program).enumerate() {
             let own = &decl.sig.name;
             let sig = self.funcs[index].clone();
-            self.check_fits(&sig, true, own.span);
+            let needs = self.import_passing(FuncId(index as u32)).size;
+            self.check_fits(needs, own.span);
             let Some(field) = decl.import_name.clone().or_else(|| kebab(&own.name)) else {
                 self.error(TypeErrorKind::NoWitName(own.name.clone()), own.span);
                 continue;
@@ -95,11 +96,9 @@ impl Checker {
         }
     }
 
-    /// Reports `sig`, declared at `span`, if it passes more in memory than
-    /// the return area holds, as one that is `imported` or one that is
-    /// exported passes it.
-    pub(super) fn check_fits(&mut self, sig: &FuncSig, imported: bool, span: Span) {
-        let needs = self.passing(sig, imported).size;
+    /// Reports a function declared at `span` that passes `needs` bytes in
+    /// memory, if that is more than the return area holds.
+    pub(super) fn check_fits(&mut self, needs: u32, span: Span) {
         let has = self.return_area_size;
         if needs > has {
             self.error(TypeErrorKind::ReturnArea { needs, has }, span);
@@ -373,7 +372,7 @@ fn allocates(wit: &WitTy) -> bool {
 
 /// Whether a function the host knows as `name` is a built-in of the
 /// component model, which no WIT declares.
-fn is_builtin(name: &str) -> bool {
+pub(super) fn is_builtin(name: &str) -> bool {
     name.starts_with('[') && !DECLARED.iter().any(|declared| name.starts_with(declared))
 }
 
@@ -792,6 +791,108 @@ fn f(wide: Wide) -> i64:
         assert_eq!(module.memory.min_pages, 1);
         assert!(module.data.is_empty());
         assert_eq!(check_with(Some(271)).unwrap_err().len(), 1);
+    }
+
+    /// The module of `src`, a library.
+    fn lower(src: &str) -> crate::ir::Module {
+        let entry = DummyManager::new().entry_point();
+        let tokens = tokenize(entry, src).unwrap();
+        let program = Program::single(entry, parse::parse(&tokens).unwrap());
+        check(&program, &Settings::default()).unwrap()
+    }
+
+    #[test]
+    fn nothing_is_evaluated_once_arguments_are_in_the_return_area() {
+        let src = "
+struct Wide:
+    a: tuple(u64, u64, u64, u64, u64, u64, u64, u64)
+    b: tuple(u64, u64, u64, u64, u64, u64, u64)
+
+extern:
+    fn pair(n: i32) -> tuple(i32, i64)
+    fn many(wide: Wide, last: i32, more: i32) -> i64
+
+fn second() -> i32:
+    return pair(1).0
+
+fn f(wide: Wide) -> i64:
+    return many(wide, second(), 3)
+";
+        // `second` writes to the return area, so it is called before any
+        // argument of `many` is stored there.
+        let module = lower(src);
+        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
+        let is_store = |stmt: &&Stmt| matches!(stmt, Stmt::Store { .. });
+        let first = f.body.iter().position(|stmt| is_store(&stmt)).unwrap();
+        let shown = format!("{:?}", &f.body[first..]);
+        let second = module.imports.len()
+            + module
+                .funcs
+                .iter()
+                .position(|f| f.name == "second")
+                .unwrap();
+        assert!(
+            !shown.contains(&format!("Call(FuncId({second})")),
+            "{shown}"
+        );
+        assert_eq!(f.body[first..].iter().filter(is_store).count(), 17);
+    }
+
+    #[test]
+    fn a_pointer_to_an_import_passes_as_a_call_of_it_does() {
+        let src = "
+extern:
+    fn pair(n: i32) -> tuple(i32, i64)
+    fn one(n: i32) -> i32
+
+let pointers = (pair, one)
+";
+        // What is called through a pointer takes and gives wasm values, as
+        // every function of the source does.
+        let module = lower(src);
+        let table = module.table.unwrap().funcs;
+        let imports = module.imports.len() as u32;
+        assert!(table[0].0 >= imports, "{table:?}");
+        assert_eq!(table[1].0, 1);
+    }
+
+    #[test]
+    fn a_built_in_is_passed_as_it_is_declared() {
+        let src = "
+extern \"wasi:cli/stdout@0.3.0\":
+    fn odd(a: tuple(i64, i64, i64, i64, i64, i64, i64, i64, i64)) -> tuple(i64, i64) = \"[stream-new-0]write-via-stream\"
+    fn huge() -> tuple(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) = \"[stream-read-0]write-via-stream\"
+
+fn f():
+    let _ = huge()
+";
+        let module = lower(src);
+        let types = |index: usize| {
+            let import = &module.imports[index];
+            (import.params.len(), import.results.len())
+        };
+        assert_eq!([types(0), types(1)], [(9, 2), (0, 17)]);
+        assert_eq!(module.memory.min_pages, 0);
+    }
+
+    #[test]
+    fn what_allocates_for_the_host_is_declared_as_the_host_calls_it() {
+        let src = "
+extern \"my:pkg/host@0.1.0\":
+    fn letter(c: u32) -> array(tuple(u32, string))
+
+pub fn cabi_realloc(old: &u8, old_size: uint, new_size: uint) -> &var u8:
+    return 0
+";
+        assert_eq!(
+            errors_in(src, Some("hosted")),
+            [(
+                "`cabi_realloc` is called by the host as a `fn(old: &u8, old_size: uint, align: \
+                 uint, new_size: uint) -> &var u8`"
+                    .to_string(),
+                "cabi_realloc"
+            )]
+        );
     }
 
     #[test]
