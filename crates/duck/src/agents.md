@@ -214,9 +214,9 @@ fn word(s: array(u8), strict: bool) -> i32:
 
 ## Literals and globals
 
-**String and array literals belong in global initializers and defaults only.**
-In a function, name a global. Only a string that is a pattern of a `match` is
-written in one.
+**A string or array literal in a function is a constant that is only read.**
+Every call of the function shares its memory, so name a global for an array
+to write to, or for one that holds what isn't constant.
 
 ```duck
 let greeting = "hello"             # array(u8)
@@ -230,9 +230,19 @@ fn f(i: uint) -> u8:
 	buf[i] = greeting[i]           # a uint index, bounds checked
 	count.* += 1
 	return buf[0]
+
+fn day(i: uint) -> array(u8):
+	let days = ["mon", "tue", "wed"]  # array(array(u8)), the same for every call
+	return days[i]
 ```
 
 - A literal is a read-only `array` unless its global is annotated `varray`.
+- In a function a `varray` literal is an error unless it is empty, and so is
+  an element, or the `len` of `[value; len]`, that isn't constant: a
+  parameter, a local, a `var`, a call, or what is read from memory, as
+  `primes[0]` is. A number, a `let` global, a constructor, a literal and an
+  address of a global are constant. `let n = f()` makes a constant of a call.
+- Literals in functions that hold the same bytes may be at one address.
 - In an initializer, `&value` and `&var value` place a value in memory, as
   a literal is, and give its address: `&var State()`, `&Mode.idle`. A name is
   copied, so `&N` twice is two addresses.

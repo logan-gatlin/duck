@@ -210,12 +210,7 @@ impl Checker {
     /// The address of `string`, which a pattern is, placing it in memory
     /// unless it is there.
     fn pattern_string(&mut self, string: &str) -> u64 {
-        if let Some(placed) = self.pattern_strings.get(string) {
-            return *placed;
-        }
-        let offset = self.place_data(string.as_bytes().to_vec(), 1);
-        self.pattern_strings.insert(string.to_string(), offset);
-        offset
+        self.share_data(string.as_bytes().to_vec(), 1, 1)
     }
 }
 

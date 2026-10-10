@@ -1144,4 +1144,43 @@ pub let after = count()
         assert_eq!(segments, [(0, 70001)]);
         assert_eq!(module.memory.min_pages, 2);
     }
+
+    #[test]
+    fn a_function_reads_its_literals_whenever_it_is_called() {
+        let src = "\
+let LIMIT: uint = 2
+fn sum(a: array(i32)) -> i32:
+    var total = 0
+    for x in a:
+        total += x
+    return total
+pub fn lengths(i: i32) -> i32:
+    let words = [\"ab\", \"cde\"]
+    let sevens = [7; LIMIT + 2]
+    return sum([1, 2, 3]) + words[i as uint].len as i32 + sevens[3]
+pub fn steps(n: i32) -> i32:
+    let first = [0, 1]
+    if n < 2:
+        return first[n as uint]
+    # Each call that is running reads the one `first`.
+    return steps(n - 1) + steps(n - 2) + first[1]
+pub fn late(i: i32) -> i32:
+    let primes: array(u8) = [2, 3, 5, 7]
+    var total = 0
+    for word in [\"cde\", \"fghi\"]:
+        total += word.len as i32
+    return primes[i as uint] as i32 + total
+pub let folded = lengths(1)
+pub let stepped = steps(6)
+";
+        let module = lower(src);
+        assert_eq!(exported(&module), "folded=16 stepped=20");
+        let mut started = Started::of(src);
+        // Those of a function that a constant called are as they were.
+        assert_eq!(started.call("lengths", &[0]), 15);
+        assert_eq!(started.call("lengths", &[1]), 16);
+        assert_eq!(started.call("steps", &[6]), 20);
+        // Those of one that none called are placed after it ran.
+        assert_eq!(started.call("late", &[3]), 14);
+    }
 }

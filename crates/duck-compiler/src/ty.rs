@@ -721,8 +721,12 @@ pub enum TypeErrorKind {
     },
     /// `module.name` naming nothing.
     UnknownModuleProperty(String),
-    /// A string or array literal outside a global initializer or default.
-    LiteralOutsideGlobal,
+    /// A `varray` literal with elements in a function, which every call of
+    /// it would share.
+    WritableFnLiteral,
+    /// An element or the length of a literal in a function that isn't
+    /// constant: every call of it shares the literal.
+    InconstantFnLiteral,
     /// A `varray` literal with elements in a default, which every value of
     /// the struct or call of the function would share.
     SharedLiteral,
@@ -886,8 +890,10 @@ struct Checker {
     /// literals', and those that code run for a constant grows memory by are
     /// not. Data that doesn't fit may end past every address.
     data_end: u128,
-    /// The address of each string that a pattern is, which is placed once.
-    pattern_strings: HashMap<String, u64>,
+    /// The address of each constant that functions only read: a literal in
+    /// one, or a string that a pattern is. It's placed once, by the bytes of
+    /// one of its elements, what they are aligned to and how many there are.
+    shared: HashMap<(Vec<u8>, u32, u64), u64>,
     /// The item of the program that declares each function that isn't
     /// generic, indexed by [`FuncId`], and each that is, by [`GenericFnId`].
     func_items: Vec<usize>,
@@ -1074,9 +1080,10 @@ struct Body<'c> {
     /// How many of `labels` the innermost `defer` is in, if this is the body
     /// of one: nothing in it branches to those.
     deferring: Option<usize>,
-    /// The program, if this is a global initializer: the only place
-    /// literals that need memory can be, and where a constant that isn't
-    /// folded yet is folded to be read.
+    /// The program, if this is a global initializer: the only place a
+    /// literal has memory of its own, which may be written and may hold
+    /// what isn't constant, and where a constant that isn't folded yet is
+    /// folded to be read.
     global: Option<&'c Program>,
     /// The program, if this is the body of a function: one lowered for a
     /// constant to call folds the constants it is first to read.
@@ -1735,9 +1742,13 @@ impl fmt::Display for TypeErrorKind {
                 "literals end at address {end}, past the {max_pages} pages memory may grow to"
             ),
             Self::UnknownModuleProperty(name) => write!(f, "`module` has no property `{name}`"),
-            Self::LiteralOutsideGlobal => write!(
+            Self::WritableFnLiteral => write!(
                 f,
-                "string and array literals are only allowed in global initializers and defaults"
+                "a writable literal in a function is shared by every call, so it must be empty"
+            ),
+            Self::InconstantFnLiteral => write!(
+                f,
+                "a literal in a function is shared by every call, so what it holds must be constant"
             ),
             Self::SharedLiteral => write!(
                 f,
@@ -1883,8 +1894,6 @@ fn lower_program(
     records: bool,
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
     let mut ck = Checker::define(program, settings, records);
-    // Literals are only in globals, so every one has been placed.
-    ck.check_data_fits();
     let start = settings
         .start
         .as_ref()
@@ -1907,6 +1916,8 @@ fn lower_program(
     if !ck.errors.iter().all(unchecked) {
         ck.errors.retain(|e| !unchecked(e));
     }
+    // Functions have literals too, so only now has every one been placed.
+    ck.check_data_fits();
     ck.place_late_literals();
     (ck, imports, funcs, start)
 }
@@ -3938,9 +3949,23 @@ impl Checker {
     /// Places `count` copies of a `ty` whose scalars are `consts` in memory.
     /// Returns the address of the first.
     fn repeat_data(&mut self, ty: Ty, consts: Vec<Const>, count: u64) -> u64 {
+        let (bytes, align) = self.const_bytes(ty, &consts);
+        self.repeat_bytes(&bytes, align, count)
+    }
+
+    /// The bytes of a `ty` whose scalars are `consts`, and what they are
+    /// aligned to.
+    fn const_bytes(&self, ty: Ty, consts: &[Const]) -> (Vec<u8>, u32) {
         let (size, align) = self.layout(ty);
         let mut bytes = vec![0; size as usize];
-        self.write_consts(&mut bytes, &self.cells(ty), &consts);
+        self.write_consts(&mut bytes, &self.cells(ty), consts);
+        (bytes, align)
+    }
+
+    /// Places `count` copies of `bytes` in memory at the next multiple of
+    /// `align`. Returns the address of the first.
+    fn repeat_bytes(&mut self, bytes: &[u8], align: u32, count: u64) -> u64 {
+        let size = bytes.len() as u64;
         let offset = self.reserve_data(u128::from(size) * u128::from(count), align);
         // Memory starts out zeroed, and data that doesn't fit is an error, so
         // neither is written out.
@@ -3950,8 +3975,29 @@ impl Checker {
             self.data.push(ir::Data { offset, bytes });
         } else if self.eval.is_some() && self.data_fits() {
             // Code that has run may have written there.
-            self.zeroed.push((offset, u64::from(size) * count));
+            self.zeroed.push((offset, size * count));
         }
+        offset
+    }
+
+    /// Places `count` copies of `bytes` in memory at the next multiple of
+    /// `align`, as a constant that functions only read, unless one that is
+    /// the same is there. Returns the address of the first.
+    fn share_data(&mut self, bytes: Vec<u8>, align: u32, count: u64) -> u64 {
+        // What a generic function lowers as declared is dropped.
+        if self.open {
+            return 0;
+        }
+        // One that is empty takes no memory to share.
+        if bytes.is_empty() || count == 0 {
+            return self.reserve_data(0, align);
+        }
+        let key = (bytes, align, count);
+        if let Some(placed) = self.shared.get(&key) {
+            return *placed;
+        }
+        let offset = self.repeat_bytes(&key.0, align, count);
+        self.shared.insert(key, offset);
         offset
     }
 
@@ -4791,12 +4837,6 @@ impl<'c> Body<'c> {
                 scalar(ValType::I32, Expr::Const(Const::I32(*b as i32))),
             ),
             ExprKind::Unit => (Ty::Unit, Value::default()),
-            ExprKind::Str(_) | ExprKind::List(_) | ExprKind::Repeat(..)
-                if self.global.is_none() =>
-            {
-                self.error(TypeErrorKind::LiteralOutsideGlobal, expr.span);
-                (Ty::Error, Value::default())
-            }
             ExprKind::Str(s) => self.string(s, expected, expr.span),
             ExprKind::List(items) => self.list(items, expected, expr.span),
             ExprKind::Repeat(value, len) => self.repeat(value, len, expected, expr.span),
@@ -5004,12 +5044,29 @@ impl<'c> Body<'c> {
     }
 
     /// Reports a literal of `len` elements at `span` that is `mutable` in a
-    /// default, unless it's empty: its elements would be shared wherever the
-    /// default is used.
+    /// default or a function, unless it's empty: its elements would be
+    /// shared wherever the default is used, or by every call.
     fn check_shared(&mut self, mutable: bool, len: usize, span: Span) {
-        if self.default && mutable && len > 0 {
-            self.error(TypeErrorKind::SharedLiteral, span);
+        if !mutable || len == 0 {
+            return;
         }
+        if self.default {
+            self.error(TypeErrorKind::SharedLiteral, span);
+        } else if self.global.is_none() {
+            self.error(TypeErrorKind::WritableFnLiteral, span);
+        }
+    }
+
+    /// Places `bytes`, the `len` elements of a literal, in memory at the
+    /// next multiple of `align`. Returns the array of them. In a function
+    /// they are constant and only read, so every literal that has them
+    /// shares them.
+    fn literal_data(&mut self, bytes: Vec<u8>, align: u32, len: u64) -> Value {
+        if self.global.is_some() {
+            return self.ck.push_data(bytes, align, len);
+        }
+        let ptr = self.ck.share_data(bytes, align, 1);
+        self.ck.array_value(ptr, len)
     }
 
     /// A string literal: an array of its UTF-8 bytes.
@@ -5019,7 +5076,7 @@ impl<'c> Body<'c> {
         let ty = self.ck.array_of(Ty::Prim(Prim::U8), mutable);
         (
             ty,
-            self.ck.push_data(s.as_bytes().to_vec(), 1, s.len() as u64),
+            self.literal_data(s.as_bytes().to_vec(), 1, s.len() as u64),
         )
     }
 
@@ -5178,8 +5235,8 @@ impl<'c> Body<'c> {
     /// An array literal, whose elements are typed like those of `expected`,
     /// or else like the first element. Its elements are placed in memory
     /// after any literals within them, and one that isn't constant is stored
-    /// there when the initializer is run. It's a `varray` where one is
-    /// expected.
+    /// there when the initializer is run, or is an error in a function. It's
+    /// a `varray` where one is expected.
     fn list(&mut self, items: &[parse::Expr], expected: Option<Ty>, span: Span) -> (Ty, Value) {
         let mutable = self.literal_writes(expected);
         self.check_shared(mutable, items.len(), span);
@@ -5217,7 +5274,7 @@ impl<'c> Body<'c> {
             self.ck
                 .write_consts(&mut bytes[i * size as usize..], &cells, consts);
         }
-        let mut value = self.ck.push_data(bytes, align, items.len() as u64);
+        let mut value = self.literal_data(bytes, align, items.len() as u64);
         let first = match value.scalars.first() {
             Some((_, Expr::Const(Const::I32(addr)))) => u64::from(*addr as u32),
             Some((_, Expr::Const(Const::I64(addr)))) => *addr as u64,
@@ -5251,7 +5308,8 @@ impl<'c> Body<'c> {
     /// rest of the initializer, as the copies are placed by it. A `value`
     /// that isn't constant is evaluated once and stored when the initializer
     /// is run. A literal within `value` is placed in memory once, and every
-    /// copy views it. It's a `varray` where one is expected.
+    /// copy views it. It's a `varray` where one is expected. In a function
+    /// `value` and `len` are constant, as an array literal's elements are.
     fn repeat(
         &mut self,
         value: &parse::Expr,
@@ -5272,7 +5330,11 @@ impl<'c> Body<'c> {
         self.expect(ty, elem, value.span);
         let consts = self.constant(lowered, value.span);
         let lowered = self.check(len, Ty::Prim(Prim::Uint));
-        let count = self.evaluate(lowered, len.span).unwrap_or_default();
+        let count = match self.global {
+            Some(_) => self.evaluate(lowered, len.span),
+            None => self.constant(lowered, len.span).ok(),
+        };
+        let count = count.unwrap_or_default();
         if !self.ck.fits(ty, elem) || !self.placeable(elem, errors, span) {
             return (Ty::Error, Value::default());
         }
@@ -5287,7 +5349,13 @@ impl<'c> Body<'c> {
             Ok(consts) => (consts, None),
             Err(stored) => (Vec::new(), Some(stored)),
         };
-        let offset = self.ck.repeat_data(elem, consts, count);
+        let offset = match self.global {
+            Some(_) => self.ck.repeat_data(elem, consts, count),
+            None => {
+                let (bytes, align) = self.ck.const_bytes(elem, &consts);
+                self.ck.share_data(bytes, align, count)
+            }
+        };
         let mut value = self.ck.array_value(offset, count);
         if let Some(stored) = stored {
             value.pre = self.fill(elem, stored, offset, count);
@@ -6362,12 +6430,18 @@ impl<'c> Body<'c> {
         }
     }
 
-    /// The scalars of `value`, part of a global initializer, if they fold.
-    /// Otherwise `value` itself, which is only known by running it. One
-    /// that traps is reported at `span`, and has no scalars.
+    /// The scalars of `value`, part of a literal or of what a `&` places, if
+    /// they fold. Otherwise `value` itself, which is only known by running
+    /// it, as a global initializer is. One that traps is reported at `span`,
+    /// and has no scalars, as is one in a function that doesn't fold: a
+    /// literal there is never stored to.
     fn constant(&mut self, value: Value, span: Span) -> Result<Vec<Const>, Value> {
         match self.ck.fold_value(&value) {
             Ok(consts) => Ok(consts),
+            Err(Fold::NotConstant) if self.global.is_none() => {
+                self.error(TypeErrorKind::InconstantFnLiteral, span);
+                Ok(Vec::new())
+            }
             Err(Fold::NotConstant) => Err(value),
             Err(Fold::Trap) => {
                 self.error(TypeErrorKind::ConstTrap, span);
@@ -8945,9 +9019,6 @@ fn f(a: i32):
     b += 1
     break
     continue
-    for x in [1]:
-        pass
-    let s = \"hi\"
     let l: array(i32) = a
 ";
         assert_eq!(
@@ -8957,8 +9028,6 @@ fn f(a: i32):
                 ImmutableAssign("b".into()),
                 BreakOutsideLoop,
                 ContinueOutsideLoop,
-                LiteralOutsideGlobal,
-                LiteralOutsideGlobal,
                 mismatch("array(i32)", "i32"),
             ]
         );
@@ -12302,7 +12371,8 @@ fn f(p: &Node, a: array(u8), v: &var Node, pp: &var &Node):
     let m: &&Node = 0 as! &&var Node
     let fp: fn(&var Node) = r
     let w = a as varray(u16)
-    let s: &var u8 = \"duck\"
+    let s: varray(u8) = \"duck\"
+    let n: varray(u8) = \"\"
 ";
         let write = |ty: &str, needs: &str, element| ReadOnlyWrite {
             ty: ty.into(),
@@ -12336,7 +12406,7 @@ fn f(p: &Node, a: array(u8), v: &var Node, pp: &var &Node):
                     from: "array(u8)".into(),
                     to: "varray(u16)".into()
                 },
-                LiteralOutsideGlobal,
+                WritableFnLiteral,
             ]
         );
         assert_eq!(
@@ -12532,6 +12602,52 @@ pub let nested: array(array(i8)) = [[], [-1]]
     }
 
     #[test]
+    fn a_literal_in_a_function_is_placed_once_for_its_contents() {
+        let src = "\
+let SIZE: uint = 2
+let word = \"ab\"
+struct P:
+    a: u8
+    b: i32
+fn f() -> array(u8):
+    return \"cd\"
+fn g(s: array(u8)) -> array(u16):
+    match s:
+        \"cd\":
+            return [1, 2]
+        else:
+            return [1; SIZE + 1]
+fn(T) h(x: T) -> array(array(u8)):
+    return [\"cd\", word]
+fn k() -> array(P):
+    let a = h(1)
+    let b = h(true)
+    let none: array(i64) = []
+    let zeros: array(u32) = [0, 0]
+    return [P(a: 1, b: -2); SIZE]
+";
+        let module = lower(src);
+        let point = [1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff];
+        assert_eq!(
+            data(&module),
+            [
+                (0, &b"ab"[..]),
+                // The pattern's string, and each literal that is the same.
+                (2, b"cd"),
+                (4, &[1, 0, 2, 0]),
+                (8, &[1, 0, 1, 0, 1, 0]),
+                // Nothing is written for `zeros`, which memory already is.
+                (24, &point.repeat(2)),
+                // An instance's, which every instance shares.
+                (40, &[2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0]),
+            ]
+        );
+        assert_eq!(body(&module, "f"), "(return 2 2)");
+        assert_eq!(body(&module, "h(i32)"), "(return 40 2)");
+        assert_eq!(body(&module, "h(bool)"), "(return 40 2)");
+    }
+
+    #[test]
     fn repeated_array_literals_copy_one_element() {
         let src = "\
 pub struct P:
@@ -12593,8 +12709,13 @@ let e = [0; -1]
 let g: array(u8) = [256; 2]
 let h: array(u8) = [true; 2]
 let j = [0; 1 / 0]
-fn f():
-    let l = [1; 2]
+fn f(k: uint, x: i32):
+    let l = [1; k]
+    let m = [x; 2]
+    let o = [get(); 2]
+    let p: varray(i32) = [1; 2]
+    let q: varray(i32) = [1; 0]
+    let r = [1; 2]
 ";
         assert_eq!(
             errors(src),
@@ -12605,7 +12726,10 @@ fn f():
                 IntOutOfRange("u8".into()),
                 mismatch("u8", "bool"),
                 ConstTrap,
-                LiteralOutsideGlobal,
+                InconstantFnLiteral,
+                InconstantFnLiteral,
+                InconstantFnLiteral,
+                WritableFnLiteral,
             ]
         );
     }
@@ -12622,9 +12746,15 @@ let c = [get()]
 let d: array(u8) = [256]
 let e = [1 / 0]
 let g: array(never) = []
-fn f():
-    let s = \"hi\"
-    let l = [1]
+var n = 1
+fn f(x: i32):
+    let l = [1, x]
+    let m = [get()]
+    let o = [[n]]
+    let p = [1 / 0]
+    let q: varray(i32) = [1]
+    let r: varray(i32) = []
+    let s: array(varray(u8)) = [\"hi\"]
 ";
         assert_eq!(
             errors(src),
@@ -12634,8 +12764,12 @@ fn f():
                 IntOutOfRange("u8".into()),
                 ConstTrap,
                 NotStorable("never".into()),
-                LiteralOutsideGlobal,
-                LiteralOutsideGlobal,
+                InconstantFnLiteral,
+                InconstantFnLiteral,
+                InconstantFnLiteral,
+                ConstTrap,
+                WritableFnLiteral,
+                WritableFnLiteral,
             ]
         );
     }
@@ -12912,6 +13046,29 @@ fn f(p: &var u8):
             ),
             [spanless(DataPastMax {
                 end: 65540,
+                max_pages: 1
+            })]
+        );
+        // A function's count, as those of a generic function's instances do.
+        let func = "fn f() -> array(u8):\n    return \"abc\"\n";
+        assert_eq!(errors(func, 65533, Some(1)), []);
+        assert_eq!(
+            errors(func, 65534, Some(1)),
+            [spanless(DataPastMax {
+                end: 65537,
+                max_pages: 1
+            })]
+        );
+        let instance = "\
+fn(T) g(x: T) -> array(u8):
+    return \"abc\"
+fn f() -> array(u8):
+    return g(1)
+";
+        assert_eq!(
+            errors(instance, 65534, Some(1)),
+            [spanless(DataPastMax {
+                end: 65537,
                 max_pages: 1
             })]
         );
