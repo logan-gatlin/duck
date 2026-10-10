@@ -15,6 +15,7 @@ use duck::manifest::{MANIFEST, Manifest};
 use duck::package::Packages;
 use duck::{git, package};
 use duck_compiler::file::FileManager;
+use duck_compiler::world::{RUN_INTERFACE, World};
 
 #[derive(Parser)]
 #[command(version, about = "The duck programming language")]
@@ -154,8 +155,17 @@ fn run(args: Vec<String>) -> ExitCode {
         Ok(wit) => wit,
         Err(e) => return fail(format_args!("cannot read the WIT of the package: {e}")),
     };
+    let settings = component.settings(wit);
+    // A world that can't be read is reported with the rest of the build.
+    if World::load(&settings).is_ok_and(|world| !world.exports_run()) {
+        return fail(format_args!(
+            "nothing to run: the world `{}` doesn't export `{RUN_INTERFACE}`, whose `run` is \
+             the program. `duck build` builds the component",
+            component.world
+        ));
+    }
     let entry = root.join(&component.entry);
-    let mut files = match Files::new(&packages, &entry, component.settings(wit)) {
+    let mut files = match Files::new(&packages, &entry, settings) {
         Ok(files) => files,
         Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
     };
