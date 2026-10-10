@@ -1265,22 +1265,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn memory64_widens_a_module_and_not_the_library_beside_it() {
-        let dir = TempDir::new("memory64");
-        let module = "[component]\nentry = \"main.duck\"\noutput = \"out.wasm\"\nworld = \"wasi:cli/imports@0.3.0\"\n[memory]\nmemory64 = true\n";
-        dir.write(&[
-            ("app/Duck.toml", &format!("{module}{LIBRARY}")),
-            ("app/main.duck", "let far: uint = 4294967296\n"),
-            ("app/lib.duck", "let far: uint = 4294967296\n"),
-        ]);
-        // A library is checked alone with addresses 32 bits wide.
-        assert_eq!(
-            check(&dir, &[]),
-            ["app/lib.duck:0:16-0:26: literal out of range for `uint`"]
-        );
-    }
-
-    #[test]
     fn errors_in_instances_note_the_instances_that_led_to_them() {
         let dir = TempDir::new("instances");
         dir.write(&[

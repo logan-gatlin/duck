@@ -223,13 +223,11 @@ impl Checker {
             memory: ir::Memory {
                 min_pages: 0,
                 max_pages: None,
-                memory64: self.memory64,
                 export: MEMORY_EXPORT.to_string(),
             },
             data: Vec::new(),
             table: Some(ir::Table {
-                table64: self.memory64,
-                export: TABLE_EXPORT.to_string(),
+                export: Some(TABLE_EXPORT.to_string()),
                 funcs: self.table.clone(),
             }),
             globals: self.ir_globals.clone(),
@@ -264,12 +262,9 @@ impl Checker {
         let eval = match &mut self.eval {
             Some(eval) => eval,
             none => {
-                let most = match self.memory64 {
-                    true => MAX_CONSTANT_PAGES,
-                    false => MAX_CONSTANT_PAGES.min(u64::from(u32::MAX) / PAGE_SIZE + 1),
-                };
+                let most = MAX_CONSTANT_PAGES.min(u64::from(u32::MAX) / PAGE_SIZE + 1);
                 let max = self.max_pages.unwrap_or(most);
-                none.insert(Evaluator::new(self.memory64, max)?)
+                none.insert(Evaluator::new(max)?)
             }
         };
         let end = u64::try_from(self.data_end).unwrap_or(u64::MAX);
@@ -1149,21 +1144,5 @@ pub let after = count()
             .collect();
         assert_eq!(segments, [(0, 70001)]);
         assert_eq!(module.memory.min_pages, 2);
-    }
-
-    #[test]
-    fn addresses_are_wide_where_memory_is() {
-        let src = "\
-let items: varray(u16) = [1, 2, 3]
-fn last(of: array(u16)) -> uint:
-    return of[of.len - 1] as uint + of.len
-pub let l = last(items)
-";
-        let settings = Settings {
-            memory64: true,
-            ..Settings::default()
-        };
-        let module = check_with(src, &settings).unwrap();
-        assert_eq!(exported(&module), "l=6i64");
     }
 }

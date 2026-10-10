@@ -361,7 +361,7 @@ fn main():
     }
 
     #[test]
-    fn only_a_32_bit_module_with_a_start_function_is_a_program() {
+    fn only_a_component_with_a_start_function_is_a_program() {
         let src = "fn main():\n    pass\n";
         let unstarted = Settings {
             start: None,
@@ -369,14 +369,6 @@ fn main():
         };
         let e = compile(src, unstarted).unwrap_err();
         assert!(e.contains("`wasi:cli/run@0.3.0`"), "{e}");
-        let wide = Settings {
-            memory64: true,
-            ..program()
-        };
-        assert_eq!(
-            compile(src, wide).unwrap_err(),
-            "`memory64` builds no component: one addresses memory with 32 bits"
-        );
         // A library is built into the components that use it.
         assert_eq!(
             compile(src, Settings::default()).unwrap_err(),

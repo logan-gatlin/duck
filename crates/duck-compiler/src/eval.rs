@@ -80,21 +80,12 @@ impl fmt::Display for Imported {
 impl std::error::Error for Imported {}
 
 impl Evaluator {
-    /// A memory of no pages that may grow to `max_pages`, addressed with an
-    /// `i64` if it's a `memory64` and an `i32` otherwise, an empty table and
-    /// no globals.
-    pub(crate) fn new(memory64: bool, max_pages: u64) -> Result<Self, Failure> {
+    /// A memory of no pages that may grow to `max_pages`, an empty table
+    /// and no globals.
+    pub(crate) fn new(max_pages: u64) -> Result<Self, Failure> {
         let mut store = Store::new(engine(), ());
-        let (memory, table) = match memory64 {
-            true => (
-                MemoryType::new64(0, Some(max_pages)),
-                TableType::new64(RefType::FUNCREF, 1, None),
-            ),
-            false => (
-                MemoryType::new(0, Some(max_pages as u32)),
-                TableType::new(RefType::FUNCREF, 1, None),
-            ),
-        };
+        let memory = MemoryType::new(0, Some(max_pages as u32));
+        let table = TableType::new(RefType::FUNCREF, 1, None);
         let memory = Memory::new(&mut store, memory).map_err(invalid)?;
         let table = Table::new(&mut store, table, Ref::Func(None)).map_err(invalid)?;
         Ok(Self {
@@ -237,7 +228,6 @@ fn engine() -> &'static Engine {
     ENGINE.get_or_init(|| {
         let mut config = Config::new();
         config.consume_fuel(true);
-        config.wasm_memory64(true);
         // A NaN has the same bits on every machine.
         config.cranelift_nan_canonicalization(true);
         Engine::new(&config).expect("the configuration is supported")
@@ -320,7 +310,6 @@ mod tests {
             memory: ir::Memory {
                 min_pages: 0,
                 max_pages: None,
-                memory64: false,
                 export: "memory".to_string(),
             },
             data: Vec::new(),
@@ -357,7 +346,7 @@ mod tests {
 
     /// An evaluator whose memory has one page and may grow to four.
     fn evaluator() -> Evaluator {
-        let mut eval = Evaluator::new(false, 4).unwrap();
+        let mut eval = Evaluator::new(4).unwrap();
         assert!(eval.cover(PAGE_SIZE));
         eval
     }
@@ -432,8 +421,7 @@ mod tests {
             exports: Vec::new(),
         }];
         first.table = Some(ir::Table {
-            table64: false,
-            export: "table".to_string(),
+            export: Some("table".to_string()),
             funcs: vec![FuncId(0)],
         });
         assert_eq!(eval.run(&first, 1000).0, Ok(Vec::new()));
@@ -554,23 +542,5 @@ mod tests {
         let failure = results.unwrap_err();
         assert_eq!(failure.kind, FailureKind::Imported(1));
         assert_eq!(failure.stack, [2]);
-    }
-
-    #[test]
-    fn memories_and_tables_are_as_wide_as_addresses() {
-        let mut eval = Evaluator::new(true, 4).unwrap();
-        assert!(eval.cover(PAGE_SIZE));
-        let addr = Expr::Const(Const::I64(8));
-        let write = Stmt::Store {
-            ty: ValType::I64,
-            op: StoreOp::Store,
-            offset: 0,
-            addr,
-            value: Expr::MemorySize,
-        };
-        let mut module = module(vec![entry(Vec::new(), vec![write])]);
-        module.memory.memory64 = true;
-        assert_eq!(eval.run(&module, 1000).0, Ok(Vec::new()));
-        assert_eq!(eval.data()[0].offset, 8);
     }
 }

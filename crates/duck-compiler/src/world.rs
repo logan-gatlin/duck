@@ -53,8 +53,6 @@ pub enum WorldError {
     Missing { world: String, error: String },
     /// A library, which is built into the components that use it.
     Library,
-    /// Memory addressed with 64 bits, as no component's is.
-    Memory64,
     /// A start function, which only the `run` of [`RUN_INTERFACE`] calls,
     /// in a world that doesn't export it.
     Start { world: String },
@@ -173,10 +171,6 @@ impl fmt::Display for WorldError {
             Self::Wit(e) => write!(f, "cannot read the WIT of the package: {e}"),
             Self::Missing { world, error } => write!(f, "no world `{world}`: {error}"),
             Self::Library => write!(f, "a library is no component: it has no world"),
-            Self::Memory64 => write!(
-                f,
-                "`memory64` builds no component: one addresses memory with 32 bits"
-            ),
             Self::Start { world } => write!(
                 f,
                 "`start` needs a world that exports `{RUN_INTERFACE}`, whose `run` calls it: \

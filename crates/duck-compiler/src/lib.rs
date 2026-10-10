@@ -77,13 +77,8 @@ impl std::error::Error for Error {}
 /// every file counts as one stage.
 pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
     let settings = files.settings();
-    let unbuilt = match (&settings.world, settings.memory64) {
-        (None, _) => Some(WorldError::Library),
-        (Some(_), true) => Some(WorldError::Memory64),
-        (Some(_), false) => None,
-    };
-    if let Some(error) = unbuilt {
-        let error = TypeError::nowhere(TypeErrorKind::World(error));
+    if settings.world.is_none() {
+        let error = TypeError::nowhere(TypeErrorKind::World(WorldError::Library));
         return Err(vec![Error::Type(error)]);
     }
     let module = lower(files)?;

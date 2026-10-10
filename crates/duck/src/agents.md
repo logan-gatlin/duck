@@ -65,9 +65,9 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 
 - `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`. Integer arithmetic wraps.
   Numeric types never mix (`u8 + i32` is an error): convert with `as`.
-- `int` and `uint`: integers as wide as an address, which is 32 bits, or 64
-  with `memory64` in `Duck.toml`. They count bytes and elements, and are
-  types of their own: `uint + u32` is an error too.
+- `int` and `uint`: integers as wide as an address, which is 32 bits. They
+  count bytes and elements, and are types of their own: `uint + u32` is an
+  error too.
 - `tuple(A, B)`: built `(a, b)`, read `t.0`. Unit is `tuple()`, written `()`.
 - `&T` reads its pointee and `&var T` also writes it. Both are unchecked
   addresses, which `as!` makes of any address. There is no null: `0` is an
@@ -440,7 +440,7 @@ fn view(p: &i32, len: uint) -> array(i32):
   itself: `for x in p.*`.
 - Pointer arithmetic is `((p as uint) + 4) as! &T`.
 - Layout follows C, and `bool` is 1 byte. A pointer, a function pointer, an
-  `int` and a `uint` are each 4 bytes, or 8 with `memory64`.
+  `int` and a `uint` are each 4 bytes.
 - The only runtime checks are array bounds and division by zero, which trap.
 - Literals are placed from address 0, or from `static.start` in `Duck.toml`.
   Memory starts as the fewest pages that hold them, which is none without
@@ -1221,7 +1221,6 @@ start = "main"           # optional: the program, which `duck run` runs
 world = "wasi:cli/command@0.3.0"  # optional: what it imports and exports
 
 [memory]                 # optional, as is each key; needs [component]
-memory64 = true          # 64-bit addresses, which are 32-bit without it
 max = "16MiB"            # sizes: B, KiB, MiB, GiB, TiB, pgs (64 KiB)
 static = { start = "1KiB" }  # where literals go from, which is 0 without it
 return = "256B"          # the return area, which is 128 bytes without it
@@ -1250,10 +1249,5 @@ xml = { git = "https://example.com/xml.git", tag = "v1.0" }  # or rev; no branch
 - Memory has no `min`: it starts with the pages below `static.start`, those
   its literals take and those its constants grow it by. For one that starts
   larger, have a constant take the pages with `module.grow`.
-- `memory64` addresses memory and the table with 64 bits: sizes may pass
-  4GiB, and `int`, `uint`, pointers and function pointers are 64 bits wide.
-  A `uint` past 4294967295 is an error without it. It builds no component,
-  as one addresses memory with 32 bits: only a library is checked with it.
-- A library builds as the component that uses it does, so it keeps addresses
-  and lengths in `uint`, never `u32` or `u64`. On its own it is checked with
-  32-bit addresses.
+- A library keeps addresses and lengths in `uint`, never `u32`: they are
+  types of their own, whatever is as wide.

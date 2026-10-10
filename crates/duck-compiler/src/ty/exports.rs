@@ -13,7 +13,7 @@ use crate::load::Program;
 use crate::parse::Ident;
 use crate::world::{REALLOC, RUN_INTERFACE, kebab};
 
-use super::{Checker, FuncSig, Item, Synth, TypeError, TypeErrorKind, fn_decls};
+use super::{Checker, FuncSig, Item, MEMORY_EXPORT, Synth, TypeError, TypeErrorKind, fn_decls};
 
 /// A function that may be what the world exports as `name`.
 struct Candidate {
@@ -215,6 +215,12 @@ impl Checker {
                 Some(interface) => format!("{interface}#{name}"),
                 None => name.to_string(),
             };
+            // The module exports its memory by that name.
+            if export == MEMORY_EXPORT {
+                let span = candidates.iter().find(|c| c.func == func).map(|c| c.span);
+                let kind = TypeErrorKind::ReservedExport(export.clone());
+                self.error(kind, span.expect("it is a candidate"));
+            }
             // What allocates for the host is no function of the world's.
             let Some(function) = self.world.export(interface, name) else {
                 funcs[func].exports.push(export);
@@ -369,9 +375,11 @@ fn private():
             ]
         );
         // Neither a global nor the table is exported, as no world has one.
-        let globals = "pub let limit = 1\npub var count = 0\nfn f():\n    count = limit\n";
+        let globals = "pub let limit = 1\npub var count = 0\nfn f():\n    count = limit\n\
+                       let pointer = f\n";
         let module = check_in(globals, "bare", None).unwrap();
         assert!(module.globals.iter().all(|g| g.exports.is_empty()));
+        assert_eq!(module.table.unwrap().export, None);
     }
 
     #[test]

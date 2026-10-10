@@ -31,10 +31,6 @@ pub struct Settings {
     /// The most pages memory may grow to, of 64 KiB each. `None` lets it
     /// grow without limit.
     pub max_pages: Option<u64>,
-    /// Whether an address is 64 bits wide rather than 32, as the memory's
-    /// and the table's then are, and with them every pointer, function
-    /// pointer, `int` and `uint`.
-    pub memory64: bool,
     /// The address literals are placed from. Memory starts with the pages
     /// below it, which hold no literal.
     pub static_start: u64,

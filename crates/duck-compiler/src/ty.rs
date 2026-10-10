@@ -873,8 +873,6 @@ struct Checker {
     /// The most pages memory may grow to, which `module.max` is, unless it
     /// may grow without limit.
     max_pages: Option<u64>,
-    /// Whether an address is 64 bits wide rather than 32.
-    memory64: bool,
     /// The address literals must end by.
     data_limit: u64,
     /// The contents of literals, placed in memory in the order they are
@@ -1852,13 +1850,11 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
         memory: ir::Memory {
             min_pages,
             max_pages: settings.max_pages,
-            memory64: settings.memory64,
             export: MEMORY_EXPORT.to_string(),
         },
         data: ck.data,
         table: (!ck.table.is_empty()).then(|| ir::Table {
-            table64: settings.memory64,
-            export: TABLE_EXPORT.to_string(),
+            export: ck.world.is_library().then(|| TABLE_EXPORT.to_string()),
             funcs: ck.table,
         }),
         globals: ck.ir_globals,
@@ -2837,7 +2833,6 @@ impl Checker {
             world,
             return_area_size: settings.return_area.unwrap_or(DEFAULT_RETURN_AREA),
             max_pages: settings.max_pages,
-            memory64: settings.memory64,
             data_end: settings.static_start.into(),
             fuel_limit: settings.fuel.unwrap_or(DEFAULT_FUEL),
             ..Self::default()
@@ -3214,14 +3209,12 @@ impl Checker {
     }
 
     /// The type of a fixed size that `prim` is held as. An `int` and a
-    /// `uint` are as wide as an address: an `i32` and a `u32`, or an `i64`
-    /// and a `u64` where addresses are 64 bits wide. Any other is itself.
+    /// `uint` are as wide as an address, which is 32 bits in a component:
+    /// an `i32` and a `u32`. Any other is itself.
     fn fixed(&self, prim: Prim) -> Prim {
-        match (prim, self.memory64) {
-            (Prim::Int, false) => Prim::I32,
-            (Prim::Int, true) => Prim::I64,
-            (Prim::Uint, false) => Prim::U32,
-            (Prim::Uint, true) => Prim::U64,
+        match prim {
+            Prim::Int => Prim::I32,
+            Prim::Uint => Prim::U32,
             _ => prim,
         }
     }
@@ -3240,10 +3233,7 @@ impl Checker {
     /// The address `n`, or a count of `n` bytes, elements or pages, as a
     /// constant.
     fn addr_const(&self, n: u64) -> Const {
-        match self.memory64 {
-            true => Const::I64(n as i64),
-            false => Const::I32(n as i32),
-        }
+        Const::I32(n as i32)
     }
 
     /// The constant array of `len` elements at `ptr`.
@@ -9175,7 +9165,6 @@ pub fn f(p: &P, a: uint, n: int) -> &u32:
             ir::Memory {
                 min_pages: 0,
                 max_pages: None,
-                memory64: false,
                 export: "memory".to_string()
             }
         );
@@ -9306,273 +9295,6 @@ fn f(n: uint, i: int, w: u32):
                 mismatch("i32", "int"),
             ]
         );
-    }
-
-    /// Lowers `src` with addresses 64 bits wide.
-    fn lower64(src: &str) -> Module {
-        let settings = Settings {
-            memory64: true,
-            ..Settings::default()
-        };
-        match check_with(src, &settings) {
-            Ok(module) => module,
-            Err(errors) => panic!("unexpected type errors: {errors:#?}"),
-        }
-    }
-
-    #[test]
-    fn memory64_widens_addresses_and_what_counts_them() {
-        let src = "\
-pub struct S:
-    a: u8
-    p: &u8
-    n: uint
-pub let BIG: uint = 5000000000
-pub let top = 18446744073709551615 as! &u8
-pub fn f(n: uint, i: int, w: u32, p: &var S) -> uint:
-    let narrow = n as u32
-    let wide = w as uint
-    let signed = n as int
-    let short = i as i32
-    let addr = p as uint
-    p.n = addr + 8
-    let q = p.p < (addr + 8) as! &u8
-    let r = &var p.n
-    let t = (fn()).size
-    return S.size + (&u8).align + array(u8).size + t + module.count_leading_zeros(n)
-";
-        let module = lower64(src);
-        assert!(module.memory.memory64);
-        let globals: Vec<_> = module.globals.iter().map(|g| (g.ty, g.init)).collect();
-        assert_eq!(
-            globals,
-            [
-                (ValType::I64, Const::I64(5000000000)),
-                (ValType::I64, Const::I64(-1))
-            ]
-        );
-        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
-        let wide = ValType::I64;
-        assert_eq!(f.params, [wide, wide, ValType::I32, wide]);
-        assert_eq!(f.results, [wide]);
-        assert_eq!(
-            body(&module, "f"),
-            "(set narrow (I64.Wrap n)) (set wide (I32.ExtendU w)) (set signed n) \
-             (set short (I64.Wrap i)) (set addr p) (I64.Store offset=16 p (I64.Add addr 8i64)) \
-             (set q (I64.LtU (I64.Load offset=8 p) (I64.Add addr 8i64))) \
-             (set r (I64.Add p 16i64)) (set t 8i64) \
-             (return (I64.Add (I64.Add (I64.Add (I64.Add 24i64 8i64) 16i64) t) \
-             (I64.Clz n)))"
-        );
-        // Neither constant is an address that 32 bits hold.
-        assert_eq!(
-            errors(src),
-            vec![
-                TypeErrorKind::IntOutOfRange("uint".into()),
-                TypeErrorKind::IntOutOfRange("uint".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn memory64_indexes_arrays_with_wide_addresses() {
-        let src = "\
-let names: array(array(u8)) = [\"ab\"]
-fn at(a: array(u64), i: uint) -> u64:
-    return a[i]
-fn sum(a: array(u16)) -> u16:
-    var total: u16 = 0
-    for x in a:
-        total += x
-    return total
-fn first(a: array(u8)) -> u8:
-    match a:
-        [x, _]:
-            return x
-        else:
-            return 0
-fn same(a: array(u16), b: array(u16)) -> bool:
-    return a == b
-";
-        let module = lower64(src);
-        assert_eq!(
-            body(&module, "at"),
-            "(if (I64.GeU i a.len) (then unreachable) (else )) \
-             (set tmp3 (I64.Add a.ptr (I64.Mul i 8i64))) (return (I64.Load offset=0 tmp3))"
-        );
-        assert_eq!(
-            body(&module, "sum"),
-            "(set total 0) (set tmp3 a.ptr) (set tmp4 a.len) (set tmp5 0i64) \
-             (block (loop (br_if 1 (I64.GeU tmp5 tmp4)) \
-             (set x (I32.Load16U offset=0 (I64.Add tmp3 (I64.Mul tmp5 2i64)))) \
-             (set tmp5 (I64.Add tmp5 1i64)) (set total (I32.And (I32.Add total x) 65535)) \
-             (br 0))) (return total)"
-        );
-        assert_eq!(
-            body(&module, "first"),
-            "(set tmp2 a.ptr) (set tmp3 a.len) \
-             (block (if (if (I64.Eq tmp3 2i64) (seq (set x (I32.Load8U offset=0 tmp2)) 1) 0) \
-             (then (return x)) (else )) (return 0)) unreachable"
-        );
-        assert_eq!(
-            body(&module, "==(array(u16))"),
-            "(if (I64.Ne a.len b.len) (then (return 0)) (else )) (set tmp4 0i64) \
-             (block (loop (br_if 1 (I64.GeU tmp4 a.len)) \
-             (if (I32.Ne (I32.Load16U offset=0 (I64.Add a.ptr (I64.Mul tmp4 2i64))) \
-             (I32.Load16U offset=0 (I64.Add b.ptr (I64.Mul tmp4 2i64)))) \
-             (then (return 0)) (else )) (set tmp4 (I64.Add tmp4 1i64)) (br 0))) (return 1)"
-        );
-        let at = module.funcs.iter().find(|f| f.name == "at").unwrap();
-        assert_eq!(at.params, [ValType::I64; 3]);
-        // An array in memory is a `ptr` and a `len` of 8 bytes each.
-        let mut name = [0u8; 16];
-        name[8] = 2;
-        assert_eq!(data(&module), [(0, &b"ab"[..]), (8, &name[..])]);
-    }
-
-    #[test]
-    fn memory64_widens_the_functions_and_constants_of_module() {
-        let src = "\
-pub let limits = (module.page_size, module.max)
-fn all() -> varray(u8):
-    return module.memory()
-fn size() -> uint:
-    return module.size()
-fn grow(n: uint) -> int:
-    return module.grow(n)
-fn fill(p: &var u8, n: uint):
-    module.fill(p, 7, n)
-fn copy(a: varray(u8), b: array(u8)):
-    module.copy(src: b.ptr, dst: a.ptr, len: a.len)
-";
-        let module = lower64(src);
-        let globals: Vec<_> = module.globals.iter().map(|g| g.init).collect();
-        assert_eq!(globals, [Const::I64(65536), Const::I64(-1)]);
-        assert_eq!(
-            body(&module, "all"),
-            "(return 0i64 (I64.Mul memory.size 65536i64))"
-        );
-        assert_eq!(body(&module, "size"), "(return memory.size)");
-        assert_eq!(body(&module, "grow"), "(return (memory.grow n))");
-        assert_eq!(body(&module, "fill"), "(memory.fill p 7 n)");
-        assert_eq!(body(&module, "copy"), "(memory.copy a.ptr b.ptr a.len)");
-        for name in ["size", "grow"] {
-            let func = module.funcs.iter().find(|f| f.name == name).unwrap();
-            assert_eq!(func.results, [ValType::I64], "{name}");
-        }
-    }
-
-    #[test]
-    fn memory64_places_literals_past_what_32_bits_address() {
-        let far = 1 << 32;
-        let settings = Settings {
-            max_pages: Some(1 << 30),
-            memory64: true,
-            static_start: far,
-            ..Settings::default()
-        };
-        let src = "\
-pub let s = \"abc\"
-pub let cell = &var 7
-pub let max = module.max
-";
-        let module = check_with(src, &settings).unwrap();
-        assert_eq!(
-            data(&module),
-            [(far, &b"abc"[..]), (far + 4, &[7, 0, 0, 0][..])]
-        );
-        let globals: Vec<_> = module.globals.iter().map(|g| g.init).collect();
-        let far = far as i64;
-        assert_eq!(globals, [far, 3, far + 4, 1 << 30].map(Const::I64));
-        // The pages below the literals, and the one they are in.
-        assert_eq!(
-            (module.memory.min_pages, module.memory.max_pages),
-            ((1 << 16) + 1, Some(1 << 30))
-        );
-        // More elements than 32 bits count, in the memory that holds them.
-        let module = lower64("pub let zeros: array(u8) = [0; 5000000000]\n");
-        assert_eq!(module.memory.min_pages, 76294);
-        assert_eq!(module.globals[1].init, Const::I64(5000000000));
-        let unfit = "let a: array(u64) = [1; 18446744073709551615]\n";
-        let settings = Settings {
-            memory64: true,
-            ..Settings::default()
-        };
-        let errors = check_with(unfit, &settings).unwrap_err();
-        assert_eq!(
-            errors.into_iter().map(|e| e.kind).collect::<Vec<_>>(),
-            [TypeErrorKind::DataTooLarge {
-                end: 8 * u128::from(u64::MAX)
-            }]
-        );
-    }
-
-    #[test]
-    fn memory64_widens_function_pointers_and_the_table() {
-        let src = "\
-struct S:
-    a: u8
-    f: fn(i32) -> i32
-fn inc(x: i32) -> i32:
-    return x + 1
-fn f(p: &var S, g: fn(i32) -> i32, i: uint) -> i32:
-    p.f = g
-    let h = i as! fn(i32) -> i32
-    let n = inc as uint
-    return p.f(1) + h(2) + S.size as i32
-";
-        let module = lower64(src);
-        assert!(module.table.as_ref().unwrap().table64);
-        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
-        assert_eq!(f.params, [ValType::I64; 3]);
-        assert_eq!(
-            body(&module, "f"),
-            "(I64.Store offset=8 p g) (set h i) (set n 1i64) \
-             (return (I32.Add (I32.Add (call_indirect (I64.Load offset=8 p) 1) \
-             (call_indirect h 2)) (I64.Wrap 16i64)))"
-        );
-        assert!(
-            !lower("fn f():\n    pass\nlet g = f\n")
-                .table
-                .unwrap()
-                .table64
-        );
-    }
-
-    #[test]
-    fn memory64_widens_the_leaves_unions_share_with_addresses() {
-        let src = "\
-union U:
-    at: uint
-    ratio: f32
-    byte: &u8
-let units: array(U) = [.at(5000000000), .ratio(1.0)]
-fn f(u: U, p: &var U) -> uint:
-    p.* = u
-    match u:
-        .at(n):
-            return n
-        else:
-            return U.size
-";
-        let module = lower64(src);
-        let f = module.funcs.iter().find(|f| f.name == "f").unwrap();
-        assert_eq!(f.params, [ValType::I32, ValType::I64, ValType::I64]);
-        assert_eq!(
-            body(&module, "f"),
-            "(I32.Store8 offset=0 p u) \
-             (if (I32.Eq u 0) (then (I64.Store offset=8 p u.0)) (else )) \
-             (if (I32.Eq u 1) \
-             (then (F32.Store offset=8 p (I32.Reinterpret (I64.Wrap u.0)))) (else )) \
-             (if (I32.Eq u 2) (then (I64.Store offset=8 p u.0)) (else )) \
-             (set tmp3 u) (set n u.0) \
-             (block (if (I32.Eq tmp3 0) (then (return n)) (else )) (return 16i64)) unreachable"
-        );
-        let mut bytes = [0u8; 32];
-        bytes[8..16].copy_from_slice(&5000000000u64.to_le_bytes());
-        bytes[16] = 1;
-        bytes[24..28].copy_from_slice(&1f32.to_le_bytes());
-        assert_eq!(data(&module), [(0, &bytes[..])]);
     }
 
     #[test]
@@ -15126,7 +14848,8 @@ fn main() -> i32:
         let module = lower(src);
         // Indices are given in the order pointers are first taken.
         assert_eq!(table(&module), ["dec", "inc"]);
-        assert_eq!(module.table.as_ref().unwrap().export, "table");
+        let export = module.table.as_ref().unwrap().export.as_deref();
+        assert_eq!(export, Some("table"));
         assert_eq!(body(&module, "apply"), "(return (call_indirect f x))");
         assert_eq!(
             body(&module, "main"),

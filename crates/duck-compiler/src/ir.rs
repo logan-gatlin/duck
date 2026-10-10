@@ -5,8 +5,7 @@
 //! have been split into one local or global per scalar field, function
 //! pointers are indices into the module's table, and control flow is wasm's
 //! structured `block`/`loop`/`if` with branch targets given as label depths.
-//! An address, a function pointer and a count of pages are each an `i32`, or
-//! an `i64` where [`Memory::memory64`] is set.
+//! An address, a function pointer and a count of pages are each an `i32`.
 
 /// A wasm function index: [`Module::imports`] come first, then
 /// [`Module::funcs`].
@@ -40,18 +39,15 @@ pub struct Memory {
     pub min_pages: u64,
     /// Size in 64 KiB pages it may grow to; `None` is unlimited.
     pub max_pages: Option<u64>,
-    /// Whether it is addressed with an `i64` rather than an `i32`.
-    pub memory64: bool,
     pub export: String,
 }
 
 /// The module's one table, which function pointers index.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
-    /// Whether it is indexed with an `i64` rather than an `i32`, as it is
-    /// where the memory is.
-    pub table64: bool,
-    pub export: String,
+    /// The name it is exported as, if it is: no world has a table, so only
+    /// the module of a library exports one.
+    pub export: Option<String>,
     /// The function at each index from 1 up. Nothing is at index 0, so
     /// calling it traps.
     pub funcs: Vec<FuncId>,

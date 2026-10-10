@@ -78,7 +78,7 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
     let memory = MemoryType {
         minimum: module.memory.min_pages,
         maximum: module.memory.max_pages,
-        memory64: module.memory.memory64,
+        memory64: false,
         shared: false,
         page_size_log2: None,
     };
@@ -97,7 +97,7 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
         imports.import(HOST, "memory", EntityType::Memory(unbounded));
         let table = TableType {
             element_type: RefType::FUNCREF,
-            table64: module.memory.memory64,
+            table64: false,
             minimum: 0,
             maximum: None,
             shared: false,
@@ -120,7 +120,7 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
         let size = table.funcs.len() as u64 + 1;
         tables.table(TableType {
             element_type: RefType::FUNCREF,
-            table64: table.table64,
+            table64: false,
             minimum: size,
             maximum: Some(size),
             shared: false,
@@ -134,7 +134,7 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
         let funcs: Vec<_> = table.funcs.iter().map(|func| func.0).collect();
         elements.active(
             None,
-            &offset(table.table64, 1),
+            &ConstExpr::i32_const(1),
             Elements::Functions(funcs.into()),
         );
     }
@@ -154,8 +154,9 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
     if !hosted {
         exports.export(&module.memory.export, ExportKind::Memory, 0);
     }
-    if let Some(table) = module.table.as_ref().filter(|_| !hosted) {
-        exports.export(&table.export, ExportKind::Table, 0);
+    let table = module.table.as_ref().filter(|_| !hosted);
+    if let Some(export) = table.and_then(|table| table.export.as_ref()) {
+        exports.export(export, ExportKind::Table, 0);
     }
     for (i, func) in module.funcs.iter().enumerate() {
         for name in &func.exports {
@@ -175,7 +176,7 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
 
     let mut data = DataSection::new();
     for segment in module.data.iter().filter(|_| !hosted) {
-        let offset = offset(module.memory.memory64, segment.offset);
+        let offset = ConstExpr::i32_const(segment.offset as i32);
         data.active(0, &offset, segment.bytes.iter().copied());
     }
 
@@ -217,15 +218,6 @@ fn encode(module: &Module, hosted: bool) -> Vec<u8> {
     }
     out.section(&code).section(&data).section(&names);
     out.finish()
-}
-
-/// Where an active segment starts: `at`, as an `i64` where its memory or
-/// table is addressed with one, if `wide`, and as an `i32` otherwise.
-fn offset(wide: bool, at: u64) -> ConstExpr {
-    match wide {
-        true => ConstExpr::i64_const(at as i64),
-        false => ConstExpr::i32_const(at as i32),
-    }
 }
 
 fn function(func: &Func, types: &mut Types) -> Function {
@@ -959,66 +951,6 @@ pub fn shown():
         // It starts with the pages a constant grew it by.
         let wat = emitted("let _ = module.grow(2)\n");
         assert!(wat.contains("(memory (;0;) 2 16)"), "{wat}");
-    }
-
-    #[test]
-    fn memory64_addresses_memory_and_the_table_with_i64() {
-        let far = 1 << 32;
-        let settings = Settings {
-            max_pages: Some(1 << 20),
-            memory64: true,
-            static_start: far,
-            ..Settings::default()
-        };
-        let src = "\
-pub struct Node:
-    val: i32
-    next: &var Node
-let text = \"far\"
-fn inc(x: i32) -> i32:
-    return x + 1
-pub fn walk(n: &var Node, a: varray(u16), i: uint, f: fn(i32) -> i32) -> i32:
-    a[i] = text[0] as u16
-    n.next.val = f(n.val) + inc(1)
-    let g = inc
-    for x in a:
-        n.val += g(x as i32)
-    return n.val
-pub fn mem(p: &var u8, q: &u8, n: uint) -> int:
-    module.fill(p, 0, n)
-    module.copy(p, q, n)
-    let all = module.memory()
-    return module.grow(all.len / module.page_size - module.size())
-";
-        let bytes = emit_with(src, &settings);
-        let wat = wat(&bytes);
-        for line in [
-            "(memory (;0;) i64 65537 1048576)",
-            "(table (;0;) i64 2 2 funcref)",
-            "(elem (;0;) (i64.const 1) func $inc)",
-            r#"(data (;0;) (i64.const 4294967296) "far")"#,
-        ] {
-            assert!(wat.contains(line), "{line}\n{wat}");
-        }
-        let walk = func_wat(&bytes, "walk");
-        for part in [
-            "(param $n i64) (param $a.ptr i64) (param $a.len i64) (param $i i64) (param $f i64)",
-            "i64.ge_u\n    if ;; label = @1\n      unreachable\n    end\n",
-            "i32.store16\n",
-            "i64.load offset=8\n",
-            "local.get $f\n    call_indirect (type",
-            "i64.const 1\n    local.set $g\n",
-        ] {
-            assert!(walk.contains(part), "{part}\n{walk}");
-        }
-        let mem = func_wat(&bytes, "mem");
-        assert!(
-            mem.contains("(param $p i64) (param $q i64) (param $n i64) (result i64)"),
-            "{mem}"
-        );
-        for instr in ["memory.fill", "memory.copy", "memory.size", "memory.grow"] {
-            assert!(mem.contains(instr), "{instr}\n{mem}");
-        }
     }
 
     #[test]

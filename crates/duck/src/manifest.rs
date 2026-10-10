@@ -20,10 +20,6 @@ const PAGE_SIZE: u64 = 64 * 1024;
 /// The most pages a 32-bit wasm memory can hold: 4 GiB.
 pub const MAX_PAGES: u64 = 1 << 16;
 
-/// The most pages a 64-bit wasm memory can hold: one byte past the largest
-/// address.
-pub const MAX_PAGES_64: u64 = 1 << 48;
-
 /// A validated `Duck.toml`. It has a component, a library, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -48,8 +44,6 @@ pub struct Component {
     /// The most pages memory may grow to. `None` lets it grow without
     /// limit.
     pub max_pages: Option<u64>,
-    /// Whether the memory is addressed with 64 bits rather than 32.
-    pub memory64: bool,
     /// The address literals are placed from.
     pub static_start: u64,
     /// The bytes of the return area, which holds what a function passes
@@ -106,6 +100,8 @@ pub enum ManifestError {
     },
     /// A `min` for memory, which starts as the constants leave it.
     Min,
+    /// A `memory64`, which no component's memory is.
+    Memory64,
     /// An `end` for the literals, which end where the last is placed.
     StaticEnd,
     /// Neither a `[component]` nor a `[library]`.
@@ -129,14 +125,10 @@ pub enum SizeErrorKind {
     /// Not a number followed by a unit.
     Malformed,
     NotPageMultiple,
-    /// More than memory holds, which is more with `memory64`.
-    TooLarge {
-        memory64: bool,
-    },
+    /// More than memory holds.
+    TooLarge,
     /// As much as memory holds, which is past every address in it.
-    NotAnAddress {
-        memory64: bool,
-    },
+    NotAnAddress,
 }
 
 /// `Duck.toml` as written, before sizes are checked.
@@ -164,8 +156,8 @@ struct RawComponent {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMemory {
-    #[serde(default)]
-    memory64: bool,
+    /// Only read to be refused.
+    memory64: Option<bool>,
     /// Only read to be refused.
     min: Option<String>,
     max: Option<String>,
@@ -284,7 +276,6 @@ impl Component {
     pub fn settings(&self, wit: Wit) -> Settings {
         Settings {
             max_pages: self.max_pages,
-            memory64: self.memory64,
             static_start: self.static_start,
             start: self.start.clone(),
             fuel: self.fuel,
@@ -305,22 +296,23 @@ impl Component {
         if min.is_some() {
             return Err(ManifestError::Min);
         }
+        if memory64.is_some() {
+            return Err(ManifestError::Memory64);
+        }
         let max_pages = max
             .as_deref()
-            .map(|max| pages("memory.max", max, memory64))
+            .map(|max| pages("memory.max", max))
             .transpose()?;
         let static_start = match literals {
             Some(RawStatic { end: Some(_), .. }) => return Err(ManifestError::StaticEnd),
-            Some(RawStatic { start, end: None }) => {
-                address("memory.static.start", &start, memory64)?
-            }
+            Some(RawStatic { start, end: None }) => address("memory.static.start", &start)?,
             None => 0,
         };
         let return_area = return_area
             .as_deref()
             .map(|size| {
-                let bytes = bytes("memory.return", size, false)?;
-                let kind = SizeErrorKind::TooLarge { memory64: false };
+                let bytes = bytes("memory.return", size)?;
+                let kind = SizeErrorKind::TooLarge;
                 u32::try_from(bytes).map_err(|_| size_error("memory.return", size, kind))
             })
             .transpose()?;
@@ -330,7 +322,6 @@ impl Component {
             start: component.start,
             world: component.world.unwrap_or_else(|| COMMAND.to_string()),
             max_pages,
-            memory64,
             static_start,
             return_area,
             fuel: None,
@@ -346,7 +337,6 @@ impl Library {
     pub fn settings(&self, wit: Wit) -> Settings {
         Settings {
             max_pages: None,
-            memory64: false,
             static_start: 0,
             start: None,
             fuel: self.fuel,
@@ -358,8 +348,8 @@ impl Library {
 }
 
 /// The number of wasm pages in `value`, a size such as `64KiB` or `2pgs`.
-fn pages(key: &'static str, value: &str, memory64: bool) -> Result<u64, ManifestError> {
-    let bytes = bytes(key, value, memory64)?;
+fn pages(key: &'static str, value: &str) -> Result<u64, ManifestError> {
+    let bytes = bytes(key, value)?;
     if bytes % u128::from(PAGE_SIZE) != 0 {
         return Err(size_error(key, value, SizeErrorKind::NotPageMultiple));
     }
@@ -368,25 +358,23 @@ fn pages(key: &'static str, value: &str, memory64: bool) -> Result<u64, Manifest
 
 /// The address `value`, a size such as `1024B` or `4KiB` from the start of
 /// memory.
-fn address(key: &'static str, value: &str, memory64: bool) -> Result<u64, ManifestError> {
-    let bytes = bytes(key, value, memory64)?;
-    if bytes == max_bytes(memory64) {
-        let kind = SizeErrorKind::NotAnAddress { memory64 };
+fn address(key: &'static str, value: &str) -> Result<u64, ManifestError> {
+    let bytes = bytes(key, value)?;
+    if bytes == max_bytes() {
+        let kind = SizeErrorKind::NotAnAddress;
         return Err(size_error(key, value, kind));
     }
     Ok(bytes as u64)
 }
 
-/// The most bytes memory can hold: 4 GiB, or with `memory64`, one past the
-/// largest `u64`.
-fn max_bytes(memory64: bool) -> u128 {
-    let pages = if memory64 { MAX_PAGES_64 } else { MAX_PAGES };
-    u128::from(pages) * u128::from(PAGE_SIZE)
+/// The most bytes memory can hold: 4 GiB.
+fn max_bytes() -> u128 {
+    u128::from(MAX_PAGES) * u128::from(PAGE_SIZE)
 }
 
 /// The number of bytes in `value`, a size such as `64KiB` or `2pgs`, which
 /// is at most what memory can hold.
-fn bytes(key: &'static str, value: &str, memory64: bool) -> Result<u128, ManifestError> {
+fn bytes(key: &'static str, value: &str) -> Result<u128, ManifestError> {
     let error = |kind| size_error(key, value, kind);
     let digits = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
     let (number, unit) = value.split_at(digits);
@@ -406,8 +394,8 @@ fn bytes(key: &'static str, value: &str, memory64: bool) -> Result<u128, Manifes
     let bytes = number.parse::<u64>().ok();
     bytes
         .map(|number| u128::from(number) * u128::from(unit_size))
-        .filter(|bytes| *bytes <= max_bytes(memory64))
-        .ok_or(error(SizeErrorKind::TooLarge { memory64 }))
+        .filter(|bytes| *bytes <= max_bytes())
+        .ok_or(error(SizeErrorKind::TooLarge))
 }
 
 fn size_error(key: &'static str, value: &str, kind: SizeErrorKind) -> ManifestError {
@@ -431,6 +419,10 @@ impl fmt::Display for ManifestError {
             Self::StaticEnd => write!(
                 f,
                 "memory.static has no `end`: literals end where the last is placed"
+            ),
+            Self::Memory64 => write!(
+                f,
+                "memory has no `memory64`: a component addresses it with 32 bits"
             ),
             Self::Empty => write!(f, "needs a [component] or [library] table"),
             Self::MemoryWithoutComponent => write!(f, "[memory] needs a [component] table"),
@@ -465,12 +457,8 @@ impl fmt::Display for SizeErrorKind {
                 )
             }
             Self::NotPageMultiple => write!(f, "is not a multiple of 64KiB"),
-            Self::TooLarge { memory64: false } => {
-                write!(f, "exceeds 4GiB; set `memory64` to address more")
-            }
-            Self::TooLarge { memory64: true } => write!(f, "exceeds 16777216TiB"),
-            Self::NotAnAddress { memory64: false } => write!(f, "is not below 4GiB"),
-            Self::NotAnAddress { memory64: true } => write!(f, "is not below 16777216TiB"),
+            Self::TooLarge => write!(f, "exceeds 4GiB, which is all a component addresses"),
+            Self::NotAnAddress => write!(f, "is not below 4GiB"),
         }
     }
 }
@@ -487,7 +475,7 @@ mod tests {
     }
 
     fn size(value: &str) -> Result<u64, String> {
-        pages("memory.max", value, false).map_err(|e| e.to_string())
+        pages("memory.max", value).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -503,8 +491,7 @@ mod tests {
 
     #[test]
     fn addresses() {
-        let address =
-            |value| address("memory.static.start", value, false).map_err(|e| e.to_string());
+        let address = |value| address("memory.static.start", value).map_err(|e| e.to_string());
         assert_eq!(address("0B"), Ok(0));
         assert_eq!(address("1025B"), Ok(1025));
         assert_eq!(address("4KiB"), Ok(4096));
@@ -516,58 +503,29 @@ mod tests {
         assert_eq!(
             address("5GiB"),
             Err(
-                "memory.static.start \"5GiB\" exceeds 4GiB; set `memory64` to address more"
+                "memory.static.start \"5GiB\" exceeds 4GiB, which is all a component addresses"
                     .to_string()
             )
         );
     }
 
     #[test]
-    fn memory64_addresses_more() {
+    fn memory_is_addressed_with_32_bits() {
         let module = |memory: &str| with_memory(memory).map(|manifest| manifest.component.unwrap());
-        let wide =
-            module("memory64 = true\nmax = \"1TiB\"\nstatic = { start = \"4GiB\" }\n").unwrap();
-        assert!(wide.memory64 && wide.settings(Wit::default()).memory64);
-        assert_eq!(wide.max_pages, Some(1 << 24));
-        assert_eq!(wide.static_start, 1 << 32);
-        // Neither size is within reach of 32 bits.
-        for memory in ["", "memory64 = false\n"] {
-            let narrow = module(&format!("{memory}max = \"4GiB\"\n")).unwrap();
-            assert!(!narrow.memory64 && !narrow.settings(Wit::default()).memory64);
-            assert_eq!(
-                module(&format!("{memory}max = \"8GiB\"\n"))
-                    .unwrap_err()
-                    .to_string(),
-                "memory.max \"8GiB\" exceeds 4GiB; set `memory64` to address more"
-            );
-        }
-        // As much as wasm lets 64 bits address, which is every address.
-        let size = |value| pages("memory.max", value, true).map_err(|e| e.to_string());
-        assert_eq!(size("281474976710656pgs"), Ok(MAX_PAGES_64));
-        assert_eq!(size("16777216TiB"), Ok(MAX_PAGES_64));
-        for value in ["281474976710657pgs", "16777217TiB", "99999999999999999999B"] {
-            assert_eq!(
-                size(value),
-                Err(format!("memory.max \"{value}\" exceeds 16777216TiB")),
-                "{value:?}"
-            );
-        }
-        let address =
-            |value| address("memory.static.start", value, true).map_err(|e| e.to_string());
-        assert_eq!(address("18446744073709551615B"), Ok(u64::MAX));
         assert_eq!(
-            address("16777216TiB"),
-            Err("memory.static.start \"16777216TiB\" is not below 16777216TiB".to_string())
+            module("max = \"4GiB\"\n").unwrap().max_pages,
+            Some(MAX_PAGES)
         );
-        assert!(
-            module("memory64 = 64\n")
-                .unwrap_err()
-                .to_string()
-                .contains("invalid type")
+        assert_eq!(
+            module("max = \"8GiB\"\n").unwrap_err().to_string(),
+            "memory.max \"8GiB\" exceeds 4GiB, which is all a component addresses"
         );
-        // A library is checked alone as the least a component may give it.
-        let library = Manifest::parse("[library]\nentry = \"lib.duck\"\n").unwrap();
-        assert!(!library.library.unwrap().settings(Wit::default()).memory64);
+        for memory in ["memory64 = true\n", "memory64 = false\n"] {
+            assert_eq!(
+                module(memory).unwrap_err().to_string(),
+                "memory has no `memory64`: a component addresses it with 32 bits"
+            );
+        }
     }
 
     #[test]
@@ -595,7 +553,7 @@ mod tests {
             assert_eq!(
                 size(value),
                 Err(format!(
-                    "memory.max \"{value}\" exceeds 4GiB; set `memory64` to address more"
+                    "memory.max \"{value}\" exceeds 4GiB, which is all a component addresses"
                 )),
                 "{value:?}"
             );
@@ -614,7 +572,6 @@ mod tests {
                     start: None,
                     world: COMMAND.to_string(),
                     max_pages: Some(256),
-                    memory64: false,
                     static_start: 1025,
                     return_area: None,
                     fuel: None,

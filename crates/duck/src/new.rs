@@ -20,9 +20,6 @@ start = "main"
 
 # Sizes are B, KiB, MiB, GiB, TiB, or pgs (64KiB wasm pages).
 # [memory]
-# Address memory with 64 bits rather than 32, which makes pointers, `int` and
-# `uint` 64 bits wide and lets sizes pass 4GiB.
-# memory64 = true
 # What memory may grow to. It starts with the pages its literals take, and
 # those its constants grow it by.
 # max = "16MiB"
@@ -131,7 +128,6 @@ mod tests {
                 start: Some("main".to_string()),
                 world: "wasi:cli/command@0.3.0".to_string(),
                 max_pages: None,
-                memory64: false,
                 static_start: 0,
                 return_area: None,
                 fuel: None,
