@@ -279,8 +279,13 @@ pub enum StmtKind {
         cond: Expr,
         body: Block,
     },
+    /// `for pattern in iter:` or `for index, pattern in iter:`.
     For {
-        var: Ident,
+        /// A name or `_`, for where the element is among those iterated.
+        index: Option<Pattern>,
+        /// What takes each element, as the pattern of a binding takes its
+        /// value.
+        pattern: Pattern,
         iter: Expr,
         body: Block,
     },
@@ -1075,6 +1080,21 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// What a `for` binds: `pattern`, or `index, pattern`, where the index is
+    /// a name or `_`.
+    fn for_bindings(&mut self) -> PResult<(Option<Pattern>, Pattern)> {
+        let indexed = matches!(self.peek().kind, TokenKind::Ident(_))
+            && self.peek_second().kind == TokenKind::Comma;
+        let index = if indexed {
+            let index = self.pattern()?;
+            self.bump();
+            Some(index)
+        } else {
+            None
+        };
+        Ok((index, self.pattern()?))
+    }
+
     fn pattern(&mut self) -> PResult<Pattern> {
         let token = self.peek();
         let kind = match &token.kind {
@@ -1188,11 +1208,16 @@ impl<'a> Parser<'a> {
             }
             TokenKind::For => {
                 self.bump();
-                let var = self.ident()?;
+                let (index, pattern) = self.for_bindings()?;
                 self.expect(TokenKind::In)?;
                 let iter = self.expr()?;
                 let body = self.block()?;
-                StmtKind::For { var, iter, body }
+                StmtKind::For {
+                    index,
+                    pattern,
+                    iter,
+                    body,
+                }
             }
             TokenKind::Match => {
                 self.bump();
@@ -2608,6 +2633,32 @@ mod tests {
         }
         // Patterns, labels and other names are not expressions.
         parse_src("fn f(_: i32):\n    for _ in xs:\n        let _ = g(_: 1)\n").unwrap();
+    }
+
+    #[test]
+    fn for_bindings() {
+        let head = |src: &str| {
+            let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
+            let module = parse_src(&src).unwrap();
+            let ItemKind::Fn(f) = &module.items[0].kind else {
+                panic!()
+            };
+            let StmtKind::For { index, pattern, .. } = &f.body[0].kind else {
+                panic!()
+            };
+            let index = index.as_ref().map(render_pattern);
+            (index.unwrap_or_default(), render_pattern(pattern))
+        };
+        assert_eq!(head("x"), ("".into(), "x".into()));
+        assert_eq!(head("_"), ("".into(), "_".into()));
+        assert_eq!(head("(k, (v, _))"), ("".into(), "(k (v _))".into()));
+        assert_eq!(head("i, x"), ("i".into(), "x".into()));
+        assert_eq!(head("_, (k, v)"), ("_".into(), "(k v)".into()));
+        // Only a name counts, and only one of them.
+        for src in ["(a, b), x", "i, j, x"] {
+            let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
+            assert_eq!(errors(&src), vec![expected("`in`", TokenKind::Comma)]);
+        }
     }
 
     #[test]

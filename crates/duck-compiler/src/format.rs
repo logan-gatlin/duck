@@ -880,6 +880,10 @@ mod tests {
             "fn f():\n\tx += 1\n\tif a <= b and not c or d != e:\n\t\tpass\n"
         );
         assert_eq!(
+            formatted("fn f():\n\tfor  i ,( k,v )in pairs:\n\t\tpass\n"),
+            "fn f():\n\tfor i, (k, v) in pairs:\n\t\tpass\n"
+        );
+        assert_eq!(
             formatted("let b:varray(u8)=[ 0 ;SIZE ]\n"),
             "let b: varray(u8) = [0; SIZE]\n"
         );

@@ -1149,6 +1149,42 @@ pub let after = count()
     }
 
     #[test]
+    fn for_loops_count_what_they_iterate() {
+        let src = "\
+enum(i32) Step:
+    first = 10
+    second = 20
+    third
+fn weigh(a: array(i32)) -> i32:
+    var total = 0
+    for i, x in a:
+        if x == 0:
+            continue
+        total += x * (i as i32 + 1)
+    return total
+fn spread(pairs: array(tuple(i32, i32))) -> i32:
+    var total = 0
+    for i, (low, high) in pairs:
+        total += (high - low) * i as i32
+    return total
+fn steps() -> i32:
+    var total = 0
+    for i, step in Step:
+        if step == .second:
+            continue
+        total += step as i32 * (i as i32 + 1)
+    return total
+pub let weighed = weigh([5, 0, 7])
+pub let spreads = spread([(1, 9), (2, 5), (0, 4)])
+pub let stepped = steps()
+";
+        let mut started = Started::of(src);
+        assert_eq!(started.global("weighed"), 5 + 7 * 3);
+        assert_eq!(started.global("spreads"), 3 + 4 * 2);
+        assert_eq!(started.global("stepped"), 10 + 21 * 3);
+    }
+
+    #[test]
     fn a_function_reads_its_literals_whenever_it_is_called() {
         let src = "\
 let LIMIT: uint = 2

@@ -417,9 +417,11 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
+    // `for x in a` or `for i, x in a`: the index is a name or `_`.
     for_statement: $ => seq(
       'for',
-      field('variable', $.identifier),
+      optional(seq(field('index', choice($.identifier, $.discard)), ',')),
+      field('pattern', $._pattern),
       'in',
       field('iterable', $._expression),
       field('body', $.block),

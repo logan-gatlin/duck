@@ -228,6 +228,46 @@ fn word(s: array(u8), strict: bool) -> i32:
 - In a generic body a value of type `T` matches a name, `_` or `else` only.
 - `let` and `var` take names, `_` and tuples, which can't fail to match.
 
+## Loops
+
+```duck
+extern:
+	fn log(n: i32, at: uint)
+
+enum(i32) Step:
+	first = 10
+	second = 20
+
+fn demo(a: array(i32), pairs: array(tuple(i32, i32))) -> i32:
+	var total = 0
+	for x in a:                      # each element, first to last
+		total += x
+	for i, x in a:                   # and where it is: a `uint` from 0
+		log(x, i)
+	for i, (low, high) in pairs:     # in a pattern that `let` takes
+		total += (high - low) * i as i32
+	for i, step in Step:             # each member: 10 at 0, then 20 at 1
+		log(step as i32, i)
+	return total
+```
+
+- `for x in a` runs its block for each element of an array, with `x` an
+  immutable copy of it. `for m in Name` runs it for each member of an enum,
+  in the order they are declared.
+- The array is evaluated once, and its `ptr` and `len` are read once, before
+  the first iteration. A block that changes what is iterated still runs for
+  the elements that were there.
+- What takes the element is a pattern that `let` takes: a name, `_` or a
+  tuple of them.
+- `for i, x in a`: a name before the pattern, or `_`, is the index. It is a
+  `uint` that counts the elements from 0, and is immutable as `x` is.
+- Of an enum the index is how many members are declared before this one,
+  whatever their values: with `err = 5` after `ok`, `err` is at 1.
+- A `for` binds a name once: `for i, i in a` and `for (x, x) in pairs` are
+  errors.
+- `break` leaves the loop. `continue` moves on to the next element, and the
+  index with it.
+
 ## Literals and globals
 
 **A string or array literal in a function is a constant that is only read.**

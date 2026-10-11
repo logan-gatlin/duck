@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use crate::file::FileId;
-use crate::parse::{self, Arg, Binding, ExprKind, ItemKind, StmtKind};
+use crate::parse::{self, Arg, Binding, ExprKind, ItemKind, Pattern, StmtKind};
 
 use super::symbols::bound;
 use super::visit::{self, Node};
@@ -46,12 +46,10 @@ impl Analysis {
             visit::each(item, &mut |node| match node {
                 Node::Stmt(stmt) => match &stmt.kind {
                     StmtKind::Binding(binding) => self.binding_hints(binding, &mut hints),
-                    StmtKind::For { var, .. } => {
-                        hints.extend(self.type_at(var.span).map(|ty| Hint {
-                            offset: var.span.end,
-                            label: format!(": {ty}"),
-                            kind: HintKind::Type,
-                        }));
+                    StmtKind::For { index, pattern, .. } => {
+                        for pattern in index.iter().chain([pattern]) {
+                            self.pattern_hints(pattern, &mut hints);
+                        }
                     }
                     _ => {}
                 },
@@ -72,8 +70,13 @@ impl Analysis {
         if binding.ty.is_some() {
             return;
         }
+        self.pattern_hints(&binding.pattern, hints);
+    }
+
+    /// The type of each name that `pattern` binds.
+    fn pattern_hints(&self, pattern: &Pattern, hints: &mut Vec<Hint>) {
         let mut names = Vec::new();
-        bound(&binding.pattern, &mut names);
+        bound(pattern, &mut names);
         for (_, span) in names {
             hints.extend(self.type_at(span).map(|ty| Hint {
                 offset: span.end,

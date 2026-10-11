@@ -76,6 +76,10 @@ Loops
 fn f():
     for p in primes:
         continue
+    for i, (k, _) in pairs:
+        pass
+    for _, x in xs:
+        pass
     while true:
         break
 
@@ -92,6 +96,20 @@ fn f():
         (block
           (expression_statement
             (continue_expression))))
+      (for_statement
+        (identifier)
+        (tuple_pattern
+          (identifier)
+          (discard))
+        (identifier)
+        (block
+          (pass_statement)))
+      (for_statement
+        (discard)
+        (identifier)
+        (identifier)
+        (block
+          (pass_statement)))
       (while_statement
         (boolean)
         (block

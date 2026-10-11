@@ -130,7 +130,11 @@ impl Analysis {
                         return declares(&name.name, name.span, UnusedKind::Function);
                     }
                     StmtKind::Binding(binding) => bound(&binding.pattern, &mut bindings),
-                    StmtKind::For { var, .. } => bindings.push((&var.name, var.span)),
+                    StmtKind::For { index, pattern, .. } => {
+                        for pattern in index.iter().chain([pattern]) {
+                            bound(pattern, &mut bindings);
+                        }
+                    }
                     StmtKind::Match { arms, .. } => {
                         for arm in arms {
                             bound(&arm.pattern, &mut bindings);

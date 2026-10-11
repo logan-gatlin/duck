@@ -90,6 +90,11 @@ pub fn completing(src: &str, offset: usize) -> Option<Completing> {
     if let Some(TokenKind::Use) = tokens.get(public as usize).map(|token| &token.kind) {
         return used(&line, &tokens[public as usize + 1..]);
     }
+    // A `for` gives names until its `in`.
+    let mut kinds = tokens.iter().map(|token| &token.kind);
+    if kinds.next() == Some(&TokenKind::For) && !kinds.any(|kind| *kind == TokenKind::In) {
+        return None;
+    }
     match tokens.last().map(|token| &token.kind) {
         Some(TokenKind::Dot) => {
             let dot = tokens.len() - 1;
@@ -107,12 +112,7 @@ pub fn completing(src: &str, offset: usize) -> Option<Completing> {
             Some(Completing::Members(line.asking(receiver)))
         }
         Some(
-            TokenKind::Let
-            | TokenKind::Var
-            | TokenKind::Fn
-            | TokenKind::Struct
-            | TokenKind::Union
-            | TokenKind::For,
+            TokenKind::Let | TokenKind::Var | TokenKind::Fn | TokenKind::Struct | TokenKind::Union,
         ) => None,
         _ => Some(Completing::Names(line.replaced(match line.indent {
             "" => "",
@@ -572,6 +572,11 @@ mod tests {
         assert_eq!(completing_at("let s = \"a.@\"\n"), None);
         assert_eq!(completing_at("let n = 12@\n"), None);
         assert_eq!(completing_at("fn f():\n    let @\n"), None);
+        assert_eq!(completing_at("fn f():\n    for @\n"), None);
+        assert_eq!(completing_at("fn f():\n    for i, @\n"), None);
+        assert_eq!(completing_at("fn f():\n    for i, (a, b@\n"), None);
+        let after = completing_at("fn f():\n    for i, x in @\n");
+        assert_eq!(after.map(|(kind, _)| kind), Some("names"));
         assert_eq!(completing_at("fn na@\n"), None);
         assert_eq!(completing_at("use geo.len as @\n"), None);
         assert_eq!(completing_at("use geo.len @\n"), None);

@@ -4643,34 +4643,9 @@ impl<'c> Body<'c> {
             StmtKind::Binding(binding) if binding.binds_type() => self.alias_stmt(binding),
             StmtKind::Binding(binding) => {
                 let (ty, value) = self.binding_value(binding);
-                let bounds = self.ck.destructure(&binding.pattern, ty);
-                // The local each leaf of the value goes to, if it's kept.
-                let mut dests = vec![None; self.ck.val_types(ty).len()];
-                let mut vars = Vec::new();
-                for (i, bound) in bounds.iter().enumerate() {
-                    if bounds[..i].iter().any(|prev| prev.name == bound.name) {
-                        let kind = TypeErrorKind::DuplicateBinding(bound.name.to_string());
-                        self.error(kind, bound.span);
-                        continue;
-                    }
-                    let slots = self.alloc(bound.name, bound.ty);
-                    for (leaf, slot) in bound.leaves.clone().zip(&slots) {
-                        dests[leaf] = Some(*slot);
-                    }
-                    vars.push((bound.name, bound.ty, slots));
-                }
-                out.extend(value.pre);
-                for (dest, (_, scalar)) in dests.into_iter().zip(value.scalars) {
-                    match dest {
-                        Some(slot) => out.push(Stmt::SetLocal(slot, scalar)),
-                        None if !is_pure(&scalar) => out.push(Stmt::Drop(scalar)),
-                        None => {}
-                    }
-                }
                 let mutable = binding.mutability == Mutability::Var;
-                for (name, ty, slots) in vars {
-                    self.bind(name, ty, mutable, slots);
-                }
+                let dests = self.bind_pattern(&binding.pattern, ty, mutable, None);
+                self.set_leaves(dests, value, out);
             }
             StmtKind::Expr(expr) => {
                 let value = match &expr.kind {
@@ -4728,7 +4703,12 @@ impl<'c> Body<'c> {
                 self.ended |= infinite && !breaks(body);
                 out.push(self.loop_stmt(inner, body));
             }
-            StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
+            StmtKind::For {
+                index,
+                pattern,
+                iter,
+                body,
+            } => self.for_loop(index.as_ref(), pattern, iter, body, out),
             StmtKind::Match { value, arms } => self.match_stmt(value, arms, out),
             StmtKind::Pass => {}
             StmtKind::Fn(decl) => self.nested_fn(decl, stmt.span, out),
@@ -4843,19 +4823,21 @@ impl<'c> Body<'c> {
         lowered
     }
 
-    /// `for var in iter`, which copies each element of the array `iter`, or
-    /// each member of the enum `iter` names, to `var` in turn. The array's
-    /// `ptr` and `len` are read once, before the first iteration, as are
-    /// those that a struct which starts as an array starts with.
+    /// `for index, pattern in iter`, which copies each element of the array
+    /// `iter`, or each member of the enum `iter` names, to `pattern` in
+    /// turn, and sets `index` to where it is among them. The array's `ptr`
+    /// and `len` are read once, before the first iteration, as are those
+    /// that a struct which starts as an array starts with.
     fn for_loop(
         &mut self,
-        var: &Ident,
+        index: Option<&Pattern>,
+        pattern: &Pattern,
         iter: &parse::Expr,
         body: &parse::Block,
         out: &mut Vec<Stmt>,
     ) {
         if let Some(id) = self.enum_name(iter) {
-            out.push(self.unrolled_loop(id, var, body));
+            out.push(self.unrolled_loop(id, index, pattern, body));
             return;
         }
         let (ty, value) = self.expr(iter, None);
@@ -4865,9 +4847,8 @@ impl<'c> Body<'c> {
             None if ty == Ty::Never => (ty, value),
             None => (self.invalid_operand("for", ty, iter.span).0, value),
         };
-        self.ck.record(var.span, elem);
         let vt = self.ck.addr_type();
-        let (ptr, len, index) = (self.temp(vt), self.temp(vt), self.temp(vt));
+        let (ptr, len, counter) = (self.temp(vt), self.temp(vt), self.temp(vt));
         let [zero, one] = [0, 1].map(|n| Expr::Const(self.ck.addr_const(n)));
         out.extend(value.pre);
         let mut scalars = exprs(value.scalars).into_iter();
@@ -4875,26 +4856,91 @@ impl<'c> Body<'c> {
             let scalar = scalars.next().unwrap_or(zero.clone());
             out.push(Stmt::SetLocal(dest, scalar));
         }
-        out.push(Stmt::SetLocal(index, zero));
-        let i = Expr::Local(index);
+        out.push(Stmt::SetLocal(counter, zero));
+        let i = Expr::Local(counter);
         let done = binary(vt, IrBinOp::GeU, i.clone(), Expr::Local(len));
         let mut inner = vec![Stmt::BrIf(1, done)];
         let stride = self.ck.layout(elem).0;
         let addr = self.ck.element_addr(Expr::Local(ptr), i.clone(), stride);
         let element = self.load(scalar(vt, addr), 0, elem);
-        let slots = self.alloc(&var.name, elem);
-        inner.extend(element.pre);
-        for (slot, (_, scalar)) in slots.iter().zip(element.scalars) {
-            inner.push(Stmt::SetLocal(*slot, scalar));
-        }
+        self.scopes.push(HashMap::new());
+        let (place, dests) = self.for_bindings(index, pattern, elem);
+        self.set_leaves(dests, element, &mut inner);
+        inner.extend(place.map(|place| Stmt::SetLocal(place, i.clone())));
         // Advanced before the body, so `continue` moves on too.
         let next = binary(vt, IrBinOp::Add, i, one);
-        inner.push(Stmt::SetLocal(index, next));
-        self.scopes.push(HashMap::new());
-        self.bind(&var.name, elem, false, slots);
+        inner.push(Stmt::SetLocal(counter, next));
         let stmt = self.loop_stmt(inner, body);
         self.scopes.pop();
         out.push(stmt);
+    }
+
+    /// Binds what the head of a `for` names, in the scope of its body: the
+    /// names of `pattern`, which takes an element of type `elem`, and
+    /// `index`, a `uint`. Gives the local of the index, if it's named, and
+    /// that of each leaf of the element, if it's kept.
+    fn for_bindings(
+        &mut self,
+        index: Option<&Pattern>,
+        pattern: &Pattern,
+        elem: Ty,
+    ) -> (Option<LocalId>, Vec<Option<LocalId>>) {
+        let uint = Ty::Prim(Prim::Uint);
+        let place = index.and_then(|index| {
+            let dests = self.bind_pattern(index, uint, false, None);
+            dests.into_iter().next().flatten()
+        });
+        let taken = index.and_then(|index| match &index.kind {
+            PatternKind::Name(name) => Some(name.as_str()),
+            _ => None,
+        });
+        (place, self.bind_pattern(pattern, elem, false, taken))
+    }
+
+    /// Binds each name of `pattern`, which takes apart a value of type `ty`,
+    /// and gives the local that each leaf of the value goes to, if it's
+    /// kept. A name that is `taken`, or that the pattern has twice, is
+    /// reported.
+    fn bind_pattern(
+        &mut self,
+        pattern: &Pattern,
+        ty: Ty,
+        mutable: bool,
+        taken: Option<&str>,
+    ) -> Vec<Option<LocalId>> {
+        let bounds = self.ck.destructure(pattern, ty);
+        let mut dests = vec![None; self.ck.val_types(ty).len()];
+        let mut vars = Vec::new();
+        for (i, bound) in bounds.iter().enumerate() {
+            let earlier = bounds[..i].iter().map(|prev| prev.name);
+            if earlier.chain(taken).any(|name| name == bound.name) {
+                let kind = TypeErrorKind::DuplicateBinding(bound.name.to_string());
+                self.error(kind, bound.span);
+                continue;
+            }
+            let slots = self.alloc(bound.name, bound.ty);
+            for (leaf, slot) in bound.leaves.clone().zip(&slots) {
+                dests[leaf] = Some(*slot);
+            }
+            vars.push((bound.name, bound.ty, slots));
+        }
+        for (name, ty, slots) in vars {
+            self.bind(name, ty, mutable, slots);
+        }
+        dests
+    }
+
+    /// Sets each of `dests` to the leaf of `value` that it is for, after
+    /// evaluating all of `value`.
+    fn set_leaves(&mut self, dests: Vec<Option<LocalId>>, value: Value, out: &mut Vec<Stmt>) {
+        out.extend(value.pre);
+        for (dest, (_, scalar)) in dests.into_iter().zip(value.scalars) {
+            match dest {
+                Some(slot) => out.push(Stmt::SetLocal(slot, scalar)),
+                None if !is_pure(&scalar) => out.push(Stmt::Drop(scalar)),
+                None => {}
+            }
+        }
     }
 
     /// A loop that runs `head`, which may leave with `br 1`, then `body`, and
@@ -12985,6 +13031,67 @@ fn f(a: array(u8)):
     }
 
     #[test]
+    fn for_loops_bind_an_index_and_take_tuples_apart() {
+        let src = "\
+extern:
+    fn log(n: u16, at: uint)
+fn f(a: array(u16), pairs: array(tuple(u16, u8))):
+    for i, x in a:
+        if x == 0:
+            continue
+        log(x, i)
+    for i, (n, _) in pairs:
+        log(n, i)
+    for _, _ in a:
+        pass
+";
+        // The index is what the counter was, which is advanced before the
+        // body, so a `continue` moves on.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp4 a.ptr) (set tmp5 a.len) (set tmp6 0) (block (loop \
+             (br_if 1 (I32.GeU tmp6 tmp5)) \
+             (set x (I32.Load16U offset=0 (I32.Add tmp4 (I32.Mul tmp6 2)))) \
+             (set i tmp6) (set tmp6 (I32.Add tmp6 1)) \
+             (if (I32.Eq x 0) (then (br 1)) (else )) (call log [x i] -> []) (br 0))) \
+             (set tmp9 pairs.ptr) (set tmp10 pairs.len) (set tmp11 0) (block (loop \
+             (br_if 1 (I32.GeU tmp11 tmp10)) \
+             (set tmp12 (I32.Add tmp9 (I32.Mul tmp11 4))) \
+             (set n (I32.Load16U offset=0 tmp12)) \
+             (set i tmp11) (set tmp11 (I32.Add tmp11 1)) \
+             (call log [n i] -> []) (br 0))) \
+             (set tmp15 a.ptr) (set tmp16 a.len) (set tmp17 0) (block (loop \
+             (br_if 1 (I32.GeU tmp17 tmp16)) \
+             (set tmp17 (I32.Add tmp17 1)) (br 0)))"
+        );
+        let src = "\
+fn f(a: array(u8), pairs: array(tuple(u8, u8))):
+    for i, x in a:
+        i = 1
+        let n: u8 = i
+    for (x, y) in a:
+        pass
+    for i, i in a:
+        pass
+    for i, (n, i) in pairs:
+        pass
+    for (n, n) in pairs:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ImmutableAssign("i".into()),
+                mismatch("u8", "uint"),
+                mismatch("tuple(_, _)", "u8"),
+                TypeErrorKind::DuplicateBinding("i".into()),
+                TypeErrorKind::DuplicateBinding("i".into()),
+                TypeErrorKind::DuplicateBinding("n".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn for_loops_copy_each_element_of_a_struct_that_starts_as_an_array() {
         let decls = "\
 extern:
@@ -15391,6 +15498,44 @@ fn f():
              (block (set r 5) (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> [])) \
              (block (set r 6) (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> []))) \
              (block (block (set p.0 1) (set p.1 2)) (block (set p.0 3) (set p.1 4)))"
+        );
+        // The index is how many members come before, whatever their values.
+        let src = "\
+extern:
+    fn log(n: i8, at: uint)
+enum(i8) R:
+    ok
+    err = 5
+enum(tuple(u8, u8)) P:
+    a = (1, 2)
+fn f():
+    for i, r in R:
+        log(r as i8, i)
+    for i, _ in P:
+        log(0, i)
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(block \
+             (block (set r 0) (set i 0) (call log [r i] -> [])) \
+             (block (set r 5) (set i 1) (call log [r i] -> []))) \
+             (block (block (set i 0) (call log [0 i] -> [])))"
+        );
+        let src = "\
+enum(tuple(u8, u8)) P:
+    a = (1, 2)
+fn f():
+    for (x, y) in P:
+        pass
+    for i, i in P:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                mismatch("tuple(_, _)", "P"),
+                TypeErrorKind::DuplicateBinding("i".into()),
+            ]
         );
         let src = "\
 enum(i8) R:
