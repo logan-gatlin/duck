@@ -15,8 +15,8 @@ use duck::package::{self, Packages, ResolveError};
 use duck_compiler::file::{FileId, FileManager, Settings};
 use duck_compiler::lex::Span;
 use duck_compiler::ty::{
-    self, Analysis, Completion, CompletionKind, HintKind, Signature, Symbol, SymbolKind,
-    TypeErrorKind,
+    self, ActionKind, Analysis, Completion, CompletionKind, HintKind, Signature, Symbol,
+    SymbolKind, TypeErrorKind, Unused,
 };
 use duck_compiler::world::WorldError;
 use duck_compiler::{Error, load};
@@ -46,6 +46,9 @@ struct Checked {
     analysis: Analysis,
     /// Whether every file loaded whole, so that every name is known.
     whole: bool,
+    /// What it declares and never uses, if it loaded whole: a build that
+    /// didn't doesn't know what it uses.
+    unused: Vec<Unused>,
 }
 
 /// What writing another name for one changes.
@@ -105,12 +108,28 @@ pub struct Outline {
     pub children: Vec<Outline>,
 }
 
-/// A change that mends an error: what it is offered as, and what it writes
-/// in place of what.
+/// A change that is offered: what it is offered as, and what it writes in
+/// place of what.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mend {
     pub title: String,
     pub edits: Vec<(Place, String)>,
+    pub kind: ActionKind,
+    /// The problem of its file that it mends, if it mends one: where that
+    /// is, and its code.
+    pub fixes: Option<(Range, &'static str)>,
+    /// Whether it is the one change that the problem asks for.
+    pub preferred: bool,
+}
+
+/// Something to show at a place of a file as if it were written there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shown {
+    pub at: Position,
+    pub label: String,
+    pub kind: HintKind,
+    /// What is written there for the file to say it, if something can be.
+    pub insert: Option<String>,
 }
 
 /// An error, and where it is.
@@ -118,6 +137,8 @@ pub struct Mend {
 pub struct Problem {
     pub place: Place,
     pub message: String,
+    /// What names the kind of problem it is, whatever it is about.
+    pub code: &'static str,
     /// What led to the error, nearest first.
     pub notes: Vec<Note>,
 }
@@ -150,6 +171,18 @@ const UNLOADED: &str =
 /// reported: about a thousandth of a second's worth.
 const ASKING_FUEL: u64 = 10_000_000;
 
+/// The code of a problem with what a manifest says.
+const MANIFEST_CODE: &str = "manifest";
+
+/// The code of a dependency that couldn't be resolved.
+const UNRESOLVED_CODE: &str = "unresolved";
+
+/// The code of a file that a manifest names and that can't be read.
+const UNREADABLE_CODE: &str = "unreadable";
+
+/// The code of a crash of the compiler.
+const CRASH_CODE: &str = "crash";
+
 thread_local! {
     /// Where this thread last panicked, which only the hook that runs as a
     /// panic starts is told.
@@ -175,6 +208,13 @@ impl Project {
     pub fn check(&mut self, buffers: Buffers<'_>) -> Vec<Problem> {
         let (problems, checked) = self.builds(buffers, false);
         self.checked = checked;
+        for checked in self.checked.iter_mut().filter(|checked| checked.whole) {
+            let mut files = Overlay {
+                files: &mut checked.files,
+                buffers,
+            };
+            checked.unused = checked.analysis.unused(&mut files);
+        }
         self.warnings = self.unused(buffers);
         problems
     }
@@ -186,8 +226,7 @@ impl Project {
     }
 
     /// What every build of the package that uses a file agrees is declared
-    /// in it and never used, of the files of the package itself. A build
-    /// that didn't load whole doesn't know what it uses.
+    /// in it and never used, of the files of the package itself.
     fn unused(&mut self, buffers: Buffers<'_>) -> Vec<Problem> {
         let root = self.root.clone();
         let mut found: Vec<Vec<Problem>> = Vec::new();
@@ -196,16 +235,13 @@ impl Project {
                 files: &mut checked.files,
                 buffers,
             };
-            let unused = match checked.whole {
-                true => checked.analysis.unused(&mut files),
-                false => Vec::new(),
-            };
-            let problem = |unused: ty::Unused| Problem {
+            let problem = |unused: &Unused| Problem {
                 place: files.place(unused.span),
                 message: format!("`{}` is never used", unused.name),
+                code: unused.kind.code(),
                 notes: Vec::new(),
             };
-            found.push(unused.into_iter().map(problem).collect());
+            found.push(checked.unused.iter().map(problem).collect());
         }
         let mut warnings: Vec<Problem> = Vec::new();
         for (build, unused) in found.iter().enumerate() {
@@ -322,37 +358,84 @@ impl Project {
     /// What to show in `shown` of the file at the canonical path `path` as
     /// if it were written there, as the package was last checked: the types
     /// of the names bound without one, and the parameters that arguments
-    /// are given to. Each with where, and whether it is a type.
-    pub fn hints(
-        &mut self,
-        buffers: Buffers<'_>,
-        path: &Path,
-        shown: Range,
-    ) -> Vec<(Position, String, HintKind)> {
+    /// are given to.
+    pub fn hints(&mut self, buffers: Buffers<'_>, path: &Path, shown: Range) -> Vec<Shown> {
         let hints = self.first(buffers, path, |analysis, _, file, src| {
             let within = offset(src, shown.start)..offset(src, shown.end);
             let hints = analysis.hints(file, within).into_iter();
-            let placed = hints.map(|hint| (position(src, hint.offset), hint.label, hint.kind));
+            let placed = hints.map(|hint| Shown {
+                at: position(src, hint.offset),
+                label: hint.label,
+                kind: hint.kind,
+                insert: hint.insert,
+            });
             Some(placed.collect())
         });
         hints.unwrap_or_default()
     }
 
-    /// What mends the errors in `within` of the file at the canonical path
-    /// `path`, as the package was last checked. Nothing does, of a package
-    /// that doesn't load: its errors are not those of what it means.
+    /// What is offered to change in `within` of the file at the canonical
+    /// path `path`, as the package was last checked: what mends each error
+    /// and each warning there, and what writes what is there otherwise.
+    /// Nothing is, of a package that doesn't load: its errors are not those
+    /// of what it means.
     pub fn mends(&mut self, buffers: Buffers<'_>, path: &Path, within: Range) -> Vec<Mend> {
-        let whole = self.checked.iter().all(|checked| checked.whole);
-        let mends = self.first(buffers, path, |analysis, files, file, src| {
+        self.offered(buffers, path, |analysis, files, file, src, unused| {
             let within = offset(src, within.start)..offset(src, within.end);
-            let actions = analysis.actions(files, file, within);
-            let mend = |action: ty::Action| Mend {
+            analysis.actions(files, file, within, unused)
+        })
+    }
+
+    /// The change that puts the `use` lines of the file at the canonical
+    /// path `path` in order, as the package was last checked, if they
+    /// aren't.
+    pub fn organized(&mut self, buffers: Buffers<'_>, path: &Path) -> Option<Mend> {
+        let organized = self.offered(buffers, path, |analysis, files, file, _, unused| {
+            let organized = analysis.organized(files, file, unused);
+            organized.into_iter().collect()
+        });
+        organized.into_iter().next()
+    }
+
+    /// The changes that `offer` makes of the first build that uses the file
+    /// at the canonical path `path` and has any, as the package was last
+    /// checked: of its analysis, its files, which of them the file is, its
+    /// source, and what the build never uses that is warned of.
+    fn offered(
+        &mut self,
+        buffers: Buffers<'_>,
+        path: &Path,
+        offer: impl Fn(&Analysis, &mut Overlay, FileId, &str, &[Unused]) -> Vec<ty::Action>,
+    ) -> Vec<Mend> {
+        let whole = self.checked.iter().all(|checked| checked.whole);
+        let warnings = &self.warnings;
+        let mends = self.checked.iter_mut().find_map(|checked| {
+            let file = checked.files.find(path)?;
+            let mut files = Overlay {
+                files: &mut checked.files,
+                buffers,
+            };
+            let src = files.contents(file);
+            // Only what every build agrees is unused is.
+            let mut warned = |unused: &Unused| {
+                let place = files.place(unused.span);
+                warnings.iter().any(|warning| warning.place == place)
+            };
+            let unused: Vec<_> = (checked.unused.iter())
+                .filter(|unused| warned(unused))
+                .cloned()
+                .collect();
+            let actions = offer(&checked.analysis, &mut files, file, &src, &unused);
+            let mut mend = |action: ty::Action| Mend {
                 title: action.title,
+                kind: action.kind,
+                fixes: (action.mends).map(|(span, code)| (files.place(span).range, code)),
+                preferred: action.preferred,
                 edits: (action.edits.into_iter())
                     .map(|(span, text)| (files.place(span), text))
                     .collect(),
             };
-            let mends: Vec<_> = actions.into_iter().map(mend).collect();
+            let mends: Vec<_> = actions.into_iter().map(&mut mend).collect();
             (!mends.is_empty()).then_some(mends)
         });
         mends.filter(|_| whole).unwrap_or_default()
@@ -765,13 +848,19 @@ impl Project {
                         files,
                         analysis,
                         whole,
+                        unused: Vec::new(),
                     }));
                     found
                 }
                 Err(e) => {
                     let message = format!("cannot read {}: {e}", entry.display());
                     let path = manifest_path.clone();
-                    vec![Problem::at_key(path, &[table, ENTRY], message)]
+                    vec![Problem::at_key(
+                        path,
+                        &[table, ENTRY],
+                        message,
+                        UNREADABLE_CODE,
+                    )]
                 }
             };
             // A file both use has its errors found twice.
@@ -786,23 +875,25 @@ impl Project {
 }
 
 impl Problem {
-    /// A problem with the whole of the manifest at `path`.
-    fn in_manifest(path: PathBuf, message: String) -> Self {
+    /// A problem of the kind that `code` names with the whole of the
+    /// manifest at `path`.
+    fn in_manifest(path: PathBuf, message: String, code: &'static str) -> Self {
         Self {
             place: Place {
                 path,
                 range: Range::default(),
             },
             message,
+            code,
             notes: Vec::new(),
         }
     }
 
-    /// A problem with what the manifest at `path` says at `key`: the tables
-    /// that lead to a key of it, and then its name. With the whole of it,
-    /// if it writes none of them.
-    fn at_key(path: PathBuf, key: &[&str], message: String) -> Self {
-        let mut problem = Self::in_manifest(path, message);
+    /// A problem of the kind that `code` names with what the manifest at
+    /// `path` says at `key`: the tables that lead to a key of it, and then
+    /// its name. With the whole of it, if it writes none of them.
+    fn at_key(path: PathBuf, key: &[&str], message: String, code: &'static str) -> Self {
+        let mut problem = Self::in_manifest(path, message, code);
         // As it was saved, which is as it was resolved.
         let src = fs::read_to_string(&problem.place.path).unwrap_or_default();
         if let Some(written) = manifest::locate(&src, key) {
@@ -823,15 +914,16 @@ impl Overlay<'_, '_> {
             Ok(checked) => checked,
             Err(crash) => {
                 let message = format!("the compiler crashed checking this package{crash}");
-                let problem = Problem::in_manifest(manifest_path.to_path_buf(), message);
-                return (vec![problem], None);
+                let path = manifest_path.to_path_buf();
+                return (vec![Problem::in_manifest(path, message, CRASH_CODE)], None);
             }
         };
         let problems = errors.iter().map(|error| {
             let message = error.to_string();
+            let code = error.code();
             let Some(span) = error.span() else {
                 let key = asked_by(error);
-                return Problem::at_key(manifest_path.to_path_buf(), key, message);
+                return Problem::at_key(manifest_path.to_path_buf(), key, message, code);
             };
             let notes = error.instances().iter().map(|site| Note {
                 place: self.place(site.span),
@@ -841,6 +933,7 @@ impl Overlay<'_, '_> {
                 notes: notes.collect(),
                 place: self.place(span),
                 message,
+                code,
             }
         });
         (problems.collect(), analysis)
@@ -969,11 +1062,15 @@ fn resolve_problem(manifest_path: PathBuf, error: &ResolveError) -> Problem {
         Some((_, error)) => error.to_string(),
         None => error.to_string(),
     };
-    let Some(site) = error.site() else {
-        return Problem::in_manifest(manifest_path, message);
+    let code = match wrong {
+        Some(_) => MANIFEST_CODE,
+        None => UNRESOLVED_CODE,
+    };
+    let Some(site) = error.site(&manifest_path) else {
+        return Problem::in_manifest(manifest_path, message, code);
     };
     let key: Vec<_> = site.key.iter().map(String::as_str).collect();
-    let mut problem = Problem::at_key(canonical(&site.manifest), &key, message);
+    let mut problem = Problem::at_key(canonical(&site.manifest), &key, message, code);
     if let Some((path, ManifestError::Toml(error))) = wrong
         && let (Some(span), Ok(src)) = (error.span(), fs::read_to_string(path))
     {
@@ -1335,6 +1432,64 @@ pub(crate) mod tests {
             signature(src, "Entry(u8)(key: 1, "),
             Some((fields, Some(1)))
         );
+    }
+
+    #[test]
+    fn a_change_says_which_problem_of_the_package_it_mends() {
+        let (dir, mut project) = package("mends");
+        let main = dir.0.join("app/main.duck");
+        let src = "use util\npub fn main():\n    let spare = util.lgo(1.0)\n";
+        let buffers = |path: &Path| (path == main).then_some(src);
+        let problems = project.check(&buffers);
+        let said = |problem: &Problem| {
+            let Position { line, character } = problem.place.range.start;
+            format!("{line}:{character} {}: {}", problem.code, problem.message)
+        };
+        assert_eq!(
+            problems.iter().map(said).collect::<Vec<_>>(),
+            ["2:21 no-item: `util` has no item `lgo`; did you mean `log`?"]
+        );
+        assert_eq!(
+            project.warnings().iter().map(said).collect::<Vec<_>>(),
+            ["2:8 unused-variable: `spare` is never used"]
+        );
+        let line = Range::new(Position::new(2, 0), Position::new(3, 0));
+        let mends = project.mends(&buffers, &main, line);
+        let named = Range::new(Position::new(2, 21), Position::new(2, 24));
+        let place = |range: Range| Place {
+            path: main.clone(),
+            range,
+        };
+        assert_eq!(
+            mends,
+            [
+                Mend {
+                    title: "Write `log` for `lgo`".to_string(),
+                    edits: vec![(place(named), "log".to_string())],
+                    kind: ActionKind::Fix,
+                    fixes: Some((problems[0].place.range, "no-item")),
+                    preferred: true,
+                },
+                Mend {
+                    title: "Name it `_spare`".to_string(),
+                    edits: vec![(
+                        place(Range::new(at(src, "spare"), at(src, "spare"))),
+                        "_".to_string()
+                    )],
+                    kind: ActionKind::Fix,
+                    fixes: Some((project.warnings()[0].place.range, "unused-variable")),
+                    preferred: false,
+                },
+            ]
+        );
+        // The `use` lines of a file are in order where it has but one.
+        assert_eq!(project.organized(&buffers, &main), None);
+        // Nothing is offered of a package that doesn't load, whose errors
+        // are not those of what it means.
+        let half = format!("{src}    let more = (\n");
+        let buffers = |path: &Path| (path == main).then_some(half.as_str());
+        assert_eq!(project.check(&buffers).len(), 1);
+        assert_eq!(project.mends(&buffers, &main, line), []);
     }
 
     #[test]

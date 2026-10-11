@@ -220,6 +220,23 @@ impl fmt::Display for TokenKind {
     }
 }
 
+impl LexErrorKind {
+    /// What names the kind of error, as [`crate::Error::code`] gives it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnexpectedChar(..) => "unexpected-character",
+            Self::UnterminatedString => "unterminated-string",
+            Self::InvalidEscape => "invalid-escape",
+            Self::InvalidNumber => "invalid-number",
+            Self::IntTooLarge => "int-too-large",
+            Self::InconsistentIndent => "inconsistent-indent",
+            Self::UnmatchedClose(..) => "unmatched-close",
+            Self::MismatchedClose { .. } => "mismatched-close",
+            Self::Unclosed(..) => "unclosed",
+        }
+    }
+}
+
 impl fmt::Display for LexErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

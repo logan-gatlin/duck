@@ -45,6 +45,19 @@ impl Error {
         }
     }
 
+    /// What names the kind of error, whatever it is about: it stays as it
+    /// is where the message is written anew, for an editor to tell errors by
+    /// and for a change that mends one to say which.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Lex(e) => e.kind.code(),
+            Self::Parse(e) => e.kind.code(),
+            Self::Use(e) => e.kind.code(),
+            Self::Type(e) => e.kind.code(),
+            Self::Component(_) => "component",
+        }
+    }
+
     /// For an error in the type arguments a call gives a generic function,
     /// the instances that need what they lack, outermost first, each with
     /// where in its body it needs it.

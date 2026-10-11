@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use duck::git::Cache;
 use duck::manifest::MANIFEST;
-use duck_compiler::ty::{self, CompletionKind, HintKind, SymbolKind};
+use duck_compiler::ty::{self, ActionKind, CompletionKind, HintKind, SymbolKind};
 use duck_compiler::{format, lex};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{
@@ -25,24 +25,25 @@ use lsp_types::request::{
     SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CancelParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionProviderCapability, CompletionItem, CompletionItemKind, CompletionOptions,
-    CompletionParams, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesRegistrationOptions,
-    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentChangeOperation, DocumentChanges, DocumentFormattingParams, DocumentHighlight,
-    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, Documentation,
-    FileSystemWatcher, GlobPattern, GotoDefinitionParams, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, MarkupContent, MarkupKind,
-    NumberOrString, OneOf, OptionalVersionedTextDocumentIdentifier, ParameterInformation,
-    ParameterLabel, Position, PublishDiagnosticsParams, Range, ReferenceParams, Registration,
-    RegistrationParams, RenameFile, RenameOptions, RenameParams, ResourceOp, ResourceOperationKind,
-    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SignatureInformation, SymbolInformation, TextDocumentEdit, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    CancelParams, CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand,
+    CodeActionParams, CodeActionProviderCapability, CompletionItem, CompletionItemKind,
+    CompletionOptions, CompletionParams, Diagnostic, DiagnosticRelatedInformation,
+    DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
+    DocumentChanges, DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams,
+    DocumentSymbol, DocumentSymbolParams, Documentation, FileSystemWatcher, GlobPattern,
+    GotoDefinitionParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
+    InlayHintLabel, InlayHintParams, Location, MarkupContent, MarkupKind, NumberOrString, OneOf,
+    OptionalVersionedTextDocumentIdentifier, ParameterInformation, ParameterLabel, Position,
+    PublishDiagnosticsParams, Range, ReferenceParams, Registration, RegistrationParams, RenameFile,
+    RenameOptions, RenameParams, ResourceOp, ResourceOperationKind, ServerCapabilities, ServerInfo,
+    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
+    SymbolInformation, TextDocumentEdit, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit,
+    TypeDefinitionProviderCapability, Uri, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -50,7 +51,7 @@ use url::Url;
 
 use super::changes;
 use super::project::{
-    self, Described, Mend, Outline, Place, Problem, Project, Renaming, Suggestion,
+    self, Described, Mend, Outline, Place, Problem, Project, Renaming, Shown, Suggestion,
 };
 
 type Fallible = Result<(), Box<dyn Error + Send + Sync>>;
@@ -415,7 +416,8 @@ impl Server<'_> {
         symbols
     }
 
-    /// What to show in part of a file as if it were written there.
+    /// What to show in part of a file as if it were written there, each
+    /// with the change that writes it, where one does.
     fn hints(&mut self, params: InlayHintParams) -> Vec<InlayHint> {
         let Some(path) = path_of(&params.text_document.uri) else {
             return Vec::new();
@@ -427,14 +429,19 @@ impl Server<'_> {
         let documents = &self.documents;
         let buffers = |path: &Path| Some(documents.get(path)?.text.as_str());
         let hints = project.hints(&buffers, &path, params.range).into_iter();
-        let hint = |(position, label, kind): (Position, String, HintKind)| InlayHint {
-            position,
-            label: InlayHintLabel::String(label),
-            kind: Some(match kind {
+        let hint = |shown: Shown| InlayHint {
+            position: shown.at,
+            label: InlayHintLabel::String(shown.label),
+            kind: Some(match shown.kind {
                 HintKind::Type => InlayHintKind::TYPE,
                 HintKind::Parameter => InlayHintKind::PARAMETER,
             }),
-            text_edits: None,
+            text_edits: shown.insert.map(|new_text| {
+                vec![TextEdit {
+                    range: Range::new(shown.at, shown.at),
+                    new_text,
+                }]
+            }),
             tooltip: None,
             padding_left: None,
             padding_right: None,
@@ -443,7 +450,11 @@ impl Server<'_> {
         hints.map(hint).collect()
     }
 
-    /// What mends the errors in part of a file.
+    /// What is offered to change in part of a file, of the kinds that are
+    /// asked for if any are: what mends the errors and the warnings there,
+    /// each with the diagnostics it mends, what writes what is there
+    /// otherwise, and what puts the `use` lines in order, which is offered
+    /// where they are, and anywhere in the file if it is asked for.
     // A `Uri` only mutates what it remembers of parsing itself, which its
     // hash doesn't read.
     #[allow(clippy::mutable_key_type)]
@@ -457,20 +468,55 @@ impl Server<'_> {
         };
         let documents = &self.documents;
         let buffers = |path: &Path| Some(documents.get(path)?.text.as_str());
-        let mends = project.mends(&buffers, &path, params.range);
-        let action = |Mend { title, edits }: Mend| {
+        // A kind is asked for by itself or by one that it is a kind of.
+        let only = params.context.only;
+        let asked = |kind: &CodeActionKind| {
+            let within = |asked: &CodeActionKind| {
+                let (kind, asked) = (kind.as_str(), asked.as_str());
+                kind.strip_prefix(asked)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+            };
+            only.as_ref().is_none_or(|only| only.iter().any(within))
+        };
+        let mut mends = project.mends(&buffers, &path, params.range);
+        let organizes = |mend: &Mend| mend.kind == ActionKind::Organize;
+        let organized = only.is_some() && asked(&CodeActionKind::SOURCE_ORGANIZE_IMPORTS);
+        if organized && !mends.iter().any(organizes) {
+            mends.extend(project.organized(&buffers, &path));
+        }
+        let diagnostics = self.uri_of(&path).and_then(|uri| self.published.get(&uri));
+        let action = |mend: Mend| {
+            let kind = match mend.kind {
+                ActionKind::Fix => CodeActionKind::QUICKFIX,
+                ActionKind::Rewrite => CodeActionKind::REFACTOR_REWRITE,
+                ActionKind::Organize => CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            };
+            // Nothing is written in what git fetched.
+            let fetched = (mend.edits.iter()).any(|(place, _)| self.cache.holds(&place.path));
+            if fetched || !asked(&kind) {
+                return None;
+            }
             let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
-            for (Place { path, range }, new_text) in edits {
+            for (Place { path, range }, new_text) in mend.edits {
                 let edit = TextEdit { range, new_text };
                 changes.entry(self.uri_of(&path)?).or_default().push(edit);
             }
+            // The diagnostics that the editor has of what it mends.
+            let mended = mend.fixes.map(|(range, code)| {
+                let code = Some(NumberOrString::String(code.to_string()));
+                let mended = diagnostics.into_iter().flatten();
+                let mended = mended.filter(|d| d.range == range && d.code == code);
+                mended.cloned().collect::<Vec<_>>()
+            });
             Some(CodeActionOrCommand::CodeAction(CodeAction {
-                title,
-                kind: Some(CodeActionKind::QUICKFIX),
+                title: mend.title,
+                kind: Some(kind),
+                diagnostics: mended.filter(|mended| !mended.is_empty()),
                 edit: Some(WorkspaceEdit {
                     changes: Some(changes),
                     ..WorkspaceEdit::default()
                 }),
+                is_preferred: mend.preferred.then_some(true),
                 ..CodeAction::default()
             }))
         };
@@ -966,6 +1012,7 @@ impl Server<'_> {
             // What is never used is shown as what could be taken away.
             tags: (!error).then(|| vec![DiagnosticTag::UNNECESSARY]),
             source: Some("duck".to_string()),
+            code: Some(NumberOrString::String(problem.code.to_string())),
             message: problem.message,
             related_information: (!notes.is_empty()).then_some(notes),
             ..Diagnostic::default()
@@ -988,9 +1035,10 @@ impl Server<'_> {
 /// a place, where it and its type are declared, where else it is named,
 /// what naming it otherwise changes and what a type there bounds, what a
 /// file and every file declares, what isn't written and would say more,
-/// what mends an error, what can be written after a `.` or anywhere, what a
-/// call takes once it is opened or goes on to another argument, and how a
-/// file is laid out.
+/// what mends an error or a warning, writes what is there otherwise or puts
+/// the `use` lines in order, what can be written after a `.` or anywhere,
+/// what a call takes once it is opened or goes on to another argument, and
+/// how a file is laid out.
 fn capabilities() -> ServerCapabilities {
     let sync = TextDocumentSyncOptions {
         open_close: Some(true),
@@ -1008,7 +1056,14 @@ fn capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         inlay_hint_provider: Some(OneOf::Left(true)),
-        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![
+                CodeActionKind::QUICKFIX,
+                CodeActionKind::REFACTOR_REWRITE,
+                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ]),
+            ..CodeActionOptions::default()
+        })),
         workspace: Some(WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                 supported: Some(true),
@@ -1654,10 +1709,13 @@ mod tests {
             "documentSymbolProvider",
             "workspaceSymbolProvider",
             "inlayHintProvider",
-            "codeActionProvider",
         ] {
             assert_eq!(capabilities[provider], true, "{provider}");
         }
+        assert_eq!(
+            capabilities["codeActionProvider"]["codeActionKinds"],
+            json!(["quickfix", "refactor.rewrite", "source.organizeImports"])
+        );
         let document = json!({ "uri": uri(&main) });
         let at = |line: u32, character: u32| {
             json!({
@@ -1750,6 +1808,9 @@ mod tests {
                 position["line"], position["character"], hint["label"], hint["kind"]
             )
         };
+        // A parameter is only shown: its name may not be written there.
+        assert_eq!(hints[1]["textEdits"][0]["newText"], ": f32");
+        assert_eq!(hints[2]["textEdits"], Value::Null);
         let hints: Vec<_> = hints.as_array().unwrap().iter().map(shown).collect();
         assert_eq!(
             hints,
@@ -1782,7 +1843,160 @@ mod tests {
         assert_eq!(cast[0]["title"], "Cast to `i32` with `as`");
         let edit = json!({ "range": range(7, 21, 21), "newText": " as i32" });
         assert_eq!(cast[0]["edit"]["changes"][uri(&main)], json!([edit]));
-        assert_eq!(mends(2, 3, &mut editor), json!([]));
+        // And what isn't written, where nothing is wrong: by the module
+        // that has it, which is how the file names the type.
+        let typed = mends(2, 3, &mut editor);
+        assert_eq!(typed.as_array().unwrap().len(), 1);
+        assert_eq!(typed[0]["title"], "Write the type of `p`");
+        assert_eq!(typed[0]["kind"], "refactor.rewrite");
+        let edit = json!({ "range": range(2, 9, 9), "newText": ": kit.Point" });
+        assert_eq!(typed[0]["edit"]["changes"][uri(&main)], json!([edit]));
+        assert_eq!(mends(8, 9, &mut editor), json!([]));
+        editor.stop();
+    }
+
+    #[test]
+    fn a_change_is_offered_with_the_diagnostics_it_mends() {
+        let dir = TempDir::new("server-mends");
+        let kit = "pub struct Point:\n    pub x: f32\n    pub y: f32\npub enum(u8) Color:\n    red\nfn hidden() -> f32:\n    return 1.0\n";
+        let src = "use kit.Point\nuse kit\nuse kit.Color\npub fn main() -> f32:\n    let total = Point(x: 1.0)\n    let far = kit.hidden()\n    return totl.x + far\n";
+        dir.write(&[("Duck.toml", MODULE), ("main.duck", src), ("kit.duck", kit)]);
+        let (main, kit) = (dir.0.join("main.duck"), dir.0.join("kit.duck"));
+        let mut editor = Editor::start(&dir, json!({}));
+
+        // Each diagnostic says what kind of problem it is.
+        let unused = "5:3 warning: `hidden` is never used";
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("kit.duck", None, &[unused])
+        );
+        let Message::Notification(notification) = editor.receive() else {
+            panic!("not a notification")
+        };
+        let diagnostics = notification.params["diagnostics"].as_array().unwrap();
+        let said = |diagnostic: &Value| {
+            let line = &diagnostic["range"]["start"]["line"];
+            let code = diagnostic["code"].as_str().unwrap();
+            format!("{line} {code}: {}", diagnostic["message"].as_str().unwrap())
+        };
+        assert_eq!(
+            diagnostics.iter().map(said).collect::<Vec<_>>(),
+            [
+                "4 missing-arg: missing argument `y`",
+                "5 private: `hidden` is private",
+                "6 unknown-name: unknown name `totl`; did you mean `total`?",
+                "2 unused-use: `Color` is never used",
+                "4 unused-variable: `total` is never used",
+            ]
+        );
+        editor.open(&main, src);
+
+        let document = json!({ "uri": uri(&main) });
+        let range = |line: u32, start: u32, end: u32| {
+            json!({
+                "start": { "line": line, "character": start },
+                "end": { "line": line, "character": end },
+            })
+        };
+        let mut offered = |line: u32, only: Option<&str>| {
+            let mut context = json!({ "diagnostics": [] });
+            if let Some(only) = only {
+                context["only"] = json!([only]);
+            }
+            let params = json!({
+                "textDocument": document,
+                "range": range(line, 0, 99),
+                "context": context,
+            });
+            let actions = editor.request(CodeActionRequest::METHOD, params);
+            actions.as_array().unwrap().clone()
+        };
+        // Each as `kind title`, with a `*` if it is what its problem asks.
+        let titles = |actions: &[Value]| -> Vec<String> {
+            let title = |action: &Value| {
+                let preferred = match action["isPreferred"] == true {
+                    true => "*",
+                    false => "",
+                };
+                let kind = action["kind"].as_str().unwrap();
+                format!("{kind}{preferred} {}", action["title"].as_str().unwrap())
+            };
+            actions.iter().map(title).collect()
+        };
+        let edits = |action: &Value, path: &Path| action["edit"]["changes"][uri(path)].clone();
+
+        // The name that was likely meant mends the error that says so.
+        let respelled = offered(6, None);
+        assert_eq!(titles(&respelled), ["quickfix* Write `total` for `totl`"]);
+        assert_eq!(
+            edits(&respelled[0], &main),
+            json!([{ "range": range(6, 11, 15), "newText": "total" }])
+        );
+        assert_eq!(respelled[0]["diagnostics"], json!([diagnostics[2]]));
+
+        // What is there is written otherwise, beside what mends it.
+        let built = offered(4, None);
+        assert_eq!(
+            titles(&built),
+            [
+                "quickfix* Add the field `y`",
+                "quickfix Name it `_total`",
+                "refactor.rewrite Write the type of `total`",
+            ]
+        );
+        assert_eq!(
+            edits(&built[0], &main),
+            json!([{ "range": range(4, 28, 28), "newText": ", y: todo" }])
+        );
+        assert_eq!(built[0]["diagnostics"], json!([diagnostics[0]]));
+        assert_eq!(built[1]["diagnostics"], json!([diagnostics[4]]));
+        assert_eq!(built[2]["diagnostics"], Value::Null);
+        assert_eq!(titles(&offered(4, Some("refactor"))), titles(&built[2..]));
+
+        // What another module keeps to itself is made `pub` there.
+        let seen = offered(5, None);
+        assert_eq!(titles(&seen), ["quickfix* Make `hidden` `pub`"]);
+        assert_eq!(
+            edits(&seen[0], &kit),
+            json!([{ "range": range(5, 0, 0), "newText": "pub " }])
+        );
+
+        // The `use` lines are put in order where they are, and anywhere
+        // in the file that it is asked for.
+        let used = offered(2, None);
+        assert_eq!(
+            titles(&used),
+            [
+                "quickfix* Remove the `use` of `Color`",
+                "source.organizeImports Organize the `use` lines",
+            ]
+        );
+        assert_eq!(used[0]["diagnostics"], json!([diagnostics[3]]));
+        let lines = json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 3, "character": 0 },
+        });
+        assert_eq!(
+            edits(&used[1], &main),
+            json!([{ "range": lines, "newText": "use kit\nuse kit.Point\n" }])
+        );
+        assert_eq!(titles(&offered(2, Some("quickfix"))), titles(&used[..1]));
+        for asked in ["source", "source.organizeImports"] {
+            assert_eq!(titles(&offered(6, Some(asked))), titles(&used[1..]));
+        }
+        assert_eq!(offered(6, Some("source.fixAll")), [] as [Value; 0]);
+
+        // A type that is hinted is written by accepting the hint.
+        let hints = editor.request(
+            InlayHintRequest::METHOD,
+            json!({ "textDocument": document, "range": range(4, 0, 99) }),
+        );
+        assert_eq!(hints[0]["label"], ": Point");
+        assert_eq!(
+            hints[0]["textEdits"],
+            json!([{ "range": range(4, 13, 13), "newText": ": Point" }])
+        );
+        assert_eq!(hints.as_array().unwrap().len(), 1);
         editor.stop();
     }
 
