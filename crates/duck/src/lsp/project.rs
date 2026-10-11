@@ -75,6 +75,20 @@ pub struct Suggestion {
     pub import: Option<(Position, String)>,
 }
 
+/// What is written at a place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Described {
+    /// Where all of what is described is, in its file.
+    pub at: Range,
+    /// Its declaration or its type, as source.
+    pub text: String,
+    /// What it is evaluated to, if it is a constant whose value is known
+    /// and isn't what `text` writes. Empty otherwise.
+    pub value: String,
+    /// The comment on its declaration. Empty if it has none.
+    pub docs: String,
+}
+
 /// Something a file declares, and where.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outline {
@@ -353,17 +367,22 @@ impl Project {
 
     /// What is written at `position` of the file at the canonical path
     /// `path`, as it was last checked: all of what is described, its
-    /// declaration or its type, and the comment on its declaration.
+    /// declaration or its type, what a constant was then evaluated to, and
+    /// the comment on its declaration.
     pub fn hover(
         &mut self,
         buffers: Buffers<'_>,
         path: &Path,
         position: Position,
-    ) -> Option<(Range, String, String)> {
+    ) -> Option<Described> {
         self.first(buffers, path, |analysis, files, file, src| {
             let hover = analysis.hover(files, file, offset(src, position))?;
-            let range = range(src, hover.span.start, hover.span.end);
-            Some((range, hover.text, hover.docs))
+            Some(Described {
+                at: range(src, hover.span.start, hover.span.end),
+                text: hover.text,
+                value: hover.value,
+                docs: hover.docs,
+            })
         })
     }
 
@@ -1066,9 +1085,9 @@ pub(crate) mod tests {
         let (dir, mut project) = package("hover");
         let main = dir.0.join("app/main.duck");
         let hover = |project: &mut Project, src: &str, text: &str| {
-            let (range, text, _) = project.hover(&|_| None, &main, at(src, text))?;
-            let Range { start, end } = range;
-            Some((start.line, start.character, end.character, text))
+            let described = project.hover(&|_| None, &main, at(src, text))?;
+            let Range { start, end } = described.at;
+            Some((start.line, start.character, end.character, described.text))
         };
         // Nothing is, of one that wasn't.
         assert_eq!(hover(&mut project, MAIN, "p = geo"), None);
@@ -1134,11 +1153,36 @@ pub(crate) mod tests {
         let edited = "use geo\nfn main():\n    let p = geo.Point(x: 1.0)\n    let d = geo.len(p,\n    let q = (p, 2)\n";
         let buffers = |path: &Path| (path == main).then_some(edited);
         assert_eq!(project.check(&buffers).len(), 1);
-        let (range, text, _) = project
+        let described = project
             .hover(&buffers, &main, at(edited, "q = (p"))
             .unwrap();
-        assert_eq!(range.start, Position::new(4, 8));
-        assert_eq!(text, "let q: tuple(Point, i32)");
+        assert_eq!(described.at.start, Position::new(4, 8));
+        assert_eq!(described.text, "let q: tuple(Point, i32)");
+    }
+
+    #[test]
+    fn a_constant_is_described_by_what_the_last_check_made_of_it() {
+        let dir = TempDir::new("constant");
+        let src = "fn spin(n: i32) -> i32:\n    var i = 0\n    while i < n:\n        i = i + 1\n    return i\npub let turns = spin(3000000)\npub let twice = 2 * 21\n";
+        dir.write(&[("app/Duck.toml", MODULE), ("app/main.duck", src)]);
+        let main = dir.0.join("app/main.duck");
+        let cache = Cache::new(dir.0.join("no-cache"));
+        let mut project = Project::resolve(dir.0.join("app"), &cache);
+        assert_eq!(project.check(&|_| None), []);
+        let value = |project: &mut Project, src: &str, text: &str| {
+            let buffers = |path: &Path| (path == main).then_some(src);
+            let described = project.hover(&buffers, &main, at(src, text)).unwrap();
+            described.value
+        };
+        assert_eq!(value(&mut project, src, "turns"), "3000000");
+        assert_eq!(value(&mut project, src, "twice"), "42");
+        // What is being written is checked for what loads of it, with
+        // little fuel: a constant that needs more has no value to give,
+        // and nothing is run to find one.
+        let edited = format!("{src}pub let more = (\n");
+        let buffers = |path: &Path| (path == main).then_some(edited.as_str());
+        assert_eq!(project.check(&buffers).len(), 1);
+        assert_eq!(value(&mut project, &edited, "turns"), "");
     }
 
     #[test]
