@@ -2,9 +2,11 @@
 //! file rather than printing it, and answers what an editor asks of the
 //! package as checked.
 
+use std::cell::RefCell;
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use duck::files::{self, Files};
 use duck::git::Cache;
@@ -147,6 +149,12 @@ const UNLOADED: &str =
 /// The fuel the constants of one item run on where their errors aren't
 /// reported: about a thousandth of a second's worth.
 const ASKING_FUEL: u64 = 10_000_000;
+
+thread_local! {
+    /// Where this thread last panicked, which only the hook that runs as a
+    /// panic starts is told.
+    static PANICKED: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 impl Project {
     /// Reads the manifest of the package in `root`, then those of its
@@ -811,11 +819,13 @@ impl Overlay<'_, '_> {
     fn problems(mut self, manifest_path: &Path) -> (Vec<Problem>, Option<(Analysis, bool)>) {
         // Half-written code is what the compiler is least tested on, and a
         // bug in it shouldn't end the server.
-        let checked = panic::catch_unwind(AssertUnwindSafe(|| self.check()));
-        let Ok((errors, analysis)) = checked else {
-            let message = "the compiler crashed checking this package".to_string();
-            let problem = Problem::in_manifest(manifest_path.to_path_buf(), message);
-            return (vec![problem], None);
+        let (errors, analysis) = match caught(|| self.check()) {
+            Ok(checked) => checked,
+            Err(crash) => {
+                let message = format!("the compiler crashed checking this package{crash}");
+                let problem = Problem::in_manifest(manifest_path.to_path_buf(), message);
+                return (vec![problem], None);
+            }
         };
         let problems = errors.iter().map(|error| {
             let message = error.to_string();
@@ -891,6 +901,32 @@ impl FileManager for Overlay<'_, '_> {
     fn settings(&mut self) -> Settings {
         self.files.settings()
     }
+}
+
+/// Runs `run`, which a bug in the compiler may panic in: what it gives, or
+/// else what the panic said and where it was, as what follows a message
+/// that says it crashed, for the bug to be reported with.
+fn caught<T>(run: impl FnOnce() -> T) -> Result<T, String> {
+    static WATCHED: Once = Once::new();
+    // A panic says where it is only to the hook, which goes on to report
+    // it as it would have been.
+    WATCHED.call_once(|| {
+        let report = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let place = info.location().map(|place| place.to_string());
+            PANICKED.with(|panicked| panicked.replace(place));
+            report(info);
+        }));
+    });
+    panic::catch_unwind(AssertUnwindSafe(run)).map_err(|payload| {
+        let said = payload.downcast_ref::<&str>().map(|said| said.to_string());
+        let said = said.or_else(|| payload.downcast_ref::<String>().cloned());
+        let said = said.map(|said| format!(": {said}")).unwrap_or_default();
+        match PANICKED.with(RefCell::take) {
+            Some(place) => format!("{said}, at {place}"),
+            None => said,
+        }
+    })
 }
 
 /// `settings` with little fuel for constants, which are run only to ask
@@ -1564,10 +1600,16 @@ pub(crate) mod tests {
         let problems = project.check(&|_| panic!("as a bug in the compiler would"));
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert_eq!(problems[0].place.path, dir.0.join("app/Duck.toml"));
-        assert_eq!(
-            problems[0].message,
-            "the compiler crashed checking this package"
-        );
+        // With what it said and where, for the crash to be reported.
+        let message = &problems[0].message;
+        let said =
+            "the compiler crashed checking this package: as a bug in the compiler would, at ";
+        assert!(message.starts_with(said), "{message}");
+        let place = &message[said.len()..];
+        let (file, at) = place.split_once(':').unwrap();
+        assert!(file.ends_with("project.rs"), "{message}");
+        let at: Vec<_> = at.split(':').map(|n| n.parse::<u32>().unwrap()).collect();
+        assert_eq!(at.len(), 2, "{message}");
     }
 
     #[test]
