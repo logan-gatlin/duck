@@ -491,19 +491,31 @@ impl Body<'_> {
         bound.resize(bound.len().max(width.max().unwrap_or(0)), None);
         self.ck.unify(want, ty, &mut bound);
         let mut settled = true;
+        let mut mismatched = false;
         for (id, hole) in &holes {
-            // What still has one of them in it says nothing of it.
-            let given = bound[index(self.ck, *hole)];
-            let given = given.filter(|ty| !self.ck.has_hole(*ty));
-            match given {
-                Some(hidden) => self.ck.hide(*id, hidden, span),
-                None => {
+            match bound[index(self.ck, *hole)] {
+                // What still has one of them in it says nothing of it.
+                Some(given) if self.ck.has_hole(given) => {
                     let opaque = self.ck.opaque_text(self.ck.opaques[id.0 as usize].bound);
                     self.error(TypeErrorKind::ReturnBeforeOpaque(opaque), span);
                     self.ck.opaques[id.0 as usize].reported = true;
                 }
+                Some(hidden) => self.ck.hide(*id, hidden, span),
+                // The value has nothing in its place: it is of another
+                // shape than the result, whatever the result hides.
+                None => {
+                    mismatched = true;
+                    self.ck.opaques[id.0 as usize].reported = true;
+                }
             }
             settled &= self.ck.opaques[id.0 as usize].hidden.is_some();
+        }
+        if mismatched {
+            let kind = TypeErrorKind::Mismatch {
+                expected: self.ck.ty_name(self.ret),
+                found: self.ck.ty_name(ty),
+            };
+            self.error(kind, span);
         }
         // What isn't settled is reported, and nothing is of it. What the
         // function gives itself is what its result hides.

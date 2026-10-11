@@ -19863,6 +19863,49 @@ fn main():
     }
 
     #[test]
+    fn a_return_of_another_shape_than_its_result_settles_nothing() {
+        let src = "\
+struct(T) Box:
+    x: T
+fn boxed(p: &var Box(i32)) -> Box(opaque()):
+    return p
+fn pair(p: &var Box(i32)) -> tuple(opaque(), Box(opaque())):
+    return (1, p)
+fn wide() -> tuple(opaque(), opaque()):
+    return (1, 2, 3)
+fn main():
+    pass
+";
+        let found = errors_at(src);
+        let shown: Vec<_> = found
+            .iter()
+            .map(|(kind, at)| (kind.to_string(), *at))
+            .collect();
+        let shown: Vec<_> = shown
+            .iter()
+            .map(|(shown, at)| (shown.as_str(), *at))
+            .collect();
+        let expected = [
+            (
+                "expected `Box(opaque() of boxed)`, found `&var Box(i32)`",
+                "p",
+            ),
+            // What is in the place of one is the type it hides.
+            (
+                "expected `tuple(opaque() of pair, Box(opaque() of pair))`, \
+                 found `tuple(i32, &var Box(i32))`",
+                "(1, p)",
+            ),
+            (
+                "expected `tuple(opaque() of wide, opaque() of wide)`, \
+                 found `tuple(i32, i32, i32)`",
+                "(1, 2, 3)",
+            ),
+        ];
+        assert_eq!(shown, expected);
+    }
+
+    #[test]
     fn an_opaque_type_is_of_each_instance_of_a_generic_function() {
         let src = "\
 fn(T) hold(x: T) -> opaque(fn() -> T):
