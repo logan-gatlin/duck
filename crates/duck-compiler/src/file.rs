@@ -70,14 +70,17 @@ pub struct WitFile {
     pub contents: String,
 }
 
+#[cfg(test)]
 pub(crate) struct DummyManager;
 
+#[cfg(test)]
 impl DummyManager {
     pub fn new() -> Self {
         Self
     }
 }
 
+#[cfg(test)]
 fn guard<T>(file_id: FileId, out: T) -> T {
     if file_id == FileId(0) {
         out
@@ -86,6 +89,7 @@ fn guard<T>(file_id: FileId, out: T) -> T {
     }
 }
 
+#[cfg(test)]
 impl FileManager for DummyManager {
     fn entry_point(&mut self) -> FileId {
         FileId(0)
