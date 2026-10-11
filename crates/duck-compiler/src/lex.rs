@@ -69,6 +69,8 @@ pub enum TokenKind {
     Dot,
     /// `.*`, lexed as one token so that `p.*= 1` isn't `p.` then `*=`.
     DotStar,
+    /// `..`, between the bounds of a range.
+    DotDot,
     Arrow,
 
     // Operators
@@ -187,6 +189,7 @@ impl fmt::Display for TokenKind {
             Self::Semi => ";",
             Self::Dot => ".",
             Self::DotStar => ".*",
+            Self::DotDot => "..",
             Self::Arrow => "->",
             Self::Plus => "+",
             Self::Minus => "-",
@@ -321,6 +324,7 @@ impl<'a> Lexer<'a> {
                 ':' => TokenKind::Colon,
                 ';' => TokenKind::Semi,
                 '.' if self.eat('*') => TokenKind::DotStar,
+                '.' if self.eat('.') => TokenKind::DotDot,
                 '.' => TokenKind::Dot,
                 '&' => TokenKind::Amp,
                 '|' if self.eat('>') => TokenKind::PipeArrow,
@@ -902,6 +906,22 @@ mod tests {
         assert_eq!(
             kinds("1.foo"),
             vec![Int(1), Dot, ident("foo"), Newline, Eof]
+        );
+        // A `.` that no digit follows is no part of the number.
+        assert_eq!(
+            kinds("0..10 t.0..n"),
+            vec![
+                Int(0),
+                DotDot,
+                Int(10),
+                ident("t"),
+                Dot,
+                Int(0),
+                DotDot,
+                ident("n"),
+                Newline,
+                Eof
+            ]
         );
         assert_eq!(error("123abc"), LexErrorKind::InvalidNumber);
         assert_eq!(error("0x"), LexErrorKind::InvalidNumber);

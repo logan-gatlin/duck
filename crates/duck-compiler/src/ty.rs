@@ -351,6 +351,8 @@ pub enum TypeErrorKind {
     DuplicateParam(String),
     /// A name bound twice by one pattern.
     DuplicateBinding(String),
+    /// An index in a `for` that iterates a range, which counts for itself.
+    RangeIndex,
     /// A struct that contains itself by value.
     RecursiveStruct(String),
     /// An enum whose values hold the enum itself, outside of any struct.
@@ -1520,6 +1522,10 @@ impl fmt::Display for TypeErrorKind {
             Self::DuplicateField(name) => write!(f, "duplicate field `{name}`"),
             Self::DuplicateParam(name) => write!(f, "duplicate parameter `{name}`"),
             Self::DuplicateBinding(name) => write!(f, "`{name}` is bound more than once"),
+            Self::RangeIndex => write!(
+                f,
+                "a range has no index: what it iterates counts from its start"
+            ),
             Self::RecursiveStruct(name) => write!(f, "struct `{name}` contains itself"),
             Self::RecursiveEnum(name) => write!(f, "enum `{name}` contains itself"),
             Self::RecursiveUnion(name) => write!(f, "union `{name}` contains itself"),
@@ -4643,34 +4649,9 @@ impl<'c> Body<'c> {
             StmtKind::Binding(binding) if binding.binds_type() => self.alias_stmt(binding),
             StmtKind::Binding(binding) => {
                 let (ty, value) = self.binding_value(binding);
-                let bounds = self.ck.destructure(&binding.pattern, ty);
-                // The local each leaf of the value goes to, if it's kept.
-                let mut dests = vec![None; self.ck.val_types(ty).len()];
-                let mut vars = Vec::new();
-                for (i, bound) in bounds.iter().enumerate() {
-                    if bounds[..i].iter().any(|prev| prev.name == bound.name) {
-                        let kind = TypeErrorKind::DuplicateBinding(bound.name.to_string());
-                        self.error(kind, bound.span);
-                        continue;
-                    }
-                    let slots = self.alloc(bound.name, bound.ty);
-                    for (leaf, slot) in bound.leaves.clone().zip(&slots) {
-                        dests[leaf] = Some(*slot);
-                    }
-                    vars.push((bound.name, bound.ty, slots));
-                }
-                out.extend(value.pre);
-                for (dest, (_, scalar)) in dests.into_iter().zip(value.scalars) {
-                    match dest {
-                        Some(slot) => out.push(Stmt::SetLocal(slot, scalar)),
-                        None if !is_pure(&scalar) => out.push(Stmt::Drop(scalar)),
-                        None => {}
-                    }
-                }
                 let mutable = binding.mutability == Mutability::Var;
-                for (name, ty, slots) in vars {
-                    self.bind(name, ty, mutable, slots);
-                }
+                let dests = self.bind_pattern(&binding.pattern, ty, mutable, None);
+                self.set_leaves(dests, value, out);
             }
             StmtKind::Expr(expr) => {
                 let value = match &expr.kind {
@@ -4728,7 +4709,13 @@ impl<'c> Body<'c> {
                 self.ended |= infinite && !breaks(body);
                 out.push(self.loop_stmt(inner, body));
             }
-            StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
+            StmtKind::For {
+                index,
+                addr,
+                pattern,
+                iter,
+                body,
+            } => self.for_loop(index.as_ref(), *addr, pattern, iter, body, out),
             StmtKind::Match { value, arms } => self.match_stmt(value, arms, out),
             StmtKind::Pass => {}
             StmtKind::Fn(decl) => self.nested_fn(decl, stmt.span, out),
@@ -4843,31 +4830,52 @@ impl<'c> Body<'c> {
         lowered
     }
 
-    /// `for var in iter`, which copies each element of the array `iter`, or
-    /// each member of the enum `iter` names, to `var` in turn. The array's
-    /// `ptr` and `len` are read once, before the first iteration, as are
-    /// those that a struct which starts as an array starts with.
+    /// `for index, pattern in iter`, which copies each element of the array
+    /// `iter`, or each member of the enum `iter` names, to `pattern` in
+    /// turn, and sets `index` to where it is among them. The array's `ptr`
+    /// and `len` are read once, before the first iteration, as are those
+    /// that a struct which starts as an array starts with. With an `addr`,
+    /// `pattern` is set to a pointer to each element, which writes it if
+    /// the `addr` is `&var`.
     fn for_loop(
         &mut self,
-        var: &Ident,
+        index: Option<&Pattern>,
+        addr: Option<Mutability>,
+        pattern: &Pattern,
         iter: &parse::Expr,
         body: &parse::Block,
         out: &mut Vec<Stmt>,
     ) {
-        if let Some(id) = self.enum_name(iter) {
-            out.push(self.unrolled_loop(id, var, body));
+        let range = match &iter.kind {
+            ExprKind::Range(start, end) => Some((&**start, &**end)),
+            _ => None,
+        };
+        let members = match range {
+            Some(_) => None,
+            None => self.enum_name(iter),
+        };
+        // Only an element is in memory, which an integer and a member are
+        // not.
+        if addr.is_some() && (range.is_some() || members.is_some()) {
+            self.error(TypeErrorKind::NotAddressable, pattern.span);
+        }
+        if let Some(range) = range {
+            return self.range_loop(index, pattern, range, iter.span, body, out);
+        }
+        if let Some(id) = members {
+            out.push(self.unrolled_loop(id, index, pattern, body));
             return;
         }
         let (ty, value) = self.expr(iter, None);
-        let (elem, value) = match self.ck.array_view(ty) {
+        let view = self.ck.array_view(ty);
+        let (elem, value) = match view {
             Some(id) => (self.ck.element(id), self.array_start(value)),
             // It has no elements, and none that the loop is run for.
             None if ty == Ty::Never => (ty, value),
             None => (self.invalid_operand("for", ty, iter.span).0, value),
         };
-        self.ck.record(var.span, elem);
         let vt = self.ck.addr_type();
-        let (ptr, len, index) = (self.temp(vt), self.temp(vt), self.temp(vt));
+        let (ptr, len, counter) = (self.temp(vt), self.temp(vt), self.temp(vt));
         let [zero, one] = [0, 1].map(|n| Expr::Const(self.ck.addr_const(n)));
         out.extend(value.pre);
         let mut scalars = exprs(value.scalars).into_iter();
@@ -4875,26 +4883,171 @@ impl<'c> Body<'c> {
             let scalar = scalars.next().unwrap_or(zero.clone());
             out.push(Stmt::SetLocal(dest, scalar));
         }
-        out.push(Stmt::SetLocal(index, zero));
-        let i = Expr::Local(index);
+        out.push(Stmt::SetLocal(counter, zero));
+        let i = Expr::Local(counter);
         let done = binary(vt, IrBinOp::GeU, i.clone(), Expr::Local(len));
         let mut inner = vec![Stmt::BrIf(1, done)];
         let stride = self.ck.layout(elem).0;
-        let addr = self.ck.element_addr(Expr::Local(ptr), i.clone(), stride);
-        let element = self.load(scalar(vt, addr), 0, elem);
-        let slots = self.alloc(&var.name, elem);
-        inner.extend(element.pre);
-        for (slot, (_, scalar)) in slots.iter().zip(element.scalars) {
-            inner.push(Stmt::SetLocal(*slot, scalar));
-        }
+        let at = scalar(
+            vt,
+            self.ck.element_addr(Expr::Local(ptr), i.clone(), stride),
+        );
+        let (bound, each) = match (addr, view) {
+            (Some(mutability), Some(id)) => {
+                let mutable = mutability == Mutability::Var;
+                if mutable && !self.ck.writes(Ty::Array(id)) {
+                    let (ty, needs, element) = self.read_only(Ty::Array(id));
+                    let kind = TypeErrorKind::ReadOnlyAddr { ty, needs, element };
+                    self.error(kind, pattern.span);
+                }
+                (self.ck.ptr_to(elem, mutable), at)
+            }
+            _ => (elem, self.load(at, 0, elem)),
+        };
+        self.scopes.push(HashMap::new());
+        let (place, dests) = self.for_bindings(index, pattern, bound);
+        self.set_leaves(dests, each, &mut inner);
+        inner.extend(place.map(|place| Stmt::SetLocal(place, i.clone())));
         // Advanced before the body, so `continue` moves on too.
         let next = binary(vt, IrBinOp::Add, i, one);
-        inner.push(Stmt::SetLocal(index, next));
-        self.scopes.push(HashMap::new());
-        self.bind(&var.name, elem, false, slots);
+        inner.push(Stmt::SetLocal(counter, next));
         let stmt = self.loop_stmt(inner, body);
         self.scopes.pop();
         out.push(stmt);
+    }
+
+    /// `for pattern in start..end`, which sets `pattern` to each integer from
+    /// `start` up to `end` in turn, and never to `end`. Both are evaluated
+    /// once, before the first iteration, and are of one integer type, which
+    /// a literal takes from the other.
+    fn range_loop(
+        &mut self,
+        index: Option<&Pattern>,
+        pattern: &Pattern,
+        (start, end): (&parse::Expr, &parse::Expr),
+        span: Span,
+        body: &parse::Block,
+        out: &mut Vec<Stmt>,
+    ) {
+        let (ty, from, to) = if is_typed_by_other(start) && !is_typed_by_other(end) {
+            let (ty, to) = self.expr(end, None);
+            (ty, self.operand(start, ty), to)
+        } else {
+            let (ty, from) = self.expr(start, None);
+            (ty, from, self.operand(end, ty))
+        };
+        let bounds = self.seq(vec![from, to]);
+        let (elem, prim) = match ty {
+            Ty::Prim(prim) if prim.is_int() => (ty, self.ck.fixed(prim)),
+            // It has no integers, and none that the loop is run for.
+            Ty::Never => (ty, Prim::I32),
+            _ => (self.invalid_operand("..", ty, span).0, Prim::I32),
+        };
+        if let Some(index) = index {
+            self.error(TypeErrorKind::RangeIndex, index.span);
+        }
+        let vt = prim.val_type();
+        let (counter, limit) = (self.temp(vt), self.temp(vt));
+        out.extend(bounds.pre);
+        let mut scalars = exprs(bounds.scalars).into_iter();
+        for dest in [counter, limit] {
+            let scalar = scalars.next().unwrap_or(Expr::Const(zero(vt)));
+            out.push(Stmt::SetLocal(dest, scalar));
+        }
+        let n = Expr::Local(counter);
+        let reached = if prim.is_signed() {
+            IrBinOp::GeS
+        } else {
+            IrBinOp::GeU
+        };
+        let mut inner = vec![Stmt::BrIf(
+            1,
+            binary(vt, reached, n.clone(), Expr::Local(limit)),
+        )];
+        self.scopes.push(HashMap::new());
+        let (_, dests) = self.for_bindings(index, pattern, elem);
+        self.set_leaves(dests, scalar(vt, n.clone()), &mut inner);
+        // Advanced before the body, so `continue` moves on too. It is less
+        // than the end here, so the next is an integer of its type.
+        let one = match vt {
+            ValType::I64 => Const::I64(1),
+            _ => Const::I32(1),
+        };
+        inner.push(Stmt::SetLocal(
+            counter,
+            binary(vt, IrBinOp::Add, n, Expr::Const(one)),
+        ));
+        let stmt = self.loop_stmt(inner, body);
+        self.scopes.pop();
+        out.push(stmt);
+    }
+
+    /// Binds what the head of a `for` names, in the scope of its body: the
+    /// names of `pattern`, which takes an element of type `elem`, and
+    /// `index`, a `uint`. Gives the local of the index, if it's named, and
+    /// that of each leaf of the element, if it's kept.
+    fn for_bindings(
+        &mut self,
+        index: Option<&Pattern>,
+        pattern: &Pattern,
+        elem: Ty,
+    ) -> (Option<LocalId>, Vec<Option<LocalId>>) {
+        let uint = Ty::Prim(Prim::Uint);
+        let place = index.and_then(|index| {
+            let dests = self.bind_pattern(index, uint, false, None);
+            dests.into_iter().next().flatten()
+        });
+        let taken = index.and_then(|index| match &index.kind {
+            PatternKind::Name(name) => Some(name.as_str()),
+            _ => None,
+        });
+        (place, self.bind_pattern(pattern, elem, false, taken))
+    }
+
+    /// Binds each name of `pattern`, which takes apart a value of type `ty`,
+    /// and gives the local that each leaf of the value goes to, if it's
+    /// kept. A name that is `taken`, or that the pattern has twice, is
+    /// reported.
+    fn bind_pattern(
+        &mut self,
+        pattern: &Pattern,
+        ty: Ty,
+        mutable: bool,
+        taken: Option<&str>,
+    ) -> Vec<Option<LocalId>> {
+        let bounds = self.ck.destructure(pattern, ty);
+        let mut dests = vec![None; self.ck.val_types(ty).len()];
+        let mut vars = Vec::new();
+        for (i, bound) in bounds.iter().enumerate() {
+            let earlier = bounds[..i].iter().map(|prev| prev.name);
+            if earlier.chain(taken).any(|name| name == bound.name) {
+                let kind = TypeErrorKind::DuplicateBinding(bound.name.to_string());
+                self.error(kind, bound.span);
+                continue;
+            }
+            let slots = self.alloc(bound.name, bound.ty);
+            for (leaf, slot) in bound.leaves.clone().zip(&slots) {
+                dests[leaf] = Some(*slot);
+            }
+            vars.push((bound.name, bound.ty, slots));
+        }
+        for (name, ty, slots) in vars {
+            self.bind(name, ty, mutable, slots);
+        }
+        dests
+    }
+
+    /// Sets each of `dests` to the leaf of `value` that it is for, after
+    /// evaluating all of `value`.
+    fn set_leaves(&mut self, dests: Vec<Option<LocalId>>, value: Value, out: &mut Vec<Stmt>) {
+        out.extend(value.pre);
+        for (dest, (_, scalar)) in dests.into_iter().zip(value.scalars) {
+            match dest {
+                Some(slot) => out.push(Stmt::SetLocal(slot, scalar)),
+                None if !is_pure(&scalar) => out.push(Stmt::Drop(scalar)),
+                None => {}
+            }
+        }
     }
 
     /// A loop that runs `head`, which may leave with `br 1`, then `body`, and
@@ -5050,18 +5203,13 @@ impl<'c> Body<'c> {
         })
     }
 
-    /// The element `array[index]`, as a place whose `pre` traps unless
-    /// `index < array.len`. `array` is one, a struct that starts as one, or
-    /// a pointer to either. `None` after reporting an error.
-    fn index_place(
-        &mut self,
-        array: &parse::Expr,
-        index: &parse::Expr,
-        span: Span,
-    ) -> Option<Place> {
+    /// `array`, which brackets follow, as the type it's written as, and what
+    /// is indexed and sliced of it: the array that it is or starts as, read
+    /// through any number of pointers, as fields are. Of a struct behind
+    /// one, only the array it starts as is read. What is no array is as it
+    /// is written.
+    fn subscripted(&mut self, array: &parse::Expr) -> (Ty, Ty, Value) {
         let (written, mut array) = self.expr(array, None);
-        // Elements are reached through any number of pointers, as fields
-        // are. Of a struct behind one, only the array it starts as is read.
         let mut ty = written;
         while let Ty::Ptr(id) = ty {
             let pointee = self.ck.pointee(id);
@@ -5072,6 +5220,87 @@ impl<'c> Body<'c> {
             };
             array = self.load(array, 0, ty);
         }
+        (written, ty, array)
+    }
+
+    /// `array[start..end]`: the elements of `array` from `start` up to `end`,
+    /// as an array that writes them if `array` does. It traps unless
+    /// `start <= end <= array.len`. One without a `start` is from the first
+    /// element, and one without an `end` to the last. `array` is one, a
+    /// struct that starts as one, or a pointer to either.
+    fn slice(
+        &mut self,
+        array: &parse::Expr,
+        start: Option<&parse::Expr>,
+        end: Option<&parse::Expr>,
+        span: Span,
+    ) -> (Ty, Value) {
+        let (written, ty, array) = self.subscripted(array);
+        let uint = Ty::Prim(Prim::Uint);
+        let bounds = [start, end].map(|bound| bound.map(|bound| self.check(bound, uint)));
+        let view = self.ck.array_view(ty);
+        let array = match view {
+            Some(_) => self.array_start(array),
+            None => array,
+        };
+        let mut value = self.seq(
+            [array]
+                .into_iter()
+                .chain(bounds.into_iter().flatten())
+                .collect(),
+        );
+        let Some(id) = view else {
+            return match ty {
+                Ty::Never => never(value.pre),
+                _ => self.invalid_operand("[]", written, span),
+            };
+        };
+        // Each is read again by the check, and everything is read after
+        // the prelude.
+        self.spill(&mut value, is_simple);
+        let mut scalars = exprs(value.scalars);
+        let to = end.and_then(|_| scalars.pop());
+        let from = start.and_then(|_| scalars.pop());
+        // Only a mistyped bound has other than one scalar.
+        let Ok([ptr, len]) = <[_; 2]>::try_from(scalars) else {
+            return (Ty::Error, Value::default());
+        };
+        let vt = self.ck.addr_type();
+        let past = |a: &Expr, b: &Expr| binary(vt, IrBinOp::GtU, a.clone(), b.clone());
+        let outside = match (&from, &to) {
+            (Some(from), Some(to)) => Some(binary(vt, IrBinOp::Or, past(from, to), past(to, &len))),
+            (Some(bound), None) | (None, Some(bound)) => Some(past(bound, &len)),
+            (None, None) => None,
+        };
+        let mut pre = value.pre;
+        pre.extend(outside.map(|cond| Stmt::If {
+            cond,
+            then_body: vec![Stmt::Unreachable],
+            else_body: Vec::new(),
+        }));
+        let to = to.unwrap_or(len);
+        let (ptr, len) = match from {
+            Some(from) => {
+                let stride = self.ck.layout(self.ck.element(id)).0;
+                let first = self.ck.element_addr(ptr, from.clone(), stride);
+                (first, binary(vt, IrBinOp::Sub, to, from))
+            }
+            None => (ptr, to),
+        };
+        let scalars = vec![(vt, ptr), (vt, len)];
+        (Ty::Array(id), Value { pre, scalars })
+    }
+
+    /// The element `array[index]`, as a place whose `pre` traps unless
+    /// `index < array.len`. `array` is one, a struct that starts as one, or
+    /// a pointer to either. `None` after reporting an error.
+    fn index_place(
+        &mut self,
+        array: &parse::Expr,
+        index: &parse::Expr,
+        span: Span,
+    ) -> Option<Place> {
+        let (written, ty, array) = self.subscripted(array);
         let index = self.check(index, Ty::Prim(Prim::Uint));
         if ty == Ty::Never {
             return Some(never_place(self.seq(vec![array, index]).pre));
@@ -5285,6 +5514,10 @@ impl<'c> Body<'c> {
             ExprKind::Str(s) => self.string(s, expected, expr.span),
             ExprKind::List(items) => self.list(items, expected, expr.span),
             ExprKind::Repeat(value, len) => self.repeat(value, len, expected, expr.span),
+            ExprKind::Range(..) => unreachable!("only a `for` has a range, which it takes apart"),
+            ExprKind::Slice(array, start, end) => {
+                self.slice(array, start.as_deref(), end.as_deref(), expr.span)
+            }
             ExprKind::Index(..) => match self.place(expr) {
                 Some(place) => {
                     let value = self.read_place(&place);
@@ -7389,11 +7622,17 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
         | ExprKind::AddrOf(_, inner)
         | ExprKind::Cast(inner, ..) => push_assigned(inner, names),
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b) => {
             push_assigned(a, names);
             push_assigned(b, names);
+        }
+        ExprKind::Slice(array, start, end) => {
+            for part in [array].into_iter().chain(start).chain(end) {
+                push_assigned(part, names);
+            }
         }
         ExprKind::Call(callee, args) => {
             push_assigned(callee, names);
@@ -7588,6 +7827,7 @@ fn has_break(expr: &parse::Expr) -> bool {
         | ExprKind::Cast(inner, ..)
         | ExprKind::Return(Some(inner)) => has_break(inner),
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b)
@@ -7596,6 +7836,10 @@ fn has_break(expr: &parse::Expr) -> bool {
             value: b,
             ..
         } => has_break(a) || has_break(b),
+        ExprKind::Slice(array, start, end) => {
+            let mut parts = [array].into_iter().chain(start).chain(end);
+            parts.any(|part| has_break(part))
+        }
         ExprKind::Call(callee, args) => {
             has_break(callee) || args.iter().any(|arg| has_break(&arg.value))
         }
@@ -12985,6 +13229,265 @@ fn f(a: array(u8)):
     }
 
     #[test]
+    fn for_loops_bind_an_index_and_take_tuples_apart() {
+        let src = "\
+extern:
+    fn log(n: u16, at: uint)
+fn f(a: array(u16), pairs: array(tuple(u16, u8))):
+    for i, x in a:
+        if x == 0:
+            continue
+        log(x, i)
+    for i, (n, _) in pairs:
+        log(n, i)
+    for _, _ in a:
+        pass
+";
+        // The index is what the counter was, which is advanced before the
+        // body, so a `continue` moves on.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp4 a.ptr) (set tmp5 a.len) (set tmp6 0) (block (loop \
+             (br_if 1 (I32.GeU tmp6 tmp5)) \
+             (set x (I32.Load16U offset=0 (I32.Add tmp4 (I32.Mul tmp6 2)))) \
+             (set i tmp6) (set tmp6 (I32.Add tmp6 1)) \
+             (if (I32.Eq x 0) (then (br 1)) (else )) (call log [x i] -> []) (br 0))) \
+             (set tmp9 pairs.ptr) (set tmp10 pairs.len) (set tmp11 0) (block (loop \
+             (br_if 1 (I32.GeU tmp11 tmp10)) \
+             (set tmp12 (I32.Add tmp9 (I32.Mul tmp11 4))) \
+             (set n (I32.Load16U offset=0 tmp12)) \
+             (set i tmp11) (set tmp11 (I32.Add tmp11 1)) \
+             (call log [n i] -> []) (br 0))) \
+             (set tmp15 a.ptr) (set tmp16 a.len) (set tmp17 0) (block (loop \
+             (br_if 1 (I32.GeU tmp17 tmp16)) \
+             (set tmp17 (I32.Add tmp17 1)) (br 0)))"
+        );
+        let src = "\
+fn f(a: array(u8), pairs: array(tuple(u8, u8))):
+    for i, x in a:
+        i = 1
+        let n: u8 = i
+    for (x, y) in a:
+        pass
+    for i, i in a:
+        pass
+    for i, (n, i) in pairs:
+        pass
+    for (n, n) in pairs:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ImmutableAssign("i".into()),
+                mismatch("u8", "uint"),
+                mismatch("tuple(_, _)", "u8"),
+                TypeErrorKind::DuplicateBinding("i".into()),
+                TypeErrorKind::DuplicateBinding("i".into()),
+                TypeErrorKind::DuplicateBinding("n".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn for_loops_count_through_a_range() {
+        let src = "\
+extern:
+    fn log(n: i64)
+    fn next() -> u8
+fn f(n: i64):
+    for i in 0..n:
+        if i == 2:
+            continue
+        log(i)
+    for b in next()..next():
+        pass
+    for _ in 0..3:
+        pass
+";
+        // Both ends are read once, and the count is advanced before the
+        // body, so a `continue` moves on.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp1 0i64) (set tmp2 n) (block (loop \
+             (br_if 1 (I64.GeS tmp1 tmp2)) \
+             (set i tmp1) (set tmp1 (I64.Add tmp1 1i64)) \
+             (if (I64.Eq i 2i64) (then (br 1)) (else )) (call log [i] -> []) (br 0))) \
+             (set tmp4 (I32.And (call next ) 255)) (set tmp5 (I32.And (call next ) 255)) \
+             (block (loop (br_if 1 (I32.GeU tmp4 tmp5)) \
+             (set b tmp4) (set tmp4 (I32.Add tmp4 1)) (br 0))) \
+             (set tmp7 0) (set tmp8 3) (block (loop \
+             (br_if 1 (I32.GeS tmp7 tmp8)) \
+             (set tmp7 (I32.Add tmp7 1)) (br 0)))"
+        );
+        let src = "\
+fn f(n: u8, wide: i64, x: f32, p: &u8):
+    for i in 0..n:
+        i = 1
+        let w: i64 = i
+    for i in n..wide:
+        pass
+    for i in 0.0..x:
+        pass
+    for i in p..p:
+        pass
+    for i, j in 0..n:
+        pass
+    for (a, b) in 0..n:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ImmutableAssign("i".into()),
+                mismatch("i64", "u8"),
+                mismatch("u8", "i64"),
+                invalid_operand("..", "f32"),
+                invalid_operand("..", "&u8"),
+                TypeErrorKind::RangeIndex,
+                mismatch("tuple(_, _)", "u8"),
+            ]
+        );
+    }
+
+    #[test]
+    fn slices_check_their_bounds_once() {
+        let src = "\
+fn f(a: array(u16), v: varray(u16), p: &varray(u16), i: uint, j: uint):
+    let both = a[i..j]
+    let from = v[i..]
+    let to = p[..j]
+    let all = a[..]
+";
+        // One check, of what is written, and none where nothing is.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(if (I32.Or (I32.GtU i j) (I32.GtU j a.len)) (then unreachable) (else )) \
+             (set both.ptr (I32.Add a.ptr (I32.Mul i 2))) (set both.len (I32.Sub j i)) \
+             (if (I32.GtU i v.len) (then unreachable) (else )) \
+             (set from.ptr (I32.Add v.ptr (I32.Mul i 2))) (set from.len (I32.Sub v.len i)) \
+             (set tmp11 (I32.Load offset=0 p)) (set tmp12 (I32.Load offset=4 p)) \
+             (if (I32.GtU j tmp12) (then unreachable) (else )) \
+             (set to.ptr tmp11) (set to.len j) \
+             (set all.ptr a.ptr) (set all.len a.len)"
+        );
+        let src = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+fn f(a: array(u8), v: Vec(u8), p: &Vec(u8), n: i32, i: i32):
+    let s: varray(u8) = a[..]
+    let t: Vec(u8) = v[..]
+    let u: varray(u8) = p[1..]
+    a[1..][0] = 1
+    v[1..][0] = 1
+    let x = n[..]
+    let y = a[i..]
+    let z = a[..2.0]
+    let w = &a[1..]
+";
+        // It is the array that is sliced, which writes if that does, and
+        // never the struct. It is a value, which has no address.
+        assert_eq!(
+            errors(src),
+            vec![
+                mismatch("varray(u8)", "array(u8)"),
+                mismatch("Vec(u8)", "varray(u8)"),
+                TypeErrorKind::ReadOnlyWrite {
+                    ty: "array(u8)".into(),
+                    needs: "varray(u8)".into(),
+                    element: true,
+                },
+                invalid_operand("[]", "i32"),
+                mismatch("uint", "i32"),
+                mismatch("uint", "f64"),
+                TypeErrorKind::NotAddressable,
+            ]
+        );
+    }
+
+    #[test]
+    fn for_loops_bind_a_pointer_to_each_element() {
+        let src = "\
+extern:
+    fn log(n: u16, at: uint)
+struct Pair:
+    low: u16
+    high: u16
+fn f(v: varray(Pair), a: array(u16)):
+    for &var p in v:
+        p.high = p.low
+        p.* = Pair(low: 1, high: 2)
+    for i, &x in a:
+        log(x.*, i)
+    for &_ in a:
+        pass
+";
+        // Its address, where a copy would be loaded from it.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp4 v.ptr) (set tmp5 v.len) (set tmp6 0) (block (loop \
+             (br_if 1 (I32.GeU tmp6 tmp5)) \
+             (set p (I32.Add tmp4 (I32.Mul tmp6 4))) (set tmp6 (I32.Add tmp6 1)) \
+             (I32.Store16 offset=2 p (I32.Load16U offset=0 p)) \
+             (I32.Store16 offset=0 p 1) (I32.Store16 offset=2 p 2) (br 0))) \
+             (set tmp8 a.ptr) (set tmp9 a.len) (set tmp10 0) (block (loop \
+             (br_if 1 (I32.GeU tmp10 tmp9)) \
+             (set x (I32.Add tmp8 (I32.Mul tmp10 2))) \
+             (set i tmp10) (set tmp10 (I32.Add tmp10 1)) \
+             (call log [(I32.Load16U offset=0 x) i] -> []) (br 0))) \
+             (set tmp13 a.ptr) (set tmp14 a.len) (set tmp15 0) (block (loop \
+             (br_if 1 (I32.GeU tmp15 tmp14)) \
+             (set tmp15 (I32.Add tmp15 1)) (br 0)))"
+        );
+        let src = "\
+enum(u8) Color:
+    red
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+fn f(a: array(u8), v: varray(u8), s: Vec(u8), n: u8):
+    for &x in a:
+        x.* = 1
+        let y: u8 = x
+    for &var x in a:
+        pass
+    for &var x in v:
+        x = x
+    for &var x in s:
+        x.* = 1
+    for &c in Color:
+        pass
+    for &var i in 0..n:
+        pass
+    for &x in n:
+        pass
+";
+        // It writes only what a `&var` of a `varray` points to, and only
+        // an element has an address.
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ReadOnlyWrite {
+                    ty: "&u8".into(),
+                    needs: "&var u8".into(),
+                    element: false,
+                },
+                mismatch("u8", "&u8"),
+                TypeErrorKind::ReadOnlyAddr {
+                    ty: "array(u8)".into(),
+                    needs: "varray(u8)".into(),
+                    element: true,
+                },
+                TypeErrorKind::ImmutableAssign("x".into()),
+                TypeErrorKind::NotAddressable,
+                TypeErrorKind::NotAddressable,
+                invalid_operand("for", "u8"),
+            ]
+        );
+    }
+
+    #[test]
     fn for_loops_copy_each_element_of_a_struct_that_starts_as_an_array() {
         let decls = "\
 extern:
@@ -15391,6 +15894,44 @@ fn f():
              (block (set r 5) (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> [])) \
              (block (set r 6) (if (I32.Eq r 5) (then (br 1)) (else )) (call log [r] -> []))) \
              (block (block (set p.0 1) (set p.1 2)) (block (set p.0 3) (set p.1 4)))"
+        );
+        // The index is how many members come before, whatever their values.
+        let src = "\
+extern:
+    fn log(n: i8, at: uint)
+enum(i8) R:
+    ok
+    err = 5
+enum(tuple(u8, u8)) P:
+    a = (1, 2)
+fn f():
+    for i, r in R:
+        log(r as i8, i)
+    for i, _ in P:
+        log(0, i)
+";
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(block \
+             (block (set r 0) (set i 0) (call log [r i] -> [])) \
+             (block (set r 5) (set i 1) (call log [r i] -> []))) \
+             (block (block (set i 0) (call log [0 i] -> [])))"
+        );
+        let src = "\
+enum(tuple(u8, u8)) P:
+    a = (1, 2)
+fn f():
+    for (x, y) in P:
+        pass
+    for i, i in P:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                mismatch("tuple(_, _)", "P"),
+                TypeErrorKind::DuplicateBinding("i".into()),
+            ]
         );
         let src = "\
 enum(i8) R:

@@ -492,6 +492,15 @@ mod tests {
             results[0].unwrap_i32()
         }
 
+        /// Whether the exported function `name`, from `i32`s to an `i32`,
+        /// traps when it is called with `args`.
+        fn traps(&mut self, name: &str, args: &[i32]) -> bool {
+            let func = self.instance.get_func(&mut self.store, name).unwrap();
+            let args: Vec<_> = args.iter().map(|arg| wasmtime::Val::I32(*arg)).collect();
+            let mut results = [wasmtime::Val::I32(0)];
+            func.call(&mut self.store, &args, &mut results).is_err()
+        }
+
         /// The `len` bytes of memory at `addr`.
         fn bytes(&mut self, addr: usize, len: usize) -> Vec<u8> {
             let memory = self.instance.get_memory(&mut self.store, "memory").unwrap();
@@ -1146,6 +1155,163 @@ pub let after = count()
             .collect();
         assert_eq!(segments, [(0, 70001)]);
         assert_eq!(module.memory.min_pages, 2);
+    }
+
+    #[test]
+    fn for_loops_count_what_they_iterate() {
+        let src = "\
+enum(i32) Step:
+    first = 10
+    second = 20
+    third
+fn weigh(a: array(i32)) -> i32:
+    var total = 0
+    for i, x in a:
+        if x == 0:
+            continue
+        total += x * (i as i32 + 1)
+    return total
+fn spread(pairs: array(tuple(i32, i32))) -> i32:
+    var total = 0
+    for i, (low, high) in pairs:
+        total += (high - low) * i as i32
+    return total
+fn steps() -> i32:
+    var total = 0
+    for i, step in Step:
+        if step == .second:
+            continue
+        total += step as i32 * (i as i32 + 1)
+    return total
+pub let weighed = weigh([5, 0, 7])
+pub let spreads = spread([(1, 9), (2, 5), (0, 4)])
+pub let stepped = steps()
+";
+        let mut started = Started::of(src);
+        assert_eq!(started.global("weighed"), 5 + 7 * 3);
+        assert_eq!(started.global("spreads"), 3 + 4 * 2);
+        assert_eq!(started.global("stepped"), 10 + 21 * 3);
+    }
+
+    #[test]
+    fn for_loops_count_from_a_start_up_to_an_end() {
+        let src = "\
+var calls = 0
+fn bound(n: i32) -> i32:
+    calls += 1
+    return n
+fn sum(from: i32, to: i32) -> i32:
+    var total = 0
+    for i in bound(from)..bound(to):
+        if i == 0:
+            continue
+        total += i
+    return total
+fn bytes() -> i32:
+    var count = 0
+    for b in 250..255 as u8:
+        count += b as i32 - 249
+    return count
+fn wide(from: i64) -> i32:
+    var count = 0
+    for n in from..0x7fff_ffff_ffff_ffff:
+        if n == 0x1_0000_0001:
+            break
+        count += 1
+    return count
+pub let up = sum(-2, 4)
+pub let none = sum(4, 4) + sum(5, -5)
+pub let read = calls
+pub let narrow = bytes()
+pub let crossed = wide(0xffff_fffe)
+";
+        let mut started = Started::of(src);
+        // From -2 to 3, without the 0 that it skips.
+        assert_eq!(started.global("up"), 3);
+        // Nothing where the start isn't less than the end.
+        assert_eq!(started.global("none"), 0);
+        assert_eq!(started.global("read"), 6);
+        assert_eq!(started.global("narrow"), 1 + 2 + 3 + 4 + 5);
+        assert_eq!(started.global("crossed"), 3);
+    }
+
+    #[test]
+    fn slices_view_the_elements_between_their_bounds() {
+        let src = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+let numbers: varray(i32) = [1, 2, 3, 4, 5]
+let vec = &var Vec(i32)(ptr: numbers.ptr, len: 4, cap: numbers.len)
+fn sum(a: array(i32)) -> i32:
+    var total = 0
+    for x in a:
+        total += x
+    return total
+fn(T, A: array(T)) tail(a: A) -> array(T):
+    return a[1..]
+pub fn between(from: i32, to: i32) -> i32:
+    return sum(numbers[from as uint..to as uint])
+pub fn after(from: i32) -> i32:
+    return sum(numbers[from as uint..])
+pub fn before(to: i32) -> i32:
+    return sum(numbers[..to as uint])
+pub fn double(from: i32) -> i32:
+    # Through the pointer, as `vec[i]` is, and only its `len` elements.
+    let rest = vec[from as uint..]
+    for i, x in rest:
+        rest[i] = x * 2
+    return sum(numbers[..]) * 10 + rest.len as i32
+pub let middle = between(1, 4)
+pub let none = between(2, 2) + after(5) + before(0)
+pub let all = sum(numbers[..]) + sum(tail(numbers)) + sum(tail(vec.*))
+pub let text = \"hello\"[1..3] == \"el\"
+";
+        let mut started = Started::of(src);
+        assert_eq!(started.global("middle"), 2 + 3 + 4);
+        assert_eq!(started.global("none"), 0);
+        assert_eq!(started.global("all"), 15 + 14 + 9);
+        assert_eq!(started.global("text"), 1);
+        assert_eq!(started.call("after", &[3]), 4 + 5);
+        assert_eq!(started.call("before", &[2]), 1 + 2);
+        // It traps unless `start <= end <= len`.
+        for (from, to) in [(3, 2), (0, 6), (6, 6), (-1, 2)] {
+            assert!(started.traps("between", &[from, to]), "{from}..{to}");
+        }
+        assert!(started.traps("after", &[6]));
+        assert!(started.traps("before", &[6]));
+        assert!(started.traps("double", &[5]));
+        assert_eq!(started.call("double", &[2]), (1 + 2 + 6 + 8 + 5) * 10 + 2);
+    }
+
+    #[test]
+    fn for_loops_write_through_a_pointer_to_each_element() {
+        let src = "\
+struct Pair:
+    low: i32
+    high: i32
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+let pairs: varray(Pair) = [Pair(low: 1, high: 0), Pair(low: 2, high: 0), Pair(low: 3, high: 0)]
+let vec = &var Vec(Pair)(ptr: pairs.ptr, len: 2, cap: pairs.len)
+fn widen() -> i32:
+    for i, &var pair in vec.*:
+        if pair.low == 1:
+            continue
+        pair.high = pair.low * 10 + i as i32
+    for &var pair in pairs[2..]:
+        pair.* = Pair(low: 7, high: 8)
+    var total = 0
+    for &pair in pairs:
+        total = total * 100 + pair.low * 10 + pair.high
+    return total
+pub let widened = widen()
+";
+        let mut started = Started::of(src);
+        // The first is skipped, the second is written through `vec`, which
+        // has two, and the third through the slice.
+        assert_eq!(started.global("widened"), 10_00_00 + (20 + 21) * 100 + 78);
     }
 
     #[test]

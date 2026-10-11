@@ -128,11 +128,20 @@ impl<'p> Free<'p> {
                 self.expr(cond);
                 self.block(body);
             }
-            StmtKind::For { var, iter, body } => {
+            StmtKind::For {
+                index,
+                pattern,
+                iter,
+                body,
+                ..
+            } => {
                 self.expr(iter);
-                self.bound.push(&var.name);
+                let outer = self.bound.len();
+                for bound in index.iter().chain([pattern]) {
+                    self.bind(bound);
+                }
                 self.block(body);
-                self.bound.pop();
+                self.bound.truncate(outer);
             }
             StmtKind::Match { value, arms } => {
                 self.expr(value);

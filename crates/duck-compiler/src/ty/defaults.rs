@@ -327,9 +327,14 @@ fn param_in_expr<'a>(
         | ExprKind::Deref(inner)
         | ExprKind::AddrOf(_, inner) => within(inner),
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b) => within(a).or_else(|| within(b)),
+        ExprKind::Slice(array, start, end) => {
+            let mut parts = [array].into_iter().chain(start).chain(end);
+            parts.find_map(|part| within(part))
+        }
         ExprKind::Call(callee, args) => {
             within(callee).or_else(|| args.iter().find_map(|arg| within(&arg.value)))
         }

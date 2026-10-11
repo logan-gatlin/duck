@@ -71,6 +71,39 @@ let _ = a - b - c
       (identifier))))
 
 ====================
+Slices
+====================
+
+let _ = a[i + 1..n]
+let _ = a[..n][i..]
+let _ = p.a[..]
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (slice_expression
+      (identifier)
+      (binary_expression
+        (identifier)
+        (integer))
+      (identifier)))
+  (binding
+    (discard)
+    (slice_expression
+      (slice_expression
+        (identifier)
+        (identifier))
+      (identifier)))
+  (binding
+    (discard)
+    (slice_expression
+      (field_expression
+        (identifier)
+        (identifier)))))
+
+====================
 Unary and postfix
 ====================
 

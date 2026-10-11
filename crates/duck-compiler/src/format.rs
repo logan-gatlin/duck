@@ -454,8 +454,8 @@ impl<'a> Formatter<'a> {
         match (prev, kind) {
             // `1.0` would be a float, where `1 .0` is the first element of 1.
             (Int(_), Dot) if !self.index => true,
-            (_, Comma | Semi | Colon | RParen | RBracket | RBrace | DotStar) => false,
-            (LParen | LBracket | LBrace | Dot, _) => false,
+            (_, Comma | Semi | Colon | RParen | RBracket | RBrace | DotStar | DotDot) => false,
+            (LParen | LBracket | LBrace | Dot | DotDot, _) => false,
             _ if self.prefix => false,
             (_, Dot) => prefix,
             // The brackets of a call, an index or type parameters.
@@ -880,6 +880,22 @@ mod tests {
             "fn f():\n\tx += 1\n\tif a <= b and not c or d != e:\n\t\tpass\n"
         );
         assert_eq!(
+            formatted("fn f():\n\tfor  i ,( k,v )in pairs:\n\t\tpass\n"),
+            "fn f():\n\tfor i, (k, v) in pairs:\n\t\tpass\n"
+        );
+        assert_eq!(
+            formatted("fn f():\n\tfor i in 0 .. n-1:\n\t\tpass\n"),
+            "fn f():\n\tfor i in 0..n - 1:\n\t\tpass\n"
+        );
+        assert_eq!(
+            formatted("fn f():\n\tfor i in - 1 .. - n:\n\t\tpass\n"),
+            "fn f():\n\tfor i in -1..-n:\n\t\tpass\n"
+        );
+        assert_eq!(
+            formatted("let s = (a [ i+1 .. n ], a[ .. n], a [i ..], a[ .. ])\n"),
+            "let s = (a[i + 1..n], a[..n], a[i..], a[..])\n"
+        );
+        assert_eq!(
             formatted("let b:varray(u8)=[ 0 ;SIZE ]\n"),
             "let b: varray(u8) = [0; SIZE]\n"
         );
@@ -909,6 +925,10 @@ mod tests {
     fn operators_before_their_operands_touch_them() {
         assert_eq!(formatted("let x = - 1 - - 2\n"), "let x = -1 - -2\n");
         assert_eq!(formatted("let x = a&b & ~ c\n"), "let x = a & b & ~c\n");
+        assert_eq!(
+            formatted("fn f():\n\tfor i,& var x in a:\n\t\tpass\n\tfor & x in a:\n\t\tpass\n"),
+            "fn f():\n\tfor i, &var x in a:\n\t\tpass\n\tfor &x in a:\n\t\tpass\n"
+        );
         assert_eq!(
             formatted("let p:& var i32=& var 0\n"),
             "let p: &var i32 = &var 0\n"

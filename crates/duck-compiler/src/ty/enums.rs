@@ -9,7 +9,7 @@ use crate::file::FileId;
 use crate::ir::{Const, Expr, Stmt, ValType};
 use crate::lex::Span;
 use crate::load::Program;
-use crate::parse::{self, EnumDecl, ExprKind, Ident, ItemKind};
+use crate::parse::{self, EnumDecl, ExprKind, Ident, ItemKind, Pattern};
 
 use super::{
     Body, Checker, EnumId, Item, Label, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, zero,
@@ -420,28 +420,33 @@ impl Body<'_> {
         Some((Ty::Enum(id), self.scalars(Ty::Enum(id), consts)))
     }
 
-    /// `for var in E`, where `E` names enum `id`: a copy of `body` per
-    /// member, in declaration order, after setting `var` to it. Each copy is
-    /// in a block that `continue` leaves, and they're all in one that `break`
-    /// leaves.
-    pub(super) fn unrolled_loop(&mut self, id: EnumId, var: &Ident, body: &parse::Block) -> Stmt {
-        let ty = Ty::Enum(id);
-        self.ck.record(var.span, ty);
-        let slots = self.alloc(&var.name, ty);
+    /// `for index, pattern in E`, where `E` names enum `id`: a copy of `body`
+    /// per member, in declaration order, after setting `pattern` to it and
+    /// `index` to how many come before it. Each copy is in a block that
+    /// `continue` leaves, and they're all in one that `break` leaves.
+    pub(super) fn unrolled_loop(
+        &mut self,
+        id: EnumId,
+        index: Option<&Pattern>,
+        pattern: &Pattern,
+        body: &parse::Block,
+    ) -> Stmt {
         self.scopes.push(HashMap::new());
-        self.bind(&var.name, ty, false, slots.clone());
+        let (place, dests) = self.for_bindings(index, pattern, Ty::Enum(id));
         self.labels.push(Label::Break);
         let (body, _) = self.maybe(|lowered| lowered.labelled(Label::Continue, body));
         self.labels.pop();
         self.scopes.pop();
-        let copies = self.ck.enums[id.0 as usize]
-            .members
-            .iter()
-            .map(|member| {
-                let sets = slots.iter().zip(&member.value);
+        let members = self.ck.enums[id.0 as usize].members.iter();
+        let copies = members
+            .enumerate()
+            .map(|(i, member)| {
+                let sets = dests.iter().zip(&member.value);
                 let mut copy: Vec<_> = sets
-                    .map(|(slot, c)| Stmt::SetLocal(*slot, Expr::Const(*c)))
+                    .filter_map(|(slot, c)| Some(Stmt::SetLocal((*slot)?, Expr::Const(*c))))
                     .collect();
+                let position = Expr::Const(self.ck.addr_const(i as u64));
+                copy.extend(place.map(|place| Stmt::SetLocal(place, position)));
                 copy.extend(body.iter().cloned());
                 Stmt::Block(copy)
             })

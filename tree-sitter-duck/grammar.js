@@ -417,12 +417,28 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
+    // `for x in a` or `for i, x in a`: the index is a name or `_`.
     for_statement: $ => seq(
       'for',
-      field('variable', $.identifier),
+      optional(seq(field('index', choice($.identifier, $.discard)), ',')),
+      field('pattern', choice($._pattern, $.pointer_binding)),
       'in',
-      field('iterable', $._expression),
+      field('iterable', choice($._expression, $.range)),
       field('body', $.block),
+    ),
+
+    // `&x` or `&var x`, which a `for` binds to a pointer to each element.
+    pointer_binding: $ => seq(
+      '&',
+      optional(field('mutability', 'var')),
+      field('name', choice($.identifier, $.discard)),
+    ),
+
+    // `start..end`, which is no expression: only a `for` iterates one.
+    range: $ => seq(
+      field('start', $._expression),
+      '..',
+      field('end', $._expression),
     ),
 
     // `else` is an arm that matches every value, and comes last.
@@ -486,6 +502,7 @@ module.exports = grammar({
       $.address_of_expression,
       $.call_expression,
       $.index_expression,
+      $.slice_expression,
       $.field_expression,
       $.dereference_expression,
     ),
@@ -623,6 +640,16 @@ module.exports = grammar({
       field('value', $._expression),
       '[',
       field('index', $._expression),
+      ']',
+    )),
+
+    // `a[start..end]`, where either bound may be left out.
+    slice_expression: $ => prec(PREC.postfix, seq(
+      field('value', $._expression),
+      '[',
+      optional(field('start', $._expression)),
+      '..',
+      optional(field('end', $._expression)),
       ']',
     )),
 

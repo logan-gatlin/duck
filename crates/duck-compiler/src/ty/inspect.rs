@@ -1825,22 +1825,26 @@ impl<'p> Walk<'p> {
                     || else_body.as_ref().is_some_and(|body| self.block(body))
             }
             StmtKind::While { cond, body } => self.expr(cond) || self.block(body),
-            StmtKind::For { var, iter, body } => {
+            StmtKind::For {
+                index,
+                pattern,
+                iter,
+                body,
+                ..
+            } => {
                 if self.expr(iter) {
                     return true;
                 }
-                let local = Local {
-                    name: &var.name,
-                    span: var.span,
-                    kind: LocalKind::Bound,
-                };
-                if !self.statement && self.holds(var.span) {
-                    return self.find(Found::Local(local));
+                let depth = self.site.locals.len();
+                for bound in index.iter().chain([pattern]) {
+                    if self.pattern(bound, LocalKind::Bound) {
+                        return true;
+                    }
+                    self.bind(bound, LocalKind::Bound);
                 }
-                self.site.locals.push(local);
                 let found = self.block(body);
                 if !found {
-                    self.site.locals.pop();
+                    self.site.locals.truncate(depth);
                 }
                 found
             }
@@ -1962,9 +1966,14 @@ impl<'p> Walk<'p> {
                 elems.iter().any(|elem| self.expr(elem))
             }
             ExprKind::Repeat(a, b)
+            | ExprKind::Range(a, b)
             | ExprKind::Binary(_, a, b)
             | ExprKind::Index(a, b)
             | ExprKind::Pipe(a, b) => self.expr(a) || self.expr(b),
+            ExprKind::Slice(array, start, end) => {
+                let mut parts = [array].into_iter().chain(start).chain(end);
+                parts.any(|part| self.expr(part))
+            }
             ExprKind::Unary(_, inner)
             | ExprKind::Deref(inner)
             | ExprKind::AddrOf(_, inner)
@@ -3562,7 +3571,7 @@ fn idle():
 fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
     let p = Point(x: 1.0)
     let (a, b) = (kit.len(p, 2.0) + p.y, wide)
-    for m in kit.Color:
+    for at, m in kit.Color:
         pass
     match s:
         .circle(r):
@@ -3690,6 +3699,7 @@ fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
                 "11: Type \": f32\"",
                 "11: Type \": i64\"",
                 "11: Parameter \"scale: \"",
+                "12: Type \": uint\"",
                 "12: Type \": Color\"",
             ]
         );
@@ -3718,6 +3728,7 @@ fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
                 "main:9: Function pick",
                 "main:11: Variable a",
                 "main:11: Variable b",
+                "main:12: Variable at",
                 "main:12: Variable m",
                 "main:15: Variable r",
                 "main:20: Variable n",

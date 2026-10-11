@@ -279,8 +279,16 @@ pub enum StmtKind {
         cond: Expr,
         body: Block,
     },
+    /// `for pattern in iter:` or `for index, pattern in iter:`.
     For {
-        var: Ident,
+        /// A name or `_`, for where the element is among those iterated.
+        index: Option<Pattern>,
+        /// `&` or `&var` before the pattern, which then takes a pointer to
+        /// each element, and is a name or `_`.
+        addr: Option<Mutability>,
+        /// What takes each element, as the pattern of a binding takes its
+        /// value.
+        pattern: Pattern,
         iter: Expr,
         body: Block,
     },
@@ -329,10 +337,17 @@ pub enum ExprKind {
     List(Vec<Expr>),
     /// `[value; len]`, an array of `len` copies of `value`.
     Repeat(Box<Expr>, Box<Expr>),
+    /// `start..end`, each integer from `start` up to `end`, which isn't one
+    /// of them. It is no value: only a `for` iterates one.
+    Range(Box<Expr>, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),
     Index(Box<Expr>, Box<Expr>),
+    /// `array[start..end]`, a view of the elements of `array` from `start`
+    /// up to `end`. One without a `start` is from the first, and one without
+    /// an `end` to the last.
+    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>),
     Field(Box<Expr>, Ident),
     /// `pointer.*`
     Deref(Box<Expr>),
@@ -480,6 +495,14 @@ enum Parens<T> {
     Group(T),
     /// `(x, y)`, or `(x,)`: a comma makes a tuple of even one.
     Tuple(Vec<T>),
+}
+
+/// What the brackets after an array hold.
+enum Subscript {
+    /// `[i]`
+    Index(Expr),
+    /// `[start..end]`, either of which may be left out.
+    Slice(Option<Expr>, Option<Expr>),
 }
 
 /// Precedence of `not`, which sits between `and` and the comparisons.
@@ -1075,6 +1098,40 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// What a `for` iterates: an expression, or `start..end`, where each is
+    /// one.
+    fn iterated(&mut self) -> PResult<Expr> {
+        let start = self.expr()?;
+        if !self.eat(TokenKind::DotDot) {
+            return Ok(start);
+        }
+        let end = self.expr()?;
+        let span = start.span;
+        Ok(Expr {
+            kind: ExprKind::Range(Box::new(start), Box::new(end)),
+            span: self.span_from(span),
+        })
+    }
+
+    /// What a `for` binds: `pattern`, or `index, pattern`, where the index is
+    /// a name or `_`. After `&` or `&var` the pattern is one too.
+    fn for_bindings(&mut self) -> PResult<(Option<Pattern>, Option<Mutability>, Pattern)> {
+        let indexed = matches!(self.peek().kind, TokenKind::Ident(_))
+            && self.peek_second().kind == TokenKind::Comma;
+        let index = if indexed {
+            let index = self.pattern()?;
+            self.bump();
+            Some(index)
+        } else {
+            None
+        };
+        let addr = self.eat(TokenKind::Amp).then(|| self.pointer_mutability());
+        if addr.is_some() && !matches!(self.peek().kind, TokenKind::Ident(_)) {
+            return Err(self.unexpected("name"));
+        }
+        Ok((index, addr, self.pattern()?))
+    }
+
     fn pattern(&mut self) -> PResult<Pattern> {
         let token = self.peek();
         let kind = match &token.kind {
@@ -1188,11 +1245,17 @@ impl<'a> Parser<'a> {
             }
             TokenKind::For => {
                 self.bump();
-                let var = self.ident()?;
+                let (index, addr, pattern) = self.for_bindings()?;
                 self.expect(TokenKind::In)?;
-                let iter = self.expr()?;
+                let iter = self.iterated()?;
                 let body = self.block()?;
-                StmtKind::For { var, iter, body }
+                StmtKind::For {
+                    index,
+                    addr,
+                    pattern,
+                    iter,
+                    body,
+                }
             }
             TokenKind::Match => {
                 self.bump();
@@ -1534,9 +1597,15 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::LBracket => {
                     self.bump();
-                    let index = self.bracketed(Self::expr)?;
+                    let subscript = self.bracketed(Self::subscript)?;
                     self.expect(TokenKind::RBracket)?;
-                    ExprKind::Index(Box::new(expr), Box::new(index))
+                    let array = Box::new(expr);
+                    match subscript {
+                        Subscript::Index(index) => ExprKind::Index(array, Box::new(index)),
+                        Subscript::Slice(start, end) => {
+                            ExprKind::Slice(array, start.map(Box::new), end.map(Box::new))
+                        }
+                    }
                 }
                 TokenKind::Dot => {
                     self.bump();
@@ -1658,6 +1727,25 @@ impl<'a> Parser<'a> {
             kind,
             span: token.span,
         })
+    }
+
+    /// What the brackets after an array hold: an index, or the `start..end`
+    /// of a slice.
+    fn subscript(&mut self) -> PResult<Subscript> {
+        let start = match self.at(TokenKind::DotDot) {
+            true => None,
+            false => Some(self.expr()?),
+        };
+        match (start, self.eat(TokenKind::DotDot)) {
+            (Some(index), false) => Ok(Subscript::Index(index)),
+            (start, _) => {
+                let end = match self.at(TokenKind::RBracket) {
+                    true => None,
+                    false => Some(self.expr()?),
+                };
+                Ok(Subscript::Slice(start, end))
+            }
+        }
     }
 
     /// Parses what brackets hold with `inner`: a pipe body that they are in
@@ -2005,6 +2093,7 @@ mod tests {
             ExprKind::Tuple(items) => format!("(tuple {})", list(items)),
             ExprKind::List(items) => format!("[{}]", list(items)),
             ExprKind::Repeat(value, len) => format!("[{}; {}]", sexpr(value), sexpr(len)),
+            ExprKind::Range(start, end) => format!("(.. {} {})", sexpr(start), sexpr(end)),
             ExprKind::Unary(op, e) => format!("({op:?} {})", sexpr(e)),
             ExprKind::Binary(op, l, r) => format!("({op:?} {} {})", sexpr(l), sexpr(r)),
             ExprKind::Call(f, args) => {
@@ -2019,6 +2108,13 @@ mod tests {
                 format!("(call {} {args})", sexpr(f))
             }
             ExprKind::Index(e, i) => format!("(index {} {})", sexpr(e), sexpr(i)),
+            ExprKind::Slice(e, start, end) => {
+                let bound = |bound: &Option<Box<Expr>>| match bound {
+                    Some(bound) => sexpr(bound),
+                    None => "_".to_string(),
+                };
+                format!("(slice {} {} {})", sexpr(e), bound(start), bound(end))
+            }
             ExprKind::Field(e, field) => format!("(. {} {})", sexpr(e), field.name),
             ExprKind::Deref(e) => format!("(.* {})", sexpr(e)),
             ExprKind::AddrOf(Mutability::Let, e) => format!("(& {})", sexpr(e)),
@@ -2608,6 +2704,122 @@ mod tests {
         }
         // Patterns, labels and other names are not expressions.
         parse_src("fn f(_: i32):\n    for _ in xs:\n        let _ = g(_: 1)\n").unwrap();
+    }
+
+    #[test]
+    fn for_bindings() {
+        let head = |src: &str| {
+            let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
+            let module = parse_src(&src).unwrap();
+            let ItemKind::Fn(f) = &module.items[0].kind else {
+                panic!()
+            };
+            let StmtKind::For {
+                index,
+                addr,
+                pattern,
+                ..
+            } = &f.body[0].kind
+            else {
+                panic!()
+            };
+            let index = index.as_ref().map(render_pattern);
+            let addr = match addr {
+                Some(Mutability::Var) => "&var ",
+                Some(Mutability::Let) => "&",
+                None => "",
+            };
+            let pattern = format!("{addr}{}", render_pattern(pattern));
+            (index.unwrap_or_default(), pattern)
+        };
+        assert_eq!(head("x"), ("".into(), "x".into()));
+        assert_eq!(head("_"), ("".into(), "_".into()));
+        assert_eq!(head("(k, (v, _))"), ("".into(), "(k (v _))".into()));
+        assert_eq!(head("i, x"), ("i".into(), "x".into()));
+        assert_eq!(head("_, (k, v)"), ("_".into(), "(k v)".into()));
+        assert_eq!(head("&x"), ("".into(), "&x".into()));
+        assert_eq!(head("& var x"), ("".into(), "&var x".into()));
+        assert_eq!(head("i, &var _"), ("i".into(), "&var _".into()));
+        // Only a name counts, and only one of them.
+        for src in ["(a, b), x", "i, j, x", "&i, x"] {
+            let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
+            assert_eq!(errors(&src), vec![expected("`in`", TokenKind::Comma)]);
+        }
+        // A pointer is to the whole of an element.
+        for (src, found) in [("&(a, b)", TokenKind::LParen), ("&&x", TokenKind::Amp)] {
+            let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
+            assert_eq!(errors(&src), vec![expected("name", found)]);
+        }
+    }
+
+    #[test]
+    fn ranges() {
+        let iterated = |src: &str| {
+            let src = format!("fn f():\n    for x in {src}:\n        pass\n");
+            let module = parse_src(&src).unwrap();
+            let ItemKind::Fn(f) = &module.items[0].kind else {
+                panic!()
+            };
+            let StmtKind::For { iter, .. } = &f.body[0].kind else {
+                panic!()
+            };
+            sexpr(iter)
+        };
+        assert_eq!(iterated("0..n"), "(.. 0 n)");
+        assert_eq!(iterated("t.0..t.1"), "(.. (. t 0) (. t 1))");
+        // Each end is a whole expression.
+        assert_eq!(
+            iterated("a + 1..b or c |> _ * 2"),
+            "(.. (Add a 1) (|> (Or b c) (Mul _ 2)))"
+        );
+        assert_eq!(iterated("-1..-n"), "(.. (Neg 1) (Neg n))");
+        // Only a `for` has one, between two expressions.
+        for (src, found) in [
+            ("let r = 0..n\n", TokenKind::DotDot),
+            ("let r = (0..n)\n", TokenKind::DotDot),
+            (
+                "fn f():\n    for x in 0..:\n        pass\n",
+                TokenKind::Colon,
+            ),
+            (
+                "fn f():\n    for x in ..n:\n        pass\n",
+                TokenKind::DotDot,
+            ),
+            (
+                "fn f():\n    for x in 0..n..m:\n        pass\n",
+                TokenKind::DotDot,
+            ),
+        ] {
+            let errors = errors(src);
+            let [ParseErrorKind::Expected { found: at, .. }] = &errors[..] else {
+                panic!("{src}: {errors:?}")
+            };
+            assert_eq!(*at, found, "{src}");
+        }
+    }
+
+    #[test]
+    fn slices() {
+        assert_eq!(expr("a[i..j]"), "(slice a i j)");
+        assert_eq!(expr("a[i..]"), "(slice a i _)");
+        assert_eq!(expr("a[..j]"), "(slice a _ j)");
+        assert_eq!(expr("a[..]"), "(slice a _ _)");
+        assert_eq!(expr("p.a[1..][0]"), "(index (slice (. p a) 1 _) 0)");
+        // Each bound is a whole expression.
+        assert_eq!(
+            expr("a[i + 1..n - 1 or m]"),
+            "(slice a (Add i 1) (Or (Sub n 1) m))"
+        );
+        assert_eq!(expr("x |> a[_.._]"), "(|> x (slice a _ _))");
+        // It is a value, which nothing is assigned to.
+        assert_eq!(
+            errors("fn f():\n    a[1..2] = b\n"),
+            vec![ParseErrorKind::InvalidAssignTarget]
+        );
+        assert_eq!(
+            errors("let s = a[1..2..3]\n"),
+            vec![expected("`]`", TokenKind::DotDot)]
+        );
     }
 
     #[test]

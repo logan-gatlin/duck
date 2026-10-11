@@ -2,7 +2,9 @@
 (block) @local.scope
 
 (parameter name: (identifier) @local.definition)
-(for_statement variable: (identifier) @local.definition)
+(for_statement index: (identifier) @local.definition)
+(for_statement pattern: (identifier) @local.definition)
+(pointer_binding name: (identifier) @local.definition)
 (binding pattern: (identifier) @local.definition)
 (tuple_pattern (identifier) @local.definition)
 (parenthesized_pattern (identifier) @local.definition)

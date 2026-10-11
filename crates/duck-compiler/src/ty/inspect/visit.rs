@@ -104,11 +104,17 @@ pub(in crate::ty) fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<
             }
         }
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b) => {
             self::expr(a, visit);
             self::expr(b, visit);
+        }
+        ExprKind::Slice(array, start, end) => {
+            for part in [array].into_iter().chain(start).chain(end) {
+                self::expr(part, visit);
+            }
         }
         ExprKind::Assign { target, value, .. } => {
             self::expr(target, visit);
