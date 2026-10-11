@@ -7,6 +7,7 @@ use std::error::Error;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use duck::git::Cache;
 use duck::manifest::MANIFEST;
@@ -28,22 +29,22 @@ use lsp_types::{
     CancelParams, CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand,
     CodeActionParams, CodeActionProviderCapability, CompletionItem, CompletionItemKind,
     CompletionOptions, CompletionParams, Diagnostic, DiagnosticRelatedInformation,
-    DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams,
+    DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
-    DocumentChanges, DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams,
-    DocumentSymbol, DocumentSymbolParams, Documentation, FileSystemWatcher, GlobPattern,
-    GotoDefinitionParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
-    InlayHintLabel, InlayHintParams, Location, MarkupContent, MarkupKind, NumberOrString, OneOf,
-    OptionalVersionedTextDocumentIdentifier, ParameterInformation, ParameterLabel, Position,
-    PublishDiagnosticsParams, Range, ReferenceParams, Registration, RegistrationParams, RenameFile,
-    RenameOptions, RenameParams, ResourceOp, ResourceOperationKind, ServerCapabilities, ServerInfo,
-    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
-    SymbolInformation, TextDocumentEdit, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit,
-    TypeDefinitionProviderCapability, Uri, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentChangeOperation, DocumentChanges, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, Documentation,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, MarkupContent, MarkupKind,
+    NumberOrString, OneOf, OptionalVersionedTextDocumentIdentifier, ParameterInformation,
+    ParameterLabel, Position, PublishDiagnosticsParams, Range, ReferenceParams, Registration,
+    RegistrationParams, RenameFile, RenameOptions, RenameParams, ResourceOp, ResourceOperationKind,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SignatureInformation, SymbolInformation, TextDocumentEdit, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -88,6 +89,11 @@ const KEYWORDS: [&str; 28] = [
     "if", "in", "let", "match", "module", "not", "or", "pass", "pub", "return", "struct", "todo",
     "true", "union", "use", "var", "while",
 ];
+
+/// How long the editor is waited for to send more before what it has sent
+/// is checked: what it asks with a change comes well within it, and a check
+/// is no later for it than anyone would see.
+const SETTLE: Duration = Duration::from_millis(20);
 
 /// What marks the source in a hover as duck, for an editor to highlight.
 const LANGUAGE: &str = "duck";
@@ -153,9 +159,16 @@ pub fn run(connection: &Connection, cache: Cache) -> Fallible {
             Message::Notification(notification) => server.notified(notification),
             Message::Response(_) => {}
         }
-        // One check answers every change the editor has sent so far.
-        if server.stale && waiting.is_empty() && connection.receiver.is_empty() {
-            server.publish()?;
+        // One check answers every change the editor has sent so far, once
+        // it has sent what it asks with the last of them: what it asks as
+        // something is typed is a moment behind the change, and is answered
+        // before the check.
+        if server.stale && waiting.is_empty() {
+            match connection.receiver.recv_timeout(SETTLE) {
+                Ok(message) => waiting.push_back(message),
+                Err(e) if e.is_timeout() => server.publish()?,
+                Err(_) => return Ok(()),
+            }
         }
     }
 }
@@ -740,7 +753,9 @@ impl Server<'_> {
         let Some((path, root)) = self.package_of(&text_document.uri) else {
             return Vec::new();
         };
-        let (project, documents) = (&self.projects[&root], &self.documents);
+        let (Some(project), documents) = (self.projects.get_mut(&root), &self.documents) else {
+            return Vec::new();
+        };
         let buffers = |path: &Path| Some(documents.get(path)?.text.as_str());
         let text = &documents[&path].text;
         let suggested = project.complete(&buffers, &path, text, position, used);
@@ -800,7 +815,7 @@ impl Server<'_> {
             position,
         } = params.text_document_position_params;
         let (path, root) = self.package_of(&text_document.uri)?;
-        let (project, documents) = (&self.projects[&root], &self.documents);
+        let (project, documents) = (self.projects.get_mut(&root)?, &self.documents);
         let buffers = |path: &Path| Some(documents.get(path)?.text.as_str());
         let text = &documents[&path].text;
         let (signature, active) = project.signature(&buffers, &path, text, position)?;
@@ -840,8 +855,14 @@ impl Server<'_> {
         Some((path, root))
     }
 
+    /// Keeps up with what the editor says has changed. What it has open is
+    /// checked again, as it is there. Only what a change may resolve
+    /// otherwise is resolved again: a manifest is read as it is saved, so
+    /// neither opening a file nor changing one in the editor is one.
     fn notified(&mut self, notification: Notification) {
         let Notification { method, params } = notification;
+        // The file that changed, if one did and only in the editor.
+        let mut edited = None;
         match method.as_str() {
             DidOpenTextDocument::METHOD => {
                 let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(params) else {
@@ -869,8 +890,10 @@ impl Server<'_> {
                     text_document,
                     content_changes,
                 } = params;
-                let path = path_of(&text_document.uri);
-                let Some(document) = path.and_then(|path| self.documents.get_mut(&path)) else {
+                let Some(path) = path_of(&text_document.uri) else {
+                    return;
+                };
+                let Some(document) = self.documents.get_mut(&path) else {
                     return;
                 };
                 document.version = text_document.version;
@@ -887,9 +910,7 @@ impl Server<'_> {
                         None => document.text = change.text,
                     }
                 }
-                // The manifests are as they were, as they are read saved.
-                self.stale = true;
-                return;
+                edited = Some(path);
             }
             DidChangeWorkspaceFolders::METHOD => {
                 let params = serde_json::from_value::<DidChangeWorkspaceFoldersParams>(params);
@@ -912,11 +933,48 @@ impl Server<'_> {
                     self.documents.remove(&path);
                 }
             }
-            DidSaveTextDocument::METHOD | DidChangeWatchedFiles::METHOD => {}
+            DidSaveTextDocument::METHOD => {
+                let Ok(params) = serde_json::from_value::<DidSaveTextDocumentParams>(params) else {
+                    return;
+                };
+                self.written(path_of(&params.text_document.uri).as_slice());
+            }
+            DidChangeWatchedFiles::METHOD => {
+                let Ok(params) = serde_json::from_value::<DidChangeWatchedFilesParams>(params)
+                else {
+                    return;
+                };
+                let changed = params.changes.iter();
+                let paths: Vec<_> = changed.filter_map(|change| path_of(&change.uri)).collect();
+                self.written(&paths);
+            }
             _ => return,
         }
-        self.projects.clear();
+        // What was checked to answer what is being written was of the
+        // files as they were.
+        for project in self.projects.values_mut() {
+            project.forget(edited.as_deref());
+        }
         self.stale = true;
+    }
+
+    /// Has each package resolved again that may be resolved otherwise now
+    /// that the files at `paths` are written anew, or are no longer there:
+    /// one that read a manifest among them, and one that didn't resolve, as
+    /// what it lacked may be there now. A package that the editor comes to
+    /// have a file of is resolved when the packages are next checked, and
+    /// one that it has none of any longer is dropped then.
+    fn written(&mut self, paths: &[PathBuf]) {
+        let manifests = paths
+            .iter()
+            .filter(|path| path.file_name().is_some_and(|name| name == MANIFEST));
+        // By its directory, which is there still if the manifest isn't.
+        let dirs: Vec<_> = manifests
+            .filter_map(|path| Some(project::canonical(path.parent()?)))
+            .collect();
+        self.projects.retain(|_, project| {
+            !project.unresolved() && !dirs.iter().any(|dir| project.reads(dir))
+        });
     }
 
     /// Checks every package the editor has a file of open, and sends it the
@@ -1419,6 +1477,100 @@ mod tests {
             refused(HoverRequest::METHOD),
             ErrorCode::InvalidParams as i32
         );
+        editor.stop();
+    }
+
+    #[test]
+    fn a_package_is_resolved_again_only_for_what_may_change_it() {
+        let dir = TempDir::new("server-resolved");
+        let library = "[library]\nentry = \"lib.duck\"\n";
+        dir.write(&[
+            ("Duck.toml", library),
+            ("lib.duck", "pub let a = 1\n"),
+            ("other.duck", ""),
+        ]);
+        let (lib, other) = (dir.0.join("lib.duck"), dir.0.join("other.duck"));
+        let manifest = dir.0.join("Duck.toml");
+        let mut editor = Editor::start(&dir, json!({}));
+        let watched = |path: &Path| json!({ "changes": [{ "uri": uri(path), "type": 2 }] });
+        // What is asked for after everything that was said is answered
+        // once that is checked, and before anything is said of it only if
+        // nothing is.
+        let settle = |editor: &mut Editor| {
+            let params = json!({ "textDocument": { "uri": uri(&other) } });
+            editor.request(DocumentSymbolRequest::METHOD, params);
+        };
+
+        // A manifest is as it was read until the editor says it has
+        // changed: not for a file that is opened, changed, saved or closed,
+        // nor for one that is written anew where it is kept.
+        settle(&mut editor);
+        dir.write(&[("Duck.toml", "[library]\n")]);
+        editor.open(&lib, "pub let a = 1\n");
+        editor.change(&lib, 2, "pub let a: Nope = 1\n");
+        let error = "0:11 unknown type `Nope`";
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("lib.duck", Some(2), &[error])
+        );
+        let document = json!({ "textDocument": { "uri": uri(&lib) } });
+        editor.notify(DidSaveTextDocument::METHOD, document.clone());
+        settle(&mut editor);
+        editor.notify(DidChangeWatchedFiles::METHOD, watched(&other));
+        settle(&mut editor);
+        editor.notify(DidCloseTextDocument::METHOD, document);
+        assert_eq!(editor.diagnostics(&dir), published("lib.duck", None, &[]));
+        settle(&mut editor);
+
+        // It is read again once it is said to have.
+        editor.notify(DidChangeWatchedFiles::METHOD, watched(&manifest));
+        let error = "0:0 missing field `entry`";
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("Duck.toml", None, &[error])
+        );
+        // A package that didn't resolve may, once anything is written.
+        dir.write(&[("Duck.toml", library)]);
+        editor.notify(DidChangeWatchedFiles::METHOD, watched(&other));
+        assert_eq!(editor.diagnostics(&dir), published("Duck.toml", None, &[]));
+        editor.stop();
+    }
+
+    #[test]
+    fn what_is_being_written_is_suggested_of_every_file_as_the_editor_has_it() {
+        let dir = TempDir::new("server-probes");
+        let geo = "pub fn one():\n    pass\n";
+        let src = "use geo\npub fn main():\n    geo.\n";
+        dir.write(&[
+            ("Duck.toml", MODULE),
+            ("main.duck", "use geo\npub fn main():\n    pass\n"),
+            ("geo.duck", geo),
+        ]);
+        let (main, geo_path) = (dir.0.join("main.duck"), dir.0.join("geo.duck"));
+        let mut editor = Editor::start(&dir, json!({}));
+        editor.open(&main, "use geo\npub fn main():\n    pass\n");
+        editor.open(&geo_path, geo);
+        editor.change(&main, 2, src);
+        let Message::Notification(_) = editor.receive() else {
+            panic!("not the diagnostics of the change")
+        };
+        let mut suggested = |editor: &mut Editor| -> Vec<String> {
+            let params = json!({
+                "textDocument": { "uri": uri(&main) },
+                "position": { "line": 2, "character": 8 },
+            });
+            let items = editor.request(Completion::METHOD, params);
+            let items = items.as_array().unwrap().iter();
+            items
+                .map(|item| item["label"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(suggested(&mut editor), ["one"]);
+        assert_eq!(suggested(&mut editor), ["one"]);
+        // What was checked to answer is forgotten once another file is
+        // changed, which leaves this one with the error it had.
+        editor.change(&geo_path, 2, &format!("{geo}pub fn two():\n    pass\n"));
+        assert_eq!(suggested(&mut editor), ["one", "two"]);
         editor.stop();
     }
 
