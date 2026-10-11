@@ -8,7 +8,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::git::{Cache, GitError};
-use crate::manifest::{Dependency, MANIFEST, Manifest, ManifestError};
+use crate::manifest::{
+    DEPENDENCIES, Dependency, ENTRY, LIBRARY, MANIFEST, Manifest, ManifestError,
+};
 
 /// Every package of a build, each once however many depend on it. The
 /// first is the one being built.
@@ -30,6 +32,9 @@ pub enum ResolveError {
     Read {
         path: PathBuf,
         error: io::Error,
+        /// What says to read it. `None` for the manifest of the package
+        /// being built, which nothing names.
+        site: Option<Site>,
     },
     Manifest {
         path: PathBuf,
@@ -39,11 +44,13 @@ pub enum ResolveError {
     NotALibrary {
         name: String,
         dir: PathBuf,
+        site: Site,
     },
     /// A git dependency that couldn't be fetched.
     Git {
         name: String,
         error: GitError,
+        site: Site,
     },
     /// A git repository needed at two commits, each with the dependencies
     /// that lead to it from the package being built.
@@ -51,7 +58,19 @@ pub enum ResolveError {
         url: String,
         first: (String, String),
         second: (String, String),
+        /// The dependency that needs the second.
+        site: Site,
     },
+}
+
+/// Where a manifest says what couldn't be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    /// The manifest, as reached from the working directory.
+    pub manifest: PathBuf,
+    /// The key of it that says so: the tables that lead to it, and then
+    /// its name. None for the whole of it.
+    pub key: Vec<String>,
 }
 
 /// Gathers the packages a build of the package in `dir` reads.
@@ -75,20 +94,44 @@ impl Packages {
     }
 }
 
+impl ResolveError {
+    /// Where a manifest says what the error is about: the dependency that
+    /// couldn't be resolved, in the manifest of the package that depends on
+    /// it, or what a manifest gets wrong, in that one. `None` for what no
+    /// manifest says.
+    pub fn site(&self) -> Option<Site> {
+        match self {
+            Self::Read { site, .. } => site.clone(),
+            Self::Manifest { path, error } => {
+                let key = error.key().unwrap_or_default();
+                Some(Site {
+                    manifest: path.clone(),
+                    key: key.into_iter().map(str::to_string).collect(),
+                })
+            }
+            Self::NotALibrary { site, .. }
+            | Self::Git { site, .. }
+            | Self::Conflict { site, .. } => Some(site.clone()),
+        }
+    }
+}
+
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Read { path, error } => write!(f, "cannot read {}: {error}", path.display()),
+            Self::Read { path, error, .. } => write!(f, "cannot read {}: {error}", path.display()),
             Self::Manifest { path, error } => write!(f, "{}: {error}", path.display()),
-            Self::NotALibrary { name, dir } => {
+            Self::NotALibrary { name, dir, .. } => {
                 write!(
                     f,
                     "dependency `{name}` at {} has no [library]",
                     dir.display()
                 )
             }
-            Self::Git { name, error } => write!(f, "dependency `{name}`: {error}"),
-            Self::Conflict { url, first, second } => write!(
+            Self::Git { name, error, .. } => write!(f, "dependency `{name}`: {error}"),
+            Self::Conflict {
+                url, first, second, ..
+            } => write!(
                 f,
                 "{url} is needed at two commits: {:.12} by {}, and {:.12} by {}",
                 first.0, first.1, second.0, second.1
@@ -108,7 +151,7 @@ pub fn resolve(dir: &Path, cache: &Cache) -> Result<Packages, ResolveError> {
         ids: HashMap::new(),
         commits: HashMap::new(),
     };
-    resolver.package(dir, &[])?;
+    resolver.package(dir, &[], None)?;
     Ok(Packages(resolver.packages))
 }
 
@@ -119,12 +162,19 @@ pub fn canonical_dir(dir: &Path) -> io::Result<PathBuf> {
 
 impl Resolver<'_> {
     /// The index of the package in `dir`, reading it if it's new. `chain`
-    /// is the dependencies that lead to it.
-    fn package(&mut self, dir: &Path, chain: &[String]) -> Result<usize, ResolveError> {
+    /// is the dependencies that lead to it, and `site` is where the last
+    /// of them is named.
+    fn package(
+        &mut self,
+        dir: &Path,
+        chain: &[String],
+        site: Option<Site>,
+    ) -> Result<usize, ResolveError> {
         let path = dir.join(MANIFEST);
         let read_error = |error| ResolveError::Read {
             path: path.clone(),
             error,
+            site: site.clone(),
         };
         let canonical = canonical_dir(dir).map_err(read_error)?;
         if let Some(id) = self.ids.get(&canonical) {
@@ -145,6 +195,10 @@ impl Resolver<'_> {
         });
         for (name, dependency) in deps {
             let chain = [chain, std::slice::from_ref(&name)].concat();
+            let site = Site {
+                manifest: path.clone(),
+                key: vec![DEPENDENCIES.to_string(), name.clone()],
+            };
             let dep_dir = match dependency {
                 Dependency::Path(path) => dir.join(path),
                 Dependency::Git {
@@ -156,18 +210,29 @@ impl Resolver<'_> {
                     let (commit, checkout) = checkout.map_err(|error| ResolveError::Git {
                         name: name.clone(),
                         error,
+                        site: site.clone(),
                     })?;
-                    self.pin(url, commit, &chain)?;
+                    self.pin(url, commit, &chain, &site)?;
                     checkout.join(path.unwrap_or_default())
                 }
             };
-            let dep = self.package(&dep_dir, &chain)?;
+            let dep = self.package(&dep_dir, &chain, Some(site.clone()))?;
             let Some(library) = &self.packages[dep].manifest.library else {
-                return Err(ResolveError::NotALibrary { name, dir: dep_dir });
+                let dir = dep_dir;
+                return Err(ResolveError::NotALibrary { name, dir, site });
             };
             let entry = dep_dir.join(&library.entry);
             if let Err(error) = fs::metadata(&entry) {
-                return Err(ResolveError::Read { path: entry, error });
+                // Its own manifest says where its library is.
+                let site = Site {
+                    manifest: dep_dir.join(MANIFEST),
+                    key: vec![LIBRARY.to_string(), ENTRY.to_string()],
+                };
+                return Err(ResolveError::Read {
+                    path: entry,
+                    error,
+                    site: Some(site),
+                });
             }
             self.packages[id].dependencies.insert(name, dep);
         }
@@ -175,14 +240,22 @@ impl Resolver<'_> {
     }
 
     /// Records that the dependencies `chain` need the repository at `url` at
-    /// `commit`, which must be the commit any others need it at.
-    fn pin(&mut self, url: String, commit: String, chain: &[String]) -> Result<(), ResolveError> {
+    /// `commit`, which must be the commit any others need it at. `site` is
+    /// where the last of them is named.
+    fn pin(
+        &mut self,
+        url: String,
+        commit: String,
+        chain: &[String],
+        site: &Site,
+    ) -> Result<(), ResolveError> {
         match self.commits.get(&url) {
             Some((first, _)) if *first == commit => Ok(()),
             Some((first, first_chain)) => Err(ResolveError::Conflict {
                 first: (first.clone(), first_chain.join(" -> ")),
                 second: (commit, chain.join(" -> ")),
                 url,
+                site: site.clone(),
             }),
             None => {
                 self.commits.insert(url, (commit, chain.to_vec()));
