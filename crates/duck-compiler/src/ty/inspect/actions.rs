@@ -9,9 +9,9 @@ use crate::file::{FileId, FileManager};
 use crate::lex::Span;
 use crate::load::Use;
 use crate::parse::{self, Arg, Arm, ExprKind, ItemKind, PatternKind, StmtKind};
+use crate::visit::{self, Node};
 
 use super::super::{Prim, Ty, TypeError, TypeErrorKind, convertible};
-use super::visit::{self, Node};
 use super::{Analysis, Found, HintKind, Item, Sources, Target, Unused, UnusedKind, line_start};
 
 /// A change to the source that is offered where it would help.

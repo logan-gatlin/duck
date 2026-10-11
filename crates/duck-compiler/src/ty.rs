@@ -9,9 +9,10 @@ use std::fmt;
 use std::iter;
 use std::mem;
 use std::ops::Range;
+use std::rc::Rc;
 
 use crate::eval::Evaluator;
-use crate::file::{FileId, Settings};
+use crate::file::{FileId, IncludeError, Includes, Settings};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
     UnOp as IrUnOp, ValType,
@@ -19,8 +20,8 @@ use crate::ir::{
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{
-    self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
-    PatternKind, StmtKind, StructDecl, TypeKind, UnaryOp, UnionDecl,
+    self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, INCLUDE, Ident, ItemKind, Mutability,
+    Pattern, PatternKind, StmtKind, StructDecl, TypeKind, UnaryOp, UnionDecl,
 };
 use crate::world::{REALLOC, ROOT, RUN_EXPORT, RUN_INTERFACE, World, WorldError, kebab};
 
@@ -130,7 +131,7 @@ const PAGE_SIZE: u64 = 64 * 1024;
 
 /// The functions of `module`, which are lowered inline at each call rather
 /// than to wasm functions.
-const MODULE_FUNCS: [&str; 8] = [
+const MODULE_FUNCS: [&str; 9] = [
     "memory",
     "size",
     "grow",
@@ -139,6 +140,7 @@ const MODULE_FUNCS: [&str; 8] = [
     "unreachable",
     COUNT_LEADING_ZEROS,
     COUNT_TRAILING_ZEROS,
+    INCLUDE,
 ];
 
 /// The function of `module` that counts the zero bits above an integer's
@@ -832,6 +834,16 @@ pub enum TypeErrorKind {
     },
     /// `module.name` naming nothing.
     UnknownModuleProperty(String),
+    /// A `module.include` of what isn't a string literal: the file is read
+    /// before anything is evaluated.
+    IncludeNotLiteral,
+    /// A `module.include` of a path that doesn't keep to its package.
+    IncludeOutsidePackage(String),
+    /// A `module.include` of a path whose file can't be read.
+    IncludeNotFound {
+        path: String,
+        reason: String,
+    },
     /// A `varray` literal with elements in a function, which every call of
     /// it would share.
     WritableFnLiteral,
@@ -902,6 +914,8 @@ struct Checker {
     module: FileId,
     /// The module whose `pub` items are exported.
     entry: FileId,
+    /// What each `module.include` of the program includes.
+    includes: Includes,
     /// The world the program is a component of, which says what is.
     world: World,
     /// Whether the world couldn't be read, which is reported: nothing is
@@ -1677,6 +1691,9 @@ impl TypeErrorKind {
             Self::DataTooLarge { .. } => "data-too-large",
             Self::DataPastMax { .. } => "data-past-max",
             Self::UnknownModuleProperty(..) => "unknown-module-property",
+            Self::IncludeNotLiteral => "include-not-literal",
+            Self::IncludeOutsidePackage(..) => "include-outside-package",
+            Self::IncludeNotFound { .. } => "include-not-found",
             Self::WritableFnLiteral => "writable-fn-literal",
             Self::InconstantFnLiteral => "inconstant-fn-literal",
             Self::SharedLiteral => "shared-literal",
@@ -2182,6 +2199,17 @@ impl fmt::Display for TypeErrorKind {
                 "literals end at address {end}, past the {max_pages} pages memory may grow to"
             ),
             Self::UnknownModuleProperty(name) => write!(f, "`module` has no property `{name}`"),
+            Self::IncludeNotLiteral => {
+                write!(f, "`module.include` takes a string literal for its path")
+            }
+            Self::IncludeOutsidePackage(path) => write!(
+                f,
+                "cannot include `{path}`: a path is the names from the directory of `Duck.toml` \
+                 down to a file of the package, with a `/` between them"
+            ),
+            Self::IncludeNotFound { path, reason } => {
+                write!(f, "cannot include `{path}`: {reason}")
+            }
             Self::WritableFnLiteral => write!(
                 f,
                 "a writable literal in a function is shared by every call, so it must be empty"
@@ -3408,6 +3436,7 @@ impl Checker {
         let mut ck = Self {
             types: records.then(HashMap::new),
             entry: program.entry,
+            includes: program.includes.clone(),
             world,
             max_pages: settings.max_pages,
             data_end: settings.static_start.into(),
@@ -5844,6 +5873,10 @@ impl<'c> Body<'c> {
             ExprKind::Dot(name) => self.dot(name, None, expected),
             ExprKind::Call(callee, args) => match &callee.kind {
                 ExprKind::Dot(name) => self.dot(name, Some(args), expected),
+                // A literal, which is typed as what is expected of it.
+                ExprKind::Module(name) if name.name == INCLUDE => {
+                    self.include(args, expected, expr.span)
+                }
                 _ => self.call(callee, args, expr.span),
             },
             ExprKind::Field(inner, field) if self.names_module(inner).is_some() => {
@@ -6053,13 +6086,50 @@ impl<'c> Body<'c> {
 
     /// A string literal: an array of its UTF-8 bytes.
     fn string(&mut self, s: &str, expected: Option<Ty>, span: Span) -> (Ty, Value) {
+        self.byte_literal(s.as_bytes().to_vec(), expected, span)
+    }
+
+    /// A literal at `span` that is `bytes`: an array of them, which is a
+    /// `varray` where one is expected.
+    fn byte_literal(&mut self, bytes: Vec<u8>, expected: Option<Ty>, span: Span) -> (Ty, Value) {
         let mutable = self.literal_writes(expected);
-        self.check_shared(mutable, s.len(), span);
+        self.check_shared(mutable, bytes.len(), span);
         let ty = self.ck.array_of(Ty::Prim(Prim::U8), mutable);
-        (
-            ty,
-            self.literal_data(s.as_bytes().to_vec(), 1, s.len() as u64),
-        )
+        let len = bytes.len() as u64;
+        (ty, self.literal_data(bytes, 1, len))
+    }
+
+    /// `module.include(path)`: a literal of the bytes of the file that
+    /// `path` names, which is read before anything is checked and so is
+    /// named by a string literal. One that includes nothing is reported at
+    /// its path, and is empty.
+    fn include(&mut self, args: &[Arg], expected: Option<Ty>, span: Span) -> (Ty, Value) {
+        let params = [("path".to_string(), self.ck.string_ty())];
+        let binding = self.bind_args(&params, &[], args, false, span);
+        // A file is read for a call of the one argument, as
+        // [`parse::Expr::included`] has it. Any other is already reported.
+        let ([arg], [Some(_)]) = (args, &binding[..]) else {
+            return (Ty::Error, Value::default());
+        };
+        let ExprKind::Str(path) = &arg.value.kind else {
+            self.error(TypeErrorKind::IncludeNotLiteral, arg.value.span);
+            return (Ty::Error, Value::default());
+        };
+        let included = self.ck.includes.get(&(arg.value.span.file, path.clone()));
+        // A program that no file manager loaded has no files to include.
+        let included = included
+            .cloned()
+            .unwrap_or_else(|| Err(IncludeError::unread()));
+        let bytes = included.unwrap_or_else(|error| {
+            let path = path.clone();
+            let kind = match error {
+                IncludeError::Outside => TypeErrorKind::IncludeOutsidePackage(path),
+                IncludeError::NotFound(reason) => TypeErrorKind::IncludeNotFound { path, reason },
+            };
+            self.error(kind, arg.value.span);
+            Rc::default()
+        });
+        self.byte_literal(bytes.to_vec(), expected, span)
     }
 
     /// `module.name`, one of `module`'s constants. `page_size` is the bytes
@@ -6090,10 +6160,14 @@ impl<'c> Body<'c> {
     /// `fill(dst, value, len)` and
     /// `copy(dst, src, len)` set and copy bytes. `unreachable()` traps.
     /// `count_leading_zeros(value)` and `count_trailing_zeros(value)` are
-    /// [`Self::count_zeros`].
+    /// [`Self::count_zeros`], and `include(path)` is [`Self::include`],
+    /// with nothing expected of it.
     fn module_call(&mut self, name: &Ident, args: &[Arg], span: Span) -> (Ty, Value) {
         if [COUNT_LEADING_ZEROS, COUNT_TRAILING_ZEROS].contains(&name.name.as_str()) {
             return self.count_zeros(name, args, span);
+        }
+        if name.name == INCLUDE {
+            return self.include(args, None, span);
         }
         let byte = Ty::Prim(Prim::U8);
         let count = Ty::Prim(Prim::Uint);

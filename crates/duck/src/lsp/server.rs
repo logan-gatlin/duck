@@ -23,7 +23,7 @@ use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
     GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest, InlayHintRequest,
     PrepareRenameRequest, References, RegisterCapability, Rename, Request as _, Shutdown,
-    SignatureHelpRequest, WorkspaceSymbolRequest,
+    SignatureHelpRequest, UnregisterCapability, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CancelParams, CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand,
@@ -43,8 +43,9 @@ use lsp_types::{
     ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
     SignatureInformation, SymbolInformation, TextDocumentEdit, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    TextDocumentSyncSaveOptions, TextEdit, TypeDefinitionProviderCapability, Unregistration,
+    UnregistrationParams, Uri, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -73,6 +74,13 @@ struct Server<'c> {
     stale: bool,
     /// Whether the editor renames a file when a change says to.
     renames_files: bool,
+    /// Whether the editor watches files once asked to.
+    watches: bool,
+    /// The globs of the files that the packages include, which the editor
+    /// was last asked to watch.
+    watched: BTreeSet<String>,
+    /// How many requests the server has made of the editor.
+    requests: i32,
 }
 
 /// A file as it is in the editor, saved or not.
@@ -101,6 +109,12 @@ const LANGUAGE: &str = "duck";
 /// What the file of a module is named after the module.
 const EXTENSION: &str = "duck";
 
+/// What the editor knows the watching of source files and manifests by.
+const WATCH: &str = "watch";
+
+/// What the editor knows the watching of included files by.
+const WATCH_INCLUDED: &str = "watch-included";
+
 /// Serves the editor at the other end of `connection` until it asks to exit,
 /// fetching git dependencies into `cache`.
 pub fn run(connection: &Connection, cache: Cache) -> Fallible {
@@ -124,10 +138,11 @@ pub fn run(connection: &Connection, cache: Cache) -> Fallible {
         published: BTreeMap::new(),
         stale: false,
         renames_files: renames_files(&params),
+        watches: watches_on_request(&params),
+        watched: BTreeSet::new(),
+        requests: 0,
     };
-    if watches_on_request(&params) {
-        server.watch()?;
-    }
+    server.watch()?;
     server.publish()?;
     // What the editor has sent and is yet to be answered, in order.
     let mut waiting: VecDeque<Message> = VecDeque::new();
@@ -195,28 +210,69 @@ fn cancelled(waiting: &mut VecDeque<Message>, id: &RequestId) -> bool {
 
 impl Server<'_> {
     /// Asks the editor to tell of changes to source files and manifests it
-    /// doesn't have open.
-    fn watch(&self) -> Fallible {
+    /// doesn't have open, if it does so once asked to.
+    fn watch(&mut self) -> Fallible {
+        let globs = vec!["**/*.duck".to_string(), format!("**/{MANIFEST}")];
+        match self.watches {
+            true => self.register(WATCH, globs),
+            false => Ok(()),
+        }
+    }
+
+    /// Asks the editor to tell of changes to the files that the packages
+    /// were last checked to include, and no longer of those they included
+    /// before: none is source, and what one holds changes what a check
+    /// finds. One that isn't there is watched for when it is. Each is
+    /// watched by its path as it is written, wherever its package is, as
+    /// source is by its name: the editor may know a directory by another
+    /// path than the server reads it by.
+    fn watch_included(&mut self) -> Fallible {
+        let paths = self.projects.values().flat_map(Project::include_paths);
+        let watched: BTreeSet<String> = paths.map(|path| format!("**/{}", literal(path))).collect();
+        if !self.watches || watched == self.watched {
+            return Ok(());
+        }
+        if !self.watched.is_empty() {
+            let params = UnregistrationParams {
+                unregisterations: vec![Unregistration {
+                    id: WATCH_INCLUDED.to_string(),
+                    method: DidChangeWatchedFiles::METHOD.to_string(),
+                }],
+            };
+            self.request(UnregisterCapability::METHOD, params)?;
+        }
+        if !watched.is_empty() {
+            self.register(WATCH_INCLUDED, watched.iter().cloned().collect())?;
+        }
+        self.watched = watched;
+        Ok(())
+    }
+
+    /// Asks the editor to tell of changes to the files that `globs` match,
+    /// as what it knows by `id`.
+    fn register(&mut self, id: &str, globs: Vec<String>) -> Fallible {
         let watcher = |glob: String| FileSystemWatcher {
             glob_pattern: GlobPattern::String(glob),
             kind: None,
         };
         let options = DidChangeWatchedFilesRegistrationOptions {
-            watchers: vec![
-                watcher("**/*.duck".to_string()),
-                watcher(format!("**/{MANIFEST}")),
-            ],
+            watchers: globs.into_iter().map(watcher).collect(),
         };
         let params = RegistrationParams {
             registrations: vec![Registration {
-                id: "watch".to_string(),
+                id: id.to_string(),
                 method: DidChangeWatchedFiles::METHOD.to_string(),
                 register_options: Some(serde_json::to_value(options)?),
             }],
         };
-        let method = RegisterCapability::METHOD.to_string();
-        // The only request the server makes.
-        let request = Request::new(RequestId::from(0), method, params);
+        self.request(RegisterCapability::METHOD, params)
+    }
+
+    /// Asks the editor to do what `method` names. What it answers is not
+    /// waited for.
+    fn request(&mut self, method: &str, params: impl Serialize) -> Fallible {
+        let request = Request::new(RequestId::from(self.requests), method.to_string(), params);
+        self.requests += 1;
         self.connection.sender.send(request.into())?;
         Ok(())
     }
@@ -1031,7 +1087,7 @@ impl Server<'_> {
                 self.send(uri, diagnostics)?;
             }
         }
-        Ok(())
+        self.watch_included()
     }
 
     /// Tells the editor that `diagnostics` are all there are for `uri`.
@@ -1207,6 +1263,19 @@ fn symbol_kind(kind: SymbolKind) -> lsp_types::SymbolKind {
         SymbolKind::Field => lsp_types::SymbolKind::FIELD,
         SymbolKind::Variant | SymbolKind::Member => lsp_types::SymbolKind::ENUM_MEMBER,
     }
+}
+
+/// The glob that matches `path` and nothing else: each character that a
+/// glob gives a meaning is a set of that character alone.
+fn literal(path: &str) -> String {
+    let mut glob = String::new();
+    for c in path.chars() {
+        match c {
+            '*' | '?' | '[' | '{' => glob.extend(['[', c, ']']),
+            _ => glob.push(c),
+        }
+    }
+    glob
 }
 
 /// Whether the editor watches files only once asked to.
@@ -1486,6 +1555,96 @@ mod tests {
             ErrorCode::InvalidParams as i32
         );
         editor.stop();
+    }
+
+    #[test]
+    fn an_included_file_is_read_again_when_written() {
+        let dir = TempDir::new("server-include");
+        let src = "pub let first = module.include(\"assets/logo.bin\")[0]\n\
+                   pub let odd = module.include(\"assets/[1]*.bin\")\n";
+        dir.write(&[
+            ("Duck.toml", "[library]\nentry = \"lib.duck\"\n"),
+            ("lib.duck", src),
+            ("assets/[1]*.bin", ""),
+        ]);
+        let editor = Editor::start(
+            &dir,
+            json!({ "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } } }),
+        );
+        // What the server next asks the editor to do, and of which files.
+        let asked = |editor: &Editor| {
+            let Message::Request(request) = editor.receive() else {
+                panic!("not a request")
+            };
+            let asked = &request.params["registrations"][0];
+            let asked = match request.method.as_str() {
+                RegisterCapability::METHOD => asked["registerOptions"]["watchers"].clone(),
+                _ => request.params["unregisterations"][0]["id"].clone(),
+            };
+            (request.method, asked)
+        };
+        assert_eq!(asked(&editor).0, RegisterCapability::METHOD);
+        let missing = "0:31 cannot include `assets/logo.bin`: no such file";
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("lib.duck", None, &[missing])
+        );
+        // A file that a package includes is watched, though none is there
+        // yet, as the editor tells of no other that isn't source: by its
+        // path as it is written, wherever the editor has its package, and
+        // by that name alone, whatever a glob would make of it.
+        let logo = dir.0.join("assets/logo.bin");
+        let watchers = json!([
+            { "globPattern": "**/assets/[[]1][*].bin" },
+            { "globPattern": "**/assets/logo.bin" },
+        ]);
+        assert_eq!(
+            asked(&editor),
+            (RegisterCapability::METHOD.to_string(), watchers)
+        );
+
+        let written = |editor: &Editor, bytes: &str| {
+            dir.write(&[("assets/logo.bin", bytes)]);
+            let change = json!({ "uri": uri(&logo), "type": 2 });
+            editor.notify(
+                DidChangeWatchedFiles::METHOD,
+                json!({ "changes": [change] }),
+            );
+        };
+        written(&editor, "duck");
+        assert_eq!(editor.diagnostics(&dir), published("lib.duck", None, &[]));
+        // It is read as it is now, which a constant then runs with.
+        written(&editor, "");
+        let trapped = "0:16 constant evaluation traps: unreachable code is reached";
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("lib.duck", None, &[trapped])
+        );
+        written(&editor, "quack");
+        assert_eq!(editor.diagnostics(&dir), published("lib.duck", None, &[]));
+        fs::remove_file(&logo).unwrap();
+        let change = json!({ "uri": uri(&logo), "type": 3 });
+        editor.notify(
+            DidChangeWatchedFiles::METHOD,
+            json!({ "changes": [change] }),
+        );
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("lib.duck", None, &[missing])
+        );
+
+        // One that is included no longer is watched no longer.
+        let lib = dir.0.join("lib.duck");
+        editor.open(&lib, "pub let first = 1\n");
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("lib.duck", Some(1), &[])
+        );
+        let unregistered = (
+            UnregisterCapability::METHOD.to_string(),
+            json!(WATCH_INCLUDED),
+        );
+        assert_eq!(asked(&editor), unregistered);
     }
 
     #[test]

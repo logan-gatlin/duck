@@ -34,7 +34,6 @@ mod hints;
 mod lints;
 mod symbols;
 mod values;
-pub(super) mod visit;
 
 /// A program as checked, with the type of all that is written in it.
 pub struct Analysis {
@@ -231,7 +230,7 @@ const ELIDED: &str = "..";
 /// the type of what it gives, as they would be written. One that takes an
 /// integer of any type has no type for it, and gives one of that type.
 #[allow(clippy::type_complexity)]
-const MODULE_SIGNATURES: [(&str, &[(&str, &str)], &str); 8] = [
+const MODULE_SIGNATURES: [(&str, &[(&str, &str)], &str); 9] = [
     ("memory", &[], "varray(u8)"),
     ("size", &[], "uint"),
     ("grow", &[("pages", "uint")], "int"),
@@ -248,6 +247,7 @@ const MODULE_SIGNATURES: [(&str, &[(&str, &str)], &str); 8] = [
     ("unreachable", &[], NEVER),
     ("count_leading_zeros", &[("value", "")], ""),
     ("count_trailing_zeros", &[("value", "")], ""),
+    ("include", &[("path", "string")], "array(u8)"),
 ];
 
 /// Each type of `module`, as it would be written.
@@ -2793,6 +2793,10 @@ fn f(h: i32):
         let module: Vec<_> = module_members().into_iter().map(|m| m.name).collect();
         assert!(module.contains(&"grow".to_string()), "{module:?}");
         assert!(module.contains(&"page_size".to_string()), "{module:?}");
+        // Each function is shown as a call of it is written.
+        let mut members = module_members().into_iter();
+        let include = members.find(|m| m.name == "include").unwrap();
+        assert_eq!(include.detail, "module.include(path: string) -> array(u8)");
         // Each constant is a `uint`.
         let consts = module_members()
             .into_iter()

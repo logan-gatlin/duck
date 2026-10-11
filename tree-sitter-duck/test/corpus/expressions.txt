@@ -371,6 +371,7 @@ Module properties
 ====================
 
 let _ = module.static.len
+let _ = module.include("assets/logo.png")
 
 ---
 
@@ -380,7 +381,15 @@ let _ = module.static.len
     (field_expression
       (module_property
         (identifier))
-      (identifier))))
+      (identifier)))
+  (binding
+    (discard)
+    (call_expression
+      (module_property
+        (identifier))
+      (arguments
+        (string
+          (string_content))))))
 
 ====================
 Numbers

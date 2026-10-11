@@ -507,6 +507,9 @@ enum Subscript {
     Slice(Option<Expr>, Option<Expr>),
 }
 
+/// The function of `module` that is the bytes of a file.
+pub(crate) const INCLUDE: &str = "include";
+
 /// Precedence of `not`, which sits between `and` and the comparisons.
 const NOT_PREC: u8 = 3;
 const CMP_PREC: u8 = 4;
@@ -545,6 +548,24 @@ impl Binding {
     /// is that type, written as an expression.
     pub fn binds_type(&self) -> bool {
         self.ty.as_ref().is_some_and(Type::is_type)
+    }
+}
+
+impl Expr {
+    /// The path it includes, if it is a `module.include` of a string
+    /// literal and nothing else: what a file is read for, before anything
+    /// is checked.
+    pub fn included(&self) -> Option<&str> {
+        let ExprKind::Call(callee, args) = &self.kind else {
+            return None;
+        };
+        match (&callee.kind, &args[..]) {
+            (ExprKind::Module(name), [arg]) if name.name == INCLUDE => match &arg.value.kind {
+                ExprKind::Str(path) => Some(path),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 

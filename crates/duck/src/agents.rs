@@ -6,11 +6,12 @@ pub const OVERVIEW: &str = include_str!("agents.md");
 
 #[cfg(test)]
 mod tests {
-    use duck_compiler::file::{FileId, FileManager, Settings, Wit, WitFile};
+    use duck_compiler::file::{FileId, FileManager, Included, Settings, Wit, WitFile};
 
     use super::*;
 
-    /// One file, which uses nothing.
+    /// One file, which uses nothing, and includes the same few bytes by
+    /// every path.
     struct Single(&'static str, Settings);
 
     impl FileManager for Single {
@@ -32,6 +33,10 @@ mod tests {
 
         fn open_package(&mut self, _from: FileId, _name: &str) -> Option<FileId> {
             None
+        }
+
+        fn include(&mut self, _from: FileId, _path: &str) -> Included {
+            Ok(b"\x89PNG"[..].into())
         }
 
         fn settings(&mut self) -> Settings {

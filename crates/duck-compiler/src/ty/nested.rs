@@ -17,8 +17,8 @@ use crate::ir::{FuncId, LocalId};
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, ExprKind, Pattern, PatternKind, StmtKind};
+use crate::visit::{self, Node};
 
-use super::inspect::visit::{self, Node};
 use super::opaque::{OpaqueSite, Owner};
 use super::{Body, Checker, Expr, FuncSig, OPEN_FUNCS, Stmt, Synth, Ty, TypeErrorKind, Value, Var};
 

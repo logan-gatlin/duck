@@ -5,10 +5,10 @@ use std::ops::Range;
 
 use crate::file::FileId;
 use crate::parse::{self, Arg, Binding, ExprKind, ItemKind, Pattern, PatternKind, StmtKind};
+use crate::visit::{self, Node};
 
 use super::super::Ty;
 use super::symbols::bound;
-use super::visit::{self, Node};
 use super::{Analysis, Item, Target};
 
 /// Something to show at a place as if it were written there.

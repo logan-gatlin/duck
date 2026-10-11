@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use crate::file::{FileId, FileManager};
 use crate::lex::Span;
 use crate::parse::{Ident, ItemKind, StmtKind};
+use crate::visit::{self, Node};
 
 use super::symbols::bound;
-use super::visit::{self, Node};
 use super::{Analysis, Sources, names, type_param_names};
 
 /// Something declared that nothing uses.

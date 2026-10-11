@@ -344,6 +344,7 @@ let empty: array(i32) = []         # [] needs an annotation
 let SIZE: uint = 1024
 let buf: varray(u8) = [0; SIZE]    # writable; zeros add nothing to the wasm
 let count = &var 0                 # &var i32: one writable value in memory
+let logo = module.include("assets/logo.png")  # array(u8): the bytes of the file
 
 fn f(i: uint) -> u8:
 	buf[i] = greeting[i]           # a uint index, bounds checked
@@ -362,6 +363,16 @@ fn day(i: uint) -> array(u8):
   `primes[0]` is. A number, a `let` global, a constructor, a literal and an
   address of a global are constant. `let n = f()` makes a constant of a call.
 - Literals in functions that hold the same bytes may be at one address.
+- `module.include("assets/logo.png")` is a literal of the bytes of a file,
+  whatever they are, read while the program is compiled: an `array(u8)`, or
+  a `varray(u8)` where its global is annotated one. Each global has its own
+  copy, so name one global for a file that is large.
+- Its path is a string literal and nothing else: the names from the
+  directory of `Duck.toml` down to the file, with a `/` between them,
+  wherever the file that includes it is. A dependency's is from its own
+  `Duck.toml`. None is `.` or `..`, and none starts with a `/`.
+- A file that isn't there, a directory, and one that a link leads out of the
+  package to are each an error at the path.
 - In an initializer, `&value` and `&var value` place a value in memory, as
   a literal is, and give its address: `&var State()`, `&Mode.idle`. A name is
   copied, so `&N` twice is two addresses.
@@ -589,8 +600,8 @@ fn view(p: &i32, len: uint) -> array(i32):
   that the page of the last has no room for goes in the pages after it, or
   past every page that a constant has grown memory by since.
 
-`module` is built in. Its functions are single wasm instructions and have no
-pointers.
+`module` is built in. Its functions have no pointers, and each but
+`include` is a single wasm instruction.
 
 - `module.page_size` and `module.max`: `uint` constants for the bytes in a
   page and the pages memory may grow to.
@@ -603,6 +614,8 @@ pointers.
   a function as one does: `ok or module.unreachable()`.
 - `module.count_leading_zeros(x)` and `module.count_trailing_zeros(x)` take
   any integer type and give that type.
+- `module.include(path: string) -> array(u8)` is the bytes of a file, as a
+  literal: see "Literals and globals".
 - `module.cabi_realloc` is a type, the
   `fn(&var u8, uint, uint, uint) -> &var u8` that a component's
   `cabi_realloc` is called as: `old`, `old_size`, `align` and `new_size`.

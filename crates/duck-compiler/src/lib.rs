@@ -17,6 +17,7 @@ pub mod lex;
 pub mod load;
 pub mod parse;
 pub mod ty;
+mod visit;
 pub mod world;
 
 /// An error from any stage of [`compile`].

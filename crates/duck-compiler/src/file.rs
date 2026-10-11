@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::rc::Rc;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FileId(usize);
 
@@ -17,12 +20,38 @@ pub trait FileManager {
     /// that the file `from` is in. Returns `None` when there is no such
     /// dependency
     fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId>;
+    /// Attempt to read the file that a `module.include` in the file `from`
+    /// names by `path`, from the directory of the package `from` is in.
+    /// `path` is one that [`include_path`] gives. Nothing is included
+    /// without a file manager that reads what isn't source
+    fn include(&mut self, _from: FileId, _path: &str) -> Included {
+        Err(IncludeError::unread())
+    }
     /// How to compile the module the files make up
     fn settings(&mut self) -> Settings;
 
     fn mint_file_id(id: usize) -> FileId {
         FileId(id)
     }
+}
+
+/// The bytes of a file that a `module.include` names, or why it has none.
+pub type Included = Result<Rc<[u8]>, IncludeError>;
+
+/// What each `module.include` of a program includes, by the module it is in
+/// and the path it names.
+pub type Includes = HashMap<(FileId, String), Included>;
+
+/// Why a `module.include` includes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncludeError {
+    /// Its path doesn't keep to the package: it isn't the names from the
+    /// directory of the package down to a file, with a `/` between them, or
+    /// it is of a file that a link takes elsewhere.
+    Outside,
+    /// Its file can't be read, for the reason this gives: there is none, or
+    /// it is a directory.
+    NotFound(String),
 }
 
 /// Module-wide choices that aren't written in any source file.
@@ -68,6 +97,25 @@ pub struct WitFile {
     /// Where it is, for errors to name.
     pub path: String,
     pub contents: String,
+}
+
+impl IncludeError {
+    /// Why nothing is included where no file is read for it.
+    pub(crate) fn unread() -> Self {
+        Self::NotFound("no file is read here".to_string())
+    }
+}
+
+/// `path` as a `module.include` may write it: the names from the directory
+/// of its package down to a file, with a `/` between them. None is empty,
+/// `.` or `..`, and none has a `\`, so a file has the one path, which is
+/// the same wherever the package is built.
+pub fn include_path(path: &str) -> Result<&str, IncludeError> {
+    let named = |name: &str| !matches!(name, "" | "." | "..") && !name.contains('\\');
+    match path.split('/').all(named) {
+        true => Ok(path),
+        false => Err(IncludeError::Outside),
+    }
 }
 
 #[cfg(test)]

@@ -8,9 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::Error;
-use crate::file::{FileId, FileManager};
+use crate::file::{self, FileId, FileManager, Includes};
 use crate::lex::{self, Span, Token};
 use crate::parse::{self, Ident, Item, ItemKind, UsePath};
+use crate::visit::{self, Node};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UseError {
@@ -41,6 +42,8 @@ pub struct Program {
     /// The module whose `pub` items the program exports, with those it uses
     /// as `pub`.
     pub entry: FileId,
+    /// What each `module.include` of a string literal includes.
+    pub includes: Includes,
 }
 
 /// A name `module` gives a module, or something reached through one.
@@ -94,6 +97,7 @@ struct Loader<'f, F> {
     seen: HashSet<FileId>,
     items: Vec<Item>,
     uses: Vec<Use>,
+    includes: Includes,
     errors: Vec<Error>,
 }
 
@@ -141,6 +145,7 @@ impl Program {
             items: module.items,
             uses: Vec::new(),
             entry,
+            includes: HashMap::new(),
         }
     }
 }
@@ -187,6 +192,7 @@ impl<'f, F: FileManager> Loader<'f, F> {
             seen: HashSet::new(),
             items: Vec::new(),
             uses: Vec::new(),
+            includes: HashMap::new(),
             errors: Vec::new(),
         };
         loader.seen.insert(entry);
@@ -199,6 +205,7 @@ impl<'f, F: FileManager> Loader<'f, F> {
             items: loader.items,
             uses: loader.uses,
             entry,
+            includes: loader.includes,
         };
         (program, loader.errors)
     }
@@ -236,7 +243,31 @@ impl<'f, F: FileManager> Loader<'f, F> {
                         }
                     }
                 }
-                _ => self.items.push(item),
+                _ => {
+                    self.include(id, &item);
+                    self.items.push(item);
+                }
+            }
+        }
+    }
+
+    /// Reads the file that each `module.include` in `item`, an item of the
+    /// module `id`, names. One is read once for a module, however many
+    /// times the module includes it, and none is kept from one load to the
+    /// next, as nothing says whether it is as it was.
+    fn include(&mut self, id: FileId, item: &Item) {
+        let mut paths = Vec::new();
+        visit::each(item, &mut |node| {
+            if let Node::Expr(expr) = node {
+                paths.extend(expr.included());
+            }
+        });
+        for path in paths {
+            let key = (id, path.to_string());
+            if !self.includes.contains_key(&key) {
+                let included =
+                    file::include_path(path).and_then(|path| self.files.include(id, path));
+                self.includes.insert(key, included);
             }
         }
     }
@@ -348,14 +379,15 @@ fn path_span(path: &UsePath) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::Settings;
+    use crate::file::{IncludeError, Included, Settings};
     use crate::ir::{self, Const};
     use crate::lex::TokenKind;
     use crate::parse::{ParseErrorKind, PatternKind};
     use crate::ty::{self, TypeErrorKind};
 
     /// Files named by the paths that use them; the first is the entry
-    /// point. A file named `@name` is the library of dependency `name`.
+    /// point. A file named `@name` is the library of dependency `name`, and
+    /// one named `#path` is what a `module.include` of `path` includes.
     struct Memory(Vec<(&'static str, &'static str)>);
 
     impl Memory {
@@ -399,6 +431,13 @@ mod tests {
 
         fn open_package(&mut self, _from: FileId, name: &str) -> Option<FileId> {
             self.named(&format!("@{name}"))
+        }
+
+        fn include(&mut self, _from: FileId, path: &str) -> Included {
+            match self.0.iter().find(|f| f.0.strip_prefix('#') == Some(path)) {
+                Some(file) => Ok(file.1.as_bytes().into()),
+                None => Err(IncludeError::NotFound("no such file".to_string())),
+            }
         }
 
         fn settings(&mut self) -> Settings {
@@ -1432,5 +1471,158 @@ fn f(r: lib.Read) -> Io:
             };
             assert_eq!(values, &[ir::Expr::Const(Const::I32(2))]);
         }
+    }
+
+    /// What the function `name` of `module` returns, which is the last
+    /// that it does.
+    fn returned(module: &ir::Module, name: &str) -> Vec<ir::Expr> {
+        let func = module.funcs.iter().find(|f| f.name == name).unwrap();
+        match &func.body[..] {
+            [.., ir::Stmt::Return(values)] => values.clone(),
+            body => panic!("{body:?}"),
+        }
+    }
+
+    #[test]
+    fn an_included_file_is_an_array_of_its_bytes() {
+        let mut files = Memory(vec![
+            (
+                "main",
+                "fn f() -> array(u8):\n    return module.include(\"assets/logo.bin\")\n",
+            ),
+            ("#assets/logo.bin", "\u{1}duck"),
+        ]);
+        let module = lower(&mut files);
+        let data = ir::Data {
+            offset: 0,
+            bytes: b"\x01duck".to_vec(),
+        };
+        assert_eq!(module.data, [data]);
+        let consts = [0, 5].map(|x| ir::Expr::Const(Const::I32(x)));
+        assert_eq!(returned(&module, "f"), consts);
+    }
+
+    #[test]
+    fn an_include_is_a_literal_wherever_one_is() {
+        let main = "\
+let logo = module.include(\"logo.bin\")
+let seed: varray(u8) = module.include(path: \"logo.bin\")
+pub let len = logo.len
+fn f(tail: array(u8) = module.include(\"logo.bin\")) -> array(u8):
+    seed[0] = 7
+    return logo
+fn g() -> array(array(u8)):
+    return [module.include(\"logo.bin\"), \"duck\"]
+";
+        let mut files = Memory(vec![("main", main), ("#logo.bin", "duck")]);
+        let module = lower(&mut files);
+        // Each global has its own, as it has of any literal, and so has the
+        // default. Those that functions only read are one, which the string
+        // that holds the same shares.
+        let placed: Vec<_> = module.data.iter().map(|data| data.offset).collect();
+        assert_eq!(placed, [0, 4, 8, 12, 16]);
+        assert!(module.data[..4].iter().all(|data| data.bytes == b"duck"));
+        let shared = [12, 0, 0, 0, 4, 0, 0, 0].repeat(2);
+        assert_eq!(module.data[4].bytes, shared);
+        assert_eq!(module.globals[0].init, Const::I32(4));
+        let consts = [0, 4].map(|x| ir::Expr::Const(Const::I32(x)));
+        assert_eq!(returned(&module, "f")[..], consts);
+
+        // One that is written to is a global's.
+        let main = "fn f():\n    let seed: varray(u8) = module.include(\"logo.bin\")\n";
+        let mut files = Memory(vec![("main", main), ("#logo.bin", "duck")]);
+        assert_eq!(type_errors(&mut files), [TypeErrorKind::WritableFnLiteral]);
+
+        // A file that is empty is an array that is.
+        let main = "pub let len = module.include(\"empty\").len\n";
+        let mut files = Memory(vec![("main", main), ("#empty", "")]);
+        let module = lower(&mut files);
+        assert_eq!(module.globals[0].init, Const::I32(0));
+        assert_eq!(module.data, []);
+    }
+
+    #[test]
+    fn a_constant_reads_what_is_included() {
+        let main = "\
+fn sum(bytes: array(u8)) -> i32:
+    var total = 0
+    for byte in bytes:
+        total += byte as i32
+    return total
+pub let total = sum(module.include(\"table.bin\"))
+";
+        let mut files = Memory(vec![("main", main), ("#table.bin", "\u{1}\u{2}\u{3}")]);
+        let module = lower(&mut files);
+        assert_eq!(module.globals[0].init, Const::I32(6));
+    }
+
+    #[test]
+    fn an_include_that_includes_nothing_is_an_error_at_its_path() {
+        let main = "\
+use lib
+let name = \"logo.bin\"
+let a = module.include(\"missing.bin\")
+let b = module.include(name)
+let c = module.include(\"../secret\")
+let d = module.include(\"/etc/passwd\")
+let e = module.include(\"assets\\\\logo.bin\")
+let f = module.include(\"assets//logo.bin\")
+let g = module.include(\"./logo.bin\")
+let h = module.include(\"assets/\")
+let i = module.include(\"\")
+let j = module.include()
+let k = module.include
+let l = module.include(\"other.bin\", \"other.bin\")
+let m = module.include(file: \"logo.bin\")
+";
+        let mut files = Memory(vec![
+            ("main", main),
+            ("lib", "pub let a = module.include(\"missing.bin\")\n"),
+            ("#logo.bin", "duck"),
+        ]);
+        let outside = |path: &str| {
+            format!(
+                "main {path:?}: cannot include `{}`: a path is the names from the directory of \
+                 `Duck.toml` down to a file of the package, with a `/` between them",
+                &path[1..path.len() - 1]
+            )
+        };
+        assert_eq!(
+            errors(&mut files),
+            [
+                "lib \"\\\"missing.bin\\\"\": cannot include `missing.bin`: no such file".to_string(),
+                "main \"\\\"missing.bin\\\"\": cannot include `missing.bin`: no such file".to_string(),
+                "main \"name\": `module.include` takes a string literal for its path".to_string(),
+                outside("\"../secret\""),
+                outside("\"/etc/passwd\""),
+                "main \"\\\"assets\\\\\\\\logo.bin\\\"\": cannot include `assets\\logo.bin`: a path is \
+                 the names from the directory of `Duck.toml` down to a file of the package, with \
+                 a `/` between them"
+                    .to_string(),
+                outside("\"assets//logo.bin\""),
+                outside("\"./logo.bin\""),
+                outside("\"assets/\""),
+                outside("\"\""),
+                "main \"module.include()\": missing argument `path`".to_string(),
+                "main \"include\": `module.include` is not a value".to_string(),
+                // What is wrong with a call is all that is wrong with one.
+                "main \"\\\"other.bin\\\"\": expected 1 arguments, found 2".to_string(),
+                "main \"\\\"logo.bin\\\"\": no parameter named `file`".to_string(),
+                "main \"module.include(file: \\\"logo.bin\\\")\": missing argument `path`".to_string(),
+            ]
+        );
+        let codes: Vec<_> = compile(&mut files)
+            .unwrap_err()
+            .iter()
+            .map(Error::code)
+            .collect();
+        assert_eq!(
+            codes[1..4],
+            [
+                "include-not-found",
+                "include-not-literal",
+                "include-outside-package"
+            ]
+        );
     }
 }

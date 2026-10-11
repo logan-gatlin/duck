@@ -1,10 +1,14 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::SystemTime;
 
-use duck_compiler::file::{FileId, FileManager, Settings, Wit, WitFile};
+use duck_compiler::file::{FileId, FileManager, IncludeError, Included, Settings, Wit, WitFile};
 
-use crate::package::Packages;
+use crate::package::{self, Packages};
 
 /// What the file of a module is named after the module.
 const EXTENSION: &str = "duck";
@@ -32,6 +36,28 @@ pub struct Files {
     /// Indexed like [`Packages`].
     packages: Vec<Package>,
     settings: Settings,
+    /// What was read of the files that were included.
+    cache: IncludeCache,
+    /// Each path that a file was asked for by to include, as it is written,
+    /// whether or not a file is there.
+    include_paths: Vec<String>,
+}
+
+/// The files that `module.include` names, each as it was last read: one
+/// that is as it was then is not read again. It is shared by what is cloned
+/// of it, so the files of one build are read as those of the last were.
+#[derive(Debug, Clone, Default)]
+pub struct IncludeCache(Rc<RefCell<HashMap<PathBuf, Kept>>>);
+
+/// A file as it was read to include, by its canonical path.
+#[derive(Debug)]
+struct Kept {
+    /// When it was written and how long it was, if that is known: what
+    /// tells whether it has been written since.
+    written: Option<(SystemTime, u64)>,
+    bytes: Rc<[u8]>,
+    /// Whether it was included since [`IncludeCache::sweep`] last ran.
+    used: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +75,9 @@ struct File {
 /// What files need of a package to open each other.
 #[derive(Debug, Clone)]
 struct Package {
+    /// The directory holding its manifest, which the files it includes are
+    /// named from, as reached from the working directory.
+    dir: PathBuf,
     /// The directory its modules are named from, as reached from the working
     /// directory: the one holding the file the build enters the package by.
     root: PathBuf,
@@ -76,6 +105,7 @@ impl Files {
                 _ => library.as_deref(),
             };
             Package {
+                dir: package.dir.clone(),
                 root: (entry.and_then(Path::parent).unwrap_or(&package.dir)).to_path_buf(),
                 library,
                 dependencies: (package.dependencies.iter())
@@ -87,6 +117,8 @@ impl Files {
             files: Vec::new(),
             packages: packages.collect(),
             settings,
+            cache: IncludeCache::default(),
+            include_paths: Vec::new(),
         };
         files.read(entry_point.to_path_buf(), 0)?;
         Ok(files)
@@ -101,6 +133,17 @@ impl Files {
     pub fn find(&self, path: &Path) -> Option<FileId> {
         let file = self.files.iter().find(|f| f.canonical == path)?;
         Some(file.id)
+    }
+
+    /// Includes each file as `cache` last read it, where it is as it was
+    /// then, rather than reading every one.
+    pub fn reuse(&mut self, cache: &IncludeCache) {
+        self.cache = cache.clone();
+    }
+
+    /// Each path that a `module.include` named a file by.
+    pub fn include_paths(&self) -> &[String] {
+        &self.include_paths
     }
 
     /// The names that the path of a `use` in the file `from` may go on
@@ -163,6 +206,54 @@ impl Files {
         let file = self.files.iter().find(|f| f.id == id);
         file.unwrap_or_else(|| panic!("Invalid file id: {id:?}"))
     }
+}
+
+impl IncludeCache {
+    /// The bytes of the file at the canonical path `file`, as they were
+    /// last read if it hasn't been written since.
+    fn read(&self, file: &Path) -> Included {
+        let metadata = fs::metadata(file).map_err(unreadable)?;
+        // What is no file may have no end to read to.
+        if !metadata.is_file() {
+            let reason = match metadata.is_dir() {
+                true => "it is a directory",
+                false => "it is not a file",
+            };
+            return Err(IncludeError::NotFound(reason.to_string()));
+        }
+        let written = metadata.modified().ok().map(|at| (at, metadata.len()));
+        let mut kept = self.0.borrow_mut();
+        if let Some(kept) = kept.get_mut(file)
+            && written.is_some()
+            && kept.written == written
+        {
+            kept.used = true;
+            return Ok(kept.bytes.clone());
+        }
+        let bytes: Rc<[u8]> = fs::read(file).map_err(unreadable)?.into();
+        let read = Kept {
+            written,
+            bytes: bytes.clone(),
+            used: true,
+        };
+        kept.insert(file.to_path_buf(), read);
+        Ok(bytes)
+    }
+
+    /// Forgets each file that wasn't included since this last ran: nothing
+    /// includes it any longer.
+    pub fn sweep(&self) {
+        let mut kept = self.0.borrow_mut();
+        kept.retain(|_, kept| std::mem::take(&mut kept.used));
+    }
+}
+
+/// Why a file that `error` says can't be read isn't included.
+fn unreadable(error: io::Error) -> IncludeError {
+    IncludeError::NotFound(match error.kind() {
+        io::ErrorKind::NotFound => "no such file".to_string(),
+        _ => error.to_string(),
+    })
 }
 
 /// Whether the file at `path` is one that a module is named after.
@@ -305,6 +396,20 @@ impl FileManager for Files {
         let package = *package;
         let library = self.packages[package].library.clone()?;
         self.read(library, package).ok()
+    }
+
+    fn include(&mut self, from: FileId, path: &str) -> Included {
+        let dir = &self.packages[self.get(from).package].dir;
+        let dir = package::canonical_dir(dir).map_err(unreadable)?;
+        if !self.include_paths.iter().any(|asked| asked == path) {
+            self.include_paths.push(path.to_string());
+        }
+        // A link may lead out of the package, which no path does.
+        let file = fs::canonicalize(dir.join(path)).map_err(unreadable)?;
+        if !file.starts_with(dir) {
+            return Err(IncludeError::Outside);
+        }
+        self.cache.read(&file)
     }
 
     fn settings(&mut self) -> Settings {

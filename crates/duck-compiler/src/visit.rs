@@ -4,14 +4,14 @@
 use crate::parse::{self, Entry, ExprKind, FnSig, ItemKind, StmtKind};
 
 /// A statement or an expression that a visit of an item comes to.
-pub(in crate::ty) enum Node<'p> {
+pub(crate) enum Node<'p> {
     Stmt(&'p parse::Stmt),
     Expr(&'p parse::Expr),
 }
 
 /// Calls `visit` with every statement and expression in `item`, each before
 /// those within it.
-pub(super) fn each<'p>(item: &'p parse::Item, visit: &mut dyn FnMut(Node<'p>)) {
+pub(crate) fn each<'p>(item: &'p parse::Item, visit: &mut dyn FnMut(Node<'p>)) {
     let defaults = |sig: &'p FnSig, visit: &mut dyn FnMut(Node<'p>)| {
         for default in sig.params.iter().filter_map(|param| param.default.as_ref()) {
             expr(default, visit);
@@ -82,7 +82,7 @@ fn block<'p>(block: &'p [parse::Stmt], visit: &mut dyn FnMut(Node<'p>)) {
 
 /// Calls `visit` with `expr` and every expression in it, each before those
 /// within it.
-pub(in crate::ty) fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
+pub(crate) fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
     visit(Node::Expr(expr));
     match &expr.kind {
         ExprKind::Int(_)

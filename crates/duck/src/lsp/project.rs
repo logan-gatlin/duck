@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::SystemTime;
 
-use duck::files::{self, Files};
+use duck::files::{self, Files, IncludeCache};
 use duck::git::Cache;
 use duck::manifest::{self, COMPONENT, ENTRY, LIBRARY, MANIFEST, ManifestError};
 use duck::package::{self, Packages, ResolveError};
-use duck_compiler::file::{FileId, FileManager, Settings};
+use duck_compiler::file::{FileId, FileManager, Included, Settings};
 use duck_compiler::lex::Span;
 use duck_compiler::load::Parsed;
 use duck_compiler::ty::{
@@ -51,6 +51,9 @@ pub struct Project {
     /// the table of the manifest that says what is built: a file that is as
     /// it was then isn't parsed again.
     parsed: HashMap<&'static str, Parsed>,
+    /// The files that the builds include, as each was last read: one that
+    /// hasn't been written since isn't read again for every check.
+    includes: IncludeCache,
 }
 
 /// The files of a build, and what checking them found. Of a build with
@@ -239,6 +242,7 @@ impl Project {
             warnings: Vec::new(),
             probes: Vec::new(),
             parsed: HashMap::new(),
+            includes: IncludeCache::default(),
         }
     }
 
@@ -283,6 +287,7 @@ impl Project {
     pub fn check(&mut self, buffers: Buffers<'_>) -> Vec<Problem> {
         let (problems, checked) = self.builds(buffers, None);
         self.checked = checked;
+        self.includes.sweep();
         for checked in self.checked.iter_mut().filter(|checked| checked.whole) {
             let mut files = Overlay {
                 files: &mut checked.files,
@@ -292,6 +297,14 @@ impl Project {
         }
         self.warnings = self.unused(buffers);
         problems
+    }
+
+    /// Each path that the package's module and its library were last
+    /// checked to include a file by, as it is written, whether or not a
+    /// file is there: what is written there changes what a check finds.
+    pub fn include_paths(&self) -> impl Iterator<Item = &str> {
+        let files = self.checked.iter().map(|checked| &checked.files);
+        files.flat_map(Files::include_paths).map(String::as_str)
     }
 
     /// What the package declares and never uses, as it was last checked:
@@ -951,6 +964,7 @@ impl Project {
             };
             let found = match Files::new(packages, self.root.join(entry), settings) {
                 Ok(mut files) => {
+                    files.reuse(&self.includes);
                     let overlay = Overlay {
                         files: &mut files,
                         buffers,
@@ -1109,6 +1123,11 @@ impl FileManager for Overlay<'_, '_> {
 
     fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId> {
         self.files.open_package(from, name)
+    }
+
+    /// As it was saved: the editor has no file open that isn't source.
+    fn include(&mut self, from: FileId, path: &str) -> Included {
+        self.files.include(from, path)
     }
 
     fn settings(&mut self) -> Settings {

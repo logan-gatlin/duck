@@ -273,7 +273,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use duck_compiler::file::{FileManager, Settings};
+    use duck_compiler::file::{FileManager, IncludeError, Included, Settings};
 
     use std::process::Command;
 
@@ -451,6 +451,135 @@ mod tests {
             format!("{file}: {error}")
         });
         Err(errors.collect())
+    }
+
+    /// What each `module.include` of the library of the package in `root`
+    /// and of the modules it uses includes, by its file, relative to `root`,
+    /// and the path it names.
+    fn included(root: &Path) -> Vec<(String, String, Included)> {
+        let packages = resolve(root, &Cache::new(root.join("no-cache"))).unwrap();
+        let library = packages.root().manifest.library.as_ref().unwrap();
+        let entry = root.join(&library.entry);
+        let mut files = Files::new(&packages, &entry, Settings::default()).unwrap();
+        let program = duck_compiler::load::load(&mut files).unwrap();
+        let mut included = Vec::new();
+        for ((file, path), bytes) in program.includes {
+            let file = files.display_name(file);
+            let file = Path::new(&file).strip_prefix(root).unwrap();
+            included.push((file.display().to_string(), path, bytes));
+        }
+        included.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        included
+    }
+
+    #[test]
+    fn a_file_is_included_from_the_directory_of_its_package() {
+        let dir = TempDir::new("include");
+        let root = dir.0.join("app");
+        dir.write(&[
+            (
+                "app/Duck.toml",
+                "[library]\nentry = \"src/lib.duck\"\n[dependencies]\nfont = { path = \"../font\" }\n",
+            ),
+            (
+                "app/src/lib.duck",
+                "use font\nuse draw.shapes\npub let logo = module.include(\"assets/logo.bin\")\n",
+            ),
+            // Wherever the file that includes it is.
+            (
+                "app/src/draw/shapes.duck",
+                "pub let logo = module.include(\"assets/logo.bin\")\n",
+            ),
+            ("font/Duck.toml", "[library]\nentry = \"lib.duck\"\n"),
+            (
+                "font/lib.duck",
+                "pub let glyphs = module.include(\"assets/logo.bin\")\n",
+            ),
+            ("font/assets/logo.bin", "glyphs"),
+        ]);
+        // Whatever its bytes are.
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("assets/logo.bin"), [0xff, 0, 0x80]).unwrap();
+
+        let path = "assets/logo.bin".to_string();
+        let file = |file: &str, bytes: &[u8]| (file.to_string(), path.clone(), Ok(bytes.into()));
+        assert_eq!(
+            included(&root),
+            [
+                file("../font/lib.duck", b"glyphs"),
+                file("src/draw/shapes.duck", &[0xff, 0, 0x80]),
+                file("src/lib.duck", &[0xff, 0, 0x80]),
+            ]
+        );
+        assert_eq!(check(&root), Ok(()));
+    }
+
+    #[test]
+    fn a_package_in_the_working_directory_includes_from_it() {
+        // Its directory is no path at all, as `duck build` has it. The
+        // tests of this crate run in its directory, which stands for one.
+        let package = Package {
+            dir: PathBuf::new(),
+            manifest: Manifest::parse("[library]\nentry = \"src/agents.md\"\n").unwrap(),
+            dependencies: BTreeMap::new(),
+        };
+        let packages = Packages(vec![package]);
+        let mut files = Files::new(&packages, "src/agents.md", Settings::default()).unwrap();
+        let entry = files.entry_point();
+        let manifest = fs::read("Cargo.toml").unwrap();
+        let included = files.include(entry, "Cargo.toml");
+        assert!(included.is_ok_and(|bytes| *bytes == *manifest));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_file_is_included_only_from_its_package() {
+        let dir = TempDir::new("include-outside");
+        let root = dir.0.join("app");
+        let lib = "\
+pub let a = module.include(\"assets/inside\")
+pub let b = module.include(\"assets/outside\")
+pub let c = module.include(\"assets/dangling\")
+pub let d = module.include(\"assets\")
+pub let e = module.include(\"shared/secret.txt\")
+pub let f = module.include(\"assets/socket\")
+";
+        dir.write(&[
+            ("app/Duck.toml", "[library]\nentry = \"lib.duck\"\n"),
+            ("app/lib.duck", lib),
+            ("app/assets/logo.bin", "logo"),
+            ("shared/secret.txt", "secret"),
+        ]);
+        let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, root.join(at)).unwrap();
+        // A link is followed to what it is of, which is in the package or
+        // isn't, whatever the path of the link.
+        link("logo.bin", "assets/inside");
+        link("../../shared/secret.txt", "assets/outside");
+        link("nothing", "assets/dangling");
+        link("../shared", "shared");
+        // What is no file is not read as one, which may never end.
+        let _socket = std::os::unix::net::UnixListener::bind(root.join("assets/socket")).unwrap();
+
+        let included = included(&root).into_iter();
+        let included: Vec<_> = included.map(|(_, path, bytes)| (path, bytes)).collect();
+        let reason = |reason: &str| Err(IncludeError::NotFound(reason.to_string()));
+        assert_eq!(
+            included,
+            [
+                ("assets".to_string(), reason("it is a directory")),
+                ("assets/dangling".to_string(), reason("no such file")),
+                ("assets/inside".to_string(), Ok(b"logo"[..].into())),
+                ("assets/outside".to_string(), Err(IncludeError::Outside)),
+                ("assets/socket".to_string(), reason("it is not a file")),
+                ("shared/secret.txt".to_string(), Err(IncludeError::Outside)),
+            ]
+        );
+        let errors = check(&root).unwrap_err();
+        assert_eq!(errors.len(), 5, "{errors:?}");
+        assert_eq!(
+            errors[1],
+            "lib.duck: cannot include `assets/dangling`: no such file"
+        );
     }
 
     #[test]
