@@ -31,6 +31,19 @@ pub enum UnusedKind {
     Use,
 }
 
+impl UnusedKind {
+    /// What names the kind of warning, as [`crate::Error::code`] names a
+    /// kind of error.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Variable => "unused-variable",
+            Self::Function => "unused-function",
+            Self::TypeParam => "unused-type-parameter",
+            Self::Use => "unused-use",
+        }
+    }
+}
+
 impl Analysis {
     /// What the program declares that nothing in it names again, in the
     /// order of its files: a variable or a global, a function, a type

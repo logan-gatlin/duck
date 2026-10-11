@@ -60,6 +60,9 @@ pub struct Use {
     pub members: Vec<Ident>,
     /// Whether modules using `module` can reach `name` through it.
     pub is_pub: bool,
+    /// The whole of the `use` that writes it, which writes every path of
+    /// its group with it.
+    pub decl: Span,
 }
 
 struct Loader<'f, F> {
@@ -76,6 +79,16 @@ struct Loader<'f, F> {
 /// The most lines with an error that are blanked for the rest of a file to
 /// lex.
 const MAX_BLANKED_LINES: usize = 16;
+
+impl UseErrorKind {
+    /// What names the kind of error, as [`crate::Error::code`] gives it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound(..) => "module-not-found",
+            Self::Ambiguous(..) => "ambiguous-module",
+        }
+    }
+}
 
 impl fmt::Display for UseErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -174,7 +187,7 @@ impl<'f, F: FileManager> Loader<'f, F> {
             match &item.kind {
                 ItemKind::Use(decl) => {
                     for path in &decl.paths {
-                        if let Err(kind) = self.use_path(id, item.is_pub, path) {
+                        if let Err(kind) = self.use_path(id, &item, path) {
                             let span = path_span(path);
                             self.errors.push(Error::Use(UseError { kind, span }));
                         }
@@ -207,8 +220,8 @@ impl<'f, F: FileManager> Loader<'f, F> {
     }
 
     /// Loads the module `path` leads into, and gives what it names its name
-    /// in the module `from`.
-    fn use_path(&mut self, from: FileId, is_pub: bool, path: &UsePath) -> Result<(), UseErrorKind> {
+    /// in the module `from`, whose `use` the item `decl` is.
+    fn use_path(&mut self, from: FileId, decl: &Item, path: &UsePath) -> Result<(), UseErrorKind> {
         let names: Vec<_> = path.segments.iter().map(|s| s.name.as_str()).collect();
         // The module is the file furthest along the path, and the names
         // after it are found by the type checker.
@@ -234,7 +247,8 @@ impl<'f, F: FileManager> Loader<'f, F> {
             target_path: names[..len].join("."),
             path: path.segments[..len].to_vec(),
             members: path.segments[len..].to_vec(),
-            is_pub,
+            is_pub: decl.is_pub,
+            decl: decl.span,
         });
         Ok(())
     }

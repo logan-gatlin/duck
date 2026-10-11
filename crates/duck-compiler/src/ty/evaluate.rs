@@ -25,8 +25,8 @@ use crate::lex::Span;
 use crate::load::Program;
 
 use super::{
-    Checker, Fold, MEMORY_EXPORT, PAGE_SIZE, TABLE_EXPORT, TEMP, Ty, TypeError, TypeErrorKind,
-    Value, exprs, fn_decls,
+    Checker, Fold, MEMORY_EXPORT, PAGE_SIZE, TABLE_EXPORT, TEMP, Ty, TypeErrorKind, Value, exprs,
+    fn_decls,
 };
 
 /// The fuel the constants of one item run on, unless the settings say: about
@@ -436,7 +436,7 @@ fn push_expr_calls(expr: &Expr, out: &mut Vec<Dep>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::check;
+    use super::super::{TypeError, check};
     use super::*;
     use crate::file::{DummyManager, FileManager, Settings};
     use crate::lex::tokenize;

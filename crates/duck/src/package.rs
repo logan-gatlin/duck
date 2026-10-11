@@ -34,7 +34,7 @@ pub enum ResolveError {
         error: io::Error,
         /// What says to read it. `None` for the manifest of the package
         /// being built, which nothing names.
-        site: Option<Site>,
+        site: Option<Box<Site>>,
     },
     Manifest {
         path: PathBuf,
@@ -44,13 +44,13 @@ pub enum ResolveError {
     NotALibrary {
         name: String,
         dir: PathBuf,
-        site: Site,
+        site: Box<Site>,
     },
     /// A git dependency that couldn't be fetched.
     Git {
         name: String,
         error: GitError,
-        site: Site,
+        site: Box<Site>,
     },
     /// A git repository needed at two commits, each with the dependencies
     /// that lead to it from the package being built.
@@ -58,8 +58,6 @@ pub enum ResolveError {
         url: String,
         first: (String, String),
         second: (String, String),
-        /// The dependency that needs the second.
-        site: Site,
     },
 }
 
@@ -84,6 +82,10 @@ struct Resolver<'c> {
     commits: HashMap<String, (String, Vec<String>)>,
 }
 
+/// What sets apart the dependencies that lead to a package, each of the one
+/// before, where an error says them.
+const LEADS_TO: &str = " -> ";
+
 impl Packages {
     pub fn root(&self) -> &Package {
         &self.0[0]
@@ -97,11 +99,13 @@ impl Packages {
 impl ResolveError {
     /// Where a manifest says what the error is about: the dependency that
     /// couldn't be resolved, in the manifest of the package that depends on
-    /// it, or what a manifest gets wrong, in that one. `None` for what no
-    /// manifest says.
-    pub fn site(&self) -> Option<Site> {
+    /// it, or what a manifest gets wrong, in that one. A repository needed
+    /// at two commits is about the dependency that leads to the second from
+    /// the package being built, whose manifest is at `root`. `None` for
+    /// what no manifest says.
+    pub fn site(&self, root: &Path) -> Option<Site> {
         match self {
-            Self::Read { site, .. } => site.clone(),
+            Self::Read { site, .. } => site.as_deref().cloned(),
             Self::Manifest { path, error } => {
                 let key = error.key().unwrap_or_default();
                 Some(Site {
@@ -109,9 +113,21 @@ impl ResolveError {
                     key: key.into_iter().map(str::to_string).collect(),
                 })
             }
-            Self::NotALibrary { site, .. }
-            | Self::Git { site, .. }
-            | Self::Conflict { site, .. } => Some(site.clone()),
+            Self::NotALibrary { site, .. } | Self::Git { site, .. } => Some((**site).clone()),
+            Self::Conflict { second, .. } => {
+                let name = second.1.split(LEADS_TO).next()?;
+                Some(Site::dependency(root, name))
+            }
+        }
+    }
+}
+
+impl Site {
+    /// Where the manifest at `manifest` names its dependency `name`.
+    fn dependency(manifest: &Path, name: &str) -> Self {
+        Self {
+            manifest: manifest.to_path_buf(),
+            key: vec![DEPENDENCIES.to_string(), name.to_string()],
         }
     }
 }
@@ -129,9 +145,7 @@ impl fmt::Display for ResolveError {
                 )
             }
             Self::Git { name, error, .. } => write!(f, "dependency `{name}`: {error}"),
-            Self::Conflict {
-                url, first, second, ..
-            } => write!(
+            Self::Conflict { url, first, second } => write!(
                 f,
                 "{url} is needed at two commits: {:.12} by {}, and {:.12} by {}",
                 first.0, first.1, second.0, second.1
@@ -168,7 +182,7 @@ impl Resolver<'_> {
         &mut self,
         dir: &Path,
         chain: &[String],
-        site: Option<Site>,
+        site: Option<Box<Site>>,
     ) -> Result<usize, ResolveError> {
         let path = dir.join(MANIFEST);
         let read_error = |error| ResolveError::Read {
@@ -195,10 +209,7 @@ impl Resolver<'_> {
         });
         for (name, dependency) in deps {
             let chain = [chain, std::slice::from_ref(&name)].concat();
-            let site = Site {
-                manifest: path.clone(),
-                key: vec![DEPENDENCIES.to_string(), name.clone()],
-            };
+            let site = Box::new(Site::dependency(&path, &name));
             let dep_dir = match dependency {
                 Dependency::Path(path) => dir.join(path),
                 Dependency::Git {
@@ -212,7 +223,7 @@ impl Resolver<'_> {
                         error,
                         site: site.clone(),
                     })?;
-                    self.pin(url, commit, &chain, &site)?;
+                    self.pin(url, commit, &chain)?;
                     checkout.join(path.unwrap_or_default())
                 }
             };
@@ -231,7 +242,7 @@ impl Resolver<'_> {
                 return Err(ResolveError::Read {
                     path: entry,
                     error,
-                    site: Some(site),
+                    site: Some(Box::new(site)),
                 });
             }
             self.packages[id].dependencies.insert(name, dep);
@@ -240,22 +251,14 @@ impl Resolver<'_> {
     }
 
     /// Records that the dependencies `chain` need the repository at `url` at
-    /// `commit`, which must be the commit any others need it at. `site` is
-    /// where the last of them is named.
-    fn pin(
-        &mut self,
-        url: String,
-        commit: String,
-        chain: &[String],
-        site: &Site,
-    ) -> Result<(), ResolveError> {
+    /// `commit`, which must be the commit any others need it at.
+    fn pin(&mut self, url: String, commit: String, chain: &[String]) -> Result<(), ResolveError> {
         match self.commits.get(&url) {
             Some((first, _)) if *first == commit => Ok(()),
             Some((first, first_chain)) => Err(ResolveError::Conflict {
-                first: (first.clone(), first_chain.join(" -> ")),
-                second: (commit, chain.join(" -> ")),
+                first: (first.clone(), first_chain.join(LEADS_TO)),
+                second: (commit, chain.join(LEADS_TO)),
                 url,
-                site: site.clone(),
             }),
             None => {
                 self.commits.insert(url, (commit, chain.to_vec()));

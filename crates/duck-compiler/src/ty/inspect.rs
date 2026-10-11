@@ -18,7 +18,7 @@ use crate::parse::{
     PatternKind, StmtKind, TypeKind, TypeParam,
 };
 
-pub use actions::Action;
+pub use actions::{Action, ActionKind};
 pub use hints::{Hint, HintKind};
 pub use lints::{Unused, UnusedKind};
 pub use symbols::{Symbol, SymbolKind};
@@ -4093,7 +4093,8 @@ fn main():
         let analysis = used(&mut files);
         let mut mended = |text: &str| -> Vec<(String, String)> {
             let (main, at) = files.at("main", text);
-            let actions = analysis.actions(&mut files, main, at..at + text.len());
+            let actions = analysis.actions(&mut files, main, at..at + text.len(), &[]);
+            let actions = actions.into_iter().filter(|a| a.kind == ActionKind::Fix);
             let made = |action: Action| {
                 let mut made = USER.to_string();
                 for (span, text) in action.edits.iter().rev() {
@@ -4105,7 +4106,7 @@ fn main():
                     .filter(|line| !USER.lines().any(|l| l == *line));
                 (action.title, changed.collect::<Vec<_>>().join("|"))
             };
-            actions.into_iter().map(made).collect()
+            actions.map(made).collect()
         };
         let action = |title: &str, lines: &str| vec![(title.to_string(), lines.to_string())];
         assert_eq!(
@@ -4130,9 +4131,336 @@ fn main():
         assert_eq!(mended("let p"), []);
         // The body of an arm is indented as that of the arm before it.
         let (main, at) = files.at("main", "match s");
-        let arm = &analysis.actions(&mut files, main, at..at + 7)[0].edits[0];
+        let arm = &analysis.actions(&mut files, main, at..at + 7, &[])[0].edits[0];
         assert_eq!(arm.1, "\n        .empty:\n            pass");
         assert_eq!(&USER[arm.0.start - 5..arm.0.start], " pass");
+    }
+
+    /// What each change of kind `kind` that is offered in the first `text`
+    /// of the entry file of `files` makes of the file it changes, by its
+    /// title. The files are checked as they are, with their errors and
+    /// what they leave unused.
+    fn changes(files: &mut Memory, text: &str, kind: ActionKind) -> Vec<(String, String)> {
+        let made = |files: &Memory, action: &Action| {
+            let file = action.edits[0].0.file;
+            let mut made = files.0[files.index(file)].1.to_string();
+            let mut edits = action.edits.clone();
+            edits.sort_by_key(|(span, _)| span.start);
+            for (span, text) in edits.iter().rev() {
+                assert_eq!(span.file, file);
+                made.replace_range(span.start..span.end, text);
+            }
+            (action.title.clone(), made)
+        };
+        let actions = offered(files, text);
+        let actions = actions.iter().filter(|action| action.kind == kind);
+        actions.map(|action| made(files, action)).collect()
+    }
+
+    /// The changes that are offered in the first `text` of the entry file
+    /// of `files`.
+    fn offered(files: &mut Memory, text: &str) -> Vec<Action> {
+        let (program, errors) = load::load_partial(files);
+        assert_eq!(errors, []);
+        let analysis = analyze(program, &Settings::default());
+        let unused = analysis.unused(files);
+        let (main, at) = files.at("main", text);
+        analysis.actions(files, main, at..at + text.len(), &unused)
+    }
+
+    /// One change, by its title and what it makes of the file it changes.
+    fn change(title: &str, made: &str) -> Vec<(String, String)> {
+        vec![(title.to_string(), made.to_string())]
+    }
+
+    #[test]
+    fn a_name_that_names_nothing_is_written_as_the_one_likely_meant() {
+        let geo = "pub struct Point:\n    pub x: f32\npub struct(T) Holder:\n    pub value: T\npub fn length(p: Point) -> f32:\n    return p.x\n";
+        let main = "use geo\nuse geo.Holder\nfn main(b: Holdr(u8)) -> f32:\n    let total = geo.lenght(geo.Point(x: 1.0))\n    return totl\n";
+        let mut files = Memory(vec![("main", main), ("geo", geo)]);
+        let fix = ActionKind::Fix;
+        assert_eq!(
+            changes(&mut files, "lenght", fix),
+            change(
+                "Write `length` for `lenght`",
+                &main.replace("lenght", "length")
+            )
+        );
+        assert_eq!(
+            changes(&mut files, "totl", fix),
+            change("Write `total` for `totl`", &main.replace("totl", "total"))
+        );
+        // The type arguments of a type stay as they are.
+        assert_eq!(
+            changes(&mut files, "Holdr", fix),
+            change(
+                "Write `Holder` for `Holdr`",
+                &main.replace("Holdr", "Holder")
+            )
+        );
+        // It mends the error that says so, and is what that asks for.
+        let respelled = &offered(&mut files, "totl")[0];
+        let (span, code) = respelled.mends.unwrap();
+        assert_eq!(&main[span.start..span.end], "totl");
+        assert_eq!(code, "unknown-name");
+        assert!(respelled.preferred);
+    }
+
+    #[test]
+    fn what_is_never_used_is_taken_away_or_named_so() {
+        let geo = "pub struct Point:\n    pub x: f32 = 0.0\npub let origin = Point()\npub fn length(p: Point) -> f32:\n    return p.x\n";
+        let main = "use geo\nuse geo.Point\nuse geo.{length, origin as start}\nfn(T) idle(count: i32):\n    let (spare, _) = (1, 2)\npub fn main() -> f32:\n    return geo.length(start)\n";
+        let mut files = Memory(vec![("main", main), ("geo", geo)]);
+        let fix = ActionKind::Fix;
+        // A `use` goes: the line of one alone, and its own names in a
+        // group, with the comma that sets them apart.
+        assert_eq!(
+            changes(&mut files, "Point", fix),
+            change(
+                "Remove the `use` of `Point`",
+                &main.replace("use geo.Point\n", "")
+            )
+        );
+        assert_eq!(
+            changes(&mut files, "length,", fix),
+            change(
+                "Remove the `use` of `length`",
+                &main.replace("length, ", "")
+            )
+        );
+        // Anything else is named as what is meant to go unused.
+        assert_eq!(
+            changes(&mut files, "spare", fix),
+            change("Name it `_spare`", &main.replace("spare", "_spare"))
+        );
+        assert_eq!(
+            changes(&mut files, "idle", fix),
+            change("Name it `_idle`", &main.replace("idle", "_idle"))
+        );
+        assert_eq!(
+            changes(&mut files, "T)", fix),
+            change("Name it `_T`", &main.replace("(T)", "(_T)"))
+        );
+        assert_eq!(changes(&mut files, "count", fix), []);
+        // Taking a `use` away is what its warning asks for, and a name is
+        // one way to answer one.
+        let removed = &offered(&mut files, "Point")[0];
+        assert_eq!(removed.mends.map(|(_, code)| code), Some("unused-use"));
+        assert!(removed.preferred);
+        let named = &offered(&mut files, "spare")[0];
+        assert_eq!(named.mends.map(|(_, code)| code), Some("unused-variable"));
+        assert!(!named.preferred);
+
+        // The last of a group goes with the comma before it, and one on a
+        // line of its own with its line.
+        let last =
+            "use geo.{origin as start, length}\npub fn main() -> geo.Point:\n    return start\n";
+        let mut files = Memory(vec![("main", last), ("geo", geo)]);
+        assert_eq!(
+            changes(&mut files, "length", fix),
+            change(
+                "Remove the `use` of `length`",
+                &last.replace(", length", "")
+            )
+        );
+        let lines = "use geo.{\n    length,\n    origin,\n}\npub fn main() -> geo.Point:\n    return origin\n";
+        let mut files = Memory(vec![("main", lines), ("geo", geo)]);
+        assert_eq!(
+            changes(&mut files, "length", fix),
+            change(
+                "Remove the `use` of `length`",
+                &lines.replace("    length,\n", "")
+            )
+        );
+    }
+
+    #[test]
+    fn a_constructor_is_given_the_fields_it_leaves_out() {
+        let main = "struct Point:\n    x: f32\n    y: f32\n    z: f32 = 0.0\nstruct(T) Box:\n    value: T\nfn far(x: f32, y: f32) -> f32:\n    return x + y\npub fn main() -> f32:\n    let a = Point(x: 1.0)\n    let b = Point()\n    let c = Box(u8)()\n    return far(a.x + b.x + c.value as f32)\n";
+        let mut files = Memory(vec![("main", main)]);
+        let fix = ActionKind::Fix;
+        assert_eq!(
+            changes(&mut files, "Point(x: 1.0)", fix),
+            change(
+                "Add the field `y`",
+                &main.replace("Point(x: 1.0)", "Point(x: 1.0, y: todo)")
+            )
+        );
+        assert_eq!(
+            changes(&mut files, "Point()", fix),
+            change(
+                "Add the fields that are left out",
+                &main.replace("Point()", "Point(x: todo, y: todo)")
+            )
+        );
+        assert_eq!(
+            changes(&mut files, "Box(u8)()", fix),
+            change(
+                "Add the field `value`",
+                &main.replace("Box(u8)()", "Box(u8)(value: todo)")
+            )
+        );
+        // A function may be given what it lacks by its place.
+        assert_eq!(changes(&mut files, "far(a.x", fix), []);
+        // One change mends every error of the call, and is what they ask
+        // for.
+        let filled = offered(&mut files, "Point()");
+        let filled: Vec<_> = (filled.iter())
+            .filter(|action| action.kind == ActionKind::Fix)
+            .collect();
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].mends.map(|(_, code)| code), Some("missing-arg"));
+        assert!(filled[0].preferred);
+    }
+
+    #[test]
+    fn what_a_module_keeps_to_itself_is_made_pub_for_another() {
+        let geo = "struct Secret:\n    id: i32\npub struct Open:\n    id: i32 = 0\nfn hidden():\n    pass\nfn inner() -> i32:\n    return 1\nlet limit = 2\nextern \"$root\":\n    fn log(n: i32)\n";
+        let main = "use geo\nuse geo.hidden\npub fn main(o: geo.Open) -> i32:\n    let s: geo.Secret = todo\n    geo.log(1)\n    return geo.inner() + o.id + geo.limit\n";
+        let mut files = Memory(vec![("main", main), ("geo", geo)]);
+        let fix = ActionKind::Fix;
+        let public = |declared: &str| geo.replace(declared, &format!("pub {declared}"));
+        assert_eq!(
+            changes(&mut files, "hidden", fix),
+            change("Make `hidden` `pub`", &public("fn hidden"))
+        );
+        assert_eq!(
+            changes(&mut files, "Secret", fix),
+            change("Make `Secret` `pub`", &public("struct Secret"))
+        );
+        assert_eq!(
+            changes(&mut files, "inner", fix),
+            change("Make `inner` `pub`", &public("fn inner"))
+        );
+        assert_eq!(
+            changes(&mut files, "limit", fix),
+            change("Make `limit` `pub`", &public("let limit"))
+        );
+        // A function that is imported, on its own line of its block.
+        assert_eq!(
+            changes(&mut files, "log", fix),
+            change("Make `log` `pub`", &public("fn log"))
+        );
+        // A field, in the struct that has it.
+        assert_eq!(
+            changes(&mut files, "id +", fix),
+            change(
+                "Make `id` `pub`",
+                &geo.replace("    id: i32 = 0", "    pub id: i32 = 0")
+            )
+        );
+        let made = &offered(&mut files, "inner")[0];
+        assert_eq!(made.mends.map(|(_, code)| code), Some("private"));
+        assert!(made.preferred);
+    }
+
+    #[test]
+    fn the_type_of_a_name_is_written_where_it_is_hinted() {
+        let geo = "pub struct Point:\n    pub x: f32 = 0.0\npub struct Other:\n    pass\npub struct(T) Box:\n    pub value: T\nstruct Kept:\n    pass\npub fn other() -> Box(Other):\n    return Box(Other)(value: Other())\npub fn kept() -> &Kept:\n    return todo\n";
+        let main = "use geo\nuse geo.Point\npub fn main(at: &var Point):\n    let p = Point()\n    let q = geo.other()\n    let (a, b) = (1, at)\n    let o: option(Point) = .none\n    let r = (o, [q])\n    let f = main\n    let k = geo.kept()\n    for i in \"\":\n        pass\n";
+        let mut files = Memory(vec![("main", main), ("geo", geo)]);
+        let rewrite = ActionKind::Rewrite;
+        let typed = |name: &str, ty: &str| {
+            let title = format!("Write the type of `{name}`");
+            let bound = format!("let {name} =");
+            change(
+                &title,
+                &main.replace(&bound, &format!("let {name}: {ty} =")),
+            )
+        };
+        // As the file names the type: by its own name for it, or by the
+        // module that has it.
+        assert_eq!(changes(&mut files, "p =", rewrite), typed("p", "Point"));
+        assert_eq!(
+            changes(&mut files, "q =", rewrite),
+            typed("q", "geo.Box(geo.Other)")
+        );
+        assert_eq!(
+            changes(&mut files, "r =", rewrite),
+            typed("r", "tuple(option(Point), array(geo.Box(geo.Other)))")
+        );
+        // Not where the type goes after more than the name, where nothing
+        // writes it, or where the file sees no name for it.
+        assert_eq!(changes(&mut files, "a, b", rewrite), []);
+        assert_eq!(changes(&mut files, "f =", rewrite), []);
+        assert_eq!(changes(&mut files, "k =", rewrite), []);
+        assert_eq!(changes(&mut files, "i in", rewrite), []);
+        assert_eq!(changes(&mut files, "o:", rewrite), []);
+
+        // A hint says what would be written for it.
+        let (program, errors) = load::load_partial(&mut files);
+        assert_eq!(errors, []);
+        let analysis = analyze(program, &Settings::default());
+        let (file, _) = files.at("main", "use");
+        let hints = analysis.hints(file, 0..main.len());
+        let types = hints.iter().filter(|hint| hint.kind == HintKind::Type);
+        let shown: Vec<_> = types
+            .map(|hint| (hint.label.as_str(), hint.insert.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (": Point", Some(": Point")),
+                (": Box(Other)", Some(": geo.Box(geo.Other)")),
+                (": i32", None),
+                (": &var Point", None),
+                (
+                    ": tuple(option(Point), array(Box(Other)))",
+                    Some(": tuple(option(Point), array(geo.Box(geo.Other)))")
+                ),
+                (": main", None),
+                (": &Kept", None),
+                (": u8", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_use_lines_of_a_file_are_put_in_order() {
+        let geo = "pub struct Point:\n    pub x: f32 = 0.0\npub let origin = Point()\npub fn length(p: Point) -> f32:\n    return p.x\n";
+        let body = "pub fn main() -> f32:\n    return length(origin) + alpha.one\n";
+        let files = |main: &'static str| {
+            Memory(vec![
+                ("main", main),
+                ("geo", geo),
+                ("alpha", "pub let one = 1.0\n"),
+                ("util", ""),
+            ])
+        };
+        let organize = ActionKind::Organize;
+        let title = "Organize the `use` lines";
+        // By what each names, without those that nothing uses.
+        let main: &str = "use geo.{origin, length}\nuse util\npub use geo.Point\nuse alpha\npub fn main() -> f32:\n    return length(origin) + alpha.one\n";
+        assert_eq!(
+            changes(&mut files(main), "use util", organize),
+            change(
+                title,
+                &format!("use alpha\npub use geo.Point\nuse geo.{{origin, length}}\n{body}")
+            )
+        );
+        // Only where they are.
+        assert_eq!(changes(&mut files(main), "return", organize), []);
+        // A group is written without what nothing uses of it.
+        let main: &str = "use alpha\nuse geo.{origin, Point as P, length, Point}\npub fn main() -> f32:\n    return length(origin) + alpha.one\n";
+        assert_eq!(
+            changes(&mut files(main), "use alpha", organize),
+            change(
+                title,
+                &format!("use alpha\nuse geo.{{origin, length}}\n{body}")
+            )
+        );
+        let main: &str = "use alpha\nuse geo.{origin, Point}\nuse geo.length\npub fn main() -> f32:\n    return length(origin) + alpha.one\n";
+        assert_eq!(
+            changes(&mut files(main), "use alpha", organize),
+            change(
+                title,
+                &format!("use alpha\nuse geo.length\nuse geo.origin\n{body}")
+            )
+        );
+        // Those in order and all used are left as they are, and so is
+        // what follows something written between them.
+        let main: &str = "use alpha\nuse geo.{origin, length}\n# The rest.\nuse util\npub fn main() -> f32:\n    return length(origin) + alpha.one\n";
+        assert_eq!(changes(&mut files(main), "use alpha", organize), []);
     }
 
     #[test]

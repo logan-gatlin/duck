@@ -596,6 +596,31 @@ impl fmt::Display for Type {
     }
 }
 
+impl ParseErrorKind {
+    /// What names the kind of error, as [`crate::Error::code`] gives it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Expected { .. } => "unexpected-token",
+            Self::UnexpectedIndent => "unexpected-indent",
+            Self::ChainedComparison => "chained-comparison",
+            Self::InvalidAssignTarget => "invalid-assign-target",
+            Self::MissingFnBody => "missing-fn-body",
+            Self::ExternFnBody => "extern-fn-body",
+            Self::PubExtern => "pub-extern",
+            Self::UseAfterItem => "use-after-item",
+            Self::UseAfterEntry => "use-after-entry",
+            Self::GenericExtern => "generic-extern",
+            Self::GenericExport => "generic-export",
+            Self::PipeWithoutPlaceholder => "pipe-without-placeholder",
+            Self::PipeAfterReturn => "pipe-after-return",
+            Self::PlaceholderOutsidePipe => "placeholder-outside-pipe",
+            Self::LeadingPipe => "leading-pipe",
+            Self::ArmAfterElse => "arm-after-else",
+            Self::QualifiedPattern => "qualified-pattern",
+        }
+    }
+}
+
 impl fmt::Display for ParseErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
