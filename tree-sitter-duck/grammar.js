@@ -271,13 +271,13 @@ module.exports = grammar({
     ),
 
     // `let` and `var`, both as items and as statements; only items take `pub`.
+    // One without a value declares variables that are assigned later.
     binding: $ => seq(
       optional('pub'),
       field('mutability', choice('let', 'var')),
       field('pattern', $._pattern),
       optional(seq(':', field('type', $._type))),
-      '=',
-      field('value', $._expression),
+      optional(seq('=', field('value', $._expression))),
       $._newline,
     ),
 

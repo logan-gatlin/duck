@@ -3,6 +3,7 @@
 //! before it don't.
 
 use std::collections::HashMap;
+use std::mem;
 
 use crate::ir::{BinOp as IrBinOp, Const, Expr, LocalId, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
@@ -10,8 +11,8 @@ use crate::load::Program;
 use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, PatternKind, StmtKind};
 
 use super::{
-    ARRAY, Body, Checker, Label, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary, scalar,
-    similar, single, unions::narrow,
+    ARRAY, Body, Checker, Flow, Label, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary,
+    scalar, similar, single, unions::narrow,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -302,7 +303,11 @@ impl Body<'_> {
         // One of them runs, or it traps: nothing follows it if each of them
         // never reaches its end.
         let mut left = true;
+        // One of them runs, so what follows is reached from the end of any.
+        let before = mem::replace(&mut self.flow, Flow::never());
+        let mut after = Flow::never();
         for (arm, case) in arms.iter().zip(cases) {
+            self.flow = before.clone();
             self.scopes.push(HashMap::new());
             for (name, ty, slots) in case.names {
                 self.bind(name, ty, false, slots);
@@ -327,6 +332,7 @@ impl Body<'_> {
                 None => lowered.block(&arm.body),
             });
             left &= arm_left;
+            after.join(mem::replace(&mut self.flow, Flow::never()));
             self.scopes.pop();
             // An arm after one that matches every value is never reached.
             if ended {
@@ -353,6 +359,7 @@ impl Body<'_> {
         if !ended {
             block.push(Stmt::Unreachable);
         }
+        self.flow = after;
         self.ended |= left;
         self.labels.pop();
         out.push(Stmt::Block(block));

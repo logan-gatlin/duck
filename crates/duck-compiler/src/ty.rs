@@ -31,6 +31,7 @@ use enums::EnumDef;
 use evaluate::Dep;
 use generic::{Arity, Instance, ParamDef, ParamDefaults, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
+use init::{Flow, Operands, Round};
 use nested::NestedFn;
 use opaque::{OpaqueDef, OpaqueSite, Owner};
 use unions::{Holds, narrow, tags_are, where_held, widen};
@@ -45,6 +46,7 @@ mod exports;
 mod fn_ptr;
 mod generic;
 mod generic_fn;
+mod init;
 mod inspect;
 mod nested;
 mod opaque;
@@ -55,8 +57,8 @@ mod wit;
 
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
-    Action, ActionKind, Analysis, Completion, CompletionKind, Hint, HintKind, Hover, Parameter,
-    Signature, Symbol, SymbolKind, Unused, UnusedKind, analyze, module_members,
+    Action, ActionKind, Analysis, Apart, Completion, CompletionKind, Hint, HintKind, Hover,
+    Parameter, Signature, Symbol, SymbolKind, Unused, UnusedKind, analyze, module_members,
 };
 
 /// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
@@ -569,6 +571,32 @@ pub enum TypeErrorKind {
     /// A pointer to a type holding a `never`, which nothing in memory is.
     NotStorable(String),
     ImmutableAssign(String),
+    /// An assignment to a `let` declared without a value, where it has one,
+    /// or where it may have one if `maybe`.
+    AssignedAgain {
+        name: String,
+        maybe: bool,
+    },
+    /// A read of a variable declared without a value, where it has none, or
+    /// where it may have none if `maybe`.
+    Uninitialized {
+        name: String,
+        maybe: bool,
+    },
+    /// A `let` or a `var`, as `keyword` is, of `pattern` that writes neither
+    /// a type nor a value.
+    UntypedBinding {
+        pattern: String,
+        keyword: &'static str,
+    },
+    /// A binding without a value of what is no variable of a function: a
+    /// global, or a name of a type.
+    NoValue(String),
+    /// `_` or `()`, as it is, in the pattern of a binding without a value.
+    BindsNothing(&'static str),
+    /// An assignment in a `defer` to a `let` declared without a value
+    /// before it, which has none there.
+    DeferInitializes(String),
     /// Another function, or a pointer to one, assigned to the variable
     /// `name`, which is of the type of the function it was bound to.
     /// `pointer` is the type of the pointers to that function.
@@ -1313,6 +1341,17 @@ struct Body<'c> {
     /// changes before the statement ends. What is read of one is held in
     /// temporaries, so that it is what the variable had when it was read.
     assigned: Vec<String>,
+    /// What is known, where control is, of the variables declared without a
+    /// value.
+    flow: Flow,
+    /// Each variable declared without a value, by its `order`, and whether
+    /// an assignment to it that may not be its first is reported.
+    late: HashMap<usize, bool>,
+    /// The loops being lowered, innermost last.
+    rounds: Vec<Round>,
+    /// How many variables were bound before the innermost `defer` whose
+    /// body is being lowered, if one is.
+    deferred_from: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1622,7 +1661,12 @@ impl TypeErrorKind {
             Self::NotAssignable => "not-assignable",
             Self::NotAddressable => "not-addressable",
             Self::NotStorable(..) => "not-storable",
-            Self::ImmutableAssign(..) => "immutable-assign",
+            Self::ImmutableAssign(..) | Self::AssignedAgain { .. } => "immutable-assign",
+            Self::Uninitialized { .. } => "uninitialized",
+            Self::UntypedBinding { .. } => "untyped-binding",
+            Self::NoValue(..) => "no-value",
+            Self::BindsNothing(..) => "binds-nothing",
+            Self::DeferInitializes(..) => "defer-initializes",
             Self::OneFunction { .. } => "one-function",
             Self::ReadOnlyWrite { .. } => "read-only-write",
             Self::ReadOnlyAddr { .. } => "read-only-addr",
@@ -1909,6 +1953,38 @@ impl fmt::Display for TypeErrorKind {
             Self::NotAddressable => write!(f, "only memory behind a pointer has an address"),
             Self::NotStorable(ty) => write!(f, "`{ty}` can't be stored in memory"),
             Self::ImmutableAssign(name) => write!(f, "can't assign to immutable `{name}`"),
+            Self::AssignedAgain { name, maybe } => {
+                let is = if *maybe {
+                    "may already be"
+                } else {
+                    "is already"
+                };
+                write!(f, "can't assign to `{name}` again: it {is} initialized")
+            }
+            Self::Uninitialized { name, maybe: false } => {
+                write!(f, "`{name}` is used before it is initialized")
+            }
+            Self::Uninitialized { name, maybe: true } => {
+                write!(f, "`{name}` may not be initialized here")
+            }
+            Self::UntypedBinding { pattern, keyword } => write!(
+                f,
+                "`{pattern}` needs a type: a `{keyword}` without a value has nothing to \
+                 infer one from"
+            ),
+            Self::NoValue(name) => write!(
+                f,
+                "`{name}` needs a value: only a variable of a function is declared without one"
+            ),
+            Self::BindsNothing(pattern) => write!(
+                f,
+                "`{pattern}` binds nothing: a binding without a value only declares names"
+            ),
+            Self::DeferInitializes(name) => write!(
+                f,
+                "can't initialize `{name}` in a `defer`: it runs as the block is left, after \
+                 what follows it"
+            ),
             Self::OneFunction { name, pointer } => write!(
                 f,
                 "`{name}` is of the type of one function, so no other is assigned to it: \
@@ -3368,15 +3444,21 @@ impl Checker {
         decl: &parse::Binding,
         mut index: usize,
     ) {
+        // It is what its initializer is when the program starts, so it has
+        // one.
+        let Some(init) = &decl.value else {
+            let kind = TypeErrorKind::NoValue(init::written(&decl.pattern));
+            return self.error(kind, decl.pattern.span);
+        };
         let reported = self.errors.len();
         // One that is folded where this one first reads it has read what it
         // has by then.
         let outer = mem::replace(&mut self.unknown, false);
         let mut body = Body::new(self, Ty::Unit);
         body.global = Some(program);
-        let (ty, value) = body.binding_value(decl);
+        let (ty, value) = body.binding_value(decl.ty.as_ref(), init);
         let mutable = decl.mutability == Mutability::Var;
-        let inits = body.evaluate(value, decl.value.span);
+        let inits = body.evaluate(value, init.span);
         // What an error leaves of an initializer is not its value, nor is
         // what is made of a global that has none.
         let unknown = mem::replace(&mut self.unknown, outer);
@@ -4756,6 +4838,10 @@ impl<'c> Body<'c> {
             ended: false,
             branches: 0,
             assigned: Vec::new(),
+            flow: Flow::default(),
+            late: HashMap::new(),
+            rounds: Vec::new(),
+            deferred_from: None,
         }
     }
 
@@ -4957,6 +5043,7 @@ impl<'c> Body<'c> {
         let mut pre = self.deferred(nesting);
         pre.push(Stmt::Br(depth));
         self.branches += 1;
+        self.leaves_round(label);
         never(pre)
     }
 
@@ -4972,12 +5059,15 @@ impl<'c> Body<'c> {
         let outer = mem::replace(&mut self.assigned, assigned_within(stmt));
         match &stmt.kind {
             StmtKind::Binding(binding) if binding.binds_type() => self.alias_stmt(binding),
-            StmtKind::Binding(binding) => {
-                let (ty, value) = self.binding_value(binding);
-                let mutable = binding.mutability == Mutability::Var;
-                let dests = self.bind_pattern(&binding.pattern, ty, mutable, None);
-                self.set_leaves(dests, value, out);
-            }
+            StmtKind::Binding(binding) => match &binding.value {
+                Some(value) => {
+                    let (ty, value) = self.binding_value(binding.ty.as_ref(), value);
+                    let mutable = binding.mutability == Mutability::Var;
+                    let dests = self.bind_pattern(&binding.pattern, ty, mutable, None);
+                    self.set_leaves(dests, value, out);
+                }
+                None => self.declare(binding),
+            },
             StmtKind::Expr(expr) => {
                 let value = match &expr.kind {
                     // Nothing reads what a statement assigns.
@@ -5000,13 +5090,16 @@ impl<'c> Body<'c> {
             } => {
                 let (pre, cond) = split1(self.check(cond, Ty::Prim(Prim::Bool)));
                 out.extend(pre);
+                let before = self.flow.clone();
                 let (then_body, then_ended) =
                     self.maybe(|body| body.labelled(Label::Other, then_body));
+                let then_flow = mem::replace(&mut self.flow, before);
                 let (else_body, else_ended) = match else_body {
                     Some(else_body) => self.maybe(|body| body.labelled(Label::Other, else_body)),
                     None => (Vec::new(), false),
                 };
                 // One of the two runs.
+                self.flow.join(then_flow);
                 self.ended |= then_ended && else_ended;
                 out.push(Stmt::If {
                     cond,
@@ -5019,6 +5112,7 @@ impl<'c> Body<'c> {
                 // The condition is in the loop, so a `break` or a `continue`
                 // in it is of this loop, as one in the body is.
                 let branches = self.branches;
+                self.enter_round();
                 self.labels.extend([Label::Break, Label::Continue]);
                 let (cond, cond_ended) = self.maybe(|body| body.check(cond, Ty::Prim(Prim::Bool)));
                 self.labels.truncate(self.labels.len() - 2);
@@ -5048,12 +5142,14 @@ impl<'c> Body<'c> {
             // now, and is run wherever the block is left.
             StmtKind::Defer(body) => {
                 let outer = self.deferring.replace(self.labels.len());
-                let (body, _) = self.maybe(|deferred| deferred.block(body));
+                let (body, _) =
+                    self.later(|deferred| deferred.maybe(|deferred| deferred.block(body)));
                 self.deferring = outer;
                 self.defers.last_mut().unwrap().bodies.push(body);
             }
         }
         self.assigned = outer;
+        self.flow.end_if(self.ended);
     }
 
     /// `target = value`, or `target op= value` if `op` is given. The target
@@ -5068,7 +5164,21 @@ impl<'c> Body<'c> {
         span: Span,
         used: bool,
     ) -> (Ty, Value) {
-        let Some(mut place) = self.place(target) else {
+        // A variable that is assigned whole is not read, so it may be one
+        // that has no value yet.
+        let variable = match (&target.kind, op) {
+            (ExprKind::Name(name), None) => self.variable(name),
+            _ => None,
+        };
+        let whole = variable.is_some();
+        let found = match variable {
+            Some(place) => {
+                self.ck.record(target.span, place.ty);
+                Some(place)
+            }
+            None => self.place(target),
+        };
+        let Some(mut place) = found else {
             self.expr(value, None);
             return (Ty::Error, Value::default());
         };
@@ -5083,7 +5193,10 @@ impl<'c> Body<'c> {
             pre.extend(value.pre);
             return never(pre);
         }
-        if !place.mutable {
+        // Whether one declared without a value has one is known once the
+        // value assigned is evaluated, which may assign to it.
+        let late = self.late_place(&place);
+        if !place.mutable && !late {
             let kind = match place.behind {
                 Some(ty) => {
                     let (ty, needs, element) = self.read_only(ty);
@@ -5104,6 +5217,9 @@ impl<'c> Body<'c> {
                 self.binary_values(op, place.ty, current, rhs, span).1
             }
         };
+        if late {
+            self.assigns(&place.name, whole, target.span);
+        }
         if !used {
             self.assign(&place, value, &mut pre);
             let scalars = Vec::new();
@@ -5236,6 +5352,7 @@ impl<'c> Body<'c> {
         // Advanced before the body, so `continue` moves on too.
         let next = binary(vt, IrBinOp::Add, i, one);
         inner.push(Stmt::SetLocal(counter, next));
+        self.enter_round();
         let stmt = self.loop_stmt(inner, body);
         self.scopes.pop();
         out.push(stmt);
@@ -5255,11 +5372,15 @@ impl<'c> Body<'c> {
         out: &mut Vec<Stmt>,
     ) {
         let (ty, from, to) = if is_typed_by_other(start) && !is_typed_by_other(end) {
-            let (ty, to) = self.expr(end, None);
-            (ty, self.operand(start, ty), to)
+            // The start is evaluated first, whichever is lowered first.
+            let mut operands = self.operands(vec![start, end]);
+            let (ty, to) = self.operand(&mut operands, 1, |body| body.expr(end, None));
+            let from = self.operand(&mut operands, 0, |body| body.typed_operand(start, ty));
+            self.evaluated(operands);
+            (ty, from, to)
         } else {
             let (ty, from) = self.expr(start, None);
-            (ty, from, self.operand(end, ty))
+            (ty, from, self.typed_operand(end, ty))
         };
         let bounds = self.seq(vec![from, to]);
         let (elem, prim) = match ty {
@@ -5302,6 +5423,7 @@ impl<'c> Body<'c> {
             counter,
             binary(vt, IrBinOp::Add, n, Expr::Const(one)),
         ));
+        self.enter_round();
         let stmt = self.loop_stmt(inner, body);
         self.scopes.pop();
         out.push(stmt);
@@ -5376,12 +5498,16 @@ impl<'c> Body<'c> {
     }
 
     /// A loop that runs `head`, which may leave with `br 1`, then `body`, and
-    /// then repeats.
+    /// then repeats. It is [entered](Self::enter_round) before what `head`
+    /// evaluates is lowered, and [ends](Self::end_round) here.
     fn loop_stmt(&mut self, mut head: Vec<Stmt>, body: &parse::Block) -> Stmt {
+        // The body may never run.
+        let skipped = self.flow.clone();
         self.labels.push(Label::Break);
         let (body, _) = self.maybe(|lowered| lowered.labelled(Label::Continue, body));
         head.extend(body);
         self.labels.pop();
+        self.end_round(skipped);
         head.push(Stmt::Br(0));
         Stmt::Block(vec![Stmt::Loop(head)])
     }
@@ -5393,13 +5519,13 @@ impl<'c> Body<'c> {
     }
 
     /// Checks the value of a `let` or `var` against its annotation, if any.
-    fn binding_value(&mut self, binding: &parse::Binding) -> (Ty, Value) {
-        match &binding.ty {
+    fn binding_value(&mut self, ty: Option<&parse::Type>, value: &parse::Expr) -> (Ty, Value) {
+        match ty {
             Some(ty) => {
                 let ty = self.resolve_ty(ty);
-                (ty, self.check(&binding.value, ty))
+                (ty, self.check(value, ty))
             }
-            None => self.expr(&binding.value, None),
+            None => self.expr(value, None),
         }
     }
 
@@ -5423,15 +5549,10 @@ impl<'c> Body<'c> {
     fn find_place(&mut self, target: &parse::Expr) -> Option<Place> {
         match &target.kind {
             ExprKind::Name(name) => {
-                if let Some(var) = self.lookup(name) {
-                    let place = Place {
-                        name: name.clone(),
-                        ty: var.ty,
-                        mutable: var.mutable,
-                        behind: None,
-                        pre: Vec::new(),
-                        slots: Slots::Local(var.slots.clone()),
-                    };
+                // All that is done with a part of a variable needs it to
+                // have a value, as reading it does.
+                if let Some(place) = self.variable(name) {
+                    self.reads(name, target.span);
                     return Some(place);
                 }
                 match self.item(name) {
@@ -5505,6 +5626,19 @@ impl<'c> Body<'c> {
                 None
             }
         }
+    }
+
+    /// The variable `name` as a place, if it names one.
+    fn variable(&self, name: &str) -> Option<Place> {
+        let var = self.lookup(name)?;
+        Some(Place {
+            name: name.to_string(),
+            ty: var.ty,
+            mutable: var.mutable,
+            behind: None,
+            pre: Vec::new(),
+            slots: Slots::Local(var.slots.clone()),
+        })
     }
 
     /// The global `item`, named `name` at `span`, as a place. `None` after
@@ -5825,6 +5959,7 @@ impl<'c> Body<'c> {
         self.ck.record(expr.span, ty);
         // Nothing after it is reached, as it has no value to go on with.
         self.ended |= ty == Ty::Never;
+        self.flow.end_if(ty == Ty::Never);
         (ty, value)
     }
 
@@ -6253,7 +6388,7 @@ impl<'c> Body<'c> {
                 operand
             }));
         }
-        let value = self.bound_args(&params, &[], args, binding, checked);
+        let value = self.bound_args(&params, &[], args, binding, checked, None);
         let prim = match ty {
             Ty::Prim(prim) if prim.is_int() => self.ck.fixed(prim),
             Ty::Never => return never(value.pre),
@@ -6476,6 +6611,7 @@ impl<'c> Body<'c> {
             let ty = var.ty;
             let reads = var.slots.iter().map(|l| Expr::Local(*l)).collect();
             let value = self.scalars(ty, reads);
+            self.reads(name, span);
             return (ty, self.read_variable(name, value));
         }
         match self.item(name) {
@@ -6693,7 +6829,9 @@ impl<'c> Body<'c> {
             // needed, which is a label.
             let branches = self.branches;
             self.labels.push(Label::Other);
+            let before = self.flow.clone();
             let (rhs, _) = self.maybe(|body| body.check(rhs, bool));
+            self.flow.join(before);
             self.labels.pop();
             let (ty, mut value) = self.binary_values(op, bool, lhs, rhs, span);
             // A `break` or a `continue` in it would be evaluated wherever
@@ -6708,13 +6846,17 @@ impl<'c> Body<'c> {
         // `x + 1` and `1 + x` work for any integer `x`, and so does a
         // `.name`, as in `.red == c`.
         let (ty, lhs, rhs) = if is_typed_by_other(lhs) && !is_typed_by_other(rhs) {
-            let (ty, rhs) = self.expr(rhs, expected);
+            // The left side is evaluated first, whichever is lowered first.
+            let mut operands = self.operands(vec![lhs, rhs]);
+            let (ty, rhs) = self.operand(&mut operands, 1, |body| body.expr(rhs, expected));
             let (ty, rhs) = self.compared(op, ty, rhs);
-            (ty, self.operand(lhs, ty), rhs)
+            let lhs = self.operand(&mut operands, 0, |body| body.typed_operand(lhs, ty));
+            self.evaluated(operands);
+            (ty, lhs, rhs)
         } else {
             let (ty, lhs) = self.expr(lhs, expected);
             let (ty, lhs) = self.compared(op, ty, lhs);
-            (ty, lhs, self.operand(rhs, ty))
+            (ty, lhs, self.typed_operand(rhs, ty))
         };
         self.binary_values(op, ty, lhs, rhs, span)
     }
@@ -6722,7 +6864,7 @@ impl<'c> Body<'c> {
     /// The operand `expr` of an operator whose other operand is a `ty`,
     /// which it is to be too. Any is taken with a `never`, as what is made
     /// of one is one whatever the other is.
-    fn operand(&mut self, expr: &parse::Expr, ty: Ty) -> Value {
+    fn typed_operand(&mut self, expr: &parse::Expr, ty: Ty) -> Value {
         match ty {
             Ty::Never => self.expr(expr, Some(ty)).1,
             _ => self.check(expr, ty),
@@ -7120,7 +7262,8 @@ impl<'c> Body<'c> {
                     sig = self.ck.funcs[id.0 as usize].clone();
                 }
                 let checked = args.iter().map(|_| None).collect();
-                let value = self.bound_args(&sig.params, &sig.defaults, args, binding, checked);
+                let value =
+                    self.bound_args(&sig.params, &sig.defaults, args, binding, checked, None);
                 self.settle(sig.ret, span);
                 self.call_func(id, value)
             }
@@ -7283,12 +7426,14 @@ impl<'c> Body<'c> {
     ) -> Value {
         let binding = self.bind_args(params, defaults, args, require_labels, span);
         let checked = args.iter().map(|_| None).collect();
-        self.bound_args(params, defaults, args, binding, checked)
+        self.bound_args(params, defaults, args, binding, checked, None)
     }
 
     /// Checks call arguments against the parameters `binding` matches them
     /// with, as [`Self::args`] does. Those `checked` already, with their
-    /// types, are only compared with their parameter's.
+    /// types, are only compared with their parameter's. If any were, out of
+    /// the order they are evaluated in, the arguments are the `operands`
+    /// they were lowered as, which the rest are too.
     fn bound_args(
         &mut self,
         params: &[(String, Ty)],
@@ -7296,6 +7441,7 @@ impl<'c> Body<'c> {
         args: &[Arg],
         binding: Vec<Option<usize>>,
         checked: Vec<Option<(Ty, Value)>>,
+        mut operands: Option<Operands>,
     ) -> Value {
         // A parameter that no argument is bound to has the scalars of its
         // default, which are constant.
@@ -7321,24 +7467,36 @@ impl<'c> Body<'c> {
         let mut values = Vec::new();
         // Parameter index and scalar count of each value.
         let mut groups = Vec::new();
-        for ((arg, param), checked) in args.iter().zip(binding).zip(checked) {
+        for (turn, ((arg, param), checked)) in args.iter().zip(binding).zip(checked).enumerate() {
             match param {
                 Some(i) => {
-                    let value = match checked {
-                        Some((ty, value)) => {
-                            let (ty, value) = self.as_expected(ty, value, Some(params[i].1));
-                            self.expect(ty, params[i].1, arg.value.span);
+                    let want = params[i].1;
+                    let value = match (checked, &mut operands) {
+                        (Some((ty, value)), _) => {
+                            let (ty, value) = self.as_expected(ty, value, Some(want));
+                            self.expect(ty, want, arg.value.span);
                             value
                         }
-                        None => self.check(&arg.value, params[i].1),
+                        (None, Some(operands)) => {
+                            self.operand(operands, turn, |body| body.check(&arg.value, want))
+                        }
+                        (None, None) => self.check(&arg.value, want),
                     };
                     groups.push((i, value.scalars.len()));
                     values.push(value);
                 }
-                None => {
-                    self.expr(&arg.value, None);
-                }
+                None => match &mut operands {
+                    Some(operands) => {
+                        self.operand(operands, turn, |body| body.expr(&arg.value, None));
+                    }
+                    None => {
+                        self.expr(&arg.value, None);
+                    }
+                },
             }
+        }
+        if let Some(operands) = operands {
+            self.evaluated(operands);
         }
         let mut value = self.seq(values);
         // Pure scalars can be reordered freely; anything with side effects
@@ -7957,13 +8115,15 @@ fn assigned_within(stmt: &parse::Stmt) -> Vec<String> {
             push_assigned(target, &mut names);
             push_assigned(value, &mut names);
         }
-        StmtKind::Binding(parse::Binding { value: expr, .. })
+        StmtKind::Binding(parse::Binding {
+            value: Some(expr), ..
+        })
         | StmtKind::Expr(expr)
         | StmtKind::If { cond: expr, .. }
         | StmtKind::While { cond: expr, .. }
         | StmtKind::For { iter: expr, .. }
         | StmtKind::Match { value: expr, .. } => push_assigned(expr, &mut names),
-        StmtKind::Pass | StmtKind::Defer(_) | StmtKind::Fn(_) => {}
+        StmtKind::Binding(_) | StmtKind::Pass | StmtKind::Defer(_) | StmtKind::Fn(_) => {}
     }
     names
 }
@@ -8160,7 +8320,9 @@ fn breaks(block: &[parse::Stmt]) -> bool {
     block.iter().any(|stmt| match &stmt.kind {
         // What a `for` iterates is evaluated before it, so a `break` there
         // is of this loop, as none in the `for` or in a `while` is.
-        StmtKind::Binding(parse::Binding { value: expr, .. })
+        StmtKind::Binding(parse::Binding {
+            value: Some(expr), ..
+        })
         | StmtKind::Expr(expr)
         | StmtKind::For { iter: expr, .. } => within(expr),
         StmtKind::If {
@@ -8172,7 +8334,11 @@ fn breaks(block: &[parse::Stmt]) -> bool {
             within(value) || arms.iter().any(|arm| breaks(&arm.body))
         }
         // One in a function declared here is of a loop in that function.
-        StmtKind::While { .. } | StmtKind::Pass | StmtKind::Defer(_) | StmtKind::Fn(_) => false,
+        StmtKind::Binding(_)
+        | StmtKind::While { .. }
+        | StmtKind::Pass
+        | StmtKind::Defer(_)
+        | StmtKind::Fn(_) => false,
     })
 }
 
@@ -8335,7 +8501,7 @@ mod tests {
     use crate::ir::{Const, Expr, Func, Module, Stmt, ValType};
     use crate::lex::tokenize;
 
-    fn check_src(src: &str) -> Result<Module, Vec<TypeError>> {
+    pub(super) fn check_src(src: &str) -> Result<Module, Vec<TypeError>> {
         check_with(src, &Settings::default())
     }
 
@@ -8348,7 +8514,7 @@ mod tests {
         )
     }
 
-    fn lower(src: &str) -> Module {
+    pub(super) fn lower(src: &str) -> Module {
         match check_src(src) {
             Ok(module) => module,
             Err(errors) => panic!("unexpected type errors: {errors:#?}"),
@@ -8364,7 +8530,7 @@ mod tests {
     }
 
     /// Renders the body of the function `name` as s-expressions.
-    fn body(module: &Module, name: &str) -> String {
+    pub(super) fn body(module: &Module, name: &str) -> String {
         let func = module.funcs.iter().find(|f| f.name == name).unwrap();
         stmts(module, func, &func.body)
     }

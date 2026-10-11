@@ -291,6 +291,82 @@ fn double(v: varray(i32)):
 - `break` leaves the loop. `continue` moves on to the next element, and the
   index with it.
 
+## Variables without a value
+
+```duck
+extern:
+	fn next() -> i32
+
+fn sign(n: i32) -> i32:
+	let s: i32                       # no value yet, so its type is written
+	if n < 0:
+		s = -1                       # the one assignment of a `let`
+	else if n == 0:
+		return 0                     # what leaves has none to make
+	else:
+		s = 1
+	return s                         # every way here has assigned it
+
+fn parts(n: i32, d: i32) -> i32:
+	var (q, r): tuple(i32, i32)      # each name is assigned by itself
+	match d:
+		0:
+			q = 0
+			r = n
+		else:
+			q = n / d
+			r = n % d
+	q += 1                           # a `var`, so assigned again
+	return q + r
+
+fn sum() -> i32:
+	var line: i32
+	var total = 0
+	while (line = next()) != 0:      # a condition runs at least once
+		total += line
+	return total - line
+```
+
+- `let x: T` and `var x: T` declare a variable that has no value yet. The
+  type is required, as there is no value to give one. Nothing runs there.
+  `x = value` gives it its value: there is no other way to write that.
+- Only a variable of a function is declared so. A global has its value when
+  the program starts, and `let Name: type` has the type it names.
+- What is declared is a name, or a tuple of names with one type after it:
+  `let (a, (b, c)): tuple(i32, tuple(bool, f32))`. Each name is a variable
+  that is assigned by itself, as a tuple is not assigned to. `_` and `()`
+  are errors, as there is no value to ignore.
+- **Nothing reads it where it may have no value**, whichever way the
+  function got there. `x += 1`, `x = x + 1`, `x.field = 1` and `x[0] = 1`
+  all read `x`, as a function declared there that names `x` does, which
+  takes its copy where it is declared.
+- **A `let` is assigned only where it has no value yet**, whichever way the
+  function got there: once. A `var` is assigned again as any is.
+- It needs no value by the end of its block, where nothing reads it.
+- After an `if` or a `match` it has a value where each branch gave it one.
+  A branch that never reaches its end counts for nothing: one that ends in
+  `return`, `break`, `continue`, `todo` or a call of what returns `never`.
+  An `if` without an `else` may not run.
+- The right side of `and` and of `or` may not run, so what it assigns may
+  not be assigned: after `if ready and (x = next()) != 0:` the block can't
+  read `x`. Write one `if` in the other.
+- The body of a loop may never run, or may run again. What it assigns has no
+  value for certain after it, and it assigns no `let` that is declared
+  before the loop, unless a `break` follows before it goes around. No
+  condition is read for what it says, `while true:` no more than another.
+  The condition of a `while` does run once, and with each time around.
+- A variable declared in the body of a loop is a new one each time around.
+- Only the ways through the function are followed, not what its conditions
+  are: after `if c:` assigns `x`, a later `if c:` can't read it. Assign in
+  both branches, or give a `var` a value where it is declared.
+- The body of a `defer` reads what has a value where the `defer` is written.
+  What it assigns is not assigned for what follows, and it doesn't give a
+  `let` declared before it its value: that would be after what follows.
+- What is never reached is not checked: after a `return`, anything is read.
+- A variable whose first statement assigns it is declared with that value:
+  `let x: i32` and then `x = 1` is `let x: i32 = 1`, which the editor warns
+  of and offers to write.
+
 ## Slices
 
 ```duck

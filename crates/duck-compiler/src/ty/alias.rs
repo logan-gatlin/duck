@@ -49,7 +49,14 @@ impl Checker {
             self.error(TypeErrorKind::TypeOutsideParam, span);
             return;
         };
-        let written = self.type_syntax(&binding.value);
+        let written = match &binding.value {
+            Some(value) => self.type_syntax(value),
+            None => {
+                let kind = TypeErrorKind::NoValue(name.name.clone());
+                self.error(kind, binding.pattern.span);
+                None
+            }
+        };
         self.aliases.push(AliasDef {
             name: name.name.clone(),
             module: self.module,
@@ -130,7 +137,13 @@ impl Body<'_> {
         }
         // The name is bound once its type is resolved, so the type is
         // written with what the name was.
-        let ty = self.expr_type(&binding.value);
+        let ty = match &binding.value {
+            Some(value) => self.expr_type(value),
+            None => {
+                self.error(TypeErrorKind::NoValue(name.clone()), pattern.span);
+                Ty::Error
+            }
+        };
         self.ck.record(pattern.span, ty);
         let var = Var {
             ty,

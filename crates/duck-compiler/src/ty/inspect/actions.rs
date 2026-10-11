@@ -8,11 +8,13 @@ use std::ptr;
 use crate::file::{FileId, FileManager};
 use crate::lex::Span;
 use crate::load::Use;
-use crate::parse::{self, Arg, Arm, ExprKind, ItemKind, PatternKind, StmtKind};
+use crate::parse::{self, Arg, Arm, ExprKind, ItemKind, Mutability, PatternKind, StmtKind};
 use crate::visit::{self, Node};
 
 use super::super::{Prim, Ty, TypeError, TypeErrorKind, convertible};
-use super::{Analysis, Found, HintKind, Item, Sources, Target, Unused, UnusedKind, line_start};
+use super::{
+    Analysis, Apart, Found, HintKind, Item, Sources, Target, Unused, UnusedKind, line_start,
+};
 
 /// A change to the source that is offered where it would help.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,15 +77,17 @@ impl Analysis {
     /// a number the kind of number expected of it, the fields that a
     /// constructor leaves out, and the `pub` that lets another module see
     /// what this one names. What mends each of `unused` there, which are
-    /// what was found to be declared and never used. Then the type that a
-    /// name there is bound without, and the `use` lines of the file in
-    /// order, if they aren't.
+    /// what was found to be declared and never used, and each of `apart`
+    /// there, which are what was found to be declared apart from its value.
+    /// Then the type that a name there is bound without, and the `use`
+    /// lines of the file in order, if they aren't.
     pub fn actions(
         &self,
         files: &mut impl FileManager,
         file: FileId,
         within: Range<usize>,
         unused: &[Unused],
+        apart: &[Apart],
     ) -> Vec<Action> {
         let here =
             |span: &Span| span.file == file && span.start <= within.end && within.start <= span.end;
@@ -138,6 +142,12 @@ impl Analysis {
             actions.extend(mending.into_iter().map(|action| Action {
                 mends: Some((unused.span, unused.kind.code())),
                 preferred: action.preferred && alone,
+                ..action
+            }));
+        }
+        for apart in apart.iter().filter(|apart| here(&apart.span)) {
+            actions.extend(joined(files, apart).map(|action| Action {
+                mends: Some((apart.span, Apart::CODE)),
                 ..action
             }));
         }
@@ -759,4 +769,35 @@ fn binds_loosely(expr: &parse::Expr) -> bool {
             | ExprKind::Pipe(..)
             | ExprKind::Assign { .. }
     )
+}
+
+/// What mends `apart`, a variable declared apart from its value: the line
+/// that declares it is taken away, and the assignment declares it with what
+/// it assigns. None is offered where the line says anything else, as a
+/// comment does, which would go with it.
+fn joined(files: &mut impl FileManager, apart: &Apart) -> Option<Action> {
+    let declared = apart.declared;
+    let text = files.contents(declared.file);
+    let start = line_start(&text, declared.start);
+    let rest = text.get(declared.end..)?;
+    let end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+    let alone = text[start..declared.start].trim().is_empty() && rest[..end].trim().is_empty();
+    if !alone {
+        return None;
+    }
+    let line = Span {
+        start,
+        end: declared.end + end,
+        ..declared
+    };
+    let keyword = match apart.mutability {
+        Mutability::Let => "let",
+        Mutability::Var => "var",
+    };
+    let name = &apart.name;
+    let ty = text.get(apart.ty.start..apart.ty.end)?;
+    let declares = format!("{keyword} {name}: {ty}");
+    let edits = vec![(line, String::new()), (apart.assigned, declares)];
+    let title = format!("Declare `{name}` where it is assigned");
+    Some(Action::fix(title, edits, true))
 }

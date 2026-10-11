@@ -22,8 +22,8 @@ use crate::parse::{self, Arg, FnSig};
 
 use super::opaque::{OpaqueSite, Owner};
 use super::{
-    Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
-    generic_fn_decls, is_typed_by_other, never, pending_defaults,
+    Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Operands, Synth, Ty, TypeErrorKind,
+    Value, generic_fn_decls, is_typed_by_other, never, pending_defaults,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -543,13 +543,17 @@ impl Body<'_> {
             sig = self.ck.generic_fns[generic.0 as usize].sig.clone();
         }
         let mut checked: Vec<_> = args.iter().map(|_| None).collect();
-        let type_args = self.type_args_of(generic, args, &binding, &mut checked, span);
+        // Those that settle a type parameter are lowered before the rest.
+        let mut operands = self.operands(args.iter().map(|arg| &arg.value).collect());
+        let type_args =
+            self.type_args_of(generic, args, &binding, &mut checked, &mut operands, span);
         // An argument that would settle one is a `never`, and so is the
         // call: nothing says which instance it would be of.
         if checked.iter().flatten().any(|(ty, _)| *ty == Ty::Never) {
             let params = sig.params.iter().map(|(p, _)| (p.clone(), Ty::Error));
             let params: Vec<_> = params.collect();
-            let value = self.bound_args(&params, &sig.defaults, args, binding, checked);
+            let operands = Some(operands);
+            let value = self.bound_args(&params, &sig.defaults, args, binding, checked, operands);
             return never(value.pre);
         }
         // A generic function checked as declared calls no instance.
@@ -568,7 +572,8 @@ impl Body<'_> {
                 .iter()
                 .map(|(p, _)| (p.clone(), Ty::Error))
                 .collect();
-            self.bound_args(&params, &sig.defaults, args, binding, checked);
+            let operands = Some(operands);
+            self.bound_args(&params, &sig.defaults, args, binding, checked, operands);
             return (Ty::Error, Value::default());
         };
         // A default with a type of its own is taken only as that type.
@@ -588,7 +593,8 @@ impl Body<'_> {
                 self.error(kind, span);
             }
         }
-        let value = self.bound_args(&instance.params, &sig.defaults, args, binding, checked);
+        let (params, operands) = (&instance.params, Some(operands));
+        let value = self.bound_args(params, &sig.defaults, args, binding, checked, operands);
         self.settle(instance.ret, span);
         match id {
             Some(id) => self.call_func(id, value),
@@ -706,14 +712,16 @@ impl Body<'_> {
     /// where a pointer is settled on and is otherwise of its own type, and
     /// then the literals and `.name`s, which take any type that fits them.
     /// Those naming generic functions are left for last. The arguments it
-    /// checks are kept in `checked`. Type parameters that no argument
-    /// settles are reported at `span`, and given the error type.
+    /// checks are kept in `checked`, each lowered as the one of `operands`
+    /// that it is. Type parameters that no argument settles are reported at
+    /// `span`, and given the error type.
     fn type_args_of(
         &mut self,
         generic: GenericFnId,
         args: &[Arg],
         binding: &[Option<usize>],
         checked: &mut [Option<(Ty, Value)>],
+        operands: &mut Operands,
         span: Span,
     ) -> Vec<Ty> {
         let def = &self.ck.generic_fns[generic.0 as usize];
@@ -755,7 +763,7 @@ impl Body<'_> {
                 {
                     continue;
                 }
-                let (ty, value) = self.expr(&arg.value, None);
+                let (ty, value) = self.operand(operands, k, |body| body.expr(&arg.value, None));
                 self.ck.unify(patterns[i], ty, &mut bound);
                 // A bound settles a type parameter before a later argument
                 // would, which is then checked against it.

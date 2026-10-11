@@ -875,6 +875,11 @@ mod tests {
             formatted("pub  fn add(a:i32,b:i32=1)->i32:\n\treturn a+b\n"),
             "pub fn add(a: i32, b: i32 = 1) -> i32:\n\treturn a + b\n"
         );
+        // A binding without a value ends with its type.
+        assert_eq!(
+            formatted("fn f():\n\tlet  x:i32\n\tvar( a,b ):tuple(i32,& var u8)\n\tx=1\n"),
+            "fn f():\n\tlet x: i32\n\tvar (a, b): tuple(i32, &var u8)\n\tx = 1\n"
+        );
         assert_eq!(
             formatted("fn f():\n\tx+=1\n\tif a<=b and not c or d!=e:\n\t\tpass\n"),
             "fn f():\n\tx += 1\n\tif a <= b and not c or d != e:\n\t\tpass\n"

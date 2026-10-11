@@ -1124,14 +1124,16 @@ impl Server<'_> {
         });
         let notes: Vec<_> = notes.collect();
         let Place { path, range } = problem.place;
+        // What is never used is shown as what could be taken away, which
+        // what is declared apart from its value is not.
+        let unused = !error && problem.code != ty::Apart::CODE;
         let diagnostic = Diagnostic {
             range,
             severity: Some(match error {
                 true => DiagnosticSeverity::ERROR,
                 false => DiagnosticSeverity::WARNING,
             }),
-            // What is never used is shown as what could be taken away.
-            tags: (!error).then(|| vec![DiagnosticTag::UNNECESSARY]),
+            tags: unused.then(|| vec![DiagnosticTag::UNNECESSARY]),
             source: Some("duck".to_string()),
             code: Some(NumberOrString::String(problem.code.to_string())),
             message: problem.message,
@@ -1407,7 +1409,10 @@ mod tests {
                 let warning = match d.severity {
                     Some(DiagnosticSeverity::ERROR) => "",
                     Some(DiagnosticSeverity::WARNING) => {
-                        assert_eq!(d.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+                        // Only what is never used could be taken away.
+                        let unused = d.message.ends_with("is never used");
+                        let tags = unused.then(|| vec![DiagnosticTag::UNNECESSARY]);
+                        assert_eq!(d.tags, tags);
                         "warning: "
                     }
                     severity => panic!("{severity:?}"),
@@ -2600,6 +2605,20 @@ mod tests {
             ErrorCode::InvalidParams as i32,
         ];
         assert!(code.is_some_and(|code| codes.contains(&code)), "{error:?}");
+        editor.stop();
+    }
+
+    #[test]
+    fn what_is_declared_apart_from_its_value_is_warned_of() {
+        let dir = TempDir::new("server-apart");
+        let saved = "pub fn main() -> i32:\n    let total: i32\n    total = 1\n    return total\n";
+        dir.write(&[("Duck.toml", MODULE), ("main.duck", saved)]);
+        let editor = Editor::start(&dir, json!({}));
+        let apart = "1:8 warning: `total` is declared apart from its value";
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("main.duck", None, &[apart])
+        );
         editor.stop();
     }
 

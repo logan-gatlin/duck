@@ -20,7 +20,7 @@ use crate::parse::{
 
 pub use actions::{Action, ActionKind};
 pub use hints::{Hint, HintKind};
-pub use lints::{Unused, UnusedKind};
+pub use lints::{Apart, Unused, UnusedKind};
 pub use symbols::{Symbol, SymbolKind};
 
 use super::{
@@ -1360,7 +1360,10 @@ impl Analysis {
             LocalKind::Bound => format!("{name}: {}", self.type_at(local.span)?),
             // A name of a type is as it is written, which is the type.
             LocalKind::Alias(binding) => {
-                format!("let {name}: type = {}", src.text(binding.value.span))
+                format!(
+                    "let {name}: type = {}",
+                    src.text(binding.value.as_ref()?.span)
+                )
             }
             LocalKind::Fn(sig) => {
                 let text = sig_text(src, sig);
@@ -1475,8 +1478,8 @@ impl Analysis {
                 let declared = self.global_name(binding, index, item)?.name;
                 let ty = self.ck.ty_name(global.ty);
                 // The value of one that is bound alone is its initializer.
-                let value = match binding.pattern.kind {
-                    PatternKind::Name(_) => src.text(binding.value.span),
+                let value = match (&binding.pattern.kind, &binding.value) {
+                    (PatternKind::Name(_), Some(value)) => src.text(value.span),
                     _ => String::new(),
                 };
                 Some(match value.is_empty() || value.len() > MAX_INITIALIZER {
@@ -1491,7 +1494,7 @@ impl Analysis {
                     return None;
                 };
                 let declared = src.text(binding.pattern.span);
-                let value = src.text(binding.value.span);
+                let value = src.text(binding.value.as_ref()?.span);
                 Some(format!("let {declared}: type = {value}"))
             }
             Item::Module(_) => {
@@ -1828,7 +1831,7 @@ impl<'p> Walk<'p> {
                 // `let _ = value` is the statement of a module.
                 let discards = matches!(binding.pattern.kind, PatternKind::Discard);
                 if self.statement && discards && item.span.start == self.site.offset {
-                    return self.find(Found::Statement(Some(&binding.value)));
+                    return self.find(Found::Statement(binding.value.as_ref()));
                 }
                 self.binding(binding)
             }
@@ -1985,7 +1988,7 @@ impl<'p> Walk<'p> {
     fn binding(&mut self, binding: &'p Binding) -> bool {
         self.pattern(&binding.pattern, binding_kind(binding))
             || binding.ty.as_ref().is_some_and(|ty| self.ty(ty))
-            || self.expr(&binding.value)
+            || binding.value.as_ref().is_some_and(|value| self.expr(value))
     }
 
     /// Looks for the place in the names that `pattern` binds, each a
@@ -4146,7 +4149,7 @@ fn main():
         let analysis = used(&mut files);
         let mut mended = |text: &str| -> Vec<(String, String)> {
             let (main, at) = files.at("main", text);
-            let actions = analysis.actions(&mut files, main, at..at + text.len(), &[]);
+            let actions = analysis.actions(&mut files, main, at..at + text.len(), &[], &[]);
             let actions = actions.into_iter().filter(|a| a.kind == ActionKind::Fix);
             let made = |action: Action| {
                 let mut made = USER.to_string();
@@ -4184,7 +4187,7 @@ fn main():
         assert_eq!(mended("let p"), []);
         // The body of an arm is indented as that of the arm before it.
         let (main, at) = files.at("main", "match s");
-        let arm = &analysis.actions(&mut files, main, at..at + 7, &[])[0].edits[0];
+        let arm = &analysis.actions(&mut files, main, at..at + 7, &[], &[])[0].edits[0];
         assert_eq!(arm.1, "\n        .empty:\n            pass");
         assert_eq!(&USER[arm.0.start - 5..arm.0.start], " pass");
     }
@@ -4218,12 +4221,114 @@ fn main():
         let analysis = analyze(program, &Settings::default());
         let unused = analysis.unused(files);
         let (main, at) = files.at("main", text);
-        analysis.actions(files, main, at..at + text.len(), &unused)
+        analysis.actions(files, main, at..at + text.len(), &unused, &analysis.apart())
     }
 
     /// One change, by its title and what it makes of the file it changes.
     fn change(title: &str, made: &str) -> Vec<(String, String)> {
         vec![(title.to_string(), made.to_string())]
+    }
+
+    #[test]
+    fn a_variable_declared_without_a_value_is_one_as_any_is() {
+        let main = "\
+pub fn main(c: bool) -> i32:
+    let x: i32
+    var (a, b): tuple(i32, bool)
+    let spare: i32
+    if c:
+        x = 1
+    else:
+        x = 2
+    a = x
+    b = c
+    return a
+";
+        let mut files = Memory(vec![("main", main)]);
+        let analysis = analysis(&mut files);
+        let mut hover = |text: &str| {
+            let (file, at) = files.at("main", text);
+            analysis.hover(&mut files, file, at).map(|hover| hover.text)
+        };
+        assert_eq!(hover("x = 2").as_deref(), Some("let x: i32"));
+        assert_eq!(hover("b = c").as_deref(), Some("var b: bool"));
+        // Its type is written, so none is shown.
+        let (file, _) = files.at("main", "fn");
+        assert!(analysis.hints(file, 0..main.len()).is_empty());
+        // What assigns to it names it, as what reads it does.
+        let unused = analysis.unused(&mut files);
+        let names: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
+        assert_eq!(names, ["spare"]);
+        assert_eq!(analysis.apart(), []);
+    }
+
+    #[test]
+    fn a_variable_declared_apart_from_its_value_is_declared_with_it() {
+        let main = "\
+extern:
+    fn next() -> i32
+fn main(c: bool) -> i32:
+    let joined: i32
+    next()
+    joined = next()
+    let branched: i32
+    if c:
+        branched = 1
+    else:
+        branched = 2
+    var (a, b): tuple(i32, i32)
+    a = 1
+    b = 2
+    var noted: i32  # why it is here
+    noted = joined
+    var named: i32
+    fn get() -> i32:
+        return 1
+    if c:
+        var named = 2
+        named = get()
+        named = get()
+    named = get()
+    var read: i32
+    next() + read
+    read = 1
+    while c:
+        var each: &var i32
+        each = 1 as &var i32
+    return joined + branched + a + b + noted + named + read
+";
+        let mut files = Memory(vec![("main", main)]);
+        let (program, _) = load::load_partial(&mut files);
+        let analysis = analyze(program, &Settings::default());
+        let show = |apart: &Apart| {
+            assert_eq!(&main[apart.span.start..apart.span.end], apart.name);
+            let line = main[..apart.span.start].matches('\n').count() + 1;
+            format!("{line}: {}", apart.name)
+        };
+        // Only where the next statement of its block to name it assigns
+        // it, whatever else is there.
+        assert_eq!(
+            analysis.apart().iter().map(show).collect::<Vec<_>>(),
+            ["4: joined", "15: noted", "29: each"]
+        );
+        let fix = ActionKind::Fix;
+        let made = main
+            .replace("    let joined: i32\n", "")
+            .replace("    joined = next()\n", "    let joined: i32 = next()\n");
+        assert_eq!(
+            changes(&mut files, "joined: i32", fix),
+            change("Declare `joined` where it is assigned", &made)
+        );
+        let made = main
+            .replace("        var each: &var i32\n", "")
+            .replace("        each = 1 as", "        var each: &var i32 = 1 as");
+        assert_eq!(
+            changes(&mut files, "each: &var", fix),
+            change("Declare `each` where it is assigned", &made)
+        );
+        // A comment on its line is not taken away with it.
+        assert_eq!(changes(&mut files, "noted: i32", fix), []);
+        assert_eq!(changes(&mut files, "branched: i32", fix), []);
     }
 
     #[test]

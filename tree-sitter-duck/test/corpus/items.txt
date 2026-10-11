@@ -774,6 +774,42 @@ pub var counter: i32 = 0
     (integer)))
 
 ====================
+Bindings without a value
+====================
+
+fn f():
+    let x: i32
+    var (a, b): tuple(i32, bool)
+    x = 1
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (binding
+        (identifier)
+        (named_type
+          (identifier)))
+      (binding
+        (tuple_pattern
+          (identifier)
+          (identifier))
+        (named_type
+          (identifier)
+          (type_arguments
+            (named_type
+              (identifier))
+            (named_type
+              (identifier)))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (integer))))))
+
+====================
 Patterns
 ====================
 

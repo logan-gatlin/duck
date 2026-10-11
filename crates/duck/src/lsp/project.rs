@@ -18,7 +18,7 @@ use duck_compiler::file::{FileId, FileManager, Included, Settings};
 use duck_compiler::lex::Span;
 use duck_compiler::load::Parsed;
 use duck_compiler::ty::{
-    self, ActionKind, Analysis, Completion, CompletionKind, HintKind, Signature, Symbol,
+    self, ActionKind, Analysis, Apart, Completion, CompletionKind, HintKind, Signature, Symbol,
     SymbolKind, TypeErrorKind, Unused,
 };
 use duck_compiler::world::WorldError;
@@ -68,6 +68,8 @@ struct Checked {
     /// What it declares and never uses, if it loaded whole: a build that
     /// didn't doesn't know what it uses.
     unused: Vec<Unused>,
+    /// What it declares apart from its value, if it loaded whole.
+    apart: Vec<Apart>,
 }
 
 /// The builds of a package that use a file, checked with the file as a
@@ -294,8 +296,9 @@ impl Project {
                 buffers,
             };
             checked.unused = checked.analysis.unused(&mut files);
+            checked.apart = checked.analysis.apart();
         }
-        self.warnings = self.unused(buffers);
+        self.warnings = self.warned(buffers);
         problems
     }
 
@@ -309,13 +312,15 @@ impl Project {
 
     /// What the package declares and never uses, as it was last checked:
     /// nothing is wrong with it, but something was likely meant to use it.
+    /// And what it declares apart from its value, which one line would say.
     pub fn warnings(&self) -> &[Problem] {
         &self.warnings
     }
 
     /// What every build of the package that uses a file agrees is declared
-    /// in it and never used, of the files of the package itself.
-    fn unused(&mut self, buffers: Buffers<'_>) -> Vec<Problem> {
+    /// in it and never used, or declared apart from its value, of the files
+    /// of the package itself.
+    fn warned(&mut self, buffers: Buffers<'_>) -> Vec<Problem> {
         let root = self.root.clone();
         let mut found: Vec<Vec<Problem>> = Vec::new();
         for checked in &mut self.checked {
@@ -329,7 +334,15 @@ impl Project {
                 code: unused.kind.code(),
                 notes: Vec::new(),
             };
-            found.push(checked.unused.iter().map(problem).collect());
+            let mut problems: Vec<_> = checked.unused.iter().map(problem).collect();
+            let problem = |apart: &Apart| Problem {
+                place: files.place(apart.span),
+                message: format!("`{}` is declared apart from its value", apart.name),
+                code: Apart::CODE,
+                notes: Vec::new(),
+            };
+            problems.extend(checked.apart.iter().map(problem));
+            found.push(problems);
         }
         let mut warnings: Vec<Problem> = Vec::new();
         for (build, unused) in found.iter().enumerate() {
@@ -468,17 +481,21 @@ impl Project {
     /// Nothing is, of a package that doesn't load: its errors are not those
     /// of what it means.
     pub fn mends(&mut self, buffers: Buffers<'_>, path: &Path, within: Range) -> Vec<Mend> {
-        self.offered(buffers, path, |analysis, files, file, src, unused| {
-            let within = offset(src, within.start)..offset(src, within.end);
-            analysis.actions(files, file, within, unused)
-        })
+        self.offered(
+            buffers,
+            path,
+            |analysis, files, file, src, unused, apart| {
+                let within = offset(src, within.start)..offset(src, within.end);
+                analysis.actions(files, file, within, unused, apart)
+            },
+        )
     }
 
     /// The change that puts the `use` lines of the file at the canonical
     /// path `path` in order, as the package was last checked, if they
     /// aren't.
     pub fn organized(&mut self, buffers: Buffers<'_>, path: &Path) -> Option<Mend> {
-        let organized = self.offered(buffers, path, |analysis, files, file, _, unused| {
+        let organized = self.offered(buffers, path, |analysis, files, file, _, unused, _| {
             let organized = analysis.organized(files, file, unused);
             organized.into_iter().collect()
         });
@@ -488,12 +505,13 @@ impl Project {
     /// The changes that `offer` makes of the first build that uses the file
     /// at the canonical path `path` and has any, as the package was last
     /// checked: of its analysis, its files, which of them the file is, its
-    /// source, and what the build never uses that is warned of.
+    /// source, and what the build never uses and what it declares apart
+    /// from its value that are warned of.
     fn offered(
         &mut self,
         buffers: Buffers<'_>,
         path: &Path,
-        offer: impl Fn(&Analysis, &mut Overlay, FileId, &str, &[Unused]) -> Vec<ty::Action>,
+        offer: impl Fn(&Analysis, &mut Overlay, FileId, &str, &[Unused], &[Apart]) -> Vec<ty::Action>,
     ) -> Vec<Mend> {
         let whole = self.checked.iter().all(|checked| checked.whole);
         let warnings = &self.warnings;
@@ -504,16 +522,20 @@ impl Project {
                 buffers,
             };
             let src = files.contents(file);
-            // Only what every build agrees is unused is.
-            let mut warned = |unused: &Unused| {
-                let place = files.place(unused.span);
+            // Only what every build agrees is unused is, or is apart.
+            let mut warned = |span: Span| {
+                let place = files.place(span);
                 warnings.iter().any(|warning| warning.place == place)
             };
             let unused: Vec<_> = (checked.unused.iter())
-                .filter(|unused| warned(unused))
+                .filter(|unused| warned(unused.span))
                 .cloned()
                 .collect();
-            let actions = offer(&checked.analysis, &mut files, file, &src, &unused);
+            let apart: Vec<_> = (checked.apart.iter())
+                .filter(|apart| warned(apart.span))
+                .cloned()
+                .collect();
+            let actions = offer(&checked.analysis, &mut files, file, &src, &unused, &apart);
             let mut mend = |action: ty::Action| Mend {
                 title: action.title,
                 kind: action.kind,
@@ -977,6 +999,7 @@ impl Project {
                         analysis,
                         whole,
                         unused: Vec::new(),
+                        apart: Vec::new(),
                     }));
                     found
                 }
@@ -1694,6 +1717,44 @@ pub(crate) mod tests {
         let buffers = |path: &Path| (path == main).then_some(half.as_str());
         assert_eq!(project.check(&buffers).len(), 1);
         assert_eq!(project.mends(&buffers, &main, line), []);
+    }
+
+    #[test]
+    fn a_variable_declared_apart_from_its_value_is_warned_of() {
+        let (dir, mut project) = package("apart");
+        let main = dir.0.join("app/main.duck");
+        let src = "pub fn main() -> i32:\n    let total: i32\n    total = 1\n    return total\n";
+        let buffers = |path: &Path| (path == main).then_some(src);
+        assert_eq!(project.check(&buffers), []);
+        let said = |problem: &Problem| {
+            let Position { line, character } = problem.place.range.start;
+            format!("{line}:{character} {}: {}", problem.code, problem.message)
+        };
+        assert_eq!(
+            project.warnings().iter().map(said).collect::<Vec<_>>(),
+            ["1:8 declared-apart: `total` is declared apart from its value"]
+        );
+        let line = Range::new(Position::new(1, 0), Position::new(2, 0));
+        let place = |range: Range| Place {
+            path: main.clone(),
+            range,
+        };
+        assert_eq!(
+            project.mends(&buffers, &main, line),
+            [Mend {
+                title: "Declare `total` where it is assigned".to_string(),
+                edits: vec![
+                    (place(line), String::new()),
+                    (
+                        place(Range::new(Position::new(2, 4), Position::new(2, 9))),
+                        "let total: i32".to_string()
+                    ),
+                ],
+                kind: ActionKind::Fix,
+                fixes: Some((project.warnings()[0].place.range, "declared-apart")),
+                preferred: true,
+            }]
+        );
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub(super) struct Capture {
     var: bool,
     /// Whether a `fn` in a function declares it.
     func: bool,
+    /// Where the body first names it.
+    at: Span,
 }
 
 /// The names that the body of a function declared in a function mentions
@@ -64,13 +66,15 @@ pub(super) struct Capture {
 struct Free<'p> {
     /// The names in scope that the function binds, innermost last.
     bound: Vec<&'p str>,
-    /// Those found so far, in the order they are first mentioned.
-    names: Vec<&'p str>,
+    /// Those found so far, in the order they are first mentioned, each
+    /// with where that is.
+    names: Vec<(&'p str, Span)>,
 }
 
 impl<'p> Free<'p> {
-    /// The names free in the function `decl`.
-    fn of(decl: &'p parse::FnDecl) -> Vec<&'p str> {
+    /// The names free in the function `decl`, each with where it is first
+    /// mentioned.
+    fn of(decl: &'p parse::FnDecl) -> Vec<(&'p str, Span)> {
         let mut free = Self::default();
         free.function(decl);
         free.names
@@ -111,7 +115,9 @@ impl<'p> Free<'p> {
         match &stmt.kind {
             // A name is bound once its value is evaluated.
             StmtKind::Binding(binding) => {
-                self.expr(&binding.value);
+                if let Some(value) = &binding.value {
+                    self.expr(value);
+                }
                 self.bind(&binding.pattern);
             }
             StmtKind::Expr(expr) => self.expr(expr),
@@ -182,12 +188,12 @@ impl<'p> Free<'p> {
         visit::expr(expr, &mut |node| {
             if let Node::Expr(parse::Expr {
                 kind: ExprKind::Name(name),
-                ..
+                span,
             }) = node
                 && !self.bound.contains(&name.as_str())
-                && !self.names.contains(&name.as_str())
+                && !self.names.iter().any(|(found, _)| found == name)
             {
-                self.names.push(name);
+                self.names.push((name, *span));
             }
         });
     }
@@ -454,14 +460,15 @@ impl Body<'_> {
     fn captured(&self, decl: &parse::FnDecl) -> Vec<Capture> {
         let named = Free::of(decl).into_iter();
         let mut captures: Vec<_> = named
-            .filter_map(|name| self.lookup(name).map(|var| (name, var)))
+            .filter_map(|(name, at)| self.lookup(name).map(|var| (name, at, var)))
             .collect();
-        captures.sort_by_key(|(_, var)| var.order);
-        let capture = |(name, var): (&str, &Var)| Capture {
+        captures.sort_by_key(|(_, _, var)| var.order);
+        let capture = |(name, at, var): (&str, Span, &Var)| Capture {
             name: name.to_string(),
             ty: var.ty,
             var: var.mutable || var.captured,
             func: var.func,
+            at,
         };
         captures.into_iter().map(capture).collect()
     }
@@ -525,6 +532,8 @@ impl Body<'_> {
         // A copy of each variable it captures, as it is now.
         let mut held = Vec::new();
         for capture in self.ck.captures(id).to_vec() {
+            // It is read here, for the body to name.
+            self.reads(&capture.name, capture.at);
             let var = self
                 .lookup(&capture.name)
                 .expect("in scope where it is declared");

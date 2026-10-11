@@ -39,16 +39,26 @@ pub(crate) fn each<'p>(item: &'p parse::Item, visit: &mut dyn FnMut(Node<'p>)) {
                 expr(value, visit);
             }
         }
-        ItemKind::Binding(binding) => expr(&binding.value, visit),
+        ItemKind::Binding(binding) => {
+            if let Some(value) = &binding.value {
+                expr(value, visit);
+            }
+        }
         ItemKind::Union(_) | ItemKind::Use(_) => {}
     }
 }
 
-fn block<'p>(block: &'p [parse::Stmt], visit: &mut dyn FnMut(Node<'p>)) {
+/// Calls `visit` with every statement of `block` and every statement and
+/// expression in each, each before those within it.
+pub(crate) fn block<'p>(block: &'p [parse::Stmt], visit: &mut dyn FnMut(Node<'p>)) {
     for stmt in block {
         visit(Node::Stmt(stmt));
         match &stmt.kind {
-            StmtKind::Binding(binding) => expr(&binding.value, visit),
+            StmtKind::Binding(binding) => {
+                if let Some(value) = &binding.value {
+                    expr(value, visit);
+                }
+            }
             StmtKind::Expr(value) => expr(value, visit),
             StmtKind::If {
                 cond,

@@ -287,7 +287,7 @@ impl Body<'_> {
             }
         }
         let checked = args.iter().map(|_| None).collect();
-        self.bound_args(&params, &defaults, args, binding, checked)
+        self.bound_args(&params, &defaults, args, binding, checked, None)
     }
 }
 

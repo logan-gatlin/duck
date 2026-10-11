@@ -436,9 +436,13 @@ impl Body<'_> {
     ) -> Stmt {
         self.scopes.push(HashMap::new());
         let (place, dests) = self.for_bindings(index, pattern, Ty::Enum(id));
+        self.enter_round();
+        // An enum may have no members to run it for.
+        let skipped = self.flow.clone();
         self.labels.push(Label::Break);
         let (body, _) = self.maybe(|lowered| lowered.labelled(Label::Continue, body));
         self.labels.pop();
+        self.end_round(skipped);
         self.scopes.pop();
         let members = self.ck.enums[id.0 as usize].members.iter();
         let copies = members

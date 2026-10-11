@@ -180,13 +180,14 @@ pub struct Variant {
 }
 
 /// `let pattern: Type = value` or `var pattern: Type = value`. The type is
-/// optional.
+/// optional, and so is the value: `let pattern: Type` declares variables
+/// that are assigned later.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
     pub mutability: Mutability,
     pub pattern: Pattern,
     pub ty: Option<Type>,
-    pub value: Expr,
+    pub value: Option<Expr>,
 }
 
 /// What a binding assigns its value to, or an arm of a `match` tests its
@@ -1136,8 +1137,14 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.expect(TokenKind::Eq)?;
-        let value = self.expr()?;
+        // Its line ends where it has no value.
+        let value = match self.peek().kind {
+            TokenKind::Newline => None,
+            _ => {
+                self.expect(TokenKind::Eq)?;
+                Some(self.expr()?)
+            }
+        };
         self.expect(TokenKind::Newline)?;
         Ok(Binding {
             mutability: kind,
@@ -2131,7 +2138,7 @@ mod tests {
         let ItemKind::Binding(binding) = &module.items[0].kind else {
             unreachable!()
         };
-        sexpr(&binding.value)
+        sexpr(binding.value.as_ref().unwrap())
     }
 
     fn sexpr(expr: &Expr) -> String {
@@ -2320,22 +2327,22 @@ mod tests {
         };
         assert_eq!(global.mutability, Mutability::Let);
         assert_eq!(global.pattern.kind, PatternKind::Name("global".to_string()));
-        assert_eq!(global.value.kind, ExprKind::Bool(true));
+        assert_eq!(global.value.as_ref().unwrap().kind, ExprKind::Bool(true));
 
         let ItemKind::Binding(counter) = &counter.kind else {
             panic!()
         };
         assert_eq!(counter.mutability, Mutability::Var);
-        assert_eq!(counter.value.kind, ExprKind::Int(0));
+        assert_eq!(counter.value.as_ref().unwrap().kind, ExprKind::Int(0));
 
         let ItemKind::Binding(greeting) = &greeting.kind else {
             panic!()
         };
-        assert_eq!(sexpr(&greeting.value), r#""Hello, duck!""#);
+        assert_eq!(sexpr(greeting.value.as_ref().unwrap()), r#""Hello, duck!""#);
         let ItemKind::Binding(primes) = &primes.kind else {
             panic!()
         };
-        assert_eq!(sexpr(&primes.value), "[2 3 5 7]");
+        assert_eq!(sexpr(primes.value.as_ref().unwrap()), "[2 3 5 7]");
 
         let ItemKind::Struct(point) = &point.kind else {
             panic!()
@@ -2550,7 +2557,7 @@ mod tests {
             let ItemKind::Binding(binding) = &module.items[0].kind else {
                 panic!()
             };
-            sexpr(&binding.value)
+            sexpr(binding.value.as_ref().unwrap())
         };
         assert_eq!(value("let _ = (1,)\n"), "(tuple 1)");
         assert_eq!(value("let _ = (1)\n"), "1");
@@ -2558,6 +2565,55 @@ mod tests {
         assert_eq!(
             errors("fn f():\n    (a, b) = (b, a)\n"),
             vec![ParseErrorKind::InvalidAssignTarget]
+        );
+    }
+
+    #[test]
+    fn bindings_without_a_value() {
+        let src = "fn f():\n    let x: i32\n    var (a, b): tuple(i32, bool)\n    let y\n";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        let bindings: Vec<_> = f
+            .body
+            .iter()
+            .map(|stmt| match &stmt.kind {
+                StmtKind::Binding(binding) => binding,
+                _ => panic!(),
+            })
+            .collect();
+        let rendered: Vec<_> = bindings
+            .iter()
+            .map(|binding| {
+                let ty = binding.ty.as_ref().map(render_ty);
+                (binding.mutability, render_pattern(&binding.pattern), ty)
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (Mutability::Let, "x".to_string(), Some("i32".to_string())),
+                (
+                    Mutability::Var,
+                    "(a b)".to_string(),
+                    Some("tuple(i32, bool)".to_string())
+                ),
+                (Mutability::Let, "y".to_string(), None),
+            ]
+        );
+        assert!(bindings.iter().all(|binding| binding.value.is_none()));
+        // One of a module parses too, for what checks it to say it needs
+        // a value.
+        parse_src("pub var counter: i32\n").unwrap();
+        // What isn't the end of the line is to be a value.
+        assert_eq!(
+            errors("let x: i32 1\n"),
+            vec![expected("`=`", TokenKind::Int(1))]
+        );
+        assert_eq!(
+            errors("let x =\n"),
+            vec![expected("expression", TokenKind::Newline)]
         );
     }
 
@@ -2886,7 +2942,7 @@ mod tests {
         let StmtKind::Binding(binding) = &f.body[0].kind else {
             panic!()
         };
-        assert_eq!(sexpr(&binding.value), "(|> 1 (call g _))");
+        assert_eq!(sexpr(binding.value.as_ref().unwrap()), "(|> 1 (call g _))");
         assert_eq!(f.body.len(), 2);
 
         // In the head of a block, the body of the block is indented as usual.

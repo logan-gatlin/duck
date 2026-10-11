@@ -1,11 +1,14 @@
 //! What a program declares and never uses: nothing is wrong with it, but
-//! something was likely meant to use it.
+//! something was likely meant to use it. And what it declares apart from
+//! the value that it is given at once, which says in two lines what one
+//! does.
 
 use std::collections::HashSet;
+use std::slice;
 
 use crate::file::{FileId, FileManager};
 use crate::lex::Span;
-use crate::parse::{Ident, ItemKind, StmtKind};
+use crate::parse::{self, ExprKind, Ident, ItemKind, Mutability, PatternKind, StmtKind};
 use crate::visit::{self, Node};
 
 use super::symbols::bound;
@@ -29,6 +32,28 @@ pub enum UnusedKind {
     TypeParam,
     /// A name that a `use` gives.
     Use,
+}
+
+/// A variable declared without a value that the next statement of its
+/// block to name it assigns one, whatever else is so: it has no need to be
+/// declared apart from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Apart {
+    pub name: String,
+    /// Where it is named, where it is declared.
+    pub span: Span,
+    /// The statement that declares it.
+    pub(super) declared: Span,
+    pub(super) mutability: Mutability,
+    /// Where its type is written.
+    pub(super) ty: Span,
+    /// Where the assignment names it.
+    pub(super) assigned: Span,
+}
+
+impl Apart {
+    /// What names the kind of warning, as [`UnusedKind::code`] does.
+    pub const CODE: &'static str = "declared-apart";
 }
 
 impl UnusedKind {
@@ -187,4 +212,120 @@ impl Analysis {
         unused.sort_by_key(place);
         unused
     }
+
+    /// Each variable that the program declares without a value and then
+    /// assigns one where it may as well be declared with it: the next
+    /// statement of its block that names it assigns it whole. Only a name
+    /// declared alone is among them, as a tuple of names is assigned one
+    /// at a time.
+    pub fn apart(&self) -> Vec<Apart> {
+        let mut apart = Vec::new();
+        for item in &self.program.items {
+            if let ItemKind::Fn(decl) = &item.kind {
+                apart.extend(apart_in(&decl.body));
+            }
+            visit::each(item, &mut |node| {
+                let Node::Stmt(stmt) = node else {
+                    return;
+                };
+                match &stmt.kind {
+                    StmtKind::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        apart.extend(apart_in(then_body));
+                        apart.extend(else_body.iter().flat_map(|body| apart_in(body)));
+                    }
+                    StmtKind::While { body, .. }
+                    | StmtKind::For { body, .. }
+                    | StmtKind::Defer(body) => apart.extend(apart_in(body)),
+                    StmtKind::Match { arms, .. } => {
+                        apart.extend(arms.iter().flat_map(|arm| apart_in(&arm.body)));
+                    }
+                    StmtKind::Fn(decl) => apart.extend(apart_in(&decl.body)),
+                    StmtKind::Binding(_) | StmtKind::Expr(_) | StmtKind::Pass => {}
+                }
+            });
+        }
+        // In the order they are written, file by file.
+        let order = self.files();
+        let place = |apart: &Apart| {
+            let file = order.iter().position(|file| *file == apart.span.file);
+            (file, apart.span.start)
+        };
+        apart.sort_by_key(place);
+        apart
+    }
+}
+
+/// Each variable that a statement of `block` itself declares apart from
+/// the value that a later one of them gives it.
+fn apart_in(block: &[parse::Stmt]) -> impl Iterator<Item = Apart> {
+    block.iter().enumerate().filter_map(|(i, stmt)| {
+        let StmtKind::Binding(binding) = &stmt.kind else {
+            return None;
+        };
+        let (PatternKind::Name(name), Some(ty), None) =
+            (&binding.pattern.kind, &binding.ty, &binding.value)
+        else {
+            return None;
+        };
+        // The next of them that has anything to do with it.
+        let next = block[i + 1..]
+            .iter()
+            .find(|stmt| binds(stmt, name) || mentions(stmt, name))?;
+        let StmtKind::Expr(parse::Expr {
+            kind:
+                ExprKind::Assign {
+                    target,
+                    op: None,
+                    value,
+                },
+            ..
+        }) = &next.kind
+        else {
+            return None;
+        };
+        let named =
+            |expr: &parse::Expr| matches!(&expr.kind, ExprKind::Name(found) if found == name);
+        let mut reads = false;
+        visit::expr(value, &mut |node| {
+            reads |= matches!(node, Node::Expr(expr) if named(expr));
+        });
+        (named(target) && !reads).then(|| Apart {
+            name: name.clone(),
+            span: binding.pattern.span,
+            declared: stmt.span,
+            mutability: binding.mutability,
+            ty: ty.span,
+            assigned: target.span,
+        })
+    })
+}
+
+/// Whether `stmt` binds `name` for the statements of its block that follow
+/// it, so that it is another that they name.
+fn binds(stmt: &parse::Stmt, name: &str) -> bool {
+    match &stmt.kind {
+        StmtKind::Binding(binding) => {
+            let mut names = Vec::new();
+            bound(&binding.pattern, &mut names);
+            names.iter().any(|(bound, _)| *bound == name)
+        }
+        StmtKind::Fn(decl) => decl.sig.name.name == name,
+        _ => false,
+    }
+}
+
+/// Whether `stmt` names `name` as a value, anywhere in it.
+fn mentions(stmt: &parse::Stmt, name: &str) -> bool {
+    let mut mentions = false;
+    visit::block(slice::from_ref(stmt), &mut |node| {
+        mentions |= matches!(
+            node,
+            Node::Expr(parse::Expr { kind: ExprKind::Name(found), .. }) if found == name
+        );
+    });
+    mentions
 }
