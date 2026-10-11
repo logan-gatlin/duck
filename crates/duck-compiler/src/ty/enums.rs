@@ -12,7 +12,8 @@ use crate::load::Program;
 use crate::parse::{self, EnumDecl, ExprKind, Ident, ItemKind, Pattern};
 
 use super::{
-    Body, Checker, EnumId, Item, Label, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, zero,
+    Body, Checker, EnumId, Item, Label, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit,
+    similar, zero,
 };
 
 pub(super) struct EnumDef {
@@ -409,7 +410,9 @@ impl Body<'_> {
                 ty: name,
                 member: field.name.clone(),
             };
-            self.error(kind, field.span);
+            let members = def.members.iter().map(|member| member.name.as_str());
+            let similar = similar::nearest(&field.name, members);
+            self.ck.error_near(kind, field.span, similar);
             return Some((Ty::Error, Value::default()));
         };
         if !self.folded(item, &name, field.span) {

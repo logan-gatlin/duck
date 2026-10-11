@@ -48,6 +48,7 @@ mod inspect;
 mod nested;
 mod opaque;
 mod patterns;
+mod similar;
 mod unions;
 mod wit;
 
@@ -177,6 +178,23 @@ const NEVER: &str = "never";
 
 /// The name of the built-in type that a function's result hides.
 const OPAQUE: &str = "opaque";
+
+/// Every primitive type.
+const PRIMS: [Prim; 13] = [
+    Prim::I8,
+    Prim::I16,
+    Prim::I32,
+    Prim::I64,
+    Prim::Int,
+    Prim::U8,
+    Prim::U16,
+    Prim::U32,
+    Prim::U64,
+    Prim::Uint,
+    Prim::F32,
+    Prim::F64,
+    Prim::Bool,
+];
 
 /// The fields of every array, in order.
 const ARRAY_FIELDS: [&str; 2] = ["ptr", "len"];
@@ -328,6 +346,10 @@ pub struct TypeError {
     /// at the call that led to it, the instances the call led to, outermost
     /// first: each but the last calls the next, and the last has the error.
     pub instances: Vec<InstanceSite>,
+    /// For an error that says a name names nothing, the name nearest it of
+    /// those that could be written there, if one is near enough to have
+    /// been meant.
+    pub similar: Option<String>,
 }
 
 /// An instance of a generic function, and where in its body it calls the
@@ -2081,15 +2103,26 @@ impl TypeError {
             kind,
             span: None,
             instances: Vec::new(),
+            similar: None,
+        }
+    }
+
+    /// What the error says: what is wrong, and then the name that was
+    /// likely meant, if it has one.
+    pub fn message(&self) -> String {
+        match &self.similar {
+            Some(similar) => format!("{}; did you mean `{similar}`?", self.kind),
+            None => self.kind.to_string(),
         }
     }
 }
 
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = self.message();
         match self.span {
-            Some(span) => write!(f, "{} at {}..{}", self.kind, span.start, span.end)?,
-            None => self.kind.fmt(f)?,
+            Some(span) => write!(f, "{message} at {}..{}", span.start, span.end)?,
+            None => message.fmt(f)?,
         }
         for site in &self.instances {
             let span = site.span;
@@ -2217,6 +2250,13 @@ impl Checker {
     /// is reported at the call that led to the instance, with `span` as
     /// where in the instance it is.
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
+        self.error_near(kind, span, None);
+    }
+
+    /// Reports an error at `span`, as [`Self::error`] does, that says a
+    /// name names nothing: `similar` is the nearest of those that could be
+    /// written there, if one is near.
+    fn error_near(&mut self, kind: TypeErrorKind, span: Span, similar: Option<String>) {
         if let TypeErrorKind::UnknownName(name) | TypeErrorKind::UnknownType(name) = &kind
             && self.unresolved.contains(&(self.module, name.clone()))
         {
@@ -2234,7 +2274,31 @@ impl Checker {
             kind,
             span: Some(span),
             instances,
+            similar,
         });
+    }
+
+    /// The name nearest `name`, which names nothing, of the items of the
+    /// current module that `meant` holds of.
+    fn near_item(&self, name: &str, meant: impl Fn(Item) -> bool) -> Option<String> {
+        let scope = self.scopes.get(&self.module).into_iter().flatten();
+        let items = scope.filter(|(_, entry)| meant(entry.item));
+        similar::nearest(name, items.map(|(name, _)| name.as_str()))
+    }
+
+    /// The name nearest `name`, which names no type, of the types that
+    /// could be written for it: a type parameter in scope, a type of the
+    /// current module, or one of the language's own.
+    fn near_type(&self, name: &str) -> Option<String> {
+        let params = self.type_params.iter().map(|(param, _)| param.as_str());
+        let is_type =
+            |item: &Item| matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Alias(_));
+        let scope = self.scopes.get(&self.module).into_iter().flatten();
+        let items = scope.filter(|(_, entry)| is_type(&entry.item));
+        let items = items.map(|(name, _)| name.as_str());
+        let prims = PRIMS.iter().map(|prim| prim.name());
+        let builtins = [ARRAY, VARRAY, STRING, TUPLE, OPTION, RESULT, NEVER];
+        similar::nearest(name, params.chain(items).chain(prims).chain(builtins))
     }
 
     /// Keeps `ty` as the type of what is written at `span`, if types are
@@ -2514,7 +2578,10 @@ impl Checker {
                     module: path.to_string(),
                     item: name.name.clone(),
                 };
-                self.error(kind, name.span);
+                let scope = self.scopes.get(&module).into_iter().flatten();
+                let seen = scope.filter(|(_, entry)| entry.is_pub || module == self.module);
+                let similar = similar::nearest(&name.name, seen.map(|(name, _)| name.as_str()));
+                self.error_near(kind, name.span, similar);
                 None
             }
         }
@@ -3223,6 +3290,7 @@ impl Checker {
             kind,
             span: None,
             instances: Vec::new(),
+            similar: None,
         });
     }
 
@@ -3237,11 +3305,8 @@ impl Checker {
             return None;
         }
         let Some(Item::Func(id)) = self.item(name) else {
-            self.errors.push(TypeError {
-                kind: TypeErrorKind::UnknownStart(name.to_string()),
-                span: None,
-                instances: Vec::new(),
-            });
+            let kind = TypeErrorKind::UnknownStart(name.to_string());
+            self.error_nowhere(kind);
             return None;
         };
         let sig = &self.funcs[id.0 as usize];
@@ -3403,7 +3468,10 @@ impl Checker {
             TypeKind::Qualified(module, inner) => match self.item(&module.name) {
                 Some(Item::Module(target)) => self.resolve_member_ty(target, &module.name, inner),
                 _ => {
-                    self.error(TypeErrorKind::UnknownName(module.name.clone()), module.span);
+                    let is_module = |item| matches!(item, Item::Module(_));
+                    let similar = self.near_item(&module.name, is_module);
+                    let kind = TypeErrorKind::UnknownName(module.name.clone());
+                    self.error_near(kind, module.span, similar);
                     Ty::Error
                 }
             },
@@ -3480,7 +3548,12 @@ impl Checker {
             (None, None) => self.type_arity(name),
         };
         let Some(arity) = arity else {
-            self.error(TypeErrorKind::UnknownType(name.to_string()), span);
+            // What another module has is as it is there.
+            let similar = match member {
+                Some(_) => None,
+                None => self.near_type(name),
+            };
+            self.error_near(TypeErrorKind::UnknownType(name.to_string()), span, similar);
             return Ty::Error;
         };
         if let Some(kind) = arity.check(name, args.as_ref().map(Vec::len)) {
@@ -3983,7 +4056,18 @@ impl Checker {
                 ty: self.ty_name(written),
                 field: field.name.clone(),
             };
-            self.error(kind, field.span);
+            // Those of the fields it has that are read where this one is.
+            let fields: Vec<&str> = match ty {
+                Ty::Struct(id) if self.union_id(ty).is_none() => {
+                    let fields = self.structs[id.0 as usize].fields.iter().enumerate();
+                    let seen = fields.filter(|(i, _)| self.sees_field(id, *i, self.module));
+                    seen.map(|(_, def)| def.name.as_str()).collect()
+                }
+                Ty::Array(_) => ARRAY_FIELDS.to_vec(),
+                _ => Vec::new(),
+            };
+            let similar = similar::nearest(&field.name, fields);
+            self.error_near(kind, field.span, similar);
         }
         None
     }
@@ -4460,8 +4544,22 @@ impl<'c> Body<'c> {
         }
     }
 
+    /// Reports an error at `span`, as [`Checker::error`] does. A name that
+    /// names nothing is reported with the nearest of those in scope: the
+    /// variables and the functions of the body, and the items of its
+    /// module.
     fn error(&mut self, kind: TypeErrorKind, span: Span) {
-        self.ck.error(kind, span);
+        let similar = match &kind {
+            TypeErrorKind::UnknownName(name) => {
+                let locals = self.scopes.iter().flat_map(|scope| scope.keys());
+                let fns = self.fns.iter().map(|(name, _)| name);
+                let items = self.ck.scopes.get(&self.ck.module).into_iter().flatten();
+                let names = locals.chain(fns).chain(items.map(|(name, _)| name));
+                similar::nearest(name, names.map(String::as_str))
+            }
+            _ => None,
+        };
+        self.ck.error_near(kind, span, similar);
     }
 
     /// Whether the constants of item `index` of the program are folded,
@@ -8491,6 +8589,59 @@ fn scoped(ok: bool, n: i32) -> i32:
     }
 
     #[test]
+    fn a_name_that_names_nothing_is_reported_with_the_nearest_that_does() {
+        let src = "\
+struct Point:
+    across: f32
+    up: f32
+enum(u8) Color:
+    red
+    green
+union Shape:
+    circle: f32
+    empty
+fn(Item) first(items: array(Item)) -> Itm:
+    return items[0]
+fn area(shape: Shape, tint: Color, text: array(u8)) -> f32:
+    let total: f32 = 1.0
+    let p = Pont(across: totl, up: 2.0)
+    let names: arrray(u8) = \"\"
+    let warm: Colour = Color.rad
+    let cold: Color = .gren
+    let q = Point(across: total, up: 2.0)
+    let none: Shape = .emty
+    match shape:
+        .circel(r):
+            return r + q.acros
+        .empty:
+            return aera(none, tint) + text.lenn as f32
+";
+        let said: Vec<_> = check_src(src).unwrap_err();
+        let said: Vec<_> = said.iter().map(TypeError::message).collect();
+        assert_eq!(
+            said,
+            [
+                "unknown type `Itm`; did you mean `Item`?",
+                "unknown name `Pont`; did you mean `Point`?",
+                "unknown name `totl`; did you mean `total`?",
+                "unknown type `arrray`; did you mean `array`?",
+                "unknown type `Colour`; did you mean `Color`?",
+                "`Color` has no member `rad`; did you mean `red`?",
+                "`Color` has no member `gren`; did you mean `green`?",
+                "`Shape` has no variant `emty`; did you mean `empty`?",
+                "`Shape` has no variant `circel`; did you mean `circle`?",
+                "`Point` has no field `acros`; did you mean `across`?",
+                "unknown name `aera`; did you mean `area`?",
+                "`array(u8)` has no field `lenn`; did you mean `len`?",
+            ]
+        );
+        // A name that nothing is near is only unknown.
+        let said = check_src("fn f(count: i32) -> i32:\n    return size + cuonter\n").unwrap_err();
+        let said: Vec<_> = said.iter().map(TypeError::message).collect();
+        assert_eq!(said, ["unknown name `size`", "unknown name `cuonter`"]);
+    }
+
+    #[test]
     fn break_and_continue_are_expressions() {
         let src = "\
 fn over(limit: i32) -> i32:
@@ -10451,11 +10602,9 @@ fn generic(T: type):
         for name in ["nope", "S", "g"] {
             assert_eq!(
                 start(name),
-                Err(vec![TypeError {
-                    kind: TypeErrorKind::UnknownStart(name.into()),
-                    span: None,
-                    instances: Vec::new(),
-                }])
+                Err(vec![TypeError::nowhere(TypeErrorKind::UnknownStart(
+                    name.into()
+                ))])
             );
         }
         for name in ["take", "back", "get", "generic"] {
@@ -14142,11 +14291,7 @@ fn f(p: &var u8):
             };
             check_with(src, &settings).err().unwrap_or_default()
         };
-        let spanless = |kind| TypeError {
-            kind,
-            span: None,
-            instances: Vec::new(),
-        };
+        let spanless = TypeError::nowhere;
         assert_eq!(errors("let s = \"\"\n", 0, Some(0)), []);
         assert_eq!(errors("let s = \"ab\"\n", 65534, Some(1)), []);
         assert_eq!(
@@ -14209,11 +14354,7 @@ fn f() -> array(u8):
 
     #[test]
     fn memory_starts_with_the_pages_that_hold_the_literals() {
-        let spanless = |kind| TypeError {
-            kind,
-            span: None,
-            instances: Vec::new(),
-        };
+        let spanless = TypeError::nowhere;
         // Without literals, it starts with nothing.
         let module = lower("fn f():\n    pass\n");
         assert_eq!(module.memory.min_pages, 0);

@@ -302,11 +302,7 @@ impl Checker {
             let FailureKind::Invalid(why) = failure.kind else {
                 unreachable!("nothing is run");
             };
-            self.errors.push(TypeError {
-                kind: TypeErrorKind::ConstNotRun(why),
-                span: None,
-                instances: Vec::new(),
-            });
+            self.error_nowhere(TypeErrorKind::ConstNotRun(why));
         }
     }
 

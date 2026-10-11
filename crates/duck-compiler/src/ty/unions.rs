@@ -16,7 +16,8 @@ use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
     Body, Checker, FieldDef, Item, Leaf, OPTION, ParamDefaults, Prim, RESULT, StructDef, StructId,
-    TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_pure, never, zero,
+    TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_pure, never, similar,
+    zero,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -423,7 +424,13 @@ impl Body<'_> {
                     ty: self.ck.ty_name(ty),
                     variant: name.name.clone(),
                 };
-                self.error(kind, name.span);
+                let variants = self
+                    .ck
+                    .union_id(ty)
+                    .map(|id| &self.ck.structs[id.0 as usize]);
+                let variants = variants.into_iter().flat_map(|def| &def.fields);
+                let similar = similar::nearest(&name.name, variants.map(|v| v.name.as_str()));
+                self.ck.error_near(kind, name.span, similar);
             }
             for arg in args.into_iter().flatten() {
                 self.expr(&arg.value, None);
