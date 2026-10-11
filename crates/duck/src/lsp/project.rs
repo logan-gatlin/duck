@@ -8,13 +8,15 @@ use std::path::{Path, PathBuf};
 
 use duck::files::{self, Files};
 use duck::git::Cache;
-use duck::manifest::{MANIFEST, ManifestError};
+use duck::manifest::{self, COMPONENT, ENTRY, LIBRARY, MANIFEST, ManifestError};
 use duck::package::{self, Packages, ResolveError};
 use duck_compiler::file::{FileId, FileManager, Settings};
 use duck_compiler::lex::Span;
 use duck_compiler::ty::{
     self, Analysis, Completion, CompletionKind, HintKind, Signature, Symbol, SymbolKind,
+    TypeErrorKind,
 };
+use duck_compiler::world::WorldError;
 use duck_compiler::{Error, load};
 use lsp_types::{Position, Range};
 
@@ -732,13 +734,14 @@ impl Project {
         // WIT that can't be read is none, which the build says.
         let wit = files::wit(packages).unwrap_or_default();
         let component = manifest.component.as_ref();
-        let module = component.map(|component| (&component.entry, component.settings(wit.clone())));
+        let module = component
+            .map(|component| (COMPONENT, &component.entry, component.settings(wit.clone())));
         let library = manifest.library.as_ref();
-        let library = library.map(|library| (&library.entry, library.settings(wit)));
+        let library = library.map(|library| (LIBRARY, &library.entry, library.settings(wit)));
 
         let mut problems = Vec::new();
         let mut checked = Vec::new();
-        for (entry, settings) in module.into_iter().chain(library) {
+        for (table, entry, settings) in module.into_iter().chain(library) {
             let settings = match asked {
                 true => brief(settings),
                 false => settings,
@@ -759,7 +762,8 @@ impl Project {
                 }
                 Err(e) => {
                     let message = format!("cannot read {}: {e}", entry.display());
-                    vec![Problem::in_manifest(manifest_path.clone(), message)]
+                    let path = manifest_path.clone();
+                    vec![Problem::at_key(path, &[table, ENTRY], message)]
                 }
             };
             // A file both use has its errors found twice.
@@ -785,6 +789,19 @@ impl Problem {
             notes: Vec::new(),
         }
     }
+
+    /// A problem with what the manifest at `path` says at `key`: the tables
+    /// that lead to a key of it, and then its name. With the whole of it,
+    /// if it writes none of them.
+    fn at_key(path: PathBuf, key: &[&str], message: String) -> Self {
+        let mut problem = Self::in_manifest(path, message);
+        // As it was saved, which is as it was resolved.
+        let src = fs::read_to_string(&problem.place.path).unwrap_or_default();
+        if let Some(written) = manifest::locate(&src, key) {
+            problem.place.range = range(&src, written.start, written.end);
+        }
+        problem
+    }
 }
 
 impl Overlay<'_, '_> {
@@ -803,7 +820,8 @@ impl Overlay<'_, '_> {
         let problems = errors.iter().map(|error| {
             let message = error.to_string();
             let Some(span) = error.span() else {
-                return Problem::in_manifest(manifest_path.to_path_buf(), message);
+                let key = asked_by(error);
+                return Problem::at_key(manifest_path.to_path_buf(), key, message);
             };
             let notes = error.instances().iter().map(|site| Note {
                 place: self.place(site.span),
@@ -901,21 +919,50 @@ pub fn canonical(path: &Path) -> PathBuf {
 }
 
 /// Places a failure to resolve the package whose manifest is at
-/// `manifest_path`: in the manifest that is wrong if one is, and otherwise in
-/// its own.
+/// `manifest_path`: in the manifest that says what failed, at the key that
+/// says it, if one does, and otherwise in its own.
 fn resolve_problem(manifest_path: PathBuf, error: &ResolveError) -> Problem {
-    let ResolveError::Manifest { path, error } = error else {
-        return Problem::in_manifest(manifest_path, error.to_string());
+    let wrong = match error {
+        ResolveError::Manifest { path, error } => Some((path, error)),
+        _ => None,
     };
-    let mut problem = Problem::in_manifest(canonical(path), error.to_string());
-    if let ManifestError::Toml(error) = error {
+    let message = match wrong {
         // Without the excerpt of the source that the full message draws.
-        problem.message = error.message().to_string();
-        if let (Some(span), Ok(src)) = (error.span(), fs::read_to_string(path)) {
-            problem.place.range = range(&src, span.start, span.end);
-        }
+        Some((_, ManifestError::Toml(error))) => error.message().to_string(),
+        // The place says which manifest.
+        Some((_, error)) => error.to_string(),
+        None => error.to_string(),
+    };
+    let Some(site) = error.site() else {
+        return Problem::in_manifest(manifest_path, message);
+    };
+    let key: Vec<_> = site.key.iter().map(String::as_str).collect();
+    let mut problem = Problem::at_key(canonical(&site.manifest), &key, message);
+    if let Some((path, ManifestError::Toml(error))) = wrong
+        && let (Some(span), Ok(src)) = (error.span(), fs::read_to_string(path))
+    {
+        problem.place.range = range(&src, span.start, span.end);
     }
     problem
+}
+
+/// The key of the manifest that asks what `error` says the program can't
+/// give, of an error that no source file holds: the tables that lead to it,
+/// and then its name. None for an error that no key asks for.
+fn asked_by(error: &Error) -> &'static [&'static str] {
+    let Error::Type(error) = error else {
+        return &[];
+    };
+    match &error.kind {
+        TypeErrorKind::UnknownStart(_) | TypeErrorKind::World(WorldError::Start { .. }) => {
+            &[COMPONENT, "start"]
+        }
+        TypeErrorKind::World(WorldError::Missing { .. }) | TypeErrorKind::MissingExports { .. } => {
+            &[COMPONENT, "world"]
+        }
+        TypeErrorKind::DataPastMax { .. } => &["memory", "max"],
+        _ => &[],
+    }
 }
 
 /// Where bytes `start..end` of `src` are, as [`position`] places each.
@@ -1353,16 +1400,38 @@ pub(crate) mod tests {
         // A program, which is what a component is of no other world.
         let start = MODULE.replace("world = \"wasi:cli/imports@0.3.0\"", "start = \"main\"");
         dir.write(&[("app/Duck.toml", &start), ("app/main.duck", "")]);
+        // At what asks for what the program can't give, if something does.
         assert_eq!(
             check(&dir, &[]),
-            ["app/Duck.toml:0:0-0:0: no function named `main` to start"]
+            ["app/Duck.toml:3:0-3:14: no function named `main` to start"]
+        );
+        let small = MODULE.replace("16MiB", "64KiB");
+        dir.write(&[
+            ("app/Duck.toml", &small),
+            ("app/main.duck", "let big: varray(u8) = [0; 100000]\n"),
+        ]);
+        let problems = check(&dir, &[]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("app/Duck.toml:5:0-5:13: "),
+            "{problems:?}"
+        );
+        // A world that the package has no WIT of is named by the manifest.
+        let world = MODULE.replace("wasi:cli/imports@0.3.0", "nope");
+        dir.write(&[("app/Duck.toml", &world), ("app/main.duck", "")]);
+        let problems = check(&dir, &[]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("app/Duck.toml:3:0-3:14: "),
+            "{problems:?}"
         );
 
+        dir.write(&[("app/Duck.toml", MODULE)]);
         fs::remove_file(dir.0.join("app/main.duck")).unwrap();
         let problems = check(&dir, &[]);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
-            problems[0].starts_with("app/Duck.toml:0:0-0:0: cannot read main.duck: "),
+            problems[0].starts_with("app/Duck.toml:1:0-1:19: cannot read main.duck: "),
             "{problems:?}"
         );
     }
@@ -1403,13 +1472,86 @@ pub(crate) mod tests {
             "{problems:?}"
         );
 
-        // But one that is missing is a problem with the package wanting it.
+        // But one that is missing is a problem with the package wanting it,
+        // where it names the dependency.
         fs::remove_file(dir.0.join("util/Duck.toml")).unwrap();
         let problems = check(&dir, &[]);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
-            problems[0].starts_with("app/Duck.toml:0:0-0:0: cannot read "),
+            problems[0].starts_with("app/Duck.toml:3:0-3:27: cannot read "),
             "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn what_a_manifest_gets_wrong_is_placed_where_it_says_it() {
+        let dir = TempDir::new("keys");
+        // The first problem of the package whose manifest is `manifest`.
+        let first = |manifest: &str| {
+            dir.write(&[("app/Duck.toml", manifest), ("app/lib.duck", "")]);
+            let problems = check(&dir, &[]);
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            problems[0].clone()
+        };
+        assert_eq!(
+            first(&MODULE.replace("16MiB", "16 MiB")),
+            "app/Duck.toml:5:0-5:14: memory.max \"16 MiB\" is not a number followed by B, KiB, MiB, GiB, TiB, or pgs"
+        );
+        let literals = format!("{MODULE}[memory.static]\nstart = \"0B\"\nend = \"1KiB\"\n");
+        assert!(
+            first(&literals).starts_with("app/Duck.toml:8:0-8:12: memory.static has no `end`"),
+            "{}",
+            first(&literals)
+        );
+        // A table that heads lines of its own is its heading.
+        assert_eq!(
+            first(&format!("{LIBRARY}[memory]\nmax = \"16MiB\"\n")),
+            "app/Duck.toml:2:0-2:8: [memory] needs a [component] table"
+        );
+        let depends = |dependency: &str| first(&format!("{LIBRARY}[dependencies]\n{dependency}\n"));
+        assert_eq!(
+            depends("util = { tag = \"v1\" }"),
+            "app/Duck.toml:3:0-3:21: dependency `util` has a `tag`, `rev`, or `branch` but no `git`"
+        );
+        assert_eq!(
+            depends("\"no name\" = { path = \"../util\" }"),
+            "app/Duck.toml:3:0-3:32: dependency name `no name` is not an identifier"
+        );
+        // What a dependency may not say is where it says it.
+        assert_eq!(
+            depends("util = { git = \"/nowhere\", branch = \"main\" }"),
+            "app/Duck.toml:3:27-3:42: git dependency `util` can't follow a branch; pin a `tag` or a `rev`"
+        );
+        assert_eq!(
+            depends("[dependencies.util]"),
+            "app/Duck.toml:3:0-3:19: dependency `util` needs a `path` or a `git`"
+        );
+
+        // A dependency that can't be used is a problem where it is named.
+        dir.write(&[("util/Duck.toml", MODULE), ("util/main.duck", "")]);
+        let problem = depends("util = { path = \"../util\" }");
+        assert!(
+            problem.starts_with("app/Duck.toml:3:0-3:27: dependency `util` at "),
+            "{problem}"
+        );
+        let problem = depends("far = { git = \"/nowhere/at/all\", tag = \"v1\" }");
+        assert!(
+            problem.starts_with("app/Duck.toml:3:0-3:45: dependency `far`: "),
+            "{problem}"
+        );
+        // One whose library isn't where its own manifest says is a problem
+        // with that.
+        dir.write(&[("util/Duck.toml", "[library]\nentry = \"gone.duck\"\n")]);
+        let problem = depends("util = { path = \"../util\" }");
+        assert!(
+            problem.starts_with("util/Duck.toml:1:0-1:19: cannot read "),
+            "{problem}"
+        );
+        // A manifest that says nothing of what it needs is wrong as a
+        // whole.
+        assert_eq!(
+            first("[dependencies]\n"),
+            "app/Duck.toml:0:0-0:0: needs a [component] or [library] table"
         );
     }
 

@@ -4,15 +4,31 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
+use std::ops::Range;
 use std::path::PathBuf;
 
 use duck_compiler::file::{Settings, Wit};
 use duck_compiler::lex;
 use duck_compiler::world::COMMAND;
 use serde::Deserialize;
+use toml::de::DeTable;
 
 /// The name of the manifest file at the root of every package.
 pub const MANIFEST: &str = "Duck.toml";
+
+/// The table of a manifest that holds its dependencies, each by the name
+/// the package uses it as.
+pub const DEPENDENCIES: &str = "dependencies";
+
+/// The table of a manifest that says what component the package builds.
+pub const COMPONENT: &str = "component";
+
+/// The table of a manifest that says what the package offers others.
+pub const LIBRARY: &str = "library";
+
+/// The key of [`COMPONENT`] and of [`LIBRARY`] that names the file each is
+/// entered by.
+pub const ENTRY: &str = "entry";
 
 /// The size of a wasm page, which every memory size is a whole number of.
 const PAGE_SIZE: u64 = 64 * 1024;
@@ -346,6 +362,26 @@ impl Library {
     }
 }
 
+/// Where the manifest `src` writes the key that `keys` lead to, each the
+/// name of a table of the one before, with the value it is given: of a
+/// table that heads lines of its own, the heading. The nearest table that
+/// is written, where the rest of them isn't, and `None` where none of them
+/// is, or `src` is no TOML.
+pub fn locate(src: &str, keys: &[&str]) -> Option<Range<usize>> {
+    let document = DeTable::parse(src).ok()?;
+    let mut table = Some(document.get_ref());
+    let mut written = None;
+    for key in keys {
+        let Some((name, value)) = table.and_then(|table| table.get_key_value(*key)) else {
+            break;
+        };
+        let (name, given) = (name.span(), value.span());
+        written = Some(name.start.min(given.start)..name.end.max(given.end));
+        table = value.get_ref().as_table();
+    }
+    written
+}
+
 /// The number of wasm pages in `value`, a size such as `64KiB` or `2pgs`.
 fn pages(key: &'static str, value: &str) -> Result<u64, ManifestError> {
     let bytes = bytes(key, value)?;
@@ -402,6 +438,28 @@ fn size_error(key: &'static str, value: &str, kind: SizeErrorKind) -> ManifestEr
         key,
         value: value.to_string(),
         kind,
+    }
+}
+
+impl ManifestError {
+    /// The key of the manifest that the error is about: the tables that
+    /// lead to it, and then its name. `None` for one that TOML places
+    /// itself, and for a manifest that lacks what it needs, which is about
+    /// no key of it.
+    pub fn key(&self) -> Option<Vec<&str>> {
+        Some(match self {
+            Self::Toml(_) | Self::Empty => return None,
+            Self::Size { key, .. } => key.split('.').collect(),
+            Self::Min => vec!["memory", "min"],
+            Self::Memory64 => vec!["memory", "memory64"],
+            Self::StaticEnd => vec!["memory", "static", "end"],
+            Self::MemoryWithoutComponent => vec!["memory"],
+            Self::DependencyName(name)
+            | Self::NoSource(name)
+            | Self::GitRef(name)
+            | Self::RefWithoutGit(name) => vec![DEPENDENCIES, name],
+            Self::Branch(name) => vec![DEPENDENCIES, name, "branch"],
+        })
     }
 }
 
@@ -475,6 +533,60 @@ mod tests {
 
     fn size(value: &str) -> Result<u64, String> {
         pages("memory.max", value).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_key_is_where_the_manifest_writes_it() {
+        let src = "[component]\nentry = \"main.duck\"\noutput = \"o.wasm\"\n[memory]\nmax = \"1KiB\"\n[memory.static]\nstart = \"4KiB\"\n[dependencies]\nutil = { path = \"../util\" }\n[dependencies.far]\ngit = \"url\"\n";
+        let written = |keys: &[&str]| locate(src, keys).map(|written| &src[written]);
+        assert_eq!(
+            written(&["component", "entry"]),
+            Some("entry = \"main.duck\"")
+        );
+        assert_eq!(
+            written(&["memory", "static", "start"]),
+            Some("start = \"4KiB\"")
+        );
+        assert_eq!(
+            written(&["dependencies", "util"]),
+            Some("util = { path = \"../util\" }")
+        );
+        assert_eq!(
+            written(&["dependencies", "util", "path"]),
+            Some("path = \"../util\"")
+        );
+        // A table that heads lines of its own is its heading.
+        assert_eq!(written(&["memory"]), Some("[memory]"));
+        assert_eq!(
+            written(&["dependencies", "far"]),
+            Some("[dependencies.far]")
+        );
+        // The nearest table that is written, where the rest isn't.
+        assert_eq!(written(&["memory", "min"]), Some("[memory]"));
+        assert_eq!(
+            written(&["dependencies", "util", "tag"]),
+            written(&["dependencies", "util"])
+        );
+        assert_eq!(written(&["library", "entry"]), None);
+        assert_eq!(written(&[]), None);
+        assert_eq!(locate("[component", &["component"]), None);
+
+        // An error is about the key that it names.
+        let key = |src: &str| {
+            let error = Manifest::parse(src).unwrap_err();
+            let key = error.key()?.into_iter().map(str::to_string);
+            Some(key.collect::<Vec<_>>().join("."))
+        };
+        assert_eq!(
+            key("[component]\nentry = \"a\"\noutput = \"b\"\n[memory]\nmax = \"1\"\n"),
+            Some("memory.max".to_string())
+        );
+        assert_eq!(
+            key("[library]\nentry = \"a\"\n[dependencies]\nutil = {}\n"),
+            Some("dependencies.util".to_string())
+        );
+        assert_eq!(key("[dependencies]\n"), None);
+        assert_eq!(key("[library]\n"), None);
     }
 
     #[test]
