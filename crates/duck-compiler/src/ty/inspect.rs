@@ -1830,6 +1830,7 @@ impl<'p> Walk<'p> {
                 pattern,
                 iter,
                 body,
+                ..
             } => {
                 if self.expr(iter) {
                     return true;

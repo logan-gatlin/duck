@@ -133,6 +133,7 @@ impl<'p> Free<'p> {
                 pattern,
                 iter,
                 body,
+                ..
             } => {
                 self.expr(iter);
                 let outer = self.bound.len();

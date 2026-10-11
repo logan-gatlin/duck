@@ -283,6 +283,9 @@ pub enum StmtKind {
     For {
         /// A name or `_`, for where the element is among those iterated.
         index: Option<Pattern>,
+        /// `&` or `&var` before the pattern, which then takes a pointer to
+        /// each element, and is a name or `_`.
+        addr: Option<Mutability>,
         /// What takes each element, as the pattern of a binding takes its
         /// value.
         pattern: Pattern,
@@ -1111,8 +1114,8 @@ impl<'a> Parser<'a> {
     }
 
     /// What a `for` binds: `pattern`, or `index, pattern`, where the index is
-    /// a name or `_`.
-    fn for_bindings(&mut self) -> PResult<(Option<Pattern>, Pattern)> {
+    /// a name or `_`. After `&` or `&var` the pattern is one too.
+    fn for_bindings(&mut self) -> PResult<(Option<Pattern>, Option<Mutability>, Pattern)> {
         let indexed = matches!(self.peek().kind, TokenKind::Ident(_))
             && self.peek_second().kind == TokenKind::Comma;
         let index = if indexed {
@@ -1122,7 +1125,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok((index, self.pattern()?))
+        let addr = self.eat(TokenKind::Amp).then(|| self.pointer_mutability());
+        if addr.is_some() && !matches!(self.peek().kind, TokenKind::Ident(_)) {
+            return Err(self.unexpected("name"));
+        }
+        Ok((index, addr, self.pattern()?))
     }
 
     fn pattern(&mut self) -> PResult<Pattern> {
@@ -1238,12 +1245,13 @@ impl<'a> Parser<'a> {
             }
             TokenKind::For => {
                 self.bump();
-                let (index, pattern) = self.for_bindings()?;
+                let (index, addr, pattern) = self.for_bindings()?;
                 self.expect(TokenKind::In)?;
                 let iter = self.iterated()?;
                 let body = self.block()?;
                 StmtKind::For {
                     index,
+                    addr,
                     pattern,
                     iter,
                     body,
@@ -2706,21 +2714,41 @@ mod tests {
             let ItemKind::Fn(f) = &module.items[0].kind else {
                 panic!()
             };
-            let StmtKind::For { index, pattern, .. } = &f.body[0].kind else {
+            let StmtKind::For {
+                index,
+                addr,
+                pattern,
+                ..
+            } = &f.body[0].kind
+            else {
                 panic!()
             };
             let index = index.as_ref().map(render_pattern);
-            (index.unwrap_or_default(), render_pattern(pattern))
+            let addr = match addr {
+                Some(Mutability::Var) => "&var ",
+                Some(Mutability::Let) => "&",
+                None => "",
+            };
+            let pattern = format!("{addr}{}", render_pattern(pattern));
+            (index.unwrap_or_default(), pattern)
         };
         assert_eq!(head("x"), ("".into(), "x".into()));
         assert_eq!(head("_"), ("".into(), "_".into()));
         assert_eq!(head("(k, (v, _))"), ("".into(), "(k (v _))".into()));
         assert_eq!(head("i, x"), ("i".into(), "x".into()));
         assert_eq!(head("_, (k, v)"), ("_".into(), "(k v)".into()));
+        assert_eq!(head("&x"), ("".into(), "&x".into()));
+        assert_eq!(head("& var x"), ("".into(), "&var x".into()));
+        assert_eq!(head("i, &var _"), ("i".into(), "&var _".into()));
         // Only a name counts, and only one of them.
-        for src in ["(a, b), x", "i, j, x"] {
+        for src in ["(a, b), x", "i, j, x", "&i, x"] {
             let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
             assert_eq!(errors(&src), vec![expected("`in`", TokenKind::Comma)]);
+        }
+        // A pointer is to the whole of an element.
+        for (src, found) in [("&(a, b)", TokenKind::LParen), ("&&x", TokenKind::Amp)] {
+            let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
+            assert_eq!(errors(&src), vec![expected("name", found)]);
         }
     }
 

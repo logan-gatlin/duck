@@ -421,10 +421,17 @@ module.exports = grammar({
     for_statement: $ => seq(
       'for',
       optional(seq(field('index', choice($.identifier, $.discard)), ',')),
-      field('pattern', $._pattern),
+      field('pattern', choice($._pattern, $.pointer_binding)),
       'in',
       field('iterable', choice($._expression, $.range)),
       field('body', $.block),
+    ),
+
+    // `&x` or `&var x`, which a `for` binds to a pointer to each element.
+    pointer_binding: $ => seq(
+      '&',
+      optional(field('mutability', 'var')),
+      field('name', choice($.identifier, $.discard)),
     ),
 
     // `start..end`, which is no expression: only a `for` iterates one.

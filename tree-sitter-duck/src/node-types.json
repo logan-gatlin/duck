@@ -1114,6 +1114,10 @@
           {
             "type": "_pattern",
             "named": true
+          },
+          {
+            "type": "pointer_binding",
+            "named": true
           }
         ]
       }
@@ -1588,6 +1592,36 @@
     "type": "placeholder",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "pointer_binding",
+    "named": true,
+    "fields": {
+      "mutability": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "var",
+            "named": false
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "discard",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
   },
   {
     "type": "pointer_type",

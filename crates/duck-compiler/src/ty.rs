@@ -4711,10 +4711,11 @@ impl<'c> Body<'c> {
             }
             StmtKind::For {
                 index,
+                addr,
                 pattern,
                 iter,
                 body,
-            } => self.for_loop(index.as_ref(), pattern, iter, body, out),
+            } => self.for_loop(index.as_ref(), *addr, pattern, iter, body, out),
             StmtKind::Match { value, arms } => self.match_stmt(value, arms, out),
             StmtKind::Pass => {}
             StmtKind::Fn(decl) => self.nested_fn(decl, stmt.span, out),
@@ -4833,24 +4834,41 @@ impl<'c> Body<'c> {
     /// `iter`, or each member of the enum `iter` names, to `pattern` in
     /// turn, and sets `index` to where it is among them. The array's `ptr`
     /// and `len` are read once, before the first iteration, as are those
-    /// that a struct which starts as an array starts with.
+    /// that a struct which starts as an array starts with. With an `addr`,
+    /// `pattern` is set to a pointer to each element, which writes it if
+    /// the `addr` is `&var`.
     fn for_loop(
         &mut self,
         index: Option<&Pattern>,
+        addr: Option<Mutability>,
         pattern: &Pattern,
         iter: &parse::Expr,
         body: &parse::Block,
         out: &mut Vec<Stmt>,
     ) {
-        if let ExprKind::Range(start, end) = &iter.kind {
-            return self.range_loop(index, pattern, (start, end), iter.span, body, out);
+        let range = match &iter.kind {
+            ExprKind::Range(start, end) => Some((&**start, &**end)),
+            _ => None,
+        };
+        let members = match range {
+            Some(_) => None,
+            None => self.enum_name(iter),
+        };
+        // Only an element is in memory, which an integer and a member are
+        // not.
+        if addr.is_some() && (range.is_some() || members.is_some()) {
+            self.error(TypeErrorKind::NotAddressable, pattern.span);
         }
-        if let Some(id) = self.enum_name(iter) {
+        if let Some(range) = range {
+            return self.range_loop(index, pattern, range, iter.span, body, out);
+        }
+        if let Some(id) = members {
             out.push(self.unrolled_loop(id, index, pattern, body));
             return;
         }
         let (ty, value) = self.expr(iter, None);
-        let (elem, value) = match self.ck.array_view(ty) {
+        let view = self.ck.array_view(ty);
+        let (elem, value) = match view {
             Some(id) => (self.ck.element(id), self.array_start(value)),
             // It has no elements, and none that the loop is run for.
             None if ty == Ty::Never => (ty, value),
@@ -4870,11 +4888,25 @@ impl<'c> Body<'c> {
         let done = binary(vt, IrBinOp::GeU, i.clone(), Expr::Local(len));
         let mut inner = vec![Stmt::BrIf(1, done)];
         let stride = self.ck.layout(elem).0;
-        let addr = self.ck.element_addr(Expr::Local(ptr), i.clone(), stride);
-        let element = self.load(scalar(vt, addr), 0, elem);
+        let at = scalar(
+            vt,
+            self.ck.element_addr(Expr::Local(ptr), i.clone(), stride),
+        );
+        let (bound, each) = match (addr, view) {
+            (Some(mutability), Some(id)) => {
+                let mutable = mutability == Mutability::Var;
+                if mutable && !self.ck.writes(Ty::Array(id)) {
+                    let (ty, needs, element) = self.read_only(Ty::Array(id));
+                    let kind = TypeErrorKind::ReadOnlyAddr { ty, needs, element };
+                    self.error(kind, pattern.span);
+                }
+                (self.ck.ptr_to(elem, mutable), at)
+            }
+            _ => (elem, self.load(at, 0, elem)),
+        };
         self.scopes.push(HashMap::new());
-        let (place, dests) = self.for_bindings(index, pattern, elem);
-        self.set_leaves(dests, element, &mut inner);
+        let (place, dests) = self.for_bindings(index, pattern, bound);
+        self.set_leaves(dests, each, &mut inner);
         inner.extend(place.map(|place| Stmt::SetLocal(place, i.clone())));
         // Advanced before the body, so `continue` moves on too.
         let next = binary(vt, IrBinOp::Add, i, one);
@@ -13370,6 +13402,87 @@ fn f(a: array(u8), v: Vec(u8), p: &Vec(u8), n: i32, i: i32):
                 mismatch("uint", "i32"),
                 mismatch("uint", "f64"),
                 TypeErrorKind::NotAddressable,
+            ]
+        );
+    }
+
+    #[test]
+    fn for_loops_bind_a_pointer_to_each_element() {
+        let src = "\
+extern:
+    fn log(n: u16, at: uint)
+struct Pair:
+    low: u16
+    high: u16
+fn f(v: varray(Pair), a: array(u16)):
+    for &var p in v:
+        p.high = p.low
+        p.* = Pair(low: 1, high: 2)
+    for i, &x in a:
+        log(x.*, i)
+    for &_ in a:
+        pass
+";
+        // Its address, where a copy would be loaded from it.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp4 v.ptr) (set tmp5 v.len) (set tmp6 0) (block (loop \
+             (br_if 1 (I32.GeU tmp6 tmp5)) \
+             (set p (I32.Add tmp4 (I32.Mul tmp6 4))) (set tmp6 (I32.Add tmp6 1)) \
+             (I32.Store16 offset=2 p (I32.Load16U offset=0 p)) \
+             (I32.Store16 offset=0 p 1) (I32.Store16 offset=2 p 2) (br 0))) \
+             (set tmp8 a.ptr) (set tmp9 a.len) (set tmp10 0) (block (loop \
+             (br_if 1 (I32.GeU tmp10 tmp9)) \
+             (set x (I32.Add tmp8 (I32.Mul tmp10 2))) \
+             (set i tmp10) (set tmp10 (I32.Add tmp10 1)) \
+             (call log [(I32.Load16U offset=0 x) i] -> []) (br 0))) \
+             (set tmp13 a.ptr) (set tmp14 a.len) (set tmp15 0) (block (loop \
+             (br_if 1 (I32.GeU tmp15 tmp14)) \
+             (set tmp15 (I32.Add tmp15 1)) (br 0)))"
+        );
+        let src = "\
+enum(u8) Color:
+    red
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+fn f(a: array(u8), v: varray(u8), s: Vec(u8), n: u8):
+    for &x in a:
+        x.* = 1
+        let y: u8 = x
+    for &var x in a:
+        pass
+    for &var x in v:
+        x = x
+    for &var x in s:
+        x.* = 1
+    for &c in Color:
+        pass
+    for &var i in 0..n:
+        pass
+    for &x in n:
+        pass
+";
+        // It writes only what a `&var` of a `varray` points to, and only
+        // an element has an address.
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ReadOnlyWrite {
+                    ty: "&u8".into(),
+                    needs: "&var u8".into(),
+                    element: false,
+                },
+                mismatch("u8", "&u8"),
+                TypeErrorKind::ReadOnlyAddr {
+                    ty: "array(u8)".into(),
+                    needs: "varray(u8)".into(),
+                    element: true,
+                },
+                TypeErrorKind::ImmutableAssign("x".into()),
+                TypeErrorKind::NotAddressable,
+                TypeErrorKind::NotAddressable,
+                invalid_operand("for", "u8"),
             ]
         );
     }

@@ -1285,6 +1285,36 @@ pub let text = \"hello\"[1..3] == \"el\"
     }
 
     #[test]
+    fn for_loops_write_through_a_pointer_to_each_element() {
+        let src = "\
+struct Pair:
+    low: i32
+    high: i32
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+let pairs: varray(Pair) = [Pair(low: 1, high: 0), Pair(low: 2, high: 0), Pair(low: 3, high: 0)]
+let vec = &var Vec(Pair)(ptr: pairs.ptr, len: 2, cap: pairs.len)
+fn widen() -> i32:
+    for i, &var pair in vec.*:
+        if pair.low == 1:
+            continue
+        pair.high = pair.low * 10 + i as i32
+    for &var pair in pairs[2..]:
+        pair.* = Pair(low: 7, high: 8)
+    var total = 0
+    for &pair in pairs:
+        total = total * 100 + pair.low * 10 + pair.high
+    return total
+pub let widened = widen()
+";
+        let mut started = Started::of(src);
+        // The first is skipped, the second is written through `vec`, which
+        // has two, and the third through the slice.
+        assert_eq!(started.global("widened"), 10_00_00 + (20 + 21) * 100 + 78);
+    }
+
+    #[test]
     fn a_function_reads_its_literals_whenever_it_is_called() {
         let src = "\
 let LIMIT: uint = 2

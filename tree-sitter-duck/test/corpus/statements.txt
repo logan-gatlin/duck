@@ -82,6 +82,10 @@ fn f():
         pass
     for n in t.0..len - 1:
         pass
+    for i, &var x in xs:
+        pass
+    for &_ in xs:
+        pass
     while true:
         break
 
@@ -121,6 +125,19 @@ fn f():
           (binary_expression
             (identifier)
             (integer)))
+        (block
+          (pass_statement)))
+      (for_statement
+        (identifier)
+        (pointer_binding
+          (identifier))
+        (identifier)
+        (block
+          (pass_statement)))
+      (for_statement
+        (pointer_binding
+          (discard))
+        (identifier)
         (block
           (pass_statement)))
       (while_statement

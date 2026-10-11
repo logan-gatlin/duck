@@ -251,6 +251,10 @@ fn demo(a: array(i32), pairs: array(tuple(i32, i32))) -> i32:
 	for n in 1..a.len:               # each `uint` from 1 up to `a.len`
 		total += a[n] - a[n - 1]
 	return total
+
+fn double(v: varray(i32)):
+	for &var x in v:                 # a `&var i32` to each element
+		x.* *= 2
 ```
 
 - `for x in a` runs its block for each element of an array, with `x` an
@@ -276,6 +280,14 @@ fn demo(a: array(i32), pairs: array(tuple(i32, i32))) -> i32:
 - A range is no value: only a `for` has one, between two whole expressions,
   so `1..n + 1` ends at `n + 1`. It counts for itself, so it has no index:
   `for i, n in 0..3` is an error.
+- `for &x in a` binds a pointer to each element in place of a copy of it: a
+  `&T`, which reads the element where it is. `for &var x in a` binds a
+  `&var T`, which writes it too, as `x.* = value` or `x.field = value`, and
+  needs a `varray(T)`.
+- After `&` is a name or `_`, and no tuple: a pointer is to the whole of an
+  element. An index comes before it as before any: `for i, &var x in a`.
+- Only an element has an address: `for &m in Name` and `for &n in 0..3` are
+  errors.
 - `break` leaves the loop. `continue` moves on to the next element, and the
   index with it.
 

@@ -926,6 +926,10 @@ mod tests {
         assert_eq!(formatted("let x = - 1 - - 2\n"), "let x = -1 - -2\n");
         assert_eq!(formatted("let x = a&b & ~ c\n"), "let x = a & b & ~c\n");
         assert_eq!(
+            formatted("fn f():\n\tfor i,& var x in a:\n\t\tpass\n\tfor & x in a:\n\t\tpass\n"),
+            "fn f():\n\tfor i, &var x in a:\n\t\tpass\n\tfor &x in a:\n\t\tpass\n"
+        );
+        assert_eq!(
             formatted("let p:& var i32=& var 0\n"),
             "let p: &var i32 = &var 0\n"
         );
