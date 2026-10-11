@@ -46,10 +46,39 @@ impl Checker {
     /// The type that a `ty` is where a pointer to a function is needed: that
     /// of the pointers to the function, if it's the type of one, and
     /// otherwise itself.
-    pub(super) fn pointed(&mut self, ty: Ty) -> Ty {
+    pub(super) fn pointer_ty_of(&mut self, ty: Ty) -> Ty {
         match ty {
             Ty::Func(id) => self.pointer_ty(id),
             _ => ty,
+        }
+    }
+
+    /// The type of a function that a value of type `ty` holds, if it holds
+    /// one: `ty` itself, or what a struct, a tuple or an enum of it holds.
+    fn func_part(&self, ty: Ty) -> Option<Ty> {
+        match ty {
+            Ty::Func(_) => Some(ty),
+            Ty::Enum(id) => self.func_part(self.enum_ty(id)),
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                let mut members = self.members(ty).into_iter();
+                members.find_map(|member| self.func_part(member))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reports each type in the signature of the `extern` function `sig`,
+    /// resolved as `params` and `ret`, that holds the type of a function:
+    /// nothing is passed for one, so the host neither takes nor gives it.
+    pub(super) fn check_host_sig(&mut self, sig: &parse::FnSig, params: &[(String, Ty)], ret: Ty) {
+        let written = sig.params.iter().map(|param| param.ty.span);
+        let params = params.iter().map(|(_, ty)| *ty).zip(written);
+        let ret = sig.ret.as_ref().map(|written| (ret, written.span));
+        for (ty, span) in params.chain(ret).collect::<Vec<_>>() {
+            if let Some(held) = self.func_part(ty) {
+                let (ty, func) = (self.ty_name(held), sig.name.name.clone());
+                self.error(TypeErrorKind::HostFnType { ty, func }, span);
+            }
         }
     }
 
@@ -145,10 +174,10 @@ impl Body<'_> {
     /// A `ty` as it is where a `want` is expected, if anything is: a
     /// function is a pointer to itself where a pointer of its type is.
     /// Any other is what it was. `value` is evaluated first.
-    pub(super) fn pointing(&mut self, ty: Ty, value: Value, want: Option<Ty>) -> (Ty, Value) {
+    pub(super) fn as_expected(&mut self, ty: Ty, value: Value, want: Option<Ty>) -> (Ty, Value) {
         match (ty, want) {
             (Ty::Func(id), Some(want @ Ty::Fn(_))) if self.ck.pointer_ty(id) == want => {
-                (want, self.pointer(id, value))
+                (want, self.pointer_to(id, value))
             }
             _ => (ty, value),
         }
@@ -156,14 +185,14 @@ impl Body<'_> {
 
     /// A function as the pointer to it, where only its address serves: it
     /// is compared, or cast. Any other is what it was.
-    pub(super) fn pointer_of(&mut self, ty: Ty, value: Value) -> (Ty, Value) {
-        let want = self.ck.pointed(ty);
-        self.pointing(ty, value, Some(want))
+    pub(super) fn as_pointer(&mut self, ty: Ty, value: Value) -> (Ty, Value) {
+        let want = self.ck.pointer_ty_of(ty);
+        self.as_expected(ty, value, Some(want))
     }
 
     /// A pointer to function `id`, once `value` is evaluated, which is the
     /// function itself.
-    pub(super) fn pointer(&mut self, id: FuncId, value: Value) -> Value {
+    pub(super) fn pointer_to(&mut self, id: FuncId, value: Value) -> Value {
         let index = self.ck.table_index(id);
         let index = Expr::Const(self.ck.addr_const(index.into()));
         Value {

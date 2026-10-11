@@ -6,6 +6,7 @@ use std::mem;
 
 use crate::file::FileId;
 use crate::lex::Span;
+use crate::load::Program;
 use crate::parse::{self, Binding, Mutability, PatternKind};
 
 use super::{Checker, Item, Ty, TypeErrorKind, Visit, pattern_names};
@@ -97,7 +98,7 @@ impl Checker {
 
     /// Resolves each alias that nothing has named yet, so that what it is
     /// written with is checked whether or not it is used.
-    pub(super) fn define_aliases(&mut self, program: &crate::load::Program) {
+    pub(super) fn define_aliases(&mut self, program: &Program) {
         for id in 0..self.aliases.len() {
             let span = program.items[self.aliases[id].item].span;
             self.alias_ty(id, span);

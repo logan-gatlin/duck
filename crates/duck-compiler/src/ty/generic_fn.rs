@@ -373,16 +373,7 @@ impl Checker {
                 }
             }
             // A function is a pointer to itself where one is expected.
-            (Ty::Fn(_), Ty::Func(id)) => {
-                let (mut a, ret) = self.func_shape(id);
-                a.push(ret);
-                let p = self.components(pattern);
-                if p.len() == a.len() {
-                    for (p, a) in p.into_iter().zip(a) {
-                        self.unify(p, a, bound);
-                    }
-                }
-            }
+            (Ty::Fn(_), Ty::Func(_)) => self.unify_called(pattern, actual, bound),
             (Ty::Ptr(_), Ty::Ptr(_))
             | (Ty::Tuple(_), Ty::Tuple(_))
             | (Ty::Array(_), Ty::Array(_))
@@ -395,6 +386,22 @@ impl Checker {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Binds each type parameter in `pattern`, a function type, to the part
+    /// in the same place of what a value of type `actual` is called with
+    /// and gives, if it is called, and with as many arguments.
+    fn unify_called(&self, pattern: Ty, actual: Ty, bound: &mut [Option<Ty>]) {
+        let Some((mut actual, ret)) = self.called_as(actual) else {
+            return;
+        };
+        actual.push(ret);
+        let pattern = self.components(pattern);
+        if pattern.len() == actual.len() {
+            for (pattern, actual) in pattern.into_iter().zip(actual) {
+                self.unify(pattern, actual, bound);
+            }
         }
     }
 
@@ -445,16 +452,7 @@ impl Checker {
                 continue;
             }
             if let Ty::Fn(_) = want {
-                let Some((mut have, ret)) = self.called_as(arg) else {
-                    continue;
-                };
-                have.push(ret);
-                let want = self.components(want);
-                if want.len() == have.len() {
-                    for (want, have) in want.into_iter().zip(have) {
-                        self.unify(want, have, bound);
-                    }
-                }
+                self.unify_called(want, arg, bound);
                 continue;
             }
             let have = self.known(arg);
@@ -689,11 +687,12 @@ impl Body<'_> {
     /// to its parameters of type `type`, and those inferred from the other
     /// arguments. Of those, the ones that aren't literals, `.name`s or the
     /// names of functions go first, so that those take the types they
-    /// settle: a function is a pointer where they settle on one, and is
-    /// otherwise of its own type. Those naming generic functions are left
-    /// for last. The arguments it checks are
-    /// kept in `checked`. Type parameters that no argument settles are
-    /// reported at `span`, and given the error type.
+    /// settle. Then the names of functions, each of which is a pointer
+    /// where a pointer is settled on and is otherwise of its own type, and
+    /// then the literals and `.name`s, which take any type that fits them.
+    /// Those naming generic functions are left for last. The arguments it
+    /// checks are kept in `checked`. Type parameters that no argument
+    /// settles are reported at `span`, and given the error type.
     fn type_args_of(
         &mut self,
         generic: GenericFnId,
@@ -722,7 +721,7 @@ impl Body<'_> {
         for index in given.iter().flatten() {
             bound[*index].get_or_insert(Ty::Error);
         }
-        for literals in [false, true] {
+        for pass in 0..3 {
             for (k, (arg, param)) in args.iter().zip(binding).enumerate() {
                 let Some(i) = *param else {
                     continue;
@@ -730,9 +729,13 @@ impl Body<'_> {
                 // A generic function's instance is picked by its parameter's
                 // type, so it settles nothing.
                 let named = self.named(&arg.value);
-                let late = is_typed_by_other(&arg.value) || matches!(named, Some(Item::Func(_)));
+                let turn = match named {
+                    _ if is_typed_by_other(&arg.value) => 2,
+                    Some(Item::Func(_)) => 1,
+                    _ => 0,
+                };
                 if matches!(named, Some(Item::GenericFn(_)))
-                    || late != literals
+                    || turn != pass
                     || !self.ck.has_unbound(patterns[i], &bound)
                 {
                     continue;

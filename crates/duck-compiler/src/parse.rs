@@ -515,7 +515,7 @@ impl FnSig {
 impl Binding {
     /// Whether it is typed `type`, as one that names a type is: its value
     /// is that type, written as an expression.
-    pub fn names_type(&self) -> bool {
+    pub fn binds_type(&self) -> bool {
         self.ty.as_ref().is_some_and(Type::is_type)
     }
 }
@@ -527,29 +527,32 @@ impl Type {
     }
 }
 
+/// Displays the type argument as it is written.
+impl fmt::Display for TypeArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.label {
+            Some(label) => write!(f, "{}: {}", label.name, self.ty),
+            None => write!(f, "{}", self.ty),
+        }
+    }
+}
+
 /// Displays the type as it is written.
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let list = |f: &mut fmt::Formatter<'_>, types: &[Type]| {
+        fn list<T: fmt::Display>(f: &mut fmt::Formatter<'_>, items: &[T]) -> fmt::Result {
             write!(f, "(")?;
-            for (i, ty) in types.iter().enumerate() {
+            for (i, item) in items.iter().enumerate() {
                 let comma = if i == 0 { "" } else { ", " };
-                write!(f, "{comma}{ty}")?;
+                write!(f, "{comma}{item}")?;
             }
             write!(f, ")")
-        };
+        }
         match &self.kind {
             TypeKind::Named(name, None) => write!(f, "{name}"),
             TypeKind::Named(name, Some(args)) => {
-                write!(f, "{name}(")?;
-                for (i, arg) in args.iter().enumerate() {
-                    let comma = if i == 0 { "" } else { ", " };
-                    match &arg.label {
-                        Some(label) => write!(f, "{comma}{}: {}", label.name, arg.ty)?,
-                        None => write!(f, "{comma}{}", arg.ty)?,
-                    }
-                }
-                write!(f, ")")
+                write!(f, "{name}")?;
+                list(f, args)
             }
             TypeKind::Pointer(Mutability::Let, pointee) => write!(f, "&{pointee}"),
             TypeKind::Pointer(Mutability::Var, pointee) => write!(f, "&var {pointee}"),

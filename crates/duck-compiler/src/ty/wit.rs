@@ -21,7 +21,7 @@ use crate::load::Program;
 use crate::parse::FnSig;
 use crate::world::{ImportError, ROOT, WitFunc, WitTy, kebab};
 
-use super::{Checker, FuncSig, OPTION, Prim, RESULT, Ty, TypeErrorKind, extern_fns};
+use super::{Checker, FuncSig, OPTION, Prim, RESULT, Ty, TypeError, TypeErrorKind, extern_fns};
 
 /// The start of the name a handle of a resource is dropped by, before the
 /// resource's.
@@ -218,6 +218,12 @@ impl Checker {
 
     /// Reports `ty`, written at `span`, if it isn't `wit`.
     fn check_wit(&mut self, ty: Ty, wit: &WitTy, span: Span) {
+        // The type of a function in an `extern` function's is reported
+        // where that is declared, as nothing of the host.
+        let host = |e: &TypeError| matches!(e.kind, TypeErrorKind::HostFnType { .. });
+        if self.errors.iter().any(|e| e.span == Some(span) && host(e)) {
+            return;
+        }
         if let Some(mismatch) = self.mismatch(ty, wit) {
             let kind = TypeErrorKind::WitMismatch {
                 wit: wit.to_string(),
@@ -1104,7 +1110,8 @@ extern \"my:pkg/host@0.1.0\":
         assert_eq!(
             errors_in(src, None),
             [(
-                "the WIT has `stream<u8>` here, which is an `i32`, as a handle is: found `local`"
+                "`local` is the type of a function, which the host has nothing of: `pipe` \
+                 neither takes nor gives one"
                     .to_string(),
                 "local"
             )]

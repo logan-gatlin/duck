@@ -396,13 +396,13 @@ pub enum TypeErrorKind {
         func: String,
         param: String,
     },
-    /// A generic function instantiated within its instances, or those of
-    /// others, too many times over, as recursion with ever larger type
-    /// arguments would be.
     /// A generic function named where a type is written. Only its instances
     /// are functions, each of a type of its own, and nothing writes one's
     /// type arguments there.
     GenericFnType(String),
+    /// A generic function instantiated within its instances, or those of
+    /// others, too many times over, as recursion with ever larger type
+    /// arguments would be.
     /// A type parameter bounded by a type that isn't a struct, a union, an
     /// enum, an array or a function type.
     NotABound(String),
@@ -457,7 +457,8 @@ pub enum TypeErrorKind {
         expected: String,
         found: String,
     },
-    /// `type` written as any type but a function's parameter's.
+    /// `type` written as any type but that of a function's parameter, or of
+    /// a global `let` of one name, which names a type.
     TypeOutsideParam,
     /// A parameter of type `type` given a default.
     TypeParamDefault(String),
@@ -793,6 +794,12 @@ pub enum TypeErrorKind {
     /// A type parameter of a generic function given a default, which only
     /// one of a struct or union has.
     FnTypeDefault(String),
+    /// The type of a function in what the `extern` function `func` takes or
+    /// gives, which is nothing that the host passes.
+    HostFnType {
+        ty: String,
+        func: String,
+    },
     /// An error in the body of an instance of a generic function, whose
     /// declaration was found to be right for every type argument. A bug in
     /// the compiler.
@@ -1232,8 +1239,9 @@ struct Value {
     scalars: Vec<(ValType, Expr)>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Visit {
+    #[default]
     New,
     Active,
     Done,
@@ -1878,6 +1886,11 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "type parameter `{name}` of a function has no default: each call infers it"
             ),
+            Self::HostFnType { ty, func } => write!(
+                f,
+                "`{ty}` is the type of a function, which the host has nothing of: `{func}` \
+                 neither takes nor gives one"
+            ),
             Self::Unchecked { instance, error } => write!(
                 f,
                 "internal error: checking the declaration of `{instance}` missed an error in its body: \
@@ -2102,7 +2115,7 @@ impl Checker {
                 ItemKind::Struct(_) => (self.structs.len(), Visit::New),
                 ItemKind::Enum(_) => (self.enums.len(), Visit::New),
                 // A name of a type has no constant.
-                ItemKind::Binding(b) if b.names_type() => (0, Visit::Done),
+                ItemKind::Binding(b) if b.binds_type() => (0, Visit::Done),
                 ItemKind::Binding(_) => (self.globals.len(), Visit::New),
                 // The defaults of its parameters.
                 ItemKind::Fn(f) if !has_default(&f.sig) => (0, Visit::Done),
@@ -2155,7 +2168,7 @@ impl Checker {
                     }
                     continue;
                 }
-                ItemKind::Binding(b) if b.names_type() => {
+                ItemKind::Binding(b) if b.binds_type() => {
                     self.declare_alias(item, index, b);
                     continue;
                 }
@@ -2737,15 +2750,16 @@ impl Checker {
             if is_pub {
                 self.check_public_sig(decl, &params, ret);
             }
+            if (id as u32) < self.import_count {
+                self.check_host_sig(decl, &params, ret);
+            }
             self.funcs[id].params = params;
             self.funcs[id].defaults = pending_defaults(decl);
             self.funcs[id].ret = ret;
         }
         self.sigs_defined = true;
         for (arg, bound, site) in mem::take(&mut self.called_bounds) {
-            if !self.meets(arg, bound) {
-                self.bound_error(arg, bound, site);
-            }
+            self.check_bound(arg, bound, site);
         }
         self.define_generic_fns(program);
     }
@@ -4241,7 +4255,7 @@ impl<'c> Body<'c> {
         // A function that is no pointer of the type expected is found as
         // the pointer that it would be.
         let found = match want {
-            Ty::Fn(_) => self.ck.pointed(found),
+            Ty::Fn(_) => self.ck.pointer_ty_of(found),
             _ => found,
         };
         let kind = TypeErrorKind::Mismatch {
@@ -4530,7 +4544,7 @@ impl<'c> Body<'c> {
             self.error(kind, target.span);
         }
         let mut value = match op {
-            None => self.assigned_value(value, &place),
+            None => self.assigned_value(target, value, &place),
             Some(op) => {
                 let current = self.read_place(&place);
                 let rhs = self.check(value, place.ty);
@@ -4558,17 +4572,23 @@ impl<'c> Body<'c> {
         (ty, Value { pre, scalars })
     }
 
-    /// `value` as it is assigned to `place`, whose type it is to be of. A
-    /// variable bound to a function is of that function's type, which is no
-    /// type of another function or of a pointer.
-    fn assigned_value(&mut self, value: &parse::Expr, place: &Place) -> Value {
-        let Ty::Func(_) = place.ty else {
+    /// `value` as it is assigned to `place`, which `target` writes, and
+    /// whose type it is to be of. A variable bound to a function is of that
+    /// function's type, which is no type of another function or of a
+    /// pointer: what would hold either is said.
+    fn assigned_value(
+        &mut self,
+        target: &parse::Expr,
+        value: &parse::Expr,
+        place: &Place,
+    ) -> Value {
+        let (Ty::Func(_), ExprKind::Name(_)) = (place.ty, &target.kind) else {
             return self.check(value, place.ty);
         };
         let (ty, lowered) = self.expr(value, Some(place.ty));
         match ty {
             Ty::Func(_) | Ty::Fn(_) if ty != place.ty => {
-                let pointer = self.ck.pointed(place.ty);
+                let pointer = self.ck.pointer_ty_of(place.ty);
                 let kind = TypeErrorKind::OneFunction {
                     name: place.name.clone(),
                     pointer: self.ck.ty_name(pointer),
@@ -5002,7 +5022,7 @@ impl<'c> Body<'c> {
             self.ck.record(expr.span, expected);
         }
         let (ty, value) = self.infer(expr, expected);
-        let (ty, value) = self.pointing(ty, value, expected);
+        let (ty, value) = self.as_expected(ty, value, expected);
         self.ck.record(expr.span, ty);
         // Nothing after it is reached, as it has no value to go on with.
         self.ended |= ty == Ty::Never;
@@ -5073,7 +5093,9 @@ impl<'c> Body<'c> {
                         }
                     }
                 }
-                if type_field && self.is_type_expr(inner) {
+                // A function names its type there, which no value of it has.
+                let names_fn = matches!(self.named(inner), Some(Item::Func(_)));
+                if type_field && (names_fn || self.is_type_expr(inner)) {
                     let ty = self.expr_type(inner);
                     return self.type_field(ty, field, inner.span);
                 }
@@ -5435,10 +5457,10 @@ impl<'c> Body<'c> {
         for item in items {
             let (mut ty, mut value) = self.expr(item, elem);
             // Functions of one signature are held as pointers to them, as
-            // each is of a type of its own.
-            if let (Some(Ty::Func(first)), Ty::Func(_)) = (elem, ty)
+            // each is of a type of its own, and so is one with a pointer.
+            if let Some(Ty::Func(first)) = elem
                 && elem != Some(ty)
-                && self.ck.pointed(ty) == self.ck.pointer_ty(first)
+                && self.ck.pointer_ty_of(ty) == self.ck.pointer_ty(first)
             {
                 let pointer = self.ck.pointer_ty(first);
                 consts = consts
@@ -5446,12 +5468,12 @@ impl<'c> Body<'c> {
                     .map(|held: Result<Vec<Const>, Value>| {
                         // One that folded had nothing to evaluate.
                         let held = held.err().unwrap_or_default();
-                        let value = self.pointer(first, held);
+                        let value = self.pointer_to(first, held);
                         self.constant(value, span)
                     })
                     .collect();
                 elem = Some(pointer);
-                (ty, value) = self.pointing(ty, value, elem);
+                (ty, value) = self.as_expected(ty, value, elem);
             }
             let want = *elem.get_or_insert(ty);
             self.expect(ty, want, item.span);
@@ -5857,7 +5879,7 @@ impl<'c> Body<'c> {
     fn compared(&mut self, op: BinOp, ty: Ty, value: Value) -> (Ty, Value) {
         match is_comparison(op) {
             true => {
-                let (ty, value) = self.pointer_of(ty, value);
+                let (ty, value) = self.as_pointer(ty, value);
                 (self.ck.with_writes(ty, false), value)
             }
             false => (ty, value),
@@ -6004,7 +6026,7 @@ impl<'c> Body<'c> {
         // A function casts as the pointer to it does.
         let (from, value) = match from == to {
             true => (from, value),
-            false => self.pointer_of(from, value),
+            false => self.as_pointer(from, value),
         };
         // A bounded type parameter casts as its bound does, which every
         // type argument casts to.
@@ -6439,7 +6461,7 @@ impl<'c> Body<'c> {
                 Some(i) => {
                     let value = match checked {
                         Some((ty, value)) => {
-                            let (ty, value) = self.pointing(ty, value, Some(params[i].1));
+                            let (ty, value) = self.as_expected(ty, value, Some(params[i].1));
                             self.expect(ty, params[i].1, arg.value.span);
                             value
                         }
@@ -15750,11 +15772,6 @@ fn f(c: C):
             RecursiveAlias("A".into()).to_string(),
             "`A` names a type that is written with `A` itself"
         );
-        assert_eq!(
-            TypeOutsideParam.to_string(),
-            "`type` is only the type of a function's parameter, which it makes a type parameter, \
-             and of a global `let` of one name, which it makes a name of the type it is bound to"
-        );
     }
 
     #[test]
@@ -15894,6 +15911,91 @@ fn g(a: Vec(u8, bump, i32, i32), b: array(T: u8), c: Vec(u8, wide), d: Plain()):
         assert_eq!(
             FnTypeDefault("T".into()).to_string(),
             "type parameter `T` of a function has no default: each call infers it"
+        );
+    }
+
+    #[test]
+    fn a_default_is_written_with_its_own_declaration_given_every_type() {
+        let src = "\
+struct(A, B = Node(A, i32)) Node:
+    next: &B
+    value: A
+fn f(p: &Node(u8), q: &Node(u8, Node(u8, i32))) -> uint:
+    let same: &Node(u8) = q
+    return Node(u8).size
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "f"), "(set same q) (return 8)");
+    }
+
+    #[test]
+    fn functions_and_pointers_meet_in_any_order() {
+        let src = "\
+fn double(x: i32) -> i32:
+    return x * 2
+fn triple(x: i32) -> i32:
+    return x * 3
+fn(A, B, F: fn(A, B) -> A) fold(a: A, b: B, f: F) -> A:
+    return f(a, b)
+fn add(a: i64, b: u8) -> i64:
+    return a + b as i64
+let p: fn(i32) -> i32 = double
+let first = [triple, p]
+let last = [p, triple]
+fn f() -> i64:
+    let s = double.size + double.align
+    return fold(1, 2, add) + (first[0] == last[1]) as i64
+";
+        let module = lower(src);
+        // Either is the pointer that the other is.
+        assert_eq!(table(&module), ["double", "triple"]);
+        assert_eq!(
+            data(&module),
+            [
+                (0, &[2, 0, 0, 0, 1, 0, 0, 0][..]),
+                (8, &[1, 0, 0, 0, 2, 0, 0, 0][..])
+            ]
+        );
+        // A literal takes the type that a function settles.
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"fold(i64, u8, add)"), "{names:?}");
+        let f = body(&module, "f");
+        assert!(f.contains("(set s (I32.Add 0 1))"), "{f}");
+
+        use TypeErrorKind::*;
+        let src = "\
+fn double(x: i32) -> i32:
+    return x * 2
+fn triple(x: i32) -> i32:
+    return x * 3
+fn broken(x: Nope) -> i32:
+    return 1
+struct(F: fn(i32) -> i32 = broken) Held:
+    f: F
+extern:
+    fn give() -> double
+    fn take(pair: tuple(i32, triple))
+fn f():
+    var t = (double, 1)
+    t.0 = triple
+";
+        let host = |ty: &str, func: &str| HostFnType {
+            ty: ty.into(),
+            func: func.into(),
+        };
+        assert_eq!(
+            errors(src),
+            vec![
+                host("double", "give"),
+                host("triple", "take"),
+                UnknownType("Nope".into()),
+                mismatch("double", "triple"),
+            ]
+        );
+        assert_eq!(
+            host("double", "give").to_string(),
+            "`double` is the type of a function, which the host has nothing of: `give` neither \
+             takes nor gives one"
         );
     }
 

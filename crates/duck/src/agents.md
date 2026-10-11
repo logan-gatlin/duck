@@ -934,18 +934,19 @@ fn demo(f: fn(i32) -> i32) -> i32:
   a call through one is a `call_indirect`.
 - It is a pointer too where only its address serves: `double == f`,
   `double as uint`. And functions of one signature in an array literal are
-  held as pointers to them: `[double, halve]` is an
-  `array(fn(i32) -> i32)`.
+  held as pointers to them, as is one beside a pointer, in either order:
+  `[double, halve]` is an `array(fn(i32) -> i32)`.
 - A `var` bound to a function is of that function's type, and is assigned
   no other: `var g: fn(i32) -> i32 = double` holds a pointer to any.
 - A function's name is its type where a type is written, as `g: double`
   or `step: lib.double`: what is of it is that function and takes no
-  storage, so a parameter of it is passed nothing. A generic function
-  names no type, as only its instances are functions.
-- A generic function takes a function among its arguments as it does a
-  literal, after the others: it is a pointer where they settle `T` as one,
-  and where nothing else settles `T`, `T` is the function's own type. So
-  `id(double)` is the instance `id(double)`, which holds nothing.
+  storage, so a parameter of it is passed nothing, and `double.size` is 0.
+  A generic function names no type, as only its instances are functions.
+- A generic function takes a function among its arguments after those
+  that are no literal, and before the literals: it is a pointer where the
+  others settle `T` as one, and where nothing else settles `T`, `T` is the
+  function's own type. So `id(double)` is the instance `id(double)`, which
+  holds nothing, and a literal takes the type that a function settles.
 - A call through a value takes every argument, positionally. Defaults
   belong to the function's name: `double` with one would still be only a
   `fn(i32) -> i32`.

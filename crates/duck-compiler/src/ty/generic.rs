@@ -46,13 +46,14 @@ pub(super) struct ParamDef {
 pub(super) struct ParamDefaults {
     /// Each as it is written, for a type parameter that has one.
     written: Vec<Option<parse::Type>>,
-    /// Each as resolved, in terms of the type parameters before its own.
-    /// The error type for one that failed to resolve. `None` until they
-    /// are first asked for.
-    tys: Option<Vec<Option<Ty>>>,
-    /// Whether they are being resolved, which leads back to them only if
-    /// one is written with its own declaration.
-    resolving: bool,
+    /// Each as resolved, in terms of the type parameters before its own,
+    /// once `resolved` is done. The error type for one that failed to
+    /// resolve.
+    tys: Vec<Option<Ty>>,
+    /// How far they are resolved, which is done when they are first asked
+    /// for. Resolving them leads back to them only if one is written with
+    /// its own declaration, given no type argument in its place.
+    resolved: Visit,
 }
 
 /// A type argument of a generic declaration's field that holds one of the
@@ -364,7 +365,14 @@ impl Checker {
     /// A type parameter is bounded by what its own bound is.
     pub(super) fn meets(&self, ty: Ty, bound: Ty) -> bool {
         match bound {
-            Ty::Fn(_) => ty == Ty::Error || self.called_as(ty) == self.called_as(bound),
+            Ty::Fn(_) => {
+                let called = self.called_as(ty);
+                // A signature that failed to resolve is already reported.
+                let failed = called
+                    .as_ref()
+                    .is_some_and(|(params, ret)| params.contains(&Ty::Error) || *ret == Ty::Error);
+                ty == Ty::Error || failed || called == self.called_as(bound)
+            }
             _ => self.starts_like(ty, bound, false),
         }
     }
@@ -494,7 +502,7 @@ impl Checker {
     /// its signature is resolved, which is after a struct's fields are: a
     /// `ty` that a function type bounds is checked then, and isn't
     /// reported until it is.
-    fn check_bound(&mut self, ty: Ty, bound: Ty, site: Span) -> bool {
+    pub(super) fn check_bound(&mut self, ty: Ty, bound: Ty, site: Span) -> bool {
         if let (Ty::Fn(_), false) = (bound, self.sigs_defined) {
             self.called_bounds.push((ty, bound, site));
             return true;
@@ -507,11 +515,11 @@ impl Checker {
     }
 
     /// Reports, at `site`, that a `ty` isn't a type that `bound` bounds.
-    pub(super) fn bound_error(&mut self, ty: Ty, bound: Ty, site: Span) {
+    fn bound_error(&mut self, ty: Ty, bound: Ty, site: Span) {
         if let Ty::Fn(_) = bound {
             // A function is called as the pointers to it are.
             let called = match ty {
-                Ty::Func(_) => Some(self.pointed(ty)),
+                Ty::Func(_) => Some(self.pointer_ty_of(ty)),
                 _ => None,
             };
             let kind = TypeErrorKind::NotCalledAs {
@@ -739,19 +747,18 @@ impl Checker {
     /// in its place, has no end, and is reported at `site`.
     pub(super) fn param_defaults(&mut self, id: StructId, site: Span) -> Vec<Option<Ty>> {
         let def = &self.structs[id.0 as usize];
-        if let Some(tys) = &def.defaults.tys {
-            return tys.clone();
-        }
         let written = def.defaults.written.clone();
-        if def.defaults.resolving {
-            self.error(TypeErrorKind::RecursiveDefault(def.name.clone()), site);
-            return written
-                .iter()
-                .map(|d| d.as_ref().map(|_| Ty::Error))
-                .collect();
+        match def.defaults.resolved {
+            Visit::Done => return def.defaults.tys.clone(),
+            Visit::Active => {
+                self.error(TypeErrorKind::RecursiveDefault(def.name.clone()), site);
+                let failed = |default: &Option<parse::Type>| default.as_ref().map(|_| Ty::Error);
+                return written.iter().map(failed).collect();
+            }
+            Visit::New => {}
         }
         let (params, decl_module) = (def.params.clone(), def.module);
-        self.structs[id.0 as usize].defaults.resolving = true;
+        self.structs[id.0 as usize].defaults.resolved = Visit::Active;
         // What first asks for them may be in another module, or generic.
         let module = mem::replace(&mut self.module, decl_module);
         let names = params.iter().map(|param| self.param_name(*param));
@@ -776,8 +783,7 @@ impl Checker {
         self.type_params = outer;
         self.module = module;
         let defaults = &mut self.structs[id.0 as usize].defaults;
-        defaults.resolving = false;
-        defaults.tys = Some(tys.clone());
+        (defaults.tys, defaults.resolved) = (tys.clone(), Visit::Done);
         tys
     }
 
@@ -821,7 +827,6 @@ impl Checker {
         args: &[TypeArg],
         span: Span,
     ) -> Option<Vec<Ty>> {
-        let defaults = self.param_defaults(id, span);
         let params = self.structs[id.0 as usize].params.clone();
         let names: Vec<_> = params.iter().map(|p| self.param_name(*p)).collect();
         let mut given: Vec<Option<Ty>> = vec![None; params.len()];
@@ -852,6 +857,12 @@ impl Checker {
                 }
             }
         }
+        // A list that gives every type parameter a type takes no default,
+        // as one in a default of the declaration itself may be.
+        let defaults = match given.contains(&None) {
+            true => self.param_defaults(id, span),
+            false => vec![None; params.len()],
+        };
         let mut settled = vec![Ty::Error; params.len()];
         for i in 0..params.len() {
             settled[i] = match (given[i], defaults[i]) {
@@ -874,8 +885,14 @@ impl Checker {
     /// arguments `args`, first used at `site`, as it is written with the
     /// fewest type arguments: one that is the default of its type parameter
     /// is left out, and those after one left out are labelled.
+    ///
+    /// One that is first used while the defaults of its declaration are
+    /// resolved, in one of them, is named with every type argument.
     fn instance_name(&mut self, generic: StructId, args: &[Ty], site: Span) -> String {
-        let defaults = self.param_defaults(generic, site);
+        let defaults = match self.structs[generic.0 as usize].defaults.resolved {
+            Visit::Active => Vec::new(),
+            _ => self.param_defaults(generic, site),
+        };
         let params = self.structs[generic.0 as usize].params.clone();
         let mut written = Vec::new();
         let mut skipped = false;
@@ -955,10 +972,9 @@ impl Checker {
             Some(id) => *id,
             None => {
                 let id = StructId(self.structs.len() as u32);
-                let name = self.instance_name(generic, &args, site);
                 let decl = &self.structs[generic.0 as usize];
                 self.structs.push(StructDef {
-                    name,
+                    name: String::new(),
                     module: decl.module,
                     item: decl.item,
                     is_pub: decl.is_pub,
@@ -976,7 +992,11 @@ impl Checker {
                     fields: Vec::new(),
                     depth: None,
                 });
-                self.instances.insert((generic, args), id);
+                self.instances.insert((generic, args.clone()), id);
+                // Named once it is one, as a default that it is given may
+                // be written with it.
+                let name = self.instance_name(generic, &args, site);
+                self.structs[id.0 as usize].name = name;
                 if !self.generics_defined {
                     self.pending.push(id);
                     return Ty::Struct(id);
