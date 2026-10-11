@@ -559,6 +559,28 @@ mod tests {
                 "main \"nope\": `a` has no item `nope`",
             ]
         );
+
+        // One that the module has a name near is likely that, if this
+        // module sees it.
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use geo.lenght\nuse geo\nlet a: geo.Piont = geo.orgin\nlet b = geo.hiden\n",
+            ),
+            (
+                "geo",
+                "pub struct Point:\n    x: i32 = 0\npub let origin = Point()\npub fn length() -> i32:\n    return 0\nlet hidden = 1\n",
+            ),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"lenght\": `geo` has no item `lenght`; did you mean `length`?",
+                "main \"Piont\": `geo` has no item `Piont`; did you mean `Point`?",
+                "main \"orgin\": `geo` has no item `orgin`; did you mean `origin`?",
+                "main \"hiden\": `geo` has no item `hiden`",
+            ]
+        );
     }
 
     #[test]

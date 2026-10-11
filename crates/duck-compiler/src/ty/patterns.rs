@@ -11,7 +11,7 @@ use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, Pattern
 
 use super::{
     ARRAY, Body, Checker, Label, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary, scalar,
-    single, unions::narrow,
+    similar, single, unions::narrow,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -571,7 +571,9 @@ impl Body<'_> {
                 ty: def.name.clone(),
                 variant: name.name.clone(),
             };
-            self.error(kind, name.span);
+            let variants = def.fields.iter().map(|variant| variant.name.as_str());
+            let similar = similar::nearest(&name.name, variants);
+            self.ck.error_near(kind, name.span, similar);
             return None;
         };
         let (held, bare) = (def.fields[index].ty, def.fields[index].bare);

@@ -25,7 +25,7 @@ pub use symbols::{Symbol, SymbolKind};
 
 use super::{
     ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, NEVER, OPAQUE, OPTION,
-    Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY,
+    PRIMS, Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY,
     is_builtin_type, lower_program,
 };
 
@@ -215,23 +215,6 @@ struct Sources<'f> {
     read: &'f mut dyn FnMut(FileId) -> String,
     files: HashMap<FileId, String>,
 }
-
-/// Every primitive type.
-const PRIMS: [Prim; 13] = [
-    Prim::I8,
-    Prim::I16,
-    Prim::I32,
-    Prim::I64,
-    Prim::Int,
-    Prim::U8,
-    Prim::U16,
-    Prim::U32,
-    Prim::U64,
-    Prim::Uint,
-    Prim::F32,
-    Prim::F64,
-    Prim::Bool,
-];
 
 /// The longest initializer shown with a global: one longer says less of the
 /// global than its type does.

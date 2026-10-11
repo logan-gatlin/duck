@@ -63,7 +63,7 @@ impl fmt::Display for Error {
             Self::Lex(e) => e.kind.fmt(f),
             Self::Parse(e) => e.kind.fmt(f),
             Self::Use(e) => e.kind.fmt(f),
-            Self::Type(e) => e.kind.fmt(f),
+            Self::Type(e) => e.message().fmt(f),
             Self::Component(e) => write!(f, "cannot make a component of the module: {e}"),
         }
     }
