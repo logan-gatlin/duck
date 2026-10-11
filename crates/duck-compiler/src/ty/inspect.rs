@@ -42,6 +42,10 @@ pub struct Analysis {
     ck: Checker,
     /// The function the module runs when it is instantiated, by its name.
     start: Option<String>,
+    /// The items of each file, each by its place in the program, in the
+    /// order they are written: what is at a place is looked for in the one
+    /// that holds it, and in no other.
+    items: HashMap<FileId, Vec<usize>>,
 }
 
 /// What is written at a place.
@@ -254,7 +258,19 @@ const MAX_USES: usize = 64;
 pub fn analyze(program: Program, settings: &Settings) -> Analysis {
     let (ck, ..) = lower_program(&program, settings, true);
     let start = settings.start.clone();
-    Analysis { program, ck, start }
+    let mut items: HashMap<FileId, Vec<usize>> = HashMap::new();
+    for (index, item) in program.items.iter().enumerate() {
+        items.entry(item.span.file).or_default().push(index);
+    }
+    for items in items.values_mut() {
+        items.sort_by_key(|index| program.items[*index].span.start);
+    }
+    Analysis {
+        program,
+        ck,
+        start,
+        items,
+    }
 }
 
 /// What can be written after `module.`.
@@ -955,9 +971,17 @@ impl Analysis {
             walk.site.found = Some(used);
             return walk.site;
         }
-        for (index, item) in self.program.items.iter().enumerate() {
-            walk.item = index;
-            if walk.holds(item.span) && walk.item(item) {
+        // Those that end before the place don't hold it, nor do those
+        // after the first that starts past it.
+        let items = self.items.get(&file).map_or(&[][..], Vec::as_slice);
+        let ends_before = |index: &usize| self.program.items[*index].span.end < offset;
+        for index in &items[items.partition_point(ends_before)..] {
+            let item = &self.program.items[*index];
+            if item.span.start > offset {
+                break;
+            }
+            walk.item = *index;
+            if walk.item(item) {
                 break;
             }
         }

@@ -37,11 +37,17 @@ pub struct Project {
     checked: Vec<Checked>,
     /// What was then found to be declared in the package and never used.
     warnings: Vec<Problem>,
+    /// The package as it was last checked to answer what is being written,
+    /// the newest last: what is asked of the same text is answered of the
+    /// same check.
+    probes: Vec<Probe>,
 }
 
 /// The files of a build, and what checking them found. Of a build with
 /// errors that is what loaded of it, which may be none of a file.
 struct Checked {
+    /// The table of the manifest that says what is built.
+    table: &'static str,
     files: Files,
     analysis: Analysis,
     /// Whether every file loaded whole, so that every name is known.
@@ -49,6 +55,16 @@ struct Checked {
     /// What it declares and never uses, if it loaded whole: a build that
     /// didn't doesn't know what it uses.
     unused: Vec<Unused>,
+}
+
+/// The builds of a package that use a file, checked with the file as a
+/// [`Cursor`] has it, and every other as it was then.
+struct Probe {
+    /// The canonical path of the file.
+    path: PathBuf,
+    /// The file as it was checked.
+    source: String,
+    checked: Vec<Checked>,
 }
 
 /// What writing another name for one changes.
@@ -171,6 +187,11 @@ const UNLOADED: &str =
 /// reported: about a thousandth of a second's worth.
 const ASKING_FUEL: u64 = 10_000_000;
 
+/// The most [`Probe`]s that are kept: what can be written in a call is
+/// asked of the line being written in two ways, one of them what the call
+/// takes, which is then asked again.
+const MAX_PROBES: usize = 2;
+
 /// The code of a problem with what a manifest says.
 const MANIFEST_CODE: &str = "manifest";
 
@@ -199,14 +220,42 @@ impl Project {
             packages,
             checked: Vec::new(),
             warnings: Vec::new(),
+            probes: Vec::new(),
         }
+    }
+
+    /// Whether the package was resolved by reading the manifest in the
+    /// canonical directory `dir`: its own, or that of a package it depends
+    /// on.
+    pub fn reads(&self, dir: &Path) -> bool {
+        let reads = |packages: &Packages| {
+            let mut dirs = packages.iter().map(|package| canonical(&package.dir));
+            dirs.any(|read| read == dir)
+        };
+        self.packages.as_ref().is_ok_and(reads)
+    }
+
+    /// Whether the package didn't resolve, so that it may once what it
+    /// lacked is there.
+    pub fn unresolved(&self) -> bool {
+        self.packages.is_err()
+    }
+
+    /// Forgets what was checked to answer what is being written, of files
+    /// that are no longer as they were then: all of it, or all but what was
+    /// checked of the file at the canonical path `edited`, if that file
+    /// alone changed, in the editor. What is checked of a file has it as it
+    /// is asked of, whatever the editor has.
+    pub fn forget(&mut self, edited: Option<&Path>) {
+        self.probes
+            .retain(|probe| Some(probe.path.as_path()) == edited);
     }
 
     /// Every error in the package's module and in its library. Files they
     /// don't use aren't checked. What is asked of the package is then
     /// answered of it as it is now.
     pub fn check(&mut self, buffers: Buffers<'_>) -> Vec<Problem> {
-        let (problems, checked) = self.builds(buffers, false);
+        let (problems, checked) = self.builds(buffers, None);
         self.checked = checked;
         for checked in self.checked.iter_mut().filter(|checked| checked.whole) {
             let mut files = Overlay {
@@ -636,7 +685,7 @@ impl Project {
     /// expected there; and in a `use`, what its path may go on with. Only
     /// that last, if nothing but what is `used` is asked for.
     pub fn complete(
-        &self,
+        &mut self,
         buffers: Buffers<'_>,
         path: &Path,
         text: &str,
@@ -729,7 +778,13 @@ impl Project {
     /// The labels that the argument being written at byte `at` of the file
     /// at `path`, which holds `text`, may be given: those of the parameters
     /// or fields that the call it is in has given no argument yet.
-    fn labels(&self, buffers: Buffers<'_>, path: &Path, text: &str, at: usize) -> Vec<Suggestion> {
+    fn labels(
+        &mut self,
+        buffers: Buffers<'_>,
+        path: &Path,
+        text: &str,
+        at: usize,
+    ) -> Vec<Suggestion> {
         let calling = cursor::calling(text, at).filter(|call| call.starts && !call.expected);
         let Some(calling) = calling else {
             return Vec::new();
@@ -766,7 +821,7 @@ impl Project {
     /// the canonical path `path`, which holds `text`, and which of its
     /// parameters the argument there is for, if it can be told.
     pub fn signature(
-        &self,
+        &mut self,
         buffers: Buffers<'_>,
         path: &Path,
         text: &str,
@@ -790,10 +845,12 @@ impl Project {
         Some((signature, active))
     }
 
-    /// Checks the package with the file at `path` as `cursor` has it, and
-    /// asks what `ask` does of the first build that uses the file.
+    /// Asks what `ask` does of the first build that uses the file at `path`
+    /// and has an answer, with the file as `cursor` has it: as the package
+    /// was checked with it so, if it was since anything else changed, and
+    /// else as it is checked now.
     fn ask<T>(
-        &self,
+        &mut self,
         buffers: Buffers<'_>,
         path: &Path,
         cursor: &Cursor,
@@ -803,8 +860,21 @@ impl Project {
             true => Some(cursor.source.as_str()),
             false => buffers(other),
         };
-        let (_, checked) = self.builds(&buffers, true);
-        checked.into_iter().find_map(|mut checked| {
+        let mut probes = self.probes.iter();
+        let known = probes.position(|probe| probe.path == path && probe.source == cursor.source);
+        let probe = match known {
+            Some(known) => self.probes.remove(known),
+            None => Probe {
+                path: path.to_path_buf(),
+                source: cursor.source.clone(),
+                checked: self.builds(&buffers, Some(path)).1,
+            },
+        };
+        self.probes.push(probe);
+        let excess = self.probes.len().saturating_sub(MAX_PROBES);
+        self.probes.drain(..excess);
+        let probe = self.probes.last_mut()?;
+        probe.checked.iter_mut().find_map(|checked| {
             let file = checked.files.find(path)?;
             let files = &mut checked.files;
             let buffers = &buffers;
@@ -813,9 +883,11 @@ impl Project {
     }
 
     /// Checks the package's module and its library: every error in them,
-    /// and each as checked. If only something is `asked` of them, their
-    /// constants run on little fuel.
-    fn builds(&self, buffers: Buffers<'_>, asked: bool) -> (Vec<Problem>, Vec<Checked>) {
+    /// and each as checked. If something is only `asked` of the file at a
+    /// path, their constants run on little fuel, and a build that didn't
+    /// use the file when the package was last checked isn't checked, as it
+    /// has nothing to say of it.
+    fn builds(&self, buffers: Buffers<'_>, asked: Option<&Path>) -> (Vec<Problem>, Vec<Checked>) {
         let manifest_path = canonical(&self.root.join(MANIFEST));
         let packages = match &self.packages {
             Ok(packages) => packages,
@@ -833,9 +905,14 @@ impl Project {
         let mut problems = Vec::new();
         let mut checked = Vec::new();
         for (table, entry, settings) in module.into_iter().chain(library) {
+            let last = self.checked.iter().find(|checked| checked.table == table);
+            let unused = |path| last.is_some_and(|last| last.files.find(path).is_none());
+            if asked.is_some_and(unused) {
+                continue;
+            }
             let settings = match asked {
-                true => brief(settings),
-                false => settings,
+                Some(_) => brief(settings),
+                None => settings,
             };
             let found = match Files::new(packages, self.root.join(entry), settings) {
                 Ok(mut files) => {
@@ -845,6 +922,7 @@ impl Project {
                     };
                     let (found, analysis) = overlay.problems(&manifest_path);
                     checked.extend(analysis.map(|(analysis, whole)| Checked {
+                        table,
                         files,
                         analysis,
                         whole,
@@ -1367,9 +1445,9 @@ pub(crate) mod tests {
 
     #[test]
     fn what_can_be_written_is_suggested_of_a_line_that_does_not_parse() {
-        let (dir, project) = package("complete");
+        let (dir, mut project) = package("complete");
         let main = dir.0.join("app/main.duck");
-        let complete = |src: &str, text: &str| {
+        let complete = |project: &mut Project, src: &str, text: &str| {
             let buffers = |path: &Path| (path == main).then_some(src);
             let position = position(src, src.find(text).unwrap() + text.len());
             let suggested = project.complete(&buffers, &main, src, position, false);
@@ -1384,25 +1462,34 @@ pub(crate) mod tests {
         let fields = |names: &[&str]| (names.iter().map(|n| n.to_string()).collect(), "members");
         let src = "use geo\nfn main():\n    let p = geo.Point(x: 1.0)\n    let d = geo.len(p.\n";
         // A field that the module of the struct keeps to itself is none.
-        assert_eq!(complete(src, "len(p."), fields(&["x", "y"]));
-        assert_eq!(complete(src, "let d = geo."), fields(&["Point", "len"]));
+        assert_eq!(complete(&mut project, src, "len(p."), fields(&["x", "y"]));
         assert_eq!(
-            complete(src, "main():\n    let p = geo."),
+            complete(&mut project, src, "let d = geo."),
+            fields(&["Point", "len"])
+        );
+        assert_eq!(
+            complete(&mut project, src, "main():\n    let p = geo."),
             fields(&["Point", "len"])
         );
         let src = "use geo\nfn main():\n    let p = geo.Point(x: 1.0)\n    if p.x < 1.0:\n        let near = (p, 1)\n        ne\n    return nea\n";
-        let (names, kind) = complete(src, "        ne");
+        let (names, kind) = complete(&mut project, src, "        ne");
         assert_eq!(
             (&names[..4], kind),
             (&["near", "p", "geo", "main"].map(String::from)[..], "names")
         );
-        let (names, _) = complete(src, "return nea");
+        let (names, _) = complete(&mut project, src, "return nea");
         assert_eq!(names[..3], ["p", "geo", "main"]);
         let src = src.replace("        ne\n", "        g(near.0.\n");
-        assert_eq!(complete(&src, "g(near.0."), fields(&["x", "y"]));
-        assert_eq!(complete(&src, "g(near.0"), (Vec::new(), "members"));
+        assert_eq!(
+            complete(&mut project, &src, "g(near.0."),
+            fields(&["x", "y"])
+        );
+        assert_eq!(
+            complete(&mut project, &src, "g(near.0"),
+            (Vec::new(), "members")
+        );
 
-        let signature = |src: &str, text: &str| {
+        let signature = |project: &mut Project, src: &str, text: &str| {
             let buffers = |path: &Path| (path == main).then_some(src);
             let position = position(src, src.find(text).unwrap() + text.len());
             let (signature, active) = project.signature(&buffers, &main, src, position)?;
@@ -1410,28 +1497,77 @@ pub(crate) mod tests {
         };
         let len = "fn len(p: Point, scale: f32 = 1.0) -> f32".to_string();
         let src = "use geo\nfn main():\n    let p = geo.Point(x: 1.0, y: \n    let d = geo.len(p, \n    geo.len(scale: 2.0, p\n";
-        assert_eq!(signature(src, "geo.len(p, "), Some((len.clone(), Some(1))));
         assert_eq!(
-            signature(src, "geo.len(scale: 2"),
+            signature(&mut project, src, "geo.len(p, "),
             Some((len.clone(), Some(1)))
         );
         assert_eq!(
-            signature(src, "geo.len(scale: 2.0, p"),
+            signature(&mut project, src, "geo.len(scale: 2"),
+            Some((len.clone(), Some(1)))
+        );
+        assert_eq!(
+            signature(&mut project, src, "geo.len(scale: 2.0, p"),
             Some((len, Some(1)))
         );
         let point = "Point(x: f32, y: f32 = 0.0, id: i32 = 0)".to_string();
-        assert_eq!(signature(src, "Point(x: 1.0, y: "), Some((point, Some(1))));
-        assert_eq!(signature(src, "let p = "), None);
+        assert_eq!(
+            signature(&mut project, src, "Point(x: 1.0, y: "),
+            Some((point, Some(1)))
+        );
+        assert_eq!(signature(&mut project, src, "let p = "), None);
         // A generic struct takes its type arguments, and then its fields.
         let src = "struct(K, V = K) Entry:\n    key: K\n    value: V\nfn main():\n    let e = Entry(u8, V: \n    let f = Entry(u8)(key: 1, \n";
         let params = "Entry(K, V = K)".to_string();
-        assert_eq!(signature(src, "Entry("), Some((params.clone(), Some(0))));
-        assert_eq!(signature(src, "Entry(u8, V: "), Some((params, Some(1))));
+        assert_eq!(
+            signature(&mut project, src, "Entry("),
+            Some((params.clone(), Some(0)))
+        );
+        assert_eq!(
+            signature(&mut project, src, "Entry(u8, V: "),
+            Some((params, Some(1)))
+        );
         let fields = "Entry(key: K, value: V)".to_string();
         assert_eq!(
-            signature(src, "Entry(u8)(key: 1, "),
+            signature(&mut project, src, "Entry(u8)(key: 1, "),
             Some((fields, Some(1)))
         );
+    }
+
+    #[test]
+    fn what_is_asked_of_the_same_text_is_answered_of_the_same_check() {
+        let (dir, mut project) = package("probes");
+        let main = dir.0.join("app/main.duck");
+        assert_eq!(project.check(&|_| None), []);
+        let src = "use geo\nfn main():\n    geo.\n";
+        let complete = |project: &mut Project, src: &str| -> Vec<String> {
+            let buffers = |path: &Path| (path == main).then_some(src);
+            let position = position(src, src.find("geo.\n").unwrap() + 4);
+            let suggested = project.complete(&buffers, &main, src, position, false);
+            let suggestions = suggested.suggestions.into_iter();
+            suggestions.map(|s| s.completion.name).collect()
+        };
+        assert_eq!(complete(&mut project, src), ["Point", "len"]);
+        // Another file is written anew where it is kept, which the package
+        // isn't checked again to see, for a text it was checked with.
+        dir.write(&[("app/geo.duck", "pub fn far():\n    pass\n")]);
+        assert_eq!(complete(&mut project, src), ["Point", "len"]);
+        // Nor once the file itself has changed in the editor, which leaves
+        // every other as it was.
+        project.forget(Some(&main));
+        assert_eq!(complete(&mut project, src), ["Point", "len"]);
+        // A line of it that is written otherwise is a text of its own, and
+        // anything else that changes is forgotten for.
+        let other = "use geo\nfn main():\n    let a = 1\n    geo.\n";
+        assert_eq!(complete(&mut project, other), ["far"]);
+        assert_eq!(complete(&mut project, src), ["Point", "len"]);
+        project.forget(None);
+        assert_eq!(complete(&mut project, src), ["far"]);
+        // A build that the file is no part of has nothing to say of it.
+        let unused = dir.0.join("app/unused.duck");
+        let buffers = |path: &Path| (path == unused).then_some(src);
+        let position = Position::new(2, 8);
+        let suggested = project.complete(&buffers, &unused, src, position, false);
+        assert_eq!(suggested.suggestions, []);
     }
 
     #[test]
