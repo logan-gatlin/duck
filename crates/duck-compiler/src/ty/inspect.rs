@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::ptr;
 
 use crate::file::{FileId, FileManager, Settings};
 use crate::lex::Span;
@@ -121,6 +122,9 @@ enum LocalKind<'p> {
     Bound,
     /// A function declared in the body, by its signature.
     Fn(&'p FnSig),
+    /// A name of a type, by the `let` of type `type` that binds it. No
+    /// variable, and so is a global one, which is bound as it is.
+    Alias(&'p Binding),
 }
 
 /// What a walk of the program found at a place.
@@ -310,7 +314,7 @@ impl Analysis {
         let mut src = Sources::new(&mut read);
         let described = match site.found.as_ref()? {
             Found::Local(local) => Some((local.span, self.local_text(&mut src, local)?)),
-            Found::Path { names, span } => match site.local_fn(names) {
+            Found::Path { names, span } => match site.local_type(names) {
                 Some(local) => Some((*span, self.local_text(&mut src, local)?)),
                 None => {
                     let item = self.path(file, names)?;
@@ -569,9 +573,13 @@ impl Analysis {
                 LocalKind::Param(param) => param.ty.to_string(),
                 _ => self.type_at(local.span).unwrap_or_default(),
             };
+            let kind = match local.kind {
+                LocalKind::Alias(_) => CompletionKind::Type,
+                _ => CompletionKind::Variable,
+            };
             names.push(Completion {
                 name: local.name.to_string(),
-                kind: CompletionKind::Variable,
+                kind,
                 detail,
                 import: None,
             });
@@ -678,7 +686,8 @@ impl Analysis {
 
     /// What a call takes of the expression that the statement starting at
     /// byte `offset` of `file` is: the parameters of a function or of a
-    /// pointer to one, the fields of a struct, or the value of a variant.
+    /// pointer to one, the fields of a struct, the value of a variant, or
+    /// the type parameters of a generic struct or union.
     pub fn signature(
         &self,
         files: &mut impl FileManager,
@@ -694,15 +703,29 @@ impl Analysis {
         }
         let mut read = |id| files.contents(id);
         let mut src = Sources::new(&mut read);
-        match self.named(&site, self.generic(&site, expr)) {
+        let named = self.generic(&site, expr);
+        match self.named(&site, named) {
             Some(item @ (Item::Func(_) | Item::GenericFn(_))) => {
                 let (_, sig) = self.fn_decl(item)?;
                 return Some(self.fn_signature(&mut src, sig));
+            }
+            // A generic one takes its type arguments before anything else.
+            Some(Item::Struct(id))
+                if ptr::eq(named, expr) && !self.ck.structs[id.0 as usize].params.is_empty() =>
+            {
+                return self.type_signature(id);
             }
             Some(Item::Struct(id)) if !self.ck.structs[id.0 as usize].union => {
                 return Some(self.struct_signature(&mut src, id));
             }
             _ => {}
+        }
+        // A name of a type takes what the struct it names does.
+        if let ExprKind::Name(_) = &expr.kind
+            && let Some(Ty::Struct(id)) = self.type_named(&site, expr)
+            && !self.ck.structs[id.0 as usize].union
+        {
+            return Some(self.struct_signature(&mut src, id));
         }
         if let ExprKind::Field(inner, field) = &expr.kind
             && let Some((def, variant)) = self.variant(&site, inner, field)
@@ -849,6 +872,11 @@ impl Analysis {
         let named = |expr: &parse::Expr| match (&expr.kind, self.named(site, expr)) {
             (_, Some(Item::Struct(id))) => Some(Ty::Struct(id)),
             (_, Some(Item::Enum(id))) => Some(Ty::Enum(id)),
+            // A name of a type is the type it names.
+            (_, Some(Item::Alias(id))) => Some(self.ck.aliased(id)),
+            (_, None) if site.local_alias(expr).is_some() => {
+                self.ty_at(site.local_alias(expr)?.span)
+            }
             // The unions of the language, which no module declares.
             (ExprKind::Name(name), None) if site.local(name).is_none() => {
                 self.ck.builtin_union(name).map(Ty::Struct)
@@ -936,9 +964,12 @@ impl Analysis {
     /// What the name found at `site` stands for.
     fn target<'p>(&'p self, site: &Site<'p>) -> Option<Target<'p>> {
         match site.found.as_ref()? {
-            // A global is bound as a variable is, and is an item.
+            // A global is bound as a variable is, and is an item. So is a
+            // name of a type.
             Found::Local(local) => Some(match self.item(site.file, local.name) {
-                Some(item @ Item::Global(_)) if self.item_span(item) == Some(local.span) => {
+                Some(item @ (Item::Global(_) | Item::Alias(_)))
+                    if self.item_span(item) == Some(local.span) =>
+                {
                     Target::Item(item)
                 }
                 _ => Target::Local(*local),
@@ -946,8 +977,8 @@ impl Analysis {
             Found::Declared(name) => self.item(site.file, &name.name).map(Target::Item),
             Found::Used { item, .. } => Some(Target::Item(*item)),
             Found::Path { names, .. } => match (self.path(site.file, names), &names[..]) {
-                _ if site.local_fn(names).is_some() => {
-                    site.local_fn(names).copied().map(Target::Local)
+                _ if site.local_type(names).is_some() => {
+                    site.local_type(names).copied().map(Target::Local)
                 }
                 (Some(item), _) => Some(Target::Item(item)),
                 (None, [name]) => site.type_param(name).map(Target::TypeParam),
@@ -1250,6 +1281,10 @@ impl Analysis {
             LocalKind::Let => format!("let {name}: {}", self.type_at(local.span)?),
             LocalKind::Var => format!("var {name}: {}", self.type_at(local.span)?),
             LocalKind::Bound => format!("{name}: {}", self.type_at(local.span)?),
+            // A name of a type is as it is written, which is the type.
+            LocalKind::Alias(binding) => {
+                format!("let {name}: type = {}", src.text(binding.value.span))
+            }
             LocalKind::Fn(sig) => {
                 let text = sig_text(src, sig);
                 let captures = match self.ty_at(local.span) {
@@ -1568,6 +1603,23 @@ impl Analysis {
         let name = decl.map_or(&def.name, |decl| &decl.name.name);
         signature(name.clone(), def.fields.iter().map(field).collect(), "")
     }
+
+    /// What a list of type arguments of struct or union `id` takes: its
+    /// type parameters, each as it is declared.
+    fn type_signature(&self, id: StructId) -> Option<Signature> {
+        let def = &self.ck.structs[id.0 as usize];
+        let (name, params) = match &self.program.items.get(def.item)?.kind {
+            ItemKind::Struct(decl) => (&decl.name, &decl.params),
+            ItemKind::Union(decl) => (&decl.name, &decl.params),
+            _ => return None,
+        };
+        let param = |param: &TypeParam| (Some(param.name.name.clone()), type_param_text(param));
+        Some(signature(
+            name.name.clone(),
+            params.iter().map(param).collect(),
+            "",
+        ))
+    }
 }
 
 impl<'p> Site<'p> {
@@ -1582,14 +1634,25 @@ impl<'p> Site<'p> {
         params.find(|param| param.name == name).copied()
     }
 
-    /// The function declared in a function that `names` name where a type
-    /// is written, if they are the name of one in scope.
-    fn local_fn(&self, names: &[&str]) -> Option<&Local<'p>> {
+    /// What `names` name where a type is written, if they are the name of
+    /// what a function binds that is in scope: a function declared in it,
+    /// whose name is its type, or a name of a type.
+    fn local_type(&self, names: &[&str]) -> Option<&Local<'p>> {
         let [name] = names else {
             return None;
         };
         let local = self.local(name)?;
-        matches!(local.kind, LocalKind::Fn(_)).then_some(local)
+        matches!(local.kind, LocalKind::Fn(_) | LocalKind::Alias(_)).then_some(local)
+    }
+
+    /// The name of a type that `expr` is here, if a function binds it and
+    /// it is in scope.
+    fn local_alias(&self, expr: &parse::Expr) -> Option<&Local<'p>> {
+        let ExprKind::Name(name) = &expr.kind else {
+            return None;
+        };
+        let local = self.local(name)?;
+        matches!(local.kind, LocalKind::Alias(_)).then_some(local)
     }
 }
 
@@ -2066,8 +2129,9 @@ fn type_param_names(sig: &FnSig) -> Vec<&Ident> {
     inferred.chain(given.map(|param| &param.name)).collect()
 }
 
-fn binding_kind<'p>(binding: &Binding) -> LocalKind<'p> {
+fn binding_kind(binding: &Binding) -> LocalKind<'_> {
     match binding.mutability {
+        _ if binding.binds_type() => LocalKind::Alias(binding),
         Mutability::Let => LocalKind::Let,
         Mutability::Var => LocalKind::Var,
     }
@@ -2135,22 +2199,24 @@ fn type_params_text(params: &[TypeParam]) -> String {
     if params.is_empty() {
         return String::new();
     }
-    let param = |param: &TypeParam| {
-        let bounded = match &param.bound[..] {
-            [] => param.name.name.clone(),
-            [bound] => format!("{}: {bound}", param.name.name),
-            bounds => {
-                let bounds: Vec<_> = bounds.iter().map(|bound| bound.to_string()).collect();
-                format!("{}: ({})", param.name.name, bounds.join(", "))
-            }
-        };
-        match &param.default {
-            Some(default) => format!("{bounded} = {default}"),
-            None => bounded,
+    let params: Vec<_> = params.iter().map(type_param_text).collect();
+    format!("({})", params.join(", "))
+}
+
+/// `A`, `B: Bound` or `C = Default`: `param` as it is declared.
+fn type_param_text(param: &TypeParam) -> String {
+    let bounded = match &param.bound[..] {
+        [] => param.name.name.clone(),
+        [bound] => format!("{}: {bound}", param.name.name),
+        bounds => {
+            let bounds: Vec<_> = bounds.iter().map(|bound| bound.to_string()).collect();
+            format!("{}: ({})", param.name.name, bounds.join(", "))
         }
     };
-    let params: Vec<_> = params.iter().map(param).collect();
-    format!("({})", params.join(", "))
+    match &param.default {
+        Some(default) => format!("{bounded} = {default}"),
+        None => bounded,
+    }
 }
 
 fn param_text(src: &mut Sources, param: &Param) -> String {
@@ -2276,6 +2342,9 @@ struct Named:
     name: array(u8) = \"\"
 struct(T) Box:
     value: T
+union(K: Head, V = K) Pair:
+    key: K
+    value: V
 pub let LIMIT = 100
 let (low, high) = (1, 2.5)
 fn(T) boxed(value: T, at: &var Box(T)) -> &var Box(T):
@@ -2306,6 +2375,9 @@ fn demo(p: &var Point, s: Shape, f: fn(i32, u8) -> i32, t: tuple(i32, f64)) -> f
     Shape.circle
     Named
     Box(u8)
+    Box
+    Pair
+    Pair(Named)
     log
     boxed
     geo.len
@@ -2621,6 +2693,11 @@ fn f(h: i32):
             "Named([id: i32], [name: array(u8) = \"\"])"
         );
         assert_eq!(signature("    Box(u8)\n").unwrap(), "Box([value: T])");
+        // A generic one takes its type arguments first.
+        assert_eq!(signature("    Box\n").unwrap(), "Box([T])");
+        assert_eq!(signature("    Pair\n").unwrap(), "Pair([K: Head], [V = K])");
+        assert_eq!(signature("    Pair(Named)\n"), None);
+        assert_eq!(signature("    Shape\n"), None);
         assert_eq!(
             signature("    Shape.circle\n").unwrap(),
             "Shape.circle([f32])"
@@ -3193,10 +3270,86 @@ fn(R: Make) take(make: R) -> &var u8:
         );
         let hover = analysis.hover(&mut files, file, offset).unwrap();
         assert_eq!(hover.text, "let Make: type = fn(uint) -> &var u8");
+        // It is described where it is bound as it is where it is named.
+        let (file, offset) = files.at("main", "Make: type");
+        assert_eq!(analysis.definition(file, offset), Some(make));
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(hover.text, "let Make: type = fn(uint) -> &var u8");
+        assert_eq!(hover.span, make);
         // One that nothing names is as unused as any global.
         let unused = analysis.unused(&mut files);
         let unused: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
         assert_eq!(unused, ["Unused", "take"]);
+    }
+
+    #[test]
+    fn a_name_of_a_type_in_a_function_is_a_name_of_its_block() {
+        let src = "\
+struct P:
+    x: i32
+    y: i32 = 0
+union Shape:
+    circle: f32
+    empty
+fn f(v: i32) -> i32:
+    let Q: type = P
+    let q: Q = Q(x: v)
+    Q
+    let S: type = Shape
+    S
+    S.circle
+    fn inner(p: Q) -> i32:
+        return p.x
+    let Spare: type = i32
+    pass
+    return inner(q)
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        // It is declared by its statement, and described as it is written
+        // there: where it is bound, where a type is written, and where a
+        // value is built.
+        let (file, bound) = files.at("main", "Q: type");
+        for text in ["Q: type", "Q = Q(x", "Q(x: v)", "Q) -> i32"] {
+            let (file, offset) = files.at("main", text);
+            let declared = analysis.definition(file, offset).unwrap();
+            assert_eq!(declared.start, bound, "{text}");
+            let hover = analysis.hover(&mut files, file, offset).unwrap();
+            assert_eq!(hover.text, "let Q: type = P", "{text}");
+        }
+        let spans = analysis.references(&mut files, file, bound, true);
+        let lines: Vec<_> = spans
+            .iter()
+            .map(|span| src[..span.start].matches('\n').count() + 1)
+            .collect();
+        assert_eq!(lines, [8, 9, 9, 10, 14]);
+        // It is called as the struct it names is, and has the variants of
+        // the union it names.
+        let (file, offset) = files.at("main", "Q\n    let S");
+        let signature = analysis.signature(&mut files, file, offset).unwrap();
+        assert_eq!(signature.label, "P(x: i32, y: i32 = 0)");
+        let (file, offset) = files.at("main", "S\n    S.circle");
+        let members = analysis.members(&mut files, file, offset);
+        let members: Vec<_> = members.iter().map(|member| member.name.as_str()).collect();
+        assert_eq!(members, ["circle", "empty", "size", "align"]);
+        let (file, offset) = files.at("main", "S.circle\n");
+        let signature = analysis.signature(&mut files, file, offset).unwrap();
+        assert_eq!(signature.label, "Shape.circle(f32)");
+        // It is a type to write, for the rest of its block.
+        let (file, offset) = files.at("main", "pass\n    return");
+        let names = analysis.names(&mut files, file, offset);
+        let types = names
+            .iter()
+            .filter(|name| name.kind == CompletionKind::Type);
+        let types: Vec<_> = types
+            .take(3)
+            .map(|name| (name.name.as_str(), name.detail.as_str()))
+            .collect();
+        assert_eq!(types, [("Spare", "i32"), ("S", "Shape"), ("Q", "P")]);
+        // One that nothing names is as unused as any variable.
+        let unused = analysis.unused(&mut files);
+        let unused: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
+        assert_eq!(unused, ["f", "Spare"]);
     }
 
     #[test]
@@ -3569,6 +3722,61 @@ fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
                 "main:15: Variable r",
                 "main:20: Variable n",
                 "main:21: Variable o",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_type_parameter_that_nothing_names_is_unused() {
+        let src = "\
+struct Head:
+    id: i32
+pub struct(T, Spare) Box:
+    value: T
+union(L, R = L, Lost: Head) Either:
+    left: L
+    right: R
+struct(_Unit) Length:
+    value: f64
+pub fn(T, Extra) first(a: T) -> T:
+    return a
+fn(T, B: Box(T, i32)) unbox(b: &B) -> i32:
+    return 0
+fn size_of(T: type, Other: type) -> uint:
+    return T.size
+fn(T) hidden(n: i32) -> i32:
+    let T: type = i32
+    let m: T = n
+    return m
+fn main():
+    let e: Either(u8, Lost: Head) = .left(1)
+    let l = Length(u8)(value: 1.0)
+    let n = unbox(&Box(i32, i32)(value: 1)) + hidden(2)
+    let s = size_of(u8, u8)
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let unused = analysis.unused(&mut files);
+        let type_params = unused
+            .iter()
+            .filter(|unused| unused.kind == UnusedKind::TypeParam);
+        let show = |unused: &Unused| {
+            let line = src[..unused.span.start].matches('\n').count() + 1;
+            format!("{line}: {}", unused.name)
+        };
+        // One is used by a field, a parameter, a result, a bound or a
+        // default of its declaration, or by the body. Whether what declares
+        // it is `pub` is nothing to it, and a label where a type argument
+        // is given is no use of it.
+        assert_eq!(
+            type_params.map(show).collect::<Vec<_>>(),
+            [
+                "3: Spare",
+                "5: Lost",
+                "10: Extra",
+                "14: Other",
+                // A name of a type that the body binds hides it there.
+                "16: T",
             ]
         );
     }

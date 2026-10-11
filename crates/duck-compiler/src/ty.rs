@@ -478,7 +478,7 @@ pub enum TypeErrorKind {
         found: String,
     },
     /// `type` written as any type but that of a function's parameter, or of
-    /// a global `let` of one name, which names a type.
+    /// a `let` of one name, which names a type.
     TypeOutsideParam,
     /// A parameter of type `type` given a default.
     TypeParamDefault(String),
@@ -912,7 +912,8 @@ struct Checker {
     /// in a generic declaration, and type arguments in an instance. While a
     /// type written in a body is resolved, the functions declared in
     /// functions that are in scope there follow them, each a name for its
-    /// own type, and the last of a name is the one it names.
+    /// own type, as do the names of types that the body binds, and the last
+    /// of a name is the one it names.
     type_params: Vec<(String, Ty)>,
     /// Enum declarations in declaration order.
     enums: Vec<EnumDef>,
@@ -1227,7 +1228,9 @@ struct Body<'c> {
     /// `return`s settle.
     opaques: Vec<OpaqueId>,
     /// The functions declared in those around its function that are in
-    /// scope where that is declared, each by its name and its type.
+    /// scope where that is declared, each by its name and its type. A name
+    /// of a type that those bind is bound in this one, as a variable that
+    /// it captures is.
     fns: Vec<(String, Ty)>,
     ret: Ty,
     locals: Vec<ir::Local>,
@@ -1274,6 +1277,9 @@ struct Var {
     /// Whether a `fn` in a function declares it, so that its name is its
     /// type where a type is written.
     func: bool,
+    /// Whether a `let` of type `type` declares it, so that it is no
+    /// variable: its name is `ty` where a type is written.
+    alias: bool,
     /// How many variables the body bound before it.
     order: usize,
     /// One local per scalar leaf of `ty`.
@@ -1633,8 +1639,8 @@ impl fmt::Display for TypeErrorKind {
             Self::TypeOutsideParam => write!(
                 f,
                 "`type` is only the type of a function's parameter, which it makes a type \
-                 parameter, and of a global `let` of one name, which it makes a name of the type \
-                 it is bound to"
+                 parameter, and of a `let` of one name, which it makes a name of the type it is \
+                 bound to"
             ),
             Self::TypeParamDefault(name) => {
                 write!(f, "type parameter `{name}` can't have a default")
@@ -4479,11 +4485,12 @@ impl<'c> Body<'c> {
         self.scalars(ty, zeros.map(Expr::Const).collect())
     }
 
-    /// The type parameter `expr` names, if it's the name of one that no
-    /// variable or item shadows, and the type it stands for.
+    /// The type parameter `expr` names, if it's the name of one that
+    /// nothing bound in the body and no item shadows, and the type it
+    /// stands for.
     fn param_named(&self, expr: &parse::Expr) -> Option<Ty> {
         match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() && self.ck.item(name).is_none() => {
+            ExprKind::Name(name) if self.local(name).is_none() && self.ck.item(name).is_none() => {
                 self.ck.type_param(name)
             }
             _ => None,
@@ -4523,6 +4530,7 @@ impl<'c> Body<'c> {
             mutable,
             captured: false,
             func: false,
+            alias: false,
             order: 0,
             slots,
         };
@@ -4539,7 +4547,14 @@ impl<'c> Body<'c> {
             .insert(name.to_string(), var);
     }
 
+    /// The variable `name` names here, which is the innermost so named. A
+    /// name of a type that the body binds is none, and hides one.
     fn lookup(&self, name: &str) -> Option<&Var> {
+        self.local(name).filter(|var| !var.alias)
+    }
+
+    /// What the body binds `name` to here: a variable, or a type.
+    fn local(&self, name: &str) -> Option<&Var> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
@@ -4625,6 +4640,7 @@ impl<'c> Body<'c> {
     fn stmt(&mut self, stmt: &parse::Stmt, out: &mut Vec<Stmt>) {
         let outer = mem::replace(&mut self.assigned, assigned_within(stmt));
         match &stmt.kind {
+            StmtKind::Binding(binding) if binding.binds_type() => self.alias_stmt(binding),
             StmtKind::Binding(binding) => {
                 let (ty, value) = self.binding_value(binding);
                 let bounds = self.ck.destructure(&binding.pattern, ty);
@@ -4940,9 +4956,9 @@ impl<'c> Body<'c> {
                     };
                     return Some(place);
                 }
-                match self.ck.item(name) {
+                match self.item(name) {
                     Some(item) => self.item_place(item, name, target.span),
-                    None if is_builtin_type(name) || self.ck.type_param(name).is_some() => {
+                    None if is_builtin_type(name) || self.stands_for(name).is_some() => {
                         self.error(TypeErrorKind::NotAssignable, target.span);
                         None
                     }
@@ -5856,10 +5872,14 @@ impl<'c> Body<'c> {
             let value = self.scalars(ty, reads);
             return (ty, self.read_variable(name, value));
         }
-        match self.ck.item(name) {
+        match self.item(name) {
             Some(item) => self.item_value(item, name, expected, span),
             None => {
-                self.error(TypeErrorKind::UnknownName(name.to_string()), span);
+                let kind = match self.alias(name) {
+                    Some(_) => TypeErrorKind::NotAValue(name.to_string()),
+                    None => TypeErrorKind::UnknownName(name.to_string()),
+                };
+                self.error(kind, span);
                 (Ty::Error, Value::default())
             }
         }
@@ -5894,7 +5914,7 @@ impl<'c> Body<'c> {
     /// one see.
     fn named(&self, expr: &parse::Expr) -> Option<Item> {
         match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => self.ck.item(name),
+            ExprKind::Name(name) if self.lookup(name).is_none() => self.item(name),
             ExprKind::Field(inner, field) => match self.named(inner)? {
                 Item::Module(module) => self.ck.member_of(module, &field.name).ok(),
                 _ => None,
@@ -5923,9 +5943,9 @@ impl<'c> Body<'c> {
     /// a pointer to one of those, or a function type.
     fn is_type_expr(&self, expr: &parse::Expr) -> bool {
         match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => match self.ck.item(name) {
+            ExprKind::Name(name) if self.lookup(name).is_none() => match self.item(name) {
                 Some(item) => matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Alias(_)),
-                None => is_builtin_type(name) || self.ck.type_param(name).is_some(),
+                None => is_builtin_type(name) || self.stands_for(name).is_some(),
             },
             ExprKind::Field(..) => {
                 matches!(
@@ -6443,7 +6463,7 @@ impl<'c> Body<'c> {
             ExprKind::Name(name) if self.lookup(name).is_some() => {
                 return self.call_value(callee, args, span);
             }
-            ExprKind::Name(name) if self.ck.takes_type_args(name) => {
+            ExprKind::Name(name) if self.alias(name).is_none() && self.ck.takes_type_args(name) => {
                 return self.generic_call(callee, args, span);
             }
             // `string` is built from its `ptr` and `len` as `array(u8)` is.
@@ -6451,12 +6471,12 @@ impl<'c> Body<'c> {
                 let ty = self.ck.string_ty();
                 return self.construct(ty, args, span);
             }
-            ExprKind::Name(name) => match self.ck.item(name) {
+            ExprKind::Name(name) => match self.item(name) {
                 Some(item) => Ok(item),
                 None if is_builtin_type(name) => {
                     Err(Some(TypeErrorKind::NotCallable(name.clone())))
                 }
-                None => match self.ck.type_param(name) {
+                None => match self.stands_for(name) {
                     Some(ty) => return self.construct(ty, args, span),
                     None => Err(Some(TypeErrorKind::UnknownName(name.clone()))),
                 },
@@ -12342,7 +12362,7 @@ fn f(T: type):
     let e = type(size: 1)
     let g = T.len
     let h = Box(T)
-    let i: type = i32
+    var i: type = i32
 ";
         assert_eq!(
             errors(src),
@@ -12359,13 +12379,12 @@ fn f(T: type):
                 NotAValue("T".into()),
                 NotAValue("Box(T)".into()),
                 TypeOutsideParam,
-                NotAValue("i32".into()),
             ]
         );
         assert_eq!(
             TypeOutsideParam.to_string(),
             "`type` is only the type of a function's parameter, which it makes a type parameter, \
-             and of a global `let` of one name, which it makes a name of the type it is bound to"
+             and of a `let` of one name, which it makes a name of the type it is bound to"
         );
     }
 
@@ -16013,6 +16032,130 @@ fn f(c: C):
         assert_eq!(
             RecursiveAlias("A".into()).to_string(),
             "`A` names a type that is written with `A` itself"
+        );
+    }
+
+    #[test]
+    fn a_let_of_type_type_in_a_function_names_a_type_there() {
+        let src = "\
+struct(T) Box:
+    value: T
+struct P:
+    x: i32
+    y: i32 = 0
+enum(u8) Color:
+    red
+    green
+union Shape:
+    circle: f32
+    empty
+fn size_of(T: type) -> uint:
+    return T.size
+fn(T) wrap(value: T) -> Box(T):
+    let B: type = Box(T)
+    let b: B = B(value: value)
+    return b
+fn(T) pick(a: T, n: i32) -> i32:
+    let T: type = i32
+    let b: T = n
+    return b
+fn f(x: i32) -> i32:
+    let Int: type = i32
+    let Q: type = P
+    let q = Q(x: 2)
+    let C: type = Color
+    let c = C.green
+    let S: type = Shape
+    let s = S.circle(1.0)
+    let n = size_of(Q) + Q.size
+    fn inner(v: Int) -> Q:
+        let r: Q = Q(x: v)
+        return r
+    let z = inner(3)
+    var count = 0
+    for m in C:
+        count += 1
+    if x > 0:
+        let Int: type = i64
+        let big: Int = 5
+        let Int = 7
+        count += Int
+    let again: Int = wrap(q.x).value
+    return again + z.x + count + pick(true, 1)
+";
+        let module = lower(src);
+        // It names the type wherever one is written: where a value is
+        // built, a variant or a member is named, and a type argument given.
+        let f = body(&module, "f");
+        for part in [
+            "(set q.x 2) (set q.y 0) (set c 1) (set s 0) (set s.0 1f32)",
+            "(set n (I32.Add (call size_of(P) ) 8))",
+            // A function declared after it names it, and captures nothing.
+            "(call f.inner [3] -> [tmp7 tmp8])",
+            // One in a block hides it there, as a variable hides that one.
+            "(then (set big 5i64) (set Int 7) (set count (I32.Add count Int)))",
+            "(set again (call wrap(i32) q.x))",
+        ] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+        assert_eq!(
+            body(&module, "f.inner"),
+            "(set r.x v) (set r.y 0) (return r.x r.y)"
+        );
+        // One in a generic function names its type parameters.
+        assert_eq!(
+            body(&module, "wrap(i32)"),
+            "(set b.value value) (return b.value)"
+        );
+        // And hides one of its name, as it hides an item.
+        assert_eq!(body(&module, "pick(bool)"), "(set b n) (return b)");
+
+        use TypeErrorKind::*;
+        let src = "\
+struct P:
+    x: i32
+fn f(v: i32):
+    let A: type = Nope
+    let (X, Y): type = i32
+    var V: type = i32
+    let i32: type = u8
+    let D: type = &D
+    let k: Later = 1
+    let Later: type = i32
+    let E: type = i32
+    let e = E
+    E = 2
+    let F: type = v
+    let P: type = bool
+    let p = P(x: 1)
+    let q: P = 3
+    if true:
+        let Inner: type = i32
+    let r: Inner = 1
+    let E = 5
+    let s: E = 1
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                UnknownType("Nope".into()),
+                // Only a `let` of one name binds one.
+                TypeOutsideParam,
+                TypeOutsideParam,
+                DuplicateItem("i32".into()),
+                // Nothing names it before its statement, itself included.
+                UnknownType("D".into()),
+                UnknownType("Later".into()),
+                NotAValue("i32".into()),
+                NotAssignable,
+                UnknownType("v".into()),
+                // It hides an item of its name.
+                NotCallable("bool".into()),
+                mismatch("bool", "i32"),
+                // Its block ends it, and a variable of its name hides it.
+                UnknownType("Inner".into()),
+                UnknownType("E".into()),
+            ]
         );
     }
 

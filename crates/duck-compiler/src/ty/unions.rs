@@ -320,8 +320,8 @@ impl Body<'_> {
         }
         let item = match &expr.kind {
             ExprKind::Call(callee, args) if self.names_type(callee, args) => self.named(callee),
-            ExprKind::Name(name) if self.lookup(name).is_none() && self.ck.item(name).is_none() => {
-                let param = self.ck.type_param(name);
+            ExprKind::Name(name) if self.lookup(name).is_none() && self.item(name).is_none() => {
+                let param = self.stands_for(name);
                 return param.is_some_and(|ty| self.ck.union_id(ty).is_some());
             }
             _ => self.named(expr),

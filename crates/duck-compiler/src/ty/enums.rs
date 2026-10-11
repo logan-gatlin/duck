@@ -387,7 +387,7 @@ impl Body<'_> {
                 _ => None,
             },
             (None, ExprKind::Name(name)) if self.lookup(name).is_none() => {
-                match self.ck.type_param(name) {
+                match self.stands_for(name) {
                     Some(Ty::Enum(id)) => Some(id),
                     _ => None,
                 }

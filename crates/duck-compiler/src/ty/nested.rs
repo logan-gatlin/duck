@@ -38,6 +38,10 @@ pub(super) struct NestedFn {
     /// it is, each by its name and its type: its body names the type of
     /// each, whether or not it captures the function.
     fns: Vec<(String, Ty)>,
+    /// The names of types that those around it bind and that are in scope
+    /// where it is, each with its type: its body names them, and captures
+    /// nothing by them.
+    aliases: Vec<(String, Ty)>,
 }
 
 /// A variable that a function declared in a function captures.
@@ -349,6 +353,7 @@ impl Body<'_> {
             return;
         };
         self.fns = nested.fns;
+        self.bind_aliases(nested.aliases);
         let mut held = Vec::new();
         for capture in nested.captures {
             let slots = self.alloc(&capture.name, capture.ty);
@@ -358,6 +363,7 @@ impl Body<'_> {
                 mutable: false,
                 captured: capture.var,
                 func: capture.func,
+                alias: false,
                 order: 0,
                 slots,
             };
@@ -374,38 +380,47 @@ impl Body<'_> {
             mutable: false,
             captured: false,
             func: ty != Ty::Error,
+            alias: false,
             order: 0,
             slots,
         };
         self.bind_var(name, var);
     }
 
-    /// The functions that are declared in this one and in those around it,
-    /// and that are in scope, each by its name and its type: those around
-    /// it first, unless a variable of this one hides the name.
-    fn fns_in_scope(&self) -> Vec<(String, Ty)> {
-        let mut seen = Vec::new();
-        let mut fns = Vec::new();
+    /// What each name that the body binds and that is in scope is bound to:
+    /// the innermost so named.
+    pub(super) fn bound_in_scope(&self) -> Vec<(&String, &Var)> {
+        let mut bound: Vec<(&String, &Var)> = Vec::new();
         for (name, var) in self.scopes.iter().rev().flatten() {
-            if seen.contains(&name) {
-                continue;
-            }
-            seen.push(name);
-            if var.func {
-                fns.push((name.clone(), var.ty));
+            if !bound.iter().any(|(seen, _)| *seen == name) {
+                bound.push((name, var));
             }
         }
-        let around = self.fns.iter().filter(|(name, _)| !seen.contains(&name));
+        bound
+    }
+
+    /// The functions that are declared in this one and in those around it,
+    /// and that are in scope, each by its name and its type: those around
+    /// it first, unless this one binds the name.
+    fn fns_in_scope(&self) -> Vec<(String, Ty)> {
+        let bound = self.bound_in_scope();
+        let hidden = |name: &String| bound.iter().any(|(seen, _)| *seen == name);
+        let around = self.fns.iter().filter(|(name, _)| !hidden(name));
+        let fns = bound.iter().filter(|(_, var)| var.func);
+        let fns = fns.map(|(name, var)| ((*name).clone(), var.ty));
         around.cloned().chain(fns).collect()
     }
 
     /// Resolves, with `resolve`, types written where each function in scope
     /// that is declared in a function names its type, as a function of the
-    /// module does.
-    pub(super) fn naming_fns<T>(&mut self, resolve: impl FnOnce(&mut Checker) -> T) -> T {
+    /// module does, and each name of a type that the body binds names its
+    /// own.
+    pub(super) fn naming_locals<T>(&mut self, resolve: impl FnOnce(&mut Checker) -> T) -> T {
         let outer = self.ck.type_params.len();
         let fns = self.fns_in_scope();
         self.ck.type_params.extend(fns);
+        let aliases = self.aliases_in_scope();
+        self.ck.type_params.extend(aliases);
         let resolved = resolve(self.ck);
         self.ck.type_params.truncate(outer);
         resolved
@@ -422,7 +437,7 @@ impl Body<'_> {
 
     /// Resolves `ty`, written in the body.
     pub(super) fn resolve_ty(&mut self, ty: &parse::Type) -> Ty {
-        self.naming_fns(|ck| ck.resolve_ty(ty))
+        self.naming_locals(|ck| ck.resolve_ty(ty))
     }
 
     /// What the function `decl` captures, declared here: each variable in
@@ -471,7 +486,7 @@ impl Body<'_> {
                 is_pub: false,
                 count: 0,
             };
-            let (params, ret) = self.naming_fns(|ck| ck.resolve_sig(&decl.sig, Some(site)));
+            let (params, ret) = self.naming_locals(|ck| ck.resolve_sig(&decl.sig, Some(site)));
             let sig = FuncSig {
                 name: func,
                 params,
@@ -484,6 +499,7 @@ impl Body<'_> {
                 held: (self.ck).tuple_of(captures.iter().map(|capture| capture.ty).collect()),
                 captures,
                 fns: self.fns_in_scope(),
+                aliases: self.aliases_in_scope(),
             };
             self.ck.declare_nested(self.func, span, sig, nested);
             let program = self.program.expect("only a function has statements");

@@ -1227,7 +1227,9 @@ impl Body<'_> {
     /// none are labelled, so that giving it some is reported.
     pub(super) fn names_type(&self, expr: &parse::Expr, args: &[Arg]) -> bool {
         let takes_args = match &expr.kind {
-            ExprKind::Name(name) if self.lookup(name).is_none() => self.ck.takes_type_args(name),
+            ExprKind::Name(name) if self.lookup(name).is_none() => {
+                self.alias(name).is_none() && self.ck.takes_type_args(name)
+            }
             ExprKind::Field(..) => self
                 .named(expr)
                 .and_then(|item| self.ck.item_arity(item))

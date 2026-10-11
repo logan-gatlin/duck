@@ -83,14 +83,21 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - `fn(A, B) -> R`: a function pointer. `fn(A)` returns nothing.
 - A type has a `size: uint` and an `align: uint`, as in `Point.size`,
   `(&Point).size` and `i64.align`. It is no value: `type` is only the type of
-  a function's parameter, which makes it a type parameter, and of a global
-  `let` that names a type.
-- `let Step: type = fn(i32) -> i32`: a global `let` of one name, typed
-  `type`, names the type it is bound to. `Step` is that type wherever a
-  type is written, and no type of its own: an error says `fn(i32) -> i32`.
-  It may be `pub`, is used from another module as any item is, and is no
-  global: nothing of it is in the module. It takes no type parameters, and
-  is not written with itself.
+  a function's parameter, which makes it a type parameter, and of a `let`
+  that names a type.
+- `let Step: type = fn(i32) -> i32`: a `let` of one name, typed `type`,
+  names the type it is bound to. `Step` is that type wherever a type is
+  written, and no type of its own: an error says `fn(i32) -> i32`. It takes
+  no type parameters, and is not written with itself.
+- A global one may be `pub`, is used from another module as any item is,
+  and is named before it is declared. It is no global: nothing of it is in
+  the module.
+- One in a function is a name of its block, as a variable is: only what
+  follows its statement names it, it hides what its name was, an item
+  among them, and a variable of its name hides it in turn. It names the
+  type parameters of its function, as in `let B: type = Box(T)`, and a
+  function declared after it names it, and captures nothing by it. It is no
+  variable: nothing of it is in the function.
 - `never`: the type of what has no value, as a `return` has none. It is
   accepted as any type, and nothing else is accepted as it, so no value of
   it is made: a function that returns it never returns. It is never stored

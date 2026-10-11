@@ -5,11 +5,11 @@ use std::collections::HashSet;
 
 use crate::file::{FileId, FileManager};
 use crate::lex::Span;
-use crate::parse::{ItemKind, StmtKind};
+use crate::parse::{Ident, ItemKind, StmtKind};
 
 use super::symbols::bound;
 use super::visit::{self, Node};
-use super::{Analysis, Sources, names};
+use super::{Analysis, Sources, names, type_param_names};
 
 /// Something declared that nothing uses.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,16 +25,21 @@ pub enum UnusedKind {
     /// A variable of a function, or a global.
     Variable,
     Function,
+    /// A type parameter of a function, a struct or a union.
+    TypeParam,
     /// A name that a `use` gives.
     Use,
 }
 
 impl Analysis {
     /// What the program declares that nothing in it names again, in the
-    /// order of its files: a variable or a global, a function, or what a
-    /// `use` names. Nothing `pub` is among them, as another program may use
-    /// it, nor a parameter, as its function may be one of several that are
-    /// called alike, nor a name that starts with `_`, which says as much.
+    /// order of its files: a variable or a global, a function, a type
+    /// parameter, or what a `use` names. Nothing `pub` is among them, as
+    /// another program may use it, nor a parameter, as its function may be
+    /// one of several that are called alike, nor a name that starts with
+    /// `_`, which says as much. A type parameter is among them whatever
+    /// declares it: only its own declaration names it, and no function
+    /// that has one is called as another is.
     pub fn unused(&self, files: &mut impl FileManager) -> Vec<Unused> {
         let mut read = |id| files.contents(id);
         let mut src = Sources::new(&mut read);
@@ -79,6 +84,15 @@ impl Analysis {
         };
         for item in &self.program.items {
             let variable = UnusedKind::Variable;
+            let type_params: Vec<&Ident> = match &item.kind {
+                ItemKind::Fn(decl) => type_param_names(&decl.sig),
+                ItemKind::Struct(decl) => decl.params.iter().map(|param| &param.name).collect(),
+                ItemKind::Union(decl) => decl.params.iter().map(|param| &param.name).collect(),
+                _ => Vec::new(),
+            };
+            for name in type_params {
+                declares(&name.name, name.span, UnusedKind::TypeParam);
+            }
             match &item.kind {
                 ItemKind::Fn(decl) if !item.is_pub => {
                     let name = &decl.sig.name;

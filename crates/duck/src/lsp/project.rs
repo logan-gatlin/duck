@@ -1196,6 +1196,16 @@ pub(crate) mod tests {
         let point = "Point(x: f32, y: f32 = 0.0, id: i32 = 0)".to_string();
         assert_eq!(signature(src, "Point(x: 1.0, y: "), Some((point, Some(1))));
         assert_eq!(signature(src, "let p = "), None);
+        // A generic struct takes its type arguments, and then its fields.
+        let src = "struct(K, V = K) Entry:\n    key: K\n    value: V\nfn main():\n    let e = Entry(u8, V: \n    let f = Entry(u8)(key: 1, \n";
+        let params = "Entry(K, V = K)".to_string();
+        assert_eq!(signature(src, "Entry("), Some((params.clone(), Some(0))));
+        assert_eq!(signature(src, "Entry(u8, V: "), Some((params, Some(1))));
+        let fields = "Entry(key: K, value: V)".to_string();
+        assert_eq!(
+            signature(src, "Entry(u8)(key: 1, "),
+            Some((fields, Some(1)))
+        );
     }
 
     #[test]

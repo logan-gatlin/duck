@@ -1,6 +1,12 @@
-//! Names of types: a global `let` of type `type` is bound to a type, written
-//! where its value would be, and is that type wherever a type is written.
-//! It is no global, and nothing of it is in the module.
+//! Names of types: a `let` of type `type` is bound to a type, written where
+//! its value would be, and is that type wherever a type is written. It is
+//! no variable, and nothing of it is in the module.
+//!
+//! A global one is an item, which is named before it is declared. One in a
+//! function is a name of its body, as a variable is: the rest of its block
+//! names it, it hides what was so named, and what is bound after it hides
+//! it. The functions declared after it name it too, and capture nothing by
+//! it.
 
 use std::mem;
 
@@ -9,7 +15,7 @@ use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, Binding, Mutability, PatternKind};
 
-use super::{Checker, Item, Ty, TypeErrorKind, Visit, pattern_names};
+use super::{Body, Checker, Item, Ty, TypeErrorKind, Var, Visit, is_builtin_type, pattern_names};
 
 /// A name of a type.
 pub(super) struct AliasDef {
@@ -103,5 +109,85 @@ impl Checker {
             let span = program.items[self.aliases[id].item].span;
             self.alias_ty(id, span);
         }
+    }
+}
+
+impl Body<'_> {
+    /// Binds the name that the statement `binding` gives a type, for the
+    /// rest of its block. Only a `let` of one name binds one, as only one
+    /// [declares](Checker::declare_alias) one in a module, and none is
+    /// named as a type of the language is.
+    pub(super) fn alias_stmt(&mut self, binding: &Binding) {
+        let pattern = &binding.pattern;
+        let (Mutability::Let, PatternKind::Name(name)) = (binding.mutability, &pattern.kind) else {
+            let span = binding.ty.as_ref().map_or(pattern.span, |ty| ty.span);
+            self.error(TypeErrorKind::TypeOutsideParam, span);
+            return;
+        };
+        if is_builtin_type(name) {
+            self.error(TypeErrorKind::DuplicateItem(name.clone()), pattern.span);
+            return;
+        }
+        // The name is bound once its type is resolved, so the type is
+        // written with what the name was.
+        let ty = self.expr_type(&binding.value);
+        self.ck.record(pattern.span, ty);
+        let var = Var {
+            ty,
+            mutable: false,
+            captured: false,
+            func: false,
+            alias: true,
+            order: 0,
+            slots: Vec::new(),
+        };
+        self.bind_var(name, var);
+    }
+
+    /// Binds each of `aliases`, the names of types in scope where the
+    /// function this is the body of is declared, to its type.
+    pub(super) fn bind_aliases(&mut self, aliases: Vec<(String, Ty)>) {
+        for (name, ty) in aliases {
+            let var = Var {
+                ty,
+                mutable: false,
+                captured: false,
+                func: false,
+                alias: true,
+                order: 0,
+                slots: Vec::new(),
+            };
+            self.bind_var(&name, var);
+        }
+    }
+
+    /// The type that `name` names here, if the body binds it to one that
+    /// no variable bound since hides.
+    pub(super) fn alias(&self, name: &str) -> Option<Ty> {
+        self.local(name).filter(|var| var.alias).map(|var| var.ty)
+    }
+
+    /// The names of types that the body binds and that are in scope, each
+    /// with its type.
+    pub(super) fn aliases_in_scope(&self) -> Vec<(String, Ty)> {
+        let bound = self.bound_in_scope().into_iter();
+        let aliases = bound.filter(|(_, var)| var.alias);
+        aliases.map(|(name, var)| (name.clone(), var.ty)).collect()
+    }
+
+    /// The item of the module that `name` names here, unless the body binds
+    /// the name to a type, which hides it.
+    pub(super) fn item(&self, name: &str) -> Option<Item> {
+        match self.alias(name) {
+            Some(_) => None,
+            None => self.ck.item(name),
+        }
+    }
+
+    /// The type that `name` stands for where no variable or item is so
+    /// named: the one that the body binds it to, or else that of a type
+    /// parameter in scope.
+    pub(super) fn stands_for(&self, name: &str) -> Option<Ty> {
+        self.alias(name).or_else(|| self.ck.type_param(name))
     }
 }
