@@ -3,6 +3,7 @@
 //! package as checked.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use duck::manifest::{self, COMPONENT, ENTRY, LIBRARY, MANIFEST, ManifestError};
 use duck::package::{self, Packages, ResolveError};
 use duck_compiler::file::{FileId, FileManager, Settings};
 use duck_compiler::lex::Span;
+use duck_compiler::load::Parsed;
 use duck_compiler::ty::{
     self, ActionKind, Analysis, Completion, CompletionKind, HintKind, Signature, Symbol,
     SymbolKind, TypeErrorKind, Unused,
@@ -41,6 +43,10 @@ pub struct Project {
     /// the newest last: what is asked of the same text is answered of the
     /// same check.
     probes: Vec<Probe>,
+    /// What the files of each build parsed to when it was last checked, by
+    /// the table of the manifest that says what is built: a file that is as
+    /// it was then isn't parsed again.
+    parsed: HashMap<&'static str, Parsed>,
 }
 
 /// The files of a build, and what checking them found. Of a build with
@@ -221,6 +227,7 @@ impl Project {
             checked: Vec::new(),
             warnings: Vec::new(),
             probes: Vec::new(),
+            parsed: HashMap::new(),
         }
     }
 
@@ -887,7 +894,11 @@ impl Project {
     /// path, their constants run on little fuel, and a build that didn't
     /// use the file when the package was last checked isn't checked, as it
     /// has nothing to say of it.
-    fn builds(&self, buffers: Buffers<'_>, asked: Option<&Path>) -> (Vec<Problem>, Vec<Checked>) {
+    fn builds(
+        &mut self,
+        buffers: Buffers<'_>,
+        asked: Option<&Path>,
+    ) -> (Vec<Problem>, Vec<Checked>) {
         let manifest_path = canonical(&self.root.join(MANIFEST));
         let packages = match &self.packages {
             Ok(packages) => packages,
@@ -920,7 +931,8 @@ impl Project {
                         files: &mut files,
                         buffers,
                     };
-                    let (found, analysis) = overlay.problems(&manifest_path);
+                    let parsed = self.parsed.entry(table).or_default();
+                    let (found, analysis) = overlay.problems(&manifest_path, parsed);
                     checked.extend(analysis.map(|(analysis, whole)| Checked {
                         table,
                         files,
@@ -984,11 +996,17 @@ impl Problem {
 impl Overlay<'_, '_> {
     /// The errors of compiling the files, those that no file holds placed
     /// in the manifest at `manifest_path`, and the files as checked, with
-    /// whether they loaded whole, unless the compiler crashed.
-    fn problems(mut self, manifest_path: &Path) -> (Vec<Problem>, Option<(Analysis, bool)>) {
+    /// whether they loaded whole, unless the compiler crashed. A file that
+    /// is as `parsed` has it, which is what the files of this build last
+    /// parsed to, isn't parsed again.
+    fn problems(
+        mut self,
+        manifest_path: &Path,
+        parsed: &mut Parsed,
+    ) -> (Vec<Problem>, Option<(Analysis, bool)>) {
         // Half-written code is what the compiler is least tested on, and a
         // bug in it shouldn't end the server.
-        let (errors, analysis) = match caught(|| self.check()) {
+        let (errors, analysis) = match caught(|| self.check(parsed)) {
             Ok(checked) => checked,
             Err(crash) => {
                 let message = format!("the compiler crashed checking this package{crash}");
@@ -1022,8 +1040,8 @@ impl Overlay<'_, '_> {
     /// as checked, with whether they loaded whole. Those that don't are
     /// checked for what did load of them, which has no errors to give, and
     /// may be more than the compiler can check.
-    fn check(&mut self) -> (Vec<Error>, Option<(Analysis, bool)>) {
-        let (program, errors) = load::load_partial(self);
+    fn check(&mut self, parsed: &mut Parsed) -> (Vec<Error>, Option<(Analysis, bool)>) {
+        let (program, errors) = load::load_again(self, parsed);
         let settings = self.settings();
         if !errors.is_empty() {
             let settings = brief(settings);

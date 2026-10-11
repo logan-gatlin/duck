@@ -4,7 +4,7 @@
 //! `util/strings.duck` is `util.strings`. Its items are kept apart from those
 //! of other modules, which it reaches through the names `use` gives them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::Error;
@@ -65,10 +65,31 @@ pub struct Use {
     pub decl: Span,
 }
 
+/// What each file of a program was when the program was last loaded, with
+/// what it parsed to: a file that is as it was then isn't lexed and parsed
+/// again.
+#[derive(Default)]
+pub struct Parsed {
+    files: HashMap<FileId, Read>,
+}
+
+/// A file as it was read, and what was made of it.
+#[derive(Clone)]
+struct Read {
+    src: String,
+    /// What parsed of it, if anything lexed.
+    module: Option<parse::Module>,
+    /// Why it didn't lex or parse whole, if it didn't.
+    errors: Vec<Error>,
+}
+
 struct Loader<'f, F> {
     files: &'f mut F,
     /// Whether what lexes and parses of a file with errors is loaded.
     partial: bool,
+    /// What the files parsed to when they were last loaded, if that was
+    /// kept.
+    parsed: Option<&'f mut Parsed>,
     /// The modules loaded or being loaded, which are not loaded again.
     seen: HashSet<FileId>,
     items: Vec<Item>,
@@ -131,7 +152,7 @@ impl Program {
 /// use one another. Errors in one file don't stop the others from loading,
 /// but the uses of a file that fails to lex or parse are not followed.
 pub fn load(files: &mut impl FileManager) -> Result<Program, Vec<Error>> {
-    match Loader::run(files, false) {
+    match Loader::run(files, false, None) {
         (program, errors) if errors.is_empty() => Ok(program),
         (_, errors) => Err(errors),
     }
@@ -141,15 +162,28 @@ pub fn load(files: &mut impl FileManager) -> Result<Program, Vec<Error>> {
 /// along with them, for a caller that asks about what is there: of a file
 /// with errors, the lines without one, whose uses are followed.
 pub fn load_partial(files: &mut impl FileManager) -> (Program, Vec<Error>) {
-    Loader::run(files, true)
+    Loader::run(files, true, None)
+}
+
+/// Loads as [`load_partial`] does, without lexing and parsing again a file
+/// that is as it was when `parsed` was last loaded with, which is then what
+/// the files are now. A file is known by its id, so `parsed` is of files
+/// that are given their ids as these are.
+pub fn load_again(files: &mut impl FileManager, parsed: &mut Parsed) -> (Program, Vec<Error>) {
+    Loader::run(files, true, Some(parsed))
 }
 
 impl<'f, F: FileManager> Loader<'f, F> {
-    fn run(files: &'f mut F, partial: bool) -> (Program, Vec<Error>) {
+    fn run(
+        files: &'f mut F,
+        partial: bool,
+        parsed: Option<&'f mut Parsed>,
+    ) -> (Program, Vec<Error>) {
         let entry = files.entry_point();
         let mut loader = Self {
             files,
             partial,
+            parsed,
             seen: HashSet::new(),
             items: Vec::new(),
             uses: Vec::new(),
@@ -157,6 +191,10 @@ impl<'f, F: FileManager> Loader<'f, F> {
         };
         loader.seen.insert(entry);
         loader.items_of(entry);
+        // A file that the program no longer uses is no longer kept.
+        if let Some(parsed) = &mut loader.parsed {
+            parsed.files.retain(|id, _| loader.seen.contains(id));
+        }
         let program = Program {
             items: loader.items,
             uses: loader.uses,
@@ -167,20 +205,25 @@ impl<'f, F: FileManager> Loader<'f, F> {
 
     fn items_of(&mut self, id: FileId) {
         let src = self.files.contents(id);
-        let lexed = self.errors.len();
-        let Some(tokens) = self.tokens_of(id, src) else {
+        let kept = self
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.files.get(&id));
+        let read = match kept.filter(|kept| kept.src == src) {
+            Some(kept) => kept.clone(),
+            None => {
+                let read = self.read(id, src);
+                if let Some(parsed) = &mut self.parsed {
+                    parsed.files.insert(id, read.clone());
+                }
+                read
+            }
+        };
+        let failed = !read.errors.is_empty();
+        self.errors.extend(read.errors);
+        let Some(module) = read.module.filter(|_| self.partial || !failed) else {
             return;
         };
-        let (module, errors) = parse::parse_partial(&tokens);
-        let failed = !errors.is_empty();
-        // What is left of a file that doesn't lex may not parse for what
-        // was taken from it.
-        if self.errors.len() == lexed {
-            self.errors.extend(errors.into_iter().map(Error::Parse));
-        }
-        if failed && !self.partial {
-            return;
-        }
         // Uses come first, so the modules they load precede these items,
         // but for one that is being loaded: it uses this module in turn.
         for item in module.items {
@@ -198,25 +241,51 @@ impl<'f, F: FileManager> Loader<'f, F> {
         }
     }
 
-    /// The tokens of `src`, the contents of file `id`. For one that doesn't
-    /// lex they are those of what is left once each line with an error is
-    /// blanked, if what loads of a file is wanted.
-    fn tokens_of(&mut self, id: FileId, mut src: String) -> Option<Vec<Token>> {
+    /// Lexes and parses `src`, the contents of file `id`: what parsed of
+    /// it, and why not all of it did.
+    fn read(&self, id: FileId, src: String) -> Read {
+        let (tokens, unlexed) = self.tokens_of(id, src.clone());
+        let Some(tokens) = tokens else {
+            return Read {
+                src,
+                module: None,
+                errors: unlexed.into_iter().collect(),
+            };
+        };
+        let (module, errors) = parse::parse_partial(&tokens);
+        // What is left of a file that doesn't lex may not parse for what
+        // was taken from it.
+        let errors = match unlexed {
+            Some(unlexed) => vec![unlexed],
+            None => errors.into_iter().map(Error::Parse).collect(),
+        };
+        Read {
+            src,
+            module: Some(module),
+            errors,
+        }
+    }
+
+    /// The tokens of `src`, the contents of file `id`, and why it doesn't
+    /// lex, if it doesn't. For one that doesn't they are those of what is
+    /// left once each line with an error is blanked, if what loads of a
+    /// file is wanted.
+    fn tokens_of(&self, id: FileId, mut src: String) -> (Option<Vec<Token>>, Option<Error>) {
         let mut error = match lex::tokenize(id, &src) {
-            Ok(tokens) => return Some(tokens),
+            Ok(tokens) => return (Some(tokens), None),
             Err(error) => error,
         };
-        self.errors.push(Error::Lex(error.clone()));
+        let unlexed = Some(Error::Lex(error.clone()));
         for _ in 0..MAX_BLANKED_LINES {
             if !self.partial || !blank_line(&mut src, error.span.start) {
                 break;
             }
             error = match lex::tokenize(id, &src) {
-                Ok(tokens) => return Some(tokens),
+                Ok(tokens) => return (Some(tokens), unlexed),
                 Err(error) => error,
             };
         }
-        None
+        (None, unlexed)
     }
 
     /// Loads the module `path` leads into, and gives what it names its name
@@ -430,6 +499,38 @@ mod tests {
         let funcs = module.funcs.iter().flat_map(|f| &f.exports);
         let globals = module.globals.iter().flat_map(|g| &g.exports);
         funcs.chain(globals).map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_file_that_is_as_it_was_is_loaded_as_it_last_parsed() {
+        let mut parsed = Parsed::default();
+        let mut files = Memory(vec![
+            ("main", "use a\nuse b\nlet x = a.y\n"),
+            ("a", "pub let y = 1\n"),
+            ("b", ""),
+        ]);
+        let first = load_again(&mut files, &mut parsed);
+        assert_eq!(first, load_partial(&mut files));
+        assert_eq!(first.1, []);
+        assert_eq!(load_again(&mut files, &mut parsed), first);
+        // One that changed is read as it is now, with what is wrong with
+        // it, which is said again of it for as long as it is so.
+        files.0[1].1 = "pub let y = @\npub let z = 2\n";
+        let changed = load_again(&mut files, &mut parsed);
+        assert_eq!(changed, load_partial(&mut files));
+        assert_eq!(changed.0.items.len(), 2);
+        assert_eq!(changed.1.len(), 1);
+        assert_eq!(load_again(&mut files, &mut parsed), changed);
+        files.0[1].1 = "pub let y = 1\n";
+        assert_eq!(load_again(&mut files, &mut parsed), first);
+        // One that the program uses no longer is kept no longer.
+        assert_eq!(parsed.files.len(), 3);
+        files.0[0].1 = "use a\nlet x = a.y\n";
+        assert_eq!(
+            load_again(&mut files, &mut parsed),
+            load_partial(&mut files)
+        );
+        assert_eq!(parsed.files.len(), 2);
     }
 
     #[test]
