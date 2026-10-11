@@ -367,6 +367,19 @@ impl Analysis {
     /// unused, which is what stays of it either way.
     fn unused_fixes(&self, files: &mut impl FileManager, unused: &Unused) -> Vec<Action> {
         let name = &unused.name;
+        // A function that is imported is the host's by its name.
+        let imports = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Extern(block) => Some(block.fns.iter()),
+                _ => None,
+            });
+        let mut imported = imports.flatten().map(|imported| imported.sig.name.span);
+        if imported.any(|imported| imported == unused.span) {
+            return Vec::new();
+        }
         if unused.kind != UnusedKind::Use {
             let at = Span {
                 end: unused.span.start,
@@ -390,8 +403,9 @@ impl Analysis {
     /// What is taken from the source for it to no longer write `used`: the
     /// lines of its `use`, if that writes nothing else, or else its own
     /// names in the group it is one of, with the comma that sets them
-    /// apart. `None` where it is alone in a group within another, which
-    /// would be left with nothing in it.
+    /// apart, and with a group within that one which holds nothing but
+    /// them. `None` where it is alone in a group whose names others share,
+    /// which would be left with nothing in it.
     fn use_removed(&self, src: &mut Sources, used: &Use) -> Option<Span> {
         let decl = used.decl;
         let together: Vec<_> = (self.program.uses.iter())
@@ -411,7 +425,16 @@ impl Analysis {
         let shared = |name: &Span| together.iter().any(|other| names(other).contains(name));
         let own = names(used);
         let start = own.iter().find(|name| !shared(name))?.start;
-        let end = own.last()?.end.max(used.name.span.end);
+        let mut end = own.last()?.end.max(used.name.span.end);
+        // A group that holds nothing else goes with them, to where it ends.
+        for _ in text.get(start..end)?.matches('{') {
+            let rest = text.get(end..decl.end)?;
+            let close = rest.find('}')?;
+            if !rest[..close].chars().all(|c| c == ',' || c.is_whitespace()) {
+                return None;
+            }
+            end += close + 1;
+        }
         let after = text.get(end..decl.end)?;
         let rest = after.trim_start();
         if rest.starts_with(',') {
@@ -505,9 +528,12 @@ impl Analysis {
         for decl in lines {
             let written: Vec<_> = uses().filter(|used| used.decl == decl).collect();
             let used: Vec<_> = written.iter().filter(|used| !is_unused(used)).collect();
+            let as_written = &text[decl.start..decl.end];
             let line = match used.len() == written.len() {
-                true => text[decl.start..decl.end].to_string(),
+                true => as_written.to_string(),
                 false if used.is_empty() => continue,
+                // What is said of a group is said in it, and stays.
+                false if as_written.contains('#') => as_written.to_string(),
                 false => use_line(&used.into_iter().copied().collect::<Vec<_>>()),
             };
             // In the order of what is named, whether or not it is `pub`.

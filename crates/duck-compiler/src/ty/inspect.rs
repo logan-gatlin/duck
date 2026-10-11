@@ -3807,6 +3807,8 @@ fn spin(n: i32) -> i32:
 let slow = spin(1000000)
 let wrong: i32 = nope
 let after = spin(3)
+let made = wrong + 1
+let of = (made, 2)
 ";
         let mut files = Memory(vec![("main", src)]);
         let (program, errors) = load::load_partial(&mut files);
@@ -3820,11 +3822,13 @@ let after = spin(3)
             let (file, offset) = files.at("main", text);
             analysis.hover(&mut files, file, offset).unwrap().value
         };
-        // One that ran out of fuel, one that didn't check, and one that
-        // wasn't run for the errors before it.
+        // One that ran out of fuel, one that didn't check, one that wasn't
+        // run for the errors before it, and one made of those.
         assert_eq!(value("slow ="), "");
         assert_eq!(value("wrong:"), "");
         assert_eq!(value("after ="), "");
+        assert_eq!(value("made ="), "");
+        assert_eq!(value("of ="), "");
     }
 
     #[test]
@@ -4296,6 +4300,29 @@ fn main():
                 &lines.replace("    length,\n", "")
             )
         );
+        // A group within its group that holds nothing else goes with it,
+        // and one that others are in is left with them.
+        let within = |group: &'static str| {
+            let main = "use shapes.{GROUP}\npub fn main() -> f32:\n    return origin.x\n";
+            let main: &'static str = main.replace("GROUP", group).leak();
+            let shapes = "pub use geo\npub use geo.origin\n";
+            let mut files = Memory(vec![("main", main), ("shapes", shapes), ("geo", geo)]);
+            let removed = changes(&mut files, "length", fix);
+            let made = removed.into_iter().map(|(_, made)| made);
+            made.map(|made| made.lines().next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(within("origin, geo.{length}"), ["use shapes.{origin}"]);
+        assert_eq!(within("geo.{length,}, origin"), ["use shapes.{origin}"]);
+        assert_eq!(
+            within("origin, geo.{length, Point}"),
+            ["use shapes.{origin, geo.{Point}}"]
+        );
+        // A function that is imported is the host's by its name, so no
+        // other is offered for it.
+        let imported = "extern \"$root\":\n    fn log(n: i32)\npub fn main():\n    pass\n";
+        let mut files = Memory(vec![("main", imported)]);
+        assert_eq!(offered(&mut files, "log").len(), 0);
     }
 
     #[test]
@@ -4481,6 +4508,9 @@ fn main():
                 &format!("use alpha\nuse geo.length\nuse geo.origin\n{body}")
             )
         );
+        // What is said in a group stays with it, whatever it is said of.
+        let main: &str = "use alpha\nuse geo.{\n    origin,  # Where it starts.\n    Point,\n    length,\n}\npub fn main() -> f32:\n    return length(origin) + alpha.one\n";
+        assert_eq!(changes(&mut files(main), "use alpha", organize), []);
         // Those in order and all used are left as they are, and so is
         // what follows something written between them.
         let main: &str = "use alpha\nuse geo.{origin, length}\n# The rest.\nuse util\npub fn main() -> f32:\n    return length(origin) + alpha.one\n";
