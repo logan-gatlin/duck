@@ -20,9 +20,10 @@ use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, Arg, FnSig};
 
+use super::opaque::{OpaqueSite, Owner};
 use super::{
-    Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Owner, Synth, Ty, TypeErrorKind,
-    Value, generic_fn_decls, is_typed_by_other, never, pending_defaults,
+    Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
+    generic_fn_decls, is_typed_by_other, never, pending_defaults,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -108,9 +109,13 @@ impl Checker {
                     self.error(kind, default.span);
                 }
             }
-            let owner = Owner::Generic(GenericFnId(i as u32));
-            let owner = (owner, decl.sig.name.name.clone(), item.is_pub);
-            let (params, ret) = self.resolve_sig(&decl.sig, Some(owner));
+            let site = OpaqueSite {
+                owner: Owner::Generic(GenericFnId(i as u32)),
+                func: decl.sig.name.name.clone(),
+                is_pub: item.is_pub,
+                count: 0,
+            };
+            let (params, ret) = self.resolve_sig(&decl.sig, Some(site));
             if item.is_pub {
                 self.check_public_sig(&decl.sig, &params, ret);
             }
@@ -584,15 +589,10 @@ impl Body<'_> {
             }
         }
         let value = self.bound_args(&instance.params, &sig.defaults, args, binding, checked);
+        self.settle(instance.ret, span);
         match id {
-            Some(id) => {
-                self.settle(instance.ret, span);
-                self.call_func(id, value)
-            }
-            None => {
-                self.settle(instance.ret, span);
-                (instance.ret, self.blank(instance.ret))
-            }
+            Some(id) => self.call_func(id, value),
+            None => (instance.ret, self.blank(instance.ret)),
         }
     }
 
@@ -687,7 +687,8 @@ impl Body<'_> {
     /// name of a function writes its type there. The error type after
     /// reporting that it's a value.
     fn type_arg(&mut self, expr: &parse::Expr) -> Ty {
-        if self.is_type_expr(expr) || matches!(self.named(expr), Some(Item::Func(_))) {
+        let names_fn = matches!(self.named(expr), Some(Item::Func(_))) || self.names_nested(expr);
+        if self.is_type_expr(expr) || names_fn {
             return self.expr_type(expr);
         }
         if self.expr(expr, None).0 != Ty::Error {

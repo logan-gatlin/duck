@@ -1444,4 +1444,73 @@ pub fn composed(n: i32) -> i32:
         assert_eq!(started.call("generic", &[2]), 114);
         assert_eq!(started.call("composed", &[3]), 11);
     }
+
+    #[test]
+    fn an_opaque_type_argument_is_used_as_the_declaration_uses_its_parameter() {
+        let src = "\
+struct(T) Box:
+    v: T
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    more: i32
+union ReadError:
+    closed
+    timeout: u32
+union IoError:
+    use ReadError
+    denied: i64
+fn(T) wrap(x: T) -> opaque(Box(T)):
+    return Box(T)(v: x)
+fn(T) size_of(x: T) -> uint:
+    return T.size
+fn(T, B: Box(T)) held_size(b: B) -> uint:
+    return size_of(b.v)
+fn(T) relay(x: T) -> T:
+    match x:
+        other:
+            return other
+fn(T) same(x: T) -> T:
+    return x as T
+fn first() -> opaque(Head):
+    return Named(id: 7, more: 8)
+fn failed(ms: u32) -> opaque(IoError):
+    return ReadError.timeout(ms)
+fn(T) hold(x: T, again: i32) -> opaque(fn() -> T):
+    fn get() -> T:
+        return x
+    if again == 0:
+        return get
+    return hold(x, again - 1)
+fn width(T: type, x: i32) -> i32:
+    return x + T.size as i32
+pub fn sizes() -> i32:
+    let narrow = held_size(wrap(3 as u8))
+    let wide = held_size(Box(i64)(v: 300))
+    return (narrow * 10 + wide) as i32
+pub fn relayed(ms: i32) -> i32:
+    match relay(failed(ms as u32)):
+        .timeout(got):
+            return got as i32 + same(first()).id + same(relay(first())).id
+        else:
+            return -1
+pub fn held(n: i32) -> i32:
+    return hold(n, 2)() + hold(n as i64, 1)() as i32
+pub fn named(n: i32) -> i32:
+    fn add(x: i32) -> i32:
+        return x + n
+    fn inner(f: add) -> i32:
+        let g: add = f
+        return g(1) + width(add, 0)
+    return inner(add) * 10 + width(add, 1)
+";
+        let mut started = Started::of(src);
+        // Whichever instance is lowered first, each reads its own.
+        assert_eq!(started.call("sizes", &[]), 18);
+        assert_eq!(started.call("relayed", &[5]), 19);
+        assert_eq!(started.call("held", &[4]), 8);
+        // A function declared in a function is a type where one is given.
+        assert_eq!(started.call("named", &[2]), 75);
+    }
 }

@@ -155,6 +155,7 @@ impl Checker {
 
     /// The type that type parameter `name` stands for, if one is in scope.
     pub(super) fn type_param(&self, name: &str) -> Option<Ty> {
+        // The last of a name, as a function declared in a function is.
         let param = self.type_params.iter().rfind(|(param, _)| param == name);
         param.map(|(_, ty)| *ty)
     }
@@ -333,15 +334,19 @@ impl Checker {
     /// which says how a type argument is called and nothing of what it
     /// holds.
     pub(super) fn known(&self, ty: Ty) -> Ty {
-        let bound = match ty {
-            Ty::Param(id) => self.params[id.0 as usize].bound,
-            // Only its bound is known of a type that a result hides.
-            Ty::Opaque(id) => self.opaque_bound(id),
-            _ => None,
-        };
-        match bound {
+        match self.bounded_by(ty) {
             Some(Ty::Fn(_)) | None => ty,
             Some(bound) => bound,
+        }
+    }
+
+    /// What bounds a `ty`, if it is a type parameter or a type that a
+    /// result hides, of which only its bound is known, and has one.
+    fn bounded_by(&self, ty: Ty) -> Option<Ty> {
+        match ty {
+            Ty::Param(id) => self.params[id.0 as usize].bound,
+            Ty::Opaque(id) => self.opaque_bound(id),
+            _ => None,
         }
     }
 
@@ -360,15 +365,10 @@ impl Checker {
         match ty {
             Ty::Fn(id) => Some(self.fn_tys[id.0 as usize].clone()),
             Ty::Func(id) => Some(self.func_shape(id)),
-            Ty::Param(id) => match self.params[id.0 as usize].bound {
+            _ => match self.bounded_by(ty) {
                 Some(bound @ Ty::Fn(_)) => self.called_as(bound),
                 _ => None,
             },
-            Ty::Opaque(id) => match self.opaque_bound(id) {
-                Some(bound @ Ty::Fn(_)) => self.called_as(bound),
-                _ => None,
-            },
-            _ => None,
         }
     }
 
@@ -492,18 +492,20 @@ impl Checker {
     /// own is `pub`.
     pub(super) fn read_as(&mut self, ty: Ty, field: &Ident) -> Ty {
         let key = (field.span.file, field.span.start);
+        // An instance reads what its declaration did, whatever its type
+        // argument is: one that a result hides has a bound of its own.
+        if !self.instance_chain.is_empty() {
+            let Some(bound) = self.bound_uses.get(&key).copied() else {
+                return ty;
+            };
+            let args: Vec<_> = self.type_params.iter().map(|(_, arg)| *arg).collect();
+            return self.substitute(bound, &args, field.span);
+        }
         let bound = self.known(ty);
         if bound != ty {
             self.bound_uses.insert(key, bound);
-            return bound;
         }
-        match self.bound_uses.get(&key) {
-            Some(bound) if !self.instance_chain.is_empty() => {
-                let args: Vec<_> = self.type_params.iter().map(|(_, arg)| *arg).collect();
-                self.substitute(*bound, &args, field.span)
-            }
-            _ => ty,
-        }
+        bound
     }
 
     /// Reports, at `site`, each of the type arguments `args` that doesn't

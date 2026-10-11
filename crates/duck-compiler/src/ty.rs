@@ -30,8 +30,8 @@ use enums::EnumDef;
 use evaluate::Dep;
 use generic::{Arity, Instance, ParamDef, ParamDefaults, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
-use nested::Closure;
-use opaque::{Hiding, OpaqueDef, Owner};
+use nested::NestedFn;
+use opaque::{OpaqueDef, OpaqueSite, Owner};
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
 mod alias;
@@ -909,7 +909,10 @@ struct Checker {
     /// Every generic struct's type parameters, indexed by [`ParamId`].
     params: Vec<ParamDef>,
     /// The type parameters in scope, and the types they stand for: themselves
-    /// in a generic declaration, and type arguments in an instance.
+    /// in a generic declaration, and type arguments in an instance. While a
+    /// type written in a body is resolved, the functions declared in
+    /// functions that are in scope there follow them, each a name for its
+    /// own type, and the last of a name is the one it names.
     type_params: Vec<(String, Ty)>,
     /// Enum declarations in declaration order.
     enums: Vec<EnumDef>,
@@ -963,13 +966,13 @@ struct Checker {
     nested: HashMap<(Option<FuncId>, Span), FuncId>,
     /// What each function that is declared in another is beyond its
     /// signature: what it is named and what it captures.
-    closures: HashMap<FuncId, Closure>,
+    nested_fns: HashMap<FuncId, NestedFn>,
     /// Every type that the result of a function hides, indexed by
     /// [`OpaqueId`].
     opaques: Vec<OpaqueDef>,
     /// The result being resolved, if it's that of a function with a body:
     /// nothing else hides a type.
-    opaque_site: Option<Hiding>,
+    opaque_site: Option<OpaqueSite>,
     /// Each opaque type of an instance of a generic function, by the one
     /// that the declaration has in its place and the type arguments.
     opaque_instances: HashMap<(OpaqueId, Vec<Ty>), OpaqueId>,
@@ -1213,7 +1216,8 @@ struct Bound<'p> {
 /// initializer.
 struct Body<'c> {
     ck: &'c mut Checker,
-    /// The function this is the body of, if it's one of the module.
+    /// The function this is the body of, if it's one: a generic function
+    /// checked as declared is none.
     func: Option<FuncId>,
     /// The name of the function this is the body of, if it's one.
     name: String,
@@ -1222,6 +1226,9 @@ struct Body<'c> {
     /// The opaque types that the result of its function hides, which its
     /// `return`s settle.
     opaques: Vec<OpaqueId>,
+    /// The functions declared in those around its function that are in
+    /// scope where that is declared, each by its name and its type.
+    fns: Vec<(String, Ty)>,
     ret: Ty,
     locals: Vec<ir::Local>,
     scopes: Vec<HashMap<String, Var>>,
@@ -2890,12 +2897,13 @@ impl Checker {
             self.module = decl.name.span.file;
             // The host gives a value of no type that it can't name.
             let imported = (id as u32) < self.import_count;
-            let owner = (
-                Owner::Func(FuncId(id as u32)),
-                decl.name.name.clone(),
+            let site = OpaqueSite {
+                owner: Owner::Func(FuncId(id as u32)),
+                func: decl.name.name.clone(),
                 is_pub,
-            );
-            let (params, ret) = self.resolve_sig(decl, (!imported).then_some(owner));
+                count: 0,
+            };
+            let (params, ret) = self.resolve_sig(decl, (!imported).then_some(site));
             if is_pub {
                 self.check_public_sig(decl, &params, ret);
             }
@@ -2964,13 +2972,8 @@ impl Checker {
 
     /// The types of the parameters and result of `sig`. If it `hides`, as
     /// the signature of a function with a body may, its result is where
-    /// `opaque` is written: that of the function given, and whether it is
-    /// `pub`.
-    fn resolve_sig(
-        &mut self,
-        sig: &FnSig,
-        hides: Option<(Owner, String, bool)>,
-    ) -> (Vec<(String, Ty)>, Ty) {
+    /// `opaque` is written.
+    fn resolve_sig(&mut self, sig: &FnSig, hides: Option<OpaqueSite>) -> (Vec<(String, Ty)>, Ty) {
         let mut params: Vec<(String, Ty)> = Vec::new();
         for param in &sig.params {
             if params.iter().any(|(name, _)| *name == param.name.name) {
@@ -2984,12 +2987,7 @@ impl Checker {
             };
             params.push((param.name.name.clone(), ty));
         }
-        self.opaque_site = hides.map(|(owner, func, is_pub)| Hiding {
-            owner,
-            func,
-            is_pub,
-            count: 0,
-        });
+        self.opaque_site = hides;
         let ret = sig.ret.as_ref().map_or(Ty::Unit, |ty| self.resolve_ty(ty));
         self.opaque_site = None;
         (params, ret)
@@ -3297,7 +3295,7 @@ impl Checker {
     ) -> ir::Func {
         // Its `return`s settle what its result hides.
         let own = self.own_opaques(id, sig.ret);
-        self.open_opaques(&own);
+        self.begin_settling(&own);
         let errors = self.errors.len();
         let mut body = Body::new(self, sig.ret);
         body.program = Some(program);
@@ -3319,7 +3317,7 @@ impl Checker {
         let returns = body.ended;
         let locals = body.locals;
         let failed = self.errors.len() > errors;
-        self.close_opaques(&own, &sig.name, failed, span);
+        self.end_settling(&own, &sig.name, failed, span);
         let results = self.val_types(sig.ret);
         if !matches!(sig.ret, Ty::Unit | Ty::Error) && !returns {
             self.error(TypeErrorKind::MissingReturn(sig.name.clone()), span);
@@ -3449,6 +3447,7 @@ impl Checker {
     ) -> Ty {
         let param = match member {
             Some(_) => None,
+            // The last of a name: a function declared in a function.
             None => self.type_params.iter().rfind(|(p, _)| p == name),
         };
         let arity = match (param, member) {
@@ -4420,6 +4419,7 @@ impl<'c> Body<'c> {
             name: String::new(),
             bound: 0,
             opaques: Vec::new(),
+            fns: Vec::new(),
             ret,
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
@@ -6263,11 +6263,14 @@ impl<'c> Body<'c> {
         };
         // A bounded type parameter casts as its bound does, which every
         // type argument casts to.
+        // So does a type that a result hides, unless it is cast as itself,
+        // as a type parameter that it is given for is.
         let written = from;
-        let value = self.as_opaque_bound(from, value);
-        let from = match self.ck.known(from) {
-            bound if !matches!(to, Ty::Param(_)) => bound,
-            _ => from,
+        let (from, value) = match self.ck.known(from) {
+            bound if !matches!(to, Ty::Param(_)) && from != to => {
+                (bound, self.as_opaque_bound(from, value))
+            }
+            _ => (from, value),
         };
         // A struct that starts as an array casts to one as that array
         // does, which its `ptr` and `len` are.
@@ -18408,13 +18411,15 @@ fn main(n: i32) -> uint:
                 (mismatch("i32", "main.add"), "1"),
             ]
         );
-        // One that names only functions holds nothing, and is one.
+        // One that captures only what holds nothing holds nothing, and is
+        // a pointer to itself as any function is.
         let src = "\
 fn main(n: i32) -> i32:
+    let unit = ()
     fn one() -> i32:
         return 1
     fn two() -> i32:
-        let unit = ()
+        let nothing = unit
         return one() + one()
     fn three() -> i32:
         return two() + one()
@@ -18425,6 +18430,18 @@ fn main(n: i32) -> i32:
         assert_eq!(
             body(&module, "main.three"),
             "(return (I32.Add (call main.two ) (call main.one )))"
+        );
+        let table = module.table.as_ref().unwrap();
+        let pointed: Vec<_> = table
+            .funcs
+            .iter()
+            .map(|id| func_name(&module, *id))
+            .collect();
+        assert_eq!(pointed, ["main.three"]);
+        let main = body(&module, "main");
+        assert!(
+            main.ends_with("(return (I32.Add (call_indirect p ) 0))"),
+            "{main}"
         );
     }
 

@@ -19,27 +19,33 @@ use crate::load::Program;
 use crate::parse::{self, ExprKind, Pattern, PatternKind, StmtKind};
 
 use super::inspect::visit::{self, Node};
-use super::{
-    Body, Checker, Expr, FuncSig, OPEN_FUNCS, Owner, Stmt, Synth, Ty, TypeErrorKind, Value, Var,
-};
+use super::opaque::{OpaqueSite, Owner};
+use super::{Body, Checker, Expr, FuncSig, OPEN_FUNCS, Stmt, Synth, Ty, TypeErrorKind, Value, Var};
 
-/// What a function declared in a function is beyond its signature.
+/// What a function declared in a function is beyond its signature. It is
+/// a closure if what it captures holds anything.
 #[derive(Clone)]
-pub(super) struct Closure {
+pub(super) struct NestedFn {
     /// The name it is declared by, which its body names it by.
     name: String,
     /// The variables of the functions around it that its body names, in
     /// the order they are declared.
-    pub(super) captures: Vec<Capture>,
+    captures: Vec<Capture>,
     /// The tuple of what it captures, which a value of its type is laid
     /// out as.
     held: Ty,
+    /// The functions declared in those around it that are in scope where
+    /// it is, each by its name and its type: its body names the type of
+    /// each, whether or not it captures the function.
+    fns: Vec<(String, Ty)>,
 }
 
 /// A variable that a function declared in a function captures.
 #[derive(Clone)]
 pub(super) struct Capture {
+    /// The name it has in the function around, and in the body.
     pub(super) name: String,
+    /// The type of the variable, and so of the copy.
     pub(super) ty: Ty,
     /// Whether it is a `var`, which the function has a copy of that it
     /// doesn't assign.
@@ -54,6 +60,7 @@ pub(super) struct Capture {
 struct Free<'p> {
     /// The names in scope that the function binds, innermost last.
     bound: Vec<&'p str>,
+    /// Those found so far, in the order they are first mentioned.
     names: Vec<&'p str>,
 }
 
@@ -77,6 +84,7 @@ impl<'p> Free<'p> {
         self.bound.truncate(outer);
     }
 
+    /// Finds those of `block`, whose names are bound until it ends.
     fn block(&mut self, block: &'p [parse::Stmt]) {
         let outer = self.bound.len();
         for stmt in block {
@@ -93,6 +101,8 @@ impl<'p> Free<'p> {
         self.bound.truncate(outer);
     }
 
+    /// Finds those of `stmt`, and binds what it declares for the rest of
+    /// its block.
     fn stmt(&mut self, stmt: &'p parse::Stmt) {
         match &stmt.kind {
             // A name is bound once its value is evaluated.
@@ -182,8 +192,8 @@ impl Checker {
     /// What function `id` captures, if it is declared in a function, in the
     /// order a value of its type holds them.
     pub(super) fn captures(&self, id: FuncId) -> &[Capture] {
-        match self.closures.get(&id) {
-            Some(closure) => &closure.captures,
+        match self.nested_fns.get(&id) {
+            Some(nested) => &nested.captures,
             None => &[],
         }
     }
@@ -191,7 +201,7 @@ impl Checker {
     /// The tuple that a value of the type of function `id` is laid out as,
     /// if the function is declared in a function: one of what it captures.
     pub(super) fn held(&self, id: FuncId) -> Option<Ty> {
-        self.closures.get(&id).map(|closure| closure.held)
+        self.nested_fns.get(&id).map(|nested| nested.held)
     }
 
     /// Whether a value of type `ty` may hold anything: a type parameter
@@ -216,8 +226,14 @@ impl Checker {
     /// of its type then holds, so that no pointer to the function alone
     /// calls it. One that captures only what holds nothing is none.
     pub(super) fn is_closure(&self, id: FuncId) -> bool {
-        let mut captures = self.captures(id).iter();
-        captures.any(|capture| self.holds_value(capture.ty))
+        self.held_captures(id).next().is_some()
+    }
+
+    /// The captures of function `id` that a value of its type holds
+    /// something of.
+    fn held_captures(&self, id: FuncId) -> impl Iterator<Item = &Capture> {
+        let captures = self.captures(id).iter();
+        captures.filter(|capture| self.holds_value(capture.ty))
     }
 
     /// The type of a closure that a value of type `ty` holds, if it holds
@@ -242,11 +258,8 @@ impl Checker {
         let Ty::Func(id) = ty else {
             return None;
         };
-        let captures = self.captures(id).iter();
-        let held: Vec<_> = captures
-            .filter(|capture| self.holds_value(capture.ty))
-            .map(|capture| capture.name.clone())
-            .collect();
+        let held = self.held_captures(id).map(|capture| capture.name.clone());
+        let held: Vec<_> = held.collect();
         (!held.is_empty()).then(|| TypeErrorKind::ClosurePointer {
             name: self.ty_name(ty),
             captures: held,
@@ -257,11 +270,9 @@ impl Checker {
     /// that a value of its type holds, and how many bytes they take, unless
     /// that is for a type argument to say. `None` if it is no closure.
     pub(super) fn captures_text(&self, id: FuncId) -> Option<String> {
-        let captures = self.captures(id).iter();
-        let held: Vec<_> = captures
-            .filter(|capture| self.holds_value(capture.ty))
-            .map(|capture| format!("{}: {}", capture.name, self.ty_name(capture.ty)))
-            .collect();
+        let held = self.held_captures(id);
+        let held = held.map(|capture| format!("{}: {}", capture.name, self.ty_name(capture.ty)));
+        let held: Vec<_> = held.collect();
         if held.is_empty() {
             return None;
         }
@@ -275,45 +286,37 @@ impl Checker {
         Some(format!("captures {}{size}", held.join(", ")))
     }
 
-    /// The function that the body of `parent` declares at `span`, which
-    /// [`Self::nested_id`] gives next if it has yet to.
-    fn nested_at(&self, parent: Option<FuncId>, span: Span) -> FuncId {
+    /// The function that the body of `parent` declares at `span`, and
+    /// whether it is yet to be declared: it is then the next that
+    /// [`Self::declare_nested`] declares. One in a generic function checked
+    /// as declared is of no instance, so it is no function of the module.
+    fn nested_at(&self, parent: Option<FuncId>, span: Span) -> (FuncId, bool) {
         match (self.nested.get(&(parent, span)), self.open) {
-            (Some(id), _) => *id,
-            (None, true) => FuncId(OPEN_FUNCS + self.open_funcs.len() as u32),
-            (None, false) => FuncId(self.funcs.len() as u32),
+            (Some(id), _) => (*id, false),
+            (None, true) => (FuncId(OPEN_FUNCS + self.open_funcs.len() as u32), true),
+            (None, false) => (FuncId(self.funcs.len() as u32), true),
         }
     }
 
-    /// The function with signature `sig` that the body of `parent` declares
-    /// at `span` as `closure`, and whether this is the first it is asked
-    /// for. One in a generic function checked as declared is of no
-    /// instance, so it is no function of the module.
-    fn nested_id(
+    /// Declares the function with signature `sig` that the body of `parent`
+    /// declares at `span`, which is `nested` beyond that.
+    fn declare_nested(
         &mut self,
         parent: Option<FuncId>,
         span: Span,
         sig: FuncSig,
-        closure: impl FnOnce(&mut Self) -> Closure,
-    ) -> (FuncId, bool) {
-        if let Some(id) = self.nested.get(&(parent, span)) {
-            return (*id, false);
-        }
-        let id = match self.open {
-            true => {
-                self.open_funcs.push(sig);
-                FuncId(OPEN_FUNCS + self.open_funcs.len() as u32 - 1)
-            }
+        nested: NestedFn,
+    ) {
+        let (id, _) = self.nested_at(parent, span);
+        match self.open {
+            true => self.open_funcs.push(sig),
             false => {
                 self.funcs.push(sig);
                 self.synths.push(Synth::Nested);
-                FuncId(self.funcs.len() as u32 - 1)
             }
-        };
+        }
         self.nested.insert((parent, span), id);
-        let closure = closure(self);
-        self.closures.insert(id, closure);
-        (id, true)
+        self.nested_fns.insert(id, nested);
     }
 
     /// Lowers function `id`, which `decl` declares at `span` in the body of
@@ -342,11 +345,12 @@ impl Body<'_> {
     /// around it, if it is declared in one: each variable it captures,
     /// which it has a copy of, and itself, which holds them all.
     pub(super) fn bind_captures(&mut self, id: FuncId) {
-        let Some(closure) = self.ck.closures.get(&id).cloned() else {
+        let Some(nested) = self.ck.nested_fns.get(&id).cloned() else {
             return;
         };
+        self.fns = nested.fns;
         let mut held = Vec::new();
-        for capture in closure.captures {
+        for capture in nested.captures {
             let slots = self.alloc(&capture.name, capture.ty);
             held.extend(&slots);
             let var = Var {
@@ -359,7 +363,7 @@ impl Body<'_> {
             };
             self.bind_var(&capture.name, var);
         }
-        self.bind_fn(&closure.name, Ty::Func(id), held);
+        self.bind_fn(&nested.name, Ty::Func(id), held);
     }
 
     /// Binds `name` to a function declared in a function, a value of type
@@ -377,7 +381,8 @@ impl Body<'_> {
     }
 
     /// The functions that are declared in this one and in those around it,
-    /// and that are in scope, each by its name and its type.
+    /// and that are in scope, each by its name and its type: those around
+    /// it first, unless a variable of this one hides the name.
     fn fns_in_scope(&self) -> Vec<(String, Ty)> {
         let mut seen = Vec::new();
         let mut fns = Vec::new();
@@ -390,7 +395,8 @@ impl Body<'_> {
                 fns.push((name.clone(), var.ty));
             }
         }
-        fns
+        let around = self.fns.iter().filter(|(name, _)| !seen.contains(&name));
+        around.cloned().chain(fns).collect()
     }
 
     /// Resolves, with `resolve`, types written where each function in scope
@@ -456,27 +462,36 @@ impl Body<'_> {
             self.bind_fn(&name.name, Ty::Error, Vec::new());
             return;
         }
-        let func = format!("{}.{}", self.name, name.name);
-        let owner = (Owner::Func(self.ck.nested_at(self.func, span)), func, false);
-        let (params, ret) = self.naming_fns(|ck| ck.resolve_sig(&decl.sig, Some(owner)));
-        // A signature that failed to resolve is already reported.
-        let failed = ret == Ty::Error || params.iter().any(|(_, ty)| *ty == Ty::Error);
-        let sig = FuncSig {
-            name: format!("{}.{}", self.name, name.name),
-            params,
-            defaults: Vec::new(),
-            ret,
-        };
-        let captures = self.captured(decl);
-        let (id, new) = self.ck.nested_id(self.func, span, sig, |ck| Closure {
-            name: own(),
-            held: ck.tuple_of(captures.iter().map(|capture| capture.ty).collect()),
-            captures,
-        });
+        let (id, new) = self.ck.nested_at(self.func, span);
         if new {
+            let func = format!("{}.{}", self.name, name.name);
+            let site = OpaqueSite {
+                owner: Owner::Func(id),
+                func: func.clone(),
+                is_pub: false,
+                count: 0,
+            };
+            let (params, ret) = self.naming_fns(|ck| ck.resolve_sig(&decl.sig, Some(site)));
+            let sig = FuncSig {
+                name: func,
+                params,
+                defaults: Vec::new(),
+                ret,
+            };
+            let captures = self.captured(decl);
+            let nested = NestedFn {
+                name: own(),
+                held: (self.ck).tuple_of(captures.iter().map(|capture| capture.ty).collect()),
+                captures,
+                fns: self.fns_in_scope(),
+            };
+            self.ck.declare_nested(self.func, span, sig, nested);
             let program = self.program.expect("only a function has statements");
             self.ck.lower_nested(program, id, decl, span);
         }
+        // A signature that failed to resolve is already reported.
+        let (params, ret) = self.ck.func_shape(id);
+        let failed = ret == Ty::Error || params.contains(&Ty::Error);
         let ty = match failed {
             true => Ty::Error,
             false => Ty::Func(id),

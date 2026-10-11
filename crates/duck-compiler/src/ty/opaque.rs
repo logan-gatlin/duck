@@ -24,7 +24,7 @@ use super::{
 
 /// The result of a function, while it is resolved: where `opaque` is
 /// written.
-pub(super) struct Hiding {
+pub(super) struct OpaqueSite {
     pub(super) owner: Owner,
     /// The name of the function, as an error says it.
     pub(super) func: String,
@@ -49,8 +49,9 @@ pub(super) struct OpaqueDef {
     state: Visit,
     /// Whether an error says why nothing settles it.
     reported: bool,
-    /// Whether its function is `pub`, and the module that declares it.
+    /// Whether its function is `pub`.
     is_pub: bool,
+    /// The module that declares its function.
     module: FileId,
     /// For that of an instance of a generic function, the one that the
     /// declaration's result has in its place.
@@ -60,6 +61,7 @@ pub(super) struct OpaqueDef {
 /// The function whose result hides a type.
 #[derive(Clone, PartialEq)]
 pub(super) enum Owner {
+    /// A function that isn't generic, or one declared in a function.
     Func(FuncId),
     /// A generic function, as declared.
     Generic(GenericFnId),
@@ -187,9 +189,9 @@ impl Checker {
         }
     }
 
-    /// The opaque type in `ty` that the module `within` can't name, or that
-    /// isn't `pub`: one of a function that isn't, or one that a type which
-    /// isn't bounds.
+    /// Opaque type `id`, if it isn't `pub` or the module `within` can't name
+    /// it, as it is of a function that isn't `pub`, or else the type that
+    /// bounds it and isn't.
     pub(super) fn private_opaque(&self, id: OpaqueId, within: Option<FileId>) -> Option<Ty> {
         let def = &self.opaques[id.0 as usize];
         if !def.is_pub && within != Some(def.module) {
@@ -284,14 +286,27 @@ impl Checker {
         Ty::Opaque(instance)
     }
 
+    /// The opaque type that the declaration of a generic function has
+    /// where the function, checked as declared, gives itself opaque type
+    /// `id`: that of the instance with its own type parameters. Any other
+    /// is itself.
+    fn as_declared(&self, id: OpaqueId) -> OpaqueId {
+        let def = &self.opaques[id.0 as usize];
+        let own = self.type_params.iter().map(|(_, ty)| ty);
+        match (&def.owner, def.decl) {
+            (Owner::Instance(_, args), Some(decl)) if self.open && own.eq(args) => decl,
+            _ => id,
+        }
+    }
+
     /// `ty` with each of the opaque types `own` replaced: by what it hides,
     /// if that is settled, and otherwise by the type parameter that stands
     /// for it until it is. So it is `ty` as the body of the function whose
     /// result it is sees it.
     pub(super) fn revealed(&mut self, ty: Ty, own: &[OpaqueId], site: Span) -> Ty {
         match ty {
-            Ty::Opaque(id) if own.contains(&id) => {
-                let def = &self.opaques[id.0 as usize];
+            Ty::Opaque(id) if own.contains(&self.as_declared(id)) => {
+                let def = &self.opaques[self.as_declared(id).0 as usize];
                 def.hidden.unwrap_or(def.hole)
             }
             Ty::Struct(id) => {
@@ -377,8 +392,8 @@ impl Checker {
                 (Visit::Active, _) => {
                     if !def.reported && def.hidden.is_none() {
                         self.error(TypeErrorKind::OpaqueCycle(def.func.clone()), span);
+                        self.opaques[asked.0 as usize].reported = true;
                     }
-                    self.opaques[asked.0 as usize].reported = true;
                 }
                 (Visit::New, Some(func)) => {
                     self.lower_early(program, func);
@@ -392,7 +407,7 @@ impl Checker {
 
     /// Says that the body of the function that hides each of `own` is
     /// being lowered, which is to settle them.
-    pub(super) fn open_opaques(&mut self, own: &[OpaqueId]) {
+    pub(super) fn begin_settling(&mut self, own: &[OpaqueId]) {
         for id in own {
             self.opaques[id.0 as usize].state = Visit::Active;
         }
@@ -402,7 +417,7 @@ impl Checker {
     /// lowered, which hides each of `own`, and reports each that no
     /// `return` of it settled, unless the body has an error to mend first,
     /// as `failed` says.
-    pub(super) fn close_opaques(&mut self, own: &[OpaqueId], func: &str, failed: bool, span: Span) {
+    pub(super) fn end_settling(&mut self, own: &[OpaqueId], func: &str, failed: bool, span: Span) {
         for id in own {
             let def = &mut self.opaques[id.0 as usize];
             def.state = Visit::Done;
