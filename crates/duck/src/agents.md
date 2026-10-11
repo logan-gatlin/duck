@@ -603,6 +603,10 @@ pointers.
   a function as one does: `ok or module.unreachable()`.
 - `module.count_leading_zeros(x)` and `module.count_trailing_zeros(x)` take
   any integer type and give that type.
+- `module.cabi_realloc` is a type, the
+  `fn(&var u8, uint, uint, uint) -> &var u8` that a component's
+  `cabi_realloc` is called as: `old`, `old_size`, `align` and `new_size`.
+  Write it where a type is: `realloc: module.cabi_realloc`.
 
 ## Defer
 
@@ -1509,11 +1513,12 @@ those as the Canonical ABI of the component model has them.
 - The host allocates what it passes that holds a `list` or a `string`: the
   result of an import, the parameters of an export, and those of an export
   that are too many for wasm values. A component whose host does has
-  `pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint)
-  -> &var u8` in its entry file, or a `pub use` of another file's as that
-  name: it is called with `old` and `old_size` as 0, and returns `new_size`
-  bytes at a multiple of `align`. Without one the error is where the host
-  would first need it.
+  `pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint,
+  new_size: uint) -> &var u8` in its entry file, or a `pub use` of another
+  file's as that name: it is called with `old` and `old_size` as 0, and
+  returns `new_size` bytes at a multiple of `align`. Without one the error
+  is where the host would first need it. `module.cabi_realloc` names the
+  type of a pointer to one.
 - What a component passes the host is the component's own to keep or free:
   the host copies a `list` that an export returns and frees nothing.
 - An integer of 32 bits or fewer, a `bool`, an enum of either and a handle
@@ -1561,7 +1566,7 @@ let written = &var result(tuple(), u8).ok(())
 var heap: uint = 0
 var end: uint = 0
 
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
 	var at = (heap + align - 1) / align * align
 	if at + new_size > end:
 		let pages = (new_size + module.page_size - 1) / module.page_size

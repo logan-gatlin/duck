@@ -625,7 +625,7 @@ extern \"$root\":
 pub fn sum(a: i32, b: i32) -> i32:
     return a + b
 
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     return 0
 "
         );
@@ -1161,14 +1161,14 @@ fn f():
 extern \"my:pkg/host@0.1.0\":
     fn letter(c: u32) -> array(tuple(u32, string))
 
-pub fn cabi_realloc(old: &u8, old_size: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, new_size: uint) -> &var u8:
     return 0
 ";
         assert_eq!(
             errors_in(src, Some("hosted")),
             [(
-                "`cabi_realloc` is called by the host as a `fn(old: &u8, old_size: uint, align: \
-                 uint, new_size: uint) -> &var u8`"
+                "`cabi_realloc` is called by the host as a `fn(old: &var u8, old_size: uint, \
+                 align: uint, new_size: uint) -> &var u8`"
                     .to_string(),
                 "cabi_realloc"
             )]
@@ -1179,7 +1179,7 @@ pub fn cabi_realloc(old: &u8, old_size: uint, new_size: uint) -> &var u8:
     fn what_the_host_allocates_needs_an_allocator() {
         let needs = "the host passes a `list<tuple<u32, string>>` in memory that it has the \
                      component allocate: the entry file is to have a `pub fn cabi_realloc(old: \
-                     &u8, old_size: uint, align: uint, new_size: uint) -> &var u8`";
+                     &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8`";
         let import = "
 extern \"my:pkg/host@0.1.0\":
     fn letter(c: u32) -> array(tuple(u32, string))
@@ -1190,7 +1190,7 @@ extern:
         let errors = errors_in(import, Some("hosted"));
         assert_eq!(errors, [(needs.to_string(), "array(tuple(u32, string))")]);
         let allocator = "
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     return 0
 ";
         assert_eq!(

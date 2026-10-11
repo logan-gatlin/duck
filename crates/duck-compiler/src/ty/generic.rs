@@ -688,6 +688,7 @@ impl Checker {
             ExprKind::AddrOf(mutability, pointee) => {
                 TypeKind::Pointer(*mutability, Box::new(self.type_syntax(pointee)?))
             }
+            ExprKind::Module(name) => TypeKind::Module(name.clone()),
             ExprKind::FnType(ty) => return Some(ty.clone()),
             ExprKind::Todo => TypeKind::Todo,
             _ => {

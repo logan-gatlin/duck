@@ -262,7 +262,7 @@ fn print(line: array(u8)):
     let _ = settle(future, future_read(future, written))
     future_drop(future)
 
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     if heap == 0:
         heap = module.size() * module.page_size
     let at = (heap + align - 1) / align * align
@@ -383,7 +383,7 @@ let written = &var result(tuple(), ErrorCode).ok(())
 let newline = "\n"
 var heap: uint = 0
 
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     if heap == 0:
         heap = module.grow(1) as uint * module.page_size
     let at = (heap + align - 1) / align * align
@@ -430,7 +430,7 @@ fn main():
     const IDLE: &str = r#"
 var heap: uint = 0
 
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     if heap == 0:
         heap = module.grow(1) as uint * module.page_size
     let at = (heap + align - 1) / align * align
@@ -715,7 +715,7 @@ fn idle():
 
 var heap: uint = 0
 
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     if heap == 0:
         heap = module.grow(1) as uint * module.page_size
     let at = (heap + align - 1) / align * align

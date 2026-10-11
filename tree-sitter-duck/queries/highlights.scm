@@ -27,6 +27,7 @@
 ; Types
 
 (named_type name: (identifier) @type)
+(module_type name: (identifier) @type)
 (type_parameters (identifier) @type)
 (bounded_type_parameter name: (identifier) @type)
 (default_type_parameter name: (identifier) @type)

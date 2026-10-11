@@ -616,7 +616,7 @@ extern \"wasi:cli/environment@0.3.0\":
 extern:
     fn trace_it(code: u32)
 
-pub fn cabi_realloc(old: &u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
     return 0
 ";
         let module = check_in(src, "hosted", None).unwrap();

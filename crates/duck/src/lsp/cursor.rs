@@ -563,6 +563,10 @@ mod tests {
             asked("members", "@let _ = geo\n    pass\n")
         );
         assert_eq!(completing_at("let n = module.@\n"), asked("module", ""));
+        assert_eq!(
+            completing_at("fn f(p: module.@):\n    pass\n"),
+            asked("module", "")
+        );
     }
 
     #[test]

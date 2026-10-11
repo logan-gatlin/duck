@@ -250,6 +250,8 @@ pub enum TypeKind {
     /// `module.T`, a type in another module, where `T` is a name or itself
     /// qualified.
     Qualified(Ident, Box<Type>),
+    /// `module.name`, a type of the module being compiled.
+    Module(Ident),
     /// `fn(A, B) -> R`, a pointer to a function. `None` is no result written.
     Fn(Vec<Type>, Option<Box<Type>>),
     /// `todo`, in place of a type yet to be written. Nothing but a `todo` is
@@ -583,6 +585,7 @@ impl fmt::Display for Type {
             TypeKind::Pointer(Mutability::Let, pointee) => write!(f, "&{pointee}"),
             TypeKind::Pointer(Mutability::Var, pointee) => write!(f, "&var {pointee}"),
             TypeKind::Qualified(module, ty) => write!(f, "{}.{ty}", module.name),
+            TypeKind::Module(name) => write!(f, "module.{}", name.name),
             TypeKind::Fn(params, ret) => {
                 write!(f, "fn")?;
                 list(f, params)?;
@@ -1201,6 +1204,11 @@ impl<'a> Parser<'a> {
                     false => None,
                 };
                 TypeKind::Named(name.clone(), args)
+            }
+            TokenKind::Module => {
+                self.bump();
+                self.expect(TokenKind::Dot)?;
+                TypeKind::Module(self.ident()?)
             }
             TokenKind::Amp => {
                 self.bump();
@@ -2178,6 +2186,7 @@ mod tests {
                 format!("&var {}", render_ty(pointee))
             }
             TypeKind::Qualified(module, ty) => format!("{}.{}", module.name, render_ty(ty)),
+            TypeKind::Module(name) => format!("module.{}", name.name),
             TypeKind::Fn(params, ret) => {
                 let params: Vec<_> = params.iter().map(render_ty).collect();
                 let ret = ret.as_ref().map(|ret| format!(" -> {}", render_ty(ret)));
@@ -4085,6 +4094,18 @@ let n = 1
         assert_eq!(render_ty(&f.sig.params[0].ty), "json.Value");
         assert_eq!(render_ty(&f.sig.params[1].ty), "&a.b.List(geo.Point)");
         assert_eq!(render_ty(f.sig.ret.as_ref().unwrap()), "m.T");
+    }
+
+    #[test]
+    fn module_types() {
+        let module = parse_src("fn f(a: module.cabi_realloc, b: &module.x):\n\tpass").unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(render_ty(&f.sig.params[0].ty), "module.cabi_realloc");
+        assert_eq!(render_ty(&f.sig.params[1].ty), "&module.x");
+        assert!(parse_src("fn f(a: module):\n\tpass").is_err());
+        assert!(parse_src("fn f(a: module.x.y):\n\tpass").is_err());
     }
 
     #[test]

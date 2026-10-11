@@ -24,9 +24,9 @@ pub use lints::{Unused, UnusedKind};
 pub use symbols::{Symbol, SymbolKind};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, NEVER, OPAQUE, OPTION,
-    PRIMS, Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY,
-    is_builtin_type, lower_program,
+    ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, MODULE_TYPES, NEVER,
+    OPAQUE, OPTION, PRIMS, Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError,
+    VARRAY, is_builtin_type, lower_program,
 };
 
 mod actions;
@@ -250,6 +250,10 @@ const MODULE_SIGNATURES: [(&str, &[(&str, &str)], &str); 8] = [
     ("count_trailing_zeros", &[("value", "")], ""),
 ];
 
+/// Each type of `module`, as it would be written.
+const MODULE_TYPE_TEXTS: [(&str, &str); 1] =
+    [("cabi_realloc", "fn(&var u8, uint, uint, uint) -> &var u8")];
+
 /// The most declarations that a field, variant or member is looked for
 /// through, each by a `use` of the next: more lead back to themselves.
 const MAX_USES: usize = 64;
@@ -279,9 +283,10 @@ pub fn module_members() -> Vec<Completion> {
         move |name: &&str| Completion {
             name: name.to_string(),
             kind,
-            detail: match module_signature(name) {
-                Some(signature) => signature.label,
-                None => Prim::Uint.name().to_string(),
+            detail: match (module_signature(name), module_type_text(name)) {
+                (Some(signature), _) => signature.label,
+                (None, Some(text)) => text.to_string(),
+                (None, None) => Prim::Uint.name().to_string(),
             },
             import: None,
             docs: String::new(),
@@ -289,7 +294,14 @@ pub fn module_members() -> Vec<Completion> {
     };
     let funcs = MODULE_FUNCS.iter().map(member(CompletionKind::Function));
     let consts = MODULE_CONSTS.iter().map(member(CompletionKind::Variable));
-    funcs.chain(consts).collect()
+    let types = MODULE_TYPES.iter().map(member(CompletionKind::Type));
+    funcs.chain(consts).chain(types).collect()
+}
+
+/// The type `name` of `module`, as it would be written, if it is one.
+fn module_type_text(name: &str) -> Option<&'static str> {
+    let (_, text) = MODULE_TYPE_TEXTS.iter().find(|(ty, _)| *ty == name)?;
+    Some(text)
 }
 
 /// What a call of the function `name` of `module` takes, if it is one.
@@ -2109,7 +2121,7 @@ impl<'p> Walk<'p> {
                 params.iter().any(|param| self.ty(param))
                     || ret.as_ref().is_some_and(|ret| self.ty(ret))
             }
-            TypeKind::Qualified(..) | TypeKind::Todo => false,
+            TypeKind::Qualified(..) | TypeKind::Module(_) | TypeKind::Todo => false,
         }
     }
 }
@@ -2789,6 +2801,15 @@ fn f(h: i32):
             .map(|m| format!("{}: {}", m.name, m.detail))
             .collect();
         assert_eq!(consts, ["page_size: uint", "max: uint"]);
+        // Each type is the one it names.
+        let types = module_members()
+            .into_iter()
+            .filter(|m| MODULE_TYPES.contains(&&*m.name));
+        let types: Vec<_> = types.map(|m| format!("{}: {}", m.name, m.detail)).collect();
+        assert_eq!(
+            types,
+            ["cabi_realloc: fn(&var u8, uint, uint, uint) -> &var u8"]
+        );
     }
 
     #[test]

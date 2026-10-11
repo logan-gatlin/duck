@@ -367,6 +367,6 @@ fn param_in_type<'a>(
             ret.as_deref()
                 .and_then(|ret| param_in_type(ret, params, false))
         }),
-        TypeKind::Todo => None,
+        TypeKind::Module(_) | TypeKind::Todo => None,
     }
 }

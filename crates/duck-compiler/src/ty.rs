@@ -22,7 +22,7 @@ use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, Ident, ItemKind, Mutability, Pattern,
     PatternKind, StmtKind, StructDecl, TypeKind, UnaryOp, UnionDecl,
 };
-use crate::world::{ROOT, RUN_EXPORT, RUN_INTERFACE, World, WorldError, kebab};
+use crate::world::{REALLOC, ROOT, RUN_EXPORT, RUN_INTERFACE, World, WorldError, kebab};
 
 use alias::AliasDef;
 use defaults::DefaultValue;
@@ -151,6 +151,10 @@ const COUNT_TRAILING_ZEROS: &str = "count_trailing_zeros";
 
 /// The constants of `module`.
 const MODULE_CONSTS: [&str; 2] = ["page_size", "max"];
+
+/// The types of `module`: `cabi_realloc` is the type of the function a
+/// component allocates for the host with.
+const MODULE_TYPES: [&str; 1] = [REALLOC];
 
 /// The name of the built-in array type.
 const ARRAY: &str = "array";
@@ -2077,13 +2081,13 @@ impl fmt::Display for TypeErrorKind {
             Self::NeedsRealloc(wit) => write!(
                 f,
                 "the host passes a `{wit}` in memory that it has the component allocate: the \
-                 entry file is to have a `pub fn cabi_realloc(old: &u8, old_size: uint, align: \
-                 uint, new_size: uint) -> &var u8`"
+                 entry file is to have a `pub fn cabi_realloc(old: &var u8, old_size: uint, \
+                 align: uint, new_size: uint) -> &var u8`"
             ),
             Self::Realloc => write!(
                 f,
-                "`cabi_realloc` is called by the host as a `fn(old: &u8, old_size: uint, align: \
-                 uint, new_size: uint) -> &var u8`"
+                "`cabi_realloc` is called by the host as a `fn(old: &var u8, old_size: uint, \
+                 align: uint, new_size: uint) -> &var u8`"
             ),
             Self::ExportOutsideEntry => {
                 write!(f, "only the entry file of a component exports an interface")
@@ -3636,6 +3640,7 @@ impl Checker {
                     Ty::Error
                 }
             },
+            TypeKind::Module(name) => self.module_ty(name),
             TypeKind::Pointer(mutability, pointee) => match self.resolve_ty(pointee) {
                 Ty::Error => Ty::Error,
                 // Struct fields are checked once every struct is defined.
@@ -3657,6 +3662,26 @@ impl Checker {
             // Only a `todo` is of it, which is of any type.
             TypeKind::Todo => Ty::Never,
         }
+    }
+
+    /// `module.name`, one of `module`'s types. `cabi_realloc` is the type of
+    /// a pointer to a function that the host can have allocate: a
+    /// `fn(&var u8, uint, uint, uint) -> &var u8`, which takes what is allocated
+    /// already, its size, the alignment and the size it is to have.
+    fn module_ty(&mut self, name: &Ident) -> Ty {
+        if !MODULE_TYPES.contains(&name.name.as_str()) {
+            let known = |names: &[&str]| names.contains(&name.name.as_str());
+            let kind = match known(&MODULE_FUNCS) || known(&MODULE_CONSTS) {
+                true => TypeErrorKind::NotAType,
+                false => TypeErrorKind::UnknownModuleProperty(name.name.clone()),
+            };
+            self.error(kind, name.span);
+            return Ty::Error;
+        }
+        let byte = Ty::Prim(Prim::U8);
+        let count = Ty::Prim(Prim::Uint);
+        let ptr = self.ptr_to(byte, true);
+        self.fn_of(vec![ptr, count, count, count], ptr)
     }
 
     /// Resolves `ty`, written after `path.` where `path` names `module`.
@@ -3682,7 +3707,7 @@ impl Checker {
                 }
                 None => Ty::Error,
             },
-            TypeKind::Pointer(..) | TypeKind::Fn(..) | TypeKind::Todo => {
+            TypeKind::Module(_) | TypeKind::Pointer(..) | TypeKind::Fn(..) | TypeKind::Todo => {
                 unreachable!("only names are qualified")
             }
         }
@@ -5803,6 +5828,7 @@ impl<'c> Body<'c> {
             },
             ExprKind::Name(_)
             | ExprKind::Field(..)
+            | ExprKind::Module(_)
             | ExprKind::AddrOf(..)
             | ExprKind::FnType(_)
                 if self.is_type_expr(expr) =>
@@ -6079,7 +6105,7 @@ impl<'c> Body<'c> {
             "fill" => &[("dst", dst), ("value", byte), ("len", count)],
             "copy" => &[("dst", dst), ("src", src), ("len", count)],
             other => {
-                let kind = if MODULE_CONSTS.contains(&other) {
+                let kind = if MODULE_CONSTS.contains(&other) || MODULE_TYPES.contains(&other) {
                     TypeErrorKind::NotCallable(format!("module.{other}"))
                 } else {
                     TypeErrorKind::UnknownModuleProperty(other.to_string())
@@ -6446,7 +6472,7 @@ impl<'c> Body<'c> {
 
     /// Whether `expr` is a type written where a value belongs: the name of a
     /// type that no variable or item shadows, a type given type arguments,
-    /// a pointer to one of those, or a function type.
+    /// a type of `module`, a pointer to one of those, or a function type.
     fn is_type_expr(&self, expr: &parse::Expr) -> bool {
         match &expr.kind {
             ExprKind::Name(name) if self.lookup(name).is_none() => match self.item(name) {
@@ -6460,6 +6486,7 @@ impl<'c> Body<'c> {
                 )
             }
             ExprKind::Call(callee, args) => self.names_type(callee, args),
+            ExprKind::Module(name) => MODULE_TYPES.contains(&name.name.as_str()),
             ExprKind::AddrOf(_, pointee) => self.is_type_expr(pointee),
             ExprKind::FnType(_) => true,
             _ => false,
@@ -14438,6 +14465,50 @@ fn f(p: &var u8):
                 Mismatch {
                     expected: "u32".into(),
                     found: "int".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn module_names_the_type_the_host_allocates_with() {
+        let src = "\
+let Alloc: type = module.cabi_realloc
+struct Heap:
+    realloc: module.cabi_realloc
+pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -> &var u8:
+    return old
+fn grow(realloc: module.cabi_realloc, old: &var u8) -> &var u8:
+    return realloc(old, 0, 1, 8)
+fn f(old: &var u8) -> uint:
+    let a: Alloc = cabi_realloc
+    let heap = Heap(realloc: a)
+    grow(heap.realloc, old)
+    return module.cabi_realloc.size + (&module.cabi_realloc).size
+";
+        let module = lower(src);
+        let f = body(&module, "f");
+        assert!(f.contains("(I32.Add 4 4)"), "{f}");
+
+        use TypeErrorKind::*;
+        let src = "\
+fn f(a: module.page_size, b: module.grow, c: module.heap):
+    let x = module.cabi_realloc
+    let y = module.cabi_realloc()
+    let z: module.cabi_realloc = 1
+";
+        let realloc = "fn(&var u8, uint, uint, uint) -> &var u8";
+        assert_eq!(
+            errors(src),
+            [
+                NotAType,
+                NotAType,
+                UnknownModuleProperty("heap".into()),
+                NotAValue(realloc.into()),
+                NotCallable("module.cabi_realloc".into()),
+                Mismatch {
+                    expected: realloc.into(),
+                    found: "i32".into()
                 },
             ]
         );

@@ -260,6 +260,10 @@
         "named": true
       },
       {
+        "type": "module_type",
+        "named": true
+      },
+      {
         "type": "named_type",
         "named": true
       },
@@ -1402,6 +1406,22 @@
   },
   {
     "type": "module_property",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "module_type",
     "named": true,
     "fields": {
       "name": {

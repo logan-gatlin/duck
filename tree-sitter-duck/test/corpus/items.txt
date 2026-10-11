@@ -636,6 +636,43 @@ fn(R: Make) take(make: R):
       (pass_statement))))
 
 ====================
+Type of the module
+====================
+
+let Alloc: type = module.cabi_realloc
+
+fn grow(realloc: module.cabi_realloc, old: &module.cabi_realloc) -> module.cabi_realloc:
+    return realloc
+
+---
+
+(source_file
+  (binding
+    (identifier)
+    (named_type
+      (identifier))
+    (module_property
+      (identifier)))
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (module_type
+          (identifier)))
+      (parameter
+        (identifier)
+        (pointer_type
+          (module_type
+            (identifier)))))
+    (module_type
+      (identifier))
+    (block
+      (expression_statement
+        (return_expression
+          (identifier))))))
+
+====================
 Default of a type parameter and labelled type argument
 ====================
 

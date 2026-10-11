@@ -328,6 +328,7 @@ module.exports = grammar({
     _type: $ => choice(
       $.named_type,
       $.qualified_type,
+      $.module_type,
       $.pointer_type,
       $.function_type,
       $.todo_type,
@@ -346,6 +347,9 @@ module.exports = grammar({
       '.',
       field('type', choice($.named_type, $.qualified_type)),
     )),
+
+    // `module.name`, a type of the module being compiled.
+    module_type: $ => seq('module', '.', field('name', $.identifier)),
 
     type_arguments: $ => prec(PREC.type, seq('(', commaSep($._type_argument), ')')),
 
