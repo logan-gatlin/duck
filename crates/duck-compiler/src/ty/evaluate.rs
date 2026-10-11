@@ -1185,6 +1185,48 @@ pub let stepped = steps()
     }
 
     #[test]
+    fn for_loops_count_from_a_start_up_to_an_end() {
+        let src = "\
+var calls = 0
+fn bound(n: i32) -> i32:
+    calls += 1
+    return n
+fn sum(from: i32, to: i32) -> i32:
+    var total = 0
+    for i in bound(from)..bound(to):
+        if i == 0:
+            continue
+        total += i
+    return total
+fn bytes() -> i32:
+    var count = 0
+    for b in 250..255 as u8:
+        count += b as i32 - 249
+    return count
+fn wide(from: i64) -> i32:
+    var count = 0
+    for n in from..0x7fff_ffff_ffff_ffff:
+        if n == 0x1_0000_0001:
+            break
+        count += 1
+    return count
+pub let up = sum(-2, 4)
+pub let none = sum(4, 4) + sum(5, -5)
+pub let read = calls
+pub let narrow = bytes()
+pub let crossed = wide(0xffff_fffe)
+";
+        let mut started = Started::of(src);
+        // From -2 to 3, without the 0 that it skips.
+        assert_eq!(started.global("up"), 3);
+        // Nothing where the start isn't less than the end.
+        assert_eq!(started.global("none"), 0);
+        assert_eq!(started.global("read"), 6);
+        assert_eq!(started.global("narrow"), 1 + 2 + 3 + 4 + 5);
+        assert_eq!(started.global("crossed"), 3);
+    }
+
+    #[test]
     fn a_function_reads_its_literals_whenever_it_is_called() {
         let src = "\
 let LIMIT: uint = 2

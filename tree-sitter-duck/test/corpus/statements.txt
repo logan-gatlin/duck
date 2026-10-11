@@ -80,6 +80,8 @@ fn f():
         pass
     for _, x in xs:
         pass
+    for n in t.0..len - 1:
+        pass
     while true:
         break
 
@@ -108,6 +110,17 @@ fn f():
         (discard)
         (identifier)
         (identifier)
+        (block
+          (pass_statement)))
+      (for_statement
+        (identifier)
+        (range
+          (field_expression
+            (identifier)
+            (tuple_index))
+          (binary_expression
+            (identifier)
+            (integer)))
         (block
           (pass_statement)))
       (while_statement

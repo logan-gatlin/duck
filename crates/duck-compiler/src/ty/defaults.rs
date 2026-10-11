@@ -327,6 +327,7 @@ fn param_in_expr<'a>(
         | ExprKind::Deref(inner)
         | ExprKind::AddrOf(_, inner) => within(inner),
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b) => within(a).or_else(|| within(b)),

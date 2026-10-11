@@ -8,7 +8,7 @@ and `duck run` runs it with WASI. `duck format` lays its files out as the
 examples here are.
 
 Absent: allocator, GC, standard library, anonymous functions, methods,
-traits, overloading, varargs, ternary, ranges, exceptions, char type, string
+traits, overloading, varargs, ternary, exceptions, char type, string
 operations.
 
 ## Syntax
@@ -248,6 +248,8 @@ fn demo(a: array(i32), pairs: array(tuple(i32, i32))) -> i32:
 		total += (high - low) * i as i32
 	for i, step in Step:             # each member: 10 at 0, then 20 at 1
 		log(step as i32, i)
+	for n in 1..a.len:               # each `uint` from 1 up to `a.len`
+		total += a[n] - a[n - 1]
 	return total
 ```
 
@@ -265,6 +267,15 @@ fn demo(a: array(i32), pairs: array(tuple(i32, i32))) -> i32:
   whatever their values: with `err = 5` after `ok`, `err` is at 1.
 - A `for` binds a name once: `for i, i in a` and `for (x, x) in pairs` are
   errors.
+- `for n in start..end` runs its block for each integer from `start` up to
+  `end`, which is not one of them: `0..3` is 0, 1 and 2. There are none
+  where `start` is not less than `end`.
+- Both ends are of one integer type, which `n` is, and a literal takes the
+  type of the other: `0..a.len` counts `uint`s, and `0..10` `i32`s. Each is
+  evaluated once, `start` first, before the first iteration.
+- A range is no value: only a `for` has one, between two whole expressions,
+  so `1..n + 1` ends at `n + 1`. It counts for itself, so it has no index:
+  `for i, n in 0..3` is an error.
 - `break` leaves the loop. `continue` moves on to the next element, and the
   index with it.
 

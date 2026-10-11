@@ -423,8 +423,15 @@ module.exports = grammar({
       optional(seq(field('index', choice($.identifier, $.discard)), ',')),
       field('pattern', $._pattern),
       'in',
-      field('iterable', $._expression),
+      field('iterable', choice($._expression, $.range)),
       field('body', $.block),
+    ),
+
+    // `start..end`, which is no expression: only a `for` iterates one.
+    range: $ => seq(
+      field('start', $._expression),
+      '..',
+      field('end', $._expression),
     ),
 
     // `else` is an arm that matches every value, and comes last.

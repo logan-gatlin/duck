@@ -1096,6 +1096,10 @@
           {
             "type": "_expression",
             "named": true
+          },
+          {
+            "type": "range",
+            "named": true
           }
         ]
       },
@@ -1631,6 +1635,32 @@
           },
           {
             "type": "qualified_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "range",
+    "named": true,
+    "fields": {
+      "end": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_expression",
+            "named": true
+          }
+        ]
+      },
+      "start": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_expression",
             "named": true
           }
         ]
@@ -2208,6 +2238,10 @@
   },
   {
     "type": ".*",
+    "named": false
+  },
+  {
+    "type": "..",
     "named": false
   },
   {

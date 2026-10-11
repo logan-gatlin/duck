@@ -1965,6 +1965,7 @@ impl<'p> Walk<'p> {
                 elems.iter().any(|elem| self.expr(elem))
             }
             ExprKind::Repeat(a, b)
+            | ExprKind::Range(a, b)
             | ExprKind::Binary(_, a, b)
             | ExprKind::Index(a, b)
             | ExprKind::Pipe(a, b) => self.expr(a) || self.expr(b),

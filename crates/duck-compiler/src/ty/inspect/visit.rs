@@ -104,6 +104,7 @@ pub(in crate::ty) fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<
             }
         }
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b) => {

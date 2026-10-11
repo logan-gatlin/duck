@@ -334,6 +334,9 @@ pub enum ExprKind {
     List(Vec<Expr>),
     /// `[value; len]`, an array of `len` copies of `value`.
     Repeat(Box<Expr>, Box<Expr>),
+    /// `start..end`, each integer from `start` up to `end`, which isn't one
+    /// of them. It is no value: only a `for` iterates one.
+    Range(Box<Expr>, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),
@@ -1080,6 +1083,21 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// What a `for` iterates: an expression, or `start..end`, where each is
+    /// one.
+    fn iterated(&mut self) -> PResult<Expr> {
+        let start = self.expr()?;
+        if !self.eat(TokenKind::DotDot) {
+            return Ok(start);
+        }
+        let end = self.expr()?;
+        let span = start.span;
+        Ok(Expr {
+            kind: ExprKind::Range(Box::new(start), Box::new(end)),
+            span: self.span_from(span),
+        })
+    }
+
     /// What a `for` binds: `pattern`, or `index, pattern`, where the index is
     /// a name or `_`.
     fn for_bindings(&mut self) -> PResult<(Option<Pattern>, Pattern)> {
@@ -1210,7 +1228,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let (index, pattern) = self.for_bindings()?;
                 self.expect(TokenKind::In)?;
-                let iter = self.expr()?;
+                let iter = self.iterated()?;
                 let body = self.block()?;
                 StmtKind::For {
                     index,
@@ -2030,6 +2048,7 @@ mod tests {
             ExprKind::Tuple(items) => format!("(tuple {})", list(items)),
             ExprKind::List(items) => format!("[{}]", list(items)),
             ExprKind::Repeat(value, len) => format!("[{}; {}]", sexpr(value), sexpr(len)),
+            ExprKind::Range(start, end) => format!("(.. {} {})", sexpr(start), sexpr(end)),
             ExprKind::Unary(op, e) => format!("({op:?} {})", sexpr(e)),
             ExprKind::Binary(op, l, r) => format!("({op:?} {} {})", sexpr(l), sexpr(r)),
             ExprKind::Call(f, args) => {
@@ -2658,6 +2677,52 @@ mod tests {
         for src in ["(a, b), x", "i, j, x"] {
             let src = format!("fn f():\n    for {src} in xs:\n        pass\n");
             assert_eq!(errors(&src), vec![expected("`in`", TokenKind::Comma)]);
+        }
+    }
+
+    #[test]
+    fn ranges() {
+        let iterated = |src: &str| {
+            let src = format!("fn f():\n    for x in {src}:\n        pass\n");
+            let module = parse_src(&src).unwrap();
+            let ItemKind::Fn(f) = &module.items[0].kind else {
+                panic!()
+            };
+            let StmtKind::For { iter, .. } = &f.body[0].kind else {
+                panic!()
+            };
+            sexpr(iter)
+        };
+        assert_eq!(iterated("0..n"), "(.. 0 n)");
+        assert_eq!(iterated("t.0..t.1"), "(.. (. t 0) (. t 1))");
+        // Each end is a whole expression.
+        assert_eq!(
+            iterated("a + 1..b or c |> _ * 2"),
+            "(.. (Add a 1) (|> (Or b c) (Mul _ 2)))"
+        );
+        assert_eq!(iterated("-1..-n"), "(.. (Neg 1) (Neg n))");
+        // Only a `for` has one, between two expressions.
+        for (src, found) in [
+            ("let r = 0..n\n", TokenKind::DotDot),
+            ("let r = (0..n)\n", TokenKind::DotDot),
+            (
+                "fn f():\n    for x in 0..:\n        pass\n",
+                TokenKind::Colon,
+            ),
+            (
+                "fn f():\n    for x in ..n:\n        pass\n",
+                TokenKind::DotDot,
+            ),
+            (
+                "fn f():\n    for x in 0..n..m:\n        pass\n",
+                TokenKind::DotDot,
+            ),
+        ] {
+            let errors = errors(src);
+            let [ParseErrorKind::Expected { found: at, .. }] = &errors[..] else {
+                panic!("{src}: {errors:?}")
+            };
+            assert_eq!(*at, found, "{src}");
         }
     }
 

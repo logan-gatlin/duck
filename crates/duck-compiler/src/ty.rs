@@ -351,6 +351,8 @@ pub enum TypeErrorKind {
     DuplicateParam(String),
     /// A name bound twice by one pattern.
     DuplicateBinding(String),
+    /// An index in a `for` that iterates a range, which counts for itself.
+    RangeIndex,
     /// A struct that contains itself by value.
     RecursiveStruct(String),
     /// An enum whose values hold the enum itself, outside of any struct.
@@ -1520,6 +1522,10 @@ impl fmt::Display for TypeErrorKind {
             Self::DuplicateField(name) => write!(f, "duplicate field `{name}`"),
             Self::DuplicateParam(name) => write!(f, "duplicate parameter `{name}`"),
             Self::DuplicateBinding(name) => write!(f, "`{name}` is bound more than once"),
+            Self::RangeIndex => write!(
+                f,
+                "a range has no index: what it iterates counts from its start"
+            ),
             Self::RecursiveStruct(name) => write!(f, "struct `{name}` contains itself"),
             Self::RecursiveEnum(name) => write!(f, "enum `{name}` contains itself"),
             Self::RecursiveUnion(name) => write!(f, "union `{name}` contains itself"),
@@ -4836,6 +4842,9 @@ impl<'c> Body<'c> {
         body: &parse::Block,
         out: &mut Vec<Stmt>,
     ) {
+        if let ExprKind::Range(start, end) = &iter.kind {
+            return self.range_loop(index, pattern, (start, end), iter.span, body, out);
+        }
         if let Some(id) = self.enum_name(iter) {
             out.push(self.unrolled_loop(id, index, pattern, body));
             return;
@@ -4870,6 +4879,72 @@ impl<'c> Body<'c> {
         // Advanced before the body, so `continue` moves on too.
         let next = binary(vt, IrBinOp::Add, i, one);
         inner.push(Stmt::SetLocal(counter, next));
+        let stmt = self.loop_stmt(inner, body);
+        self.scopes.pop();
+        out.push(stmt);
+    }
+
+    /// `for pattern in start..end`, which sets `pattern` to each integer from
+    /// `start` up to `end` in turn, and never to `end`. Both are evaluated
+    /// once, before the first iteration, and are of one integer type, which
+    /// a literal takes from the other.
+    fn range_loop(
+        &mut self,
+        index: Option<&Pattern>,
+        pattern: &Pattern,
+        (start, end): (&parse::Expr, &parse::Expr),
+        span: Span,
+        body: &parse::Block,
+        out: &mut Vec<Stmt>,
+    ) {
+        let (ty, from, to) = if is_typed_by_other(start) && !is_typed_by_other(end) {
+            let (ty, to) = self.expr(end, None);
+            (ty, self.operand(start, ty), to)
+        } else {
+            let (ty, from) = self.expr(start, None);
+            (ty, from, self.operand(end, ty))
+        };
+        let bounds = self.seq(vec![from, to]);
+        let (elem, prim) = match ty {
+            Ty::Prim(prim) if prim.is_int() => (ty, self.ck.fixed(prim)),
+            // It has no integers, and none that the loop is run for.
+            Ty::Never => (ty, Prim::I32),
+            _ => (self.invalid_operand("..", ty, span).0, Prim::I32),
+        };
+        if let Some(index) = index {
+            self.error(TypeErrorKind::RangeIndex, index.span);
+        }
+        let vt = prim.val_type();
+        let (counter, limit) = (self.temp(vt), self.temp(vt));
+        out.extend(bounds.pre);
+        let mut scalars = exprs(bounds.scalars).into_iter();
+        for dest in [counter, limit] {
+            let scalar = scalars.next().unwrap_or(Expr::Const(zero(vt)));
+            out.push(Stmt::SetLocal(dest, scalar));
+        }
+        let n = Expr::Local(counter);
+        let reached = if prim.is_signed() {
+            IrBinOp::GeS
+        } else {
+            IrBinOp::GeU
+        };
+        let mut inner = vec![Stmt::BrIf(
+            1,
+            binary(vt, reached, n.clone(), Expr::Local(limit)),
+        )];
+        self.scopes.push(HashMap::new());
+        let (_, dests) = self.for_bindings(index, pattern, elem);
+        self.set_leaves(dests, scalar(vt, n.clone()), &mut inner);
+        // Advanced before the body, so `continue` moves on too. It is less
+        // than the end here, so the next is an integer of its type.
+        let one = match vt {
+            ValType::I64 => Const::I64(1),
+            _ => Const::I32(1),
+        };
+        inner.push(Stmt::SetLocal(
+            counter,
+            binary(vt, IrBinOp::Add, n, Expr::Const(one)),
+        ));
         let stmt = self.loop_stmt(inner, body);
         self.scopes.pop();
         out.push(stmt);
@@ -5331,6 +5406,7 @@ impl<'c> Body<'c> {
             ExprKind::Str(s) => self.string(s, expected, expr.span),
             ExprKind::List(items) => self.list(items, expected, expr.span),
             ExprKind::Repeat(value, len) => self.repeat(value, len, expected, expr.span),
+            ExprKind::Range(..) => unreachable!("only a `for` has a range, which it takes apart"),
             ExprKind::Index(..) => match self.place(expr) {
                 Some(place) => {
                     let value = self.read_place(&place);
@@ -7435,6 +7511,7 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
         | ExprKind::AddrOf(_, inner)
         | ExprKind::Cast(inner, ..) => push_assigned(inner, names),
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b) => {
@@ -7634,6 +7711,7 @@ fn has_break(expr: &parse::Expr) -> bool {
         | ExprKind::Cast(inner, ..)
         | ExprKind::Return(Some(inner)) => has_break(inner),
         ExprKind::Repeat(a, b)
+        | ExprKind::Range(a, b)
         | ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::Pipe(a, b)
@@ -13087,6 +13165,67 @@ fn f(a: array(u8), pairs: array(tuple(u8, u8))):
                 TypeErrorKind::DuplicateBinding("i".into()),
                 TypeErrorKind::DuplicateBinding("i".into()),
                 TypeErrorKind::DuplicateBinding("n".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn for_loops_count_through_a_range() {
+        let src = "\
+extern:
+    fn log(n: i64)
+    fn next() -> u8
+fn f(n: i64):
+    for i in 0..n:
+        if i == 2:
+            continue
+        log(i)
+    for b in next()..next():
+        pass
+    for _ in 0..3:
+        pass
+";
+        // Both ends are read once, and the count is advanced before the
+        // body, so a `continue` moves on.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(set tmp1 0i64) (set tmp2 n) (block (loop \
+             (br_if 1 (I64.GeS tmp1 tmp2)) \
+             (set i tmp1) (set tmp1 (I64.Add tmp1 1i64)) \
+             (if (I64.Eq i 2i64) (then (br 1)) (else )) (call log [i] -> []) (br 0))) \
+             (set tmp4 (I32.And (call next ) 255)) (set tmp5 (I32.And (call next ) 255)) \
+             (block (loop (br_if 1 (I32.GeU tmp4 tmp5)) \
+             (set b tmp4) (set tmp4 (I32.Add tmp4 1)) (br 0))) \
+             (set tmp7 0) (set tmp8 3) (block (loop \
+             (br_if 1 (I32.GeS tmp7 tmp8)) \
+             (set tmp7 (I32.Add tmp7 1)) (br 0)))"
+        );
+        let src = "\
+fn f(n: u8, wide: i64, x: f32, p: &u8):
+    for i in 0..n:
+        i = 1
+        let w: i64 = i
+    for i in n..wide:
+        pass
+    for i in 0.0..x:
+        pass
+    for i in p..p:
+        pass
+    for i, j in 0..n:
+        pass
+    for (a, b) in 0..n:
+        pass
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::ImmutableAssign("i".into()),
+                mismatch("i64", "u8"),
+                mismatch("u8", "i64"),
+                invalid_operand("..", "f32"),
+                invalid_operand("..", "&u8"),
+                TypeErrorKind::RangeIndex,
+                mismatch("tuple(_, _)", "u8"),
             ]
         );
     }
