@@ -636,6 +636,50 @@ fn(R: Make) take(make: R):
       (pass_statement))))
 
 ====================
+Default of a type parameter and labelled type argument
+====================
+
+struct(T, R: Make = lib.bump, N = tuple(T, u8)) Vec:
+    next: &Vec(T, N: i32)
+
+---
+
+(source_file
+  (struct_declaration
+    (type_parameters
+      (identifier)
+      (default_type_parameter
+        (identifier)
+        (named_type
+          (identifier))
+        (qualified_type
+          (identifier)
+          (named_type
+            (identifier))))
+      (default_type_parameter
+        (identifier)
+        (named_type
+          (identifier)
+          (type_arguments
+            (named_type
+              (identifier))
+            (named_type
+              (identifier))))))
+    (identifier)
+    (field_declaration
+      (identifier)
+      (pointer_type
+        (named_type
+          (identifier)
+          (type_arguments
+            (named_type
+              (identifier))
+            (labeled_type_argument
+              (identifier)
+              (named_type
+                (identifier)))))))))
+
+====================
 Generic function
 ====================
 

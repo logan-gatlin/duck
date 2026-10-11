@@ -29,6 +29,8 @@
 (named_type name: (identifier) @type)
 (type_parameters (identifier) @type)
 (bounded_type_parameter name: (identifier) @type)
+(default_type_parameter name: (identifier) @type)
+(labeled_type_argument label: (identifier) @type)
 (struct_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
 (union_declaration name: (identifier) @type)

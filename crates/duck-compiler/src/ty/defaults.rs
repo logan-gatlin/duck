@@ -353,7 +353,8 @@ fn param_in_type<'a>(
         TypeKind::Named(name, args) => {
             let named = !qualified && params.iter().any(|param| param.name == *name);
             let named = named.then_some((name.as_str(), ty.span));
-            named.or_else(|| args.as_deref().and_then(any))
+            let mut args = args.iter().flatten();
+            named.or_else(|| args.find_map(|arg| param_in_type(&arg.ty, params, false)))
         }
         TypeKind::Pointer(_, pointee) => param_in_type(pointee, params, false),
         TypeKind::Qualified(_, inner) => param_in_type(inner, params, true),

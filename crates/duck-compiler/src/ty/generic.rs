@@ -6,7 +6,7 @@
 use std::mem;
 
 use crate::lex::Span;
-use crate::parse::{self, Arg, ExprKind, Ident, TypeKind, TypeParam};
+use crate::parse::{self, Arg, ExprKind, Ident, TypeArg, TypeKind, TypeParam};
 
 use super::{
     ARRAY, ARRAY_FIELDS, Body, Checker, FieldDef, Item, OPTION, ParamId, RESULT, StructDef,
@@ -40,6 +40,21 @@ pub(super) struct ParamDef {
     pub(super) bound: Option<Ty>,
 }
 
+/// The defaults of a generic struct's or union's type parameters: what each
+/// is where a list of type arguments gives it none.
+#[derive(Default)]
+pub(super) struct ParamDefaults {
+    /// Each as it is written, for a type parameter that has one.
+    written: Vec<Option<parse::Type>>,
+    /// Each as resolved, in terms of the type parameters before its own.
+    /// The error type for one that failed to resolve. `None` until they
+    /// are first asked for.
+    tys: Option<Vec<Option<Ty>>>,
+    /// Whether they are being resolved, which leads back to them only if
+    /// one is written with its own declaration.
+    resolving: bool,
+}
+
 /// A type argument of a generic declaration's field that holds one of the
 /// declaration's type parameters, which it passes on to another generic.
 #[derive(Clone, Copy)]
@@ -59,6 +74,8 @@ pub(super) enum Arity {
     Plain,
     /// A list of exactly this many.
     Exactly(usize),
+    /// A list of this many or fewer, where a type parameter has a default.
+    AtMost(usize),
     /// A list of any number.
     Any,
 }
@@ -92,7 +109,24 @@ impl Arity {
                     found,
                 })
             }
+            (Self::AtMost(expected), Some(found)) if found > expected => {
+                Some(TypeErrorKind::TypeArgCount {
+                    name,
+                    expected,
+                    found,
+                })
+            }
             _ => None,
+        }
+    }
+}
+
+impl ParamDefaults {
+    /// Those that `params` are declared with, yet to be resolved.
+    pub(super) fn written(params: &[TypeParam]) -> Self {
+        Self {
+            written: params.iter().map(|param| param.default.clone()).collect(),
+            ..Self::default()
         }
     }
 }
@@ -218,6 +252,7 @@ impl Checker {
             is_pub: true,
             union: false,
             params: Vec::new(),
+            defaults: ParamDefaults::default(),
             instance: None,
             uses: Vec::new(),
             fields: Vec::new(),
@@ -449,16 +484,24 @@ impl Checker {
                 continue;
             };
             let bound = self.substitute(bound, args, site);
-            // What a function is called as isn't known until its signature
-            // is resolved, which is after a struct's fields are.
-            if let (Ty::Fn(_), false) = (bound, self.sigs_defined) {
-                self.called_bounds.push((*arg, bound, site));
-                continue;
-            }
-            if !self.meets(*arg, bound) {
-                self.bound_error(*arg, bound, site);
-                met = false;
-            }
+            met &= self.check_bound(*arg, bound, site);
+        }
+        met
+    }
+
+    /// Reports, at `site`, a `ty` that isn't a type that `bound` bounds.
+    /// Whether it wasn't. What a function is called as isn't known until
+    /// its signature is resolved, which is after a struct's fields are: a
+    /// `ty` that a function type bounds is checked then, and isn't
+    /// reported until it is.
+    fn check_bound(&mut self, ty: Ty, bound: Ty, site: Span) -> bool {
+        if let (Ty::Fn(_), false) = (bound, self.sigs_defined) {
+            self.called_bounds.push((ty, bound, site));
+            return true;
+        }
+        let met = self.meets(ty, bound);
+        if !met {
+            self.bound_error(ty, bound, site);
         }
         met
     }
@@ -638,7 +681,7 @@ impl Checker {
     fn path_type(
         &mut self,
         path: &parse::Expr,
-        args: Option<Vec<parse::Type>>,
+        args: Option<Vec<TypeArg>>,
         span: Span,
     ) -> Option<parse::Type> {
         let (modules, name) = match &path.kind {
@@ -677,17 +720,180 @@ impl Checker {
         Some(ty)
     }
 
-    /// Reads `args`, written as expressions, as a list of type arguments.
-    /// `None` after reporting an error.
-    fn type_args_syntax(&mut self, args: &[Arg]) -> Option<Vec<parse::Type>> {
+    /// Reads `args`, written as expressions, as a list of type arguments,
+    /// each labelled as it is there. `None` after reporting an error.
+    fn type_args_syntax(&mut self, args: &[Arg]) -> Option<Vec<TypeArg>> {
         let mut types = Vec::new();
         for arg in args {
-            if let Some(label) = &arg.label {
-                self.error(TypeErrorKind::LabelledTypeArg, label.span);
-            }
-            types.push(self.type_syntax(&arg.value));
+            let label = arg.label.clone();
+            types.push(self.type_syntax(&arg.value).map(|ty| TypeArg { label, ty }));
         }
         types.into_iter().collect()
+    }
+
+    /// What each type parameter of generic struct or union `id` is where a
+    /// list of type arguments gives it none, if it has a default: a type
+    /// that names only the type parameters before its own. They are
+    /// resolved the first time they are asked for, where the declaration
+    /// is. One written with the declaration itself, given no type argument
+    /// in its place, has no end, and is reported at `site`.
+    pub(super) fn param_defaults(&mut self, id: StructId, site: Span) -> Vec<Option<Ty>> {
+        let def = &self.structs[id.0 as usize];
+        if let Some(tys) = &def.defaults.tys {
+            return tys.clone();
+        }
+        let written = def.defaults.written.clone();
+        if def.defaults.resolving {
+            self.error(TypeErrorKind::RecursiveDefault(def.name.clone()), site);
+            return written
+                .iter()
+                .map(|d| d.as_ref().map(|_| Ty::Error))
+                .collect();
+        }
+        let (params, decl_module) = (def.params.clone(), def.module);
+        self.structs[id.0 as usize].defaults.resolving = true;
+        // What first asks for them may be in another module, or generic.
+        let module = mem::replace(&mut self.module, decl_module);
+        let names = params.iter().map(|param| self.param_name(*param));
+        let scope = names.zip(params.iter().copied()).collect();
+        let outer = mem::replace(&mut self.type_params, scope);
+        let mut tys = Vec::new();
+        for (i, written) in written.iter().enumerate() {
+            let Some(written) = written else {
+                tys.push(None);
+                continue;
+            };
+            let mut ty = self.resolve_ty(written);
+            let later = params[i..].iter().find(|later| self.holds(ty, **later));
+            if let Some(later) = later {
+                let (default, param) = (self.ty_name(ty), self.param_name(*later));
+                let kind = TypeErrorKind::DefaultNamesLater { default, param };
+                self.error(kind, written.span);
+                ty = Ty::Error;
+            }
+            tys.push(Some(ty));
+        }
+        self.type_params = outer;
+        self.module = module;
+        let defaults = &mut self.structs[id.0 as usize].defaults;
+        defaults.resolving = false;
+        defaults.tys = Some(tys.clone());
+        tys
+    }
+
+    /// Checks each default of generic struct or union `id` that names no
+    /// type parameter against the bound of its type parameter, where that
+    /// names none either: such a default meets the bound in every list of
+    /// type arguments or in none. Any other is checked in each list that
+    /// leaves it out. `site` is where the declaration is.
+    pub(super) fn check_param_defaults(&mut self, id: StructId, site: Span) {
+        let defaults = self.param_defaults(id, site);
+        let params = self.structs[id.0 as usize].params.clone();
+        for (i, (default, param)) in defaults.iter().zip(params).enumerate() {
+            let (Some(default), Ty::Param(param)) = (*default, param) else {
+                continue;
+            };
+            let Some(bound) = self.params[param.0 as usize].bound else {
+                continue;
+            };
+            if default == Ty::Error || self.has_param(default) || self.has_param(bound) {
+                continue;
+            }
+            let written = &self.structs[id.0 as usize].defaults.written[i];
+            let span = written.as_ref().map_or(site, |written| written.span);
+            self.check_bound(default, bound, span);
+        }
+    }
+
+    /// The type arguments of generic struct or union `id`, named `name`,
+    /// from the list `args` written at `span`: those without a label are
+    /// given to its type parameters in order, then each with one to the
+    /// type parameter so named, and one left with none is its default,
+    /// with the type arguments before it in place of the type parameters
+    /// it names. `None` after reporting an argument given to no type
+    /// parameter or to one that has another, or a type parameter left
+    /// with none that has no default, or if a type argument is the error
+    /// type.
+    pub(super) fn bound_type_args(
+        &mut self,
+        id: StructId,
+        name: &str,
+        args: &[TypeArg],
+        span: Span,
+    ) -> Option<Vec<Ty>> {
+        let defaults = self.param_defaults(id, span);
+        let params = self.structs[id.0 as usize].params.clone();
+        let names: Vec<_> = params.iter().map(|p| self.param_name(*p)).collect();
+        let mut given: Vec<Option<Ty>> = vec![None; params.len()];
+        let (mut labelled, mut next, mut failed) = (false, 0, false);
+        for arg in args {
+            let ty = self.resolve_ty(&arg.ty);
+            let index = match &arg.label {
+                None if labelled => Err(TypeErrorKind::PositionalAfterLabel),
+                None => {
+                    next += 1;
+                    Ok(next - 1)
+                }
+                Some(label) => {
+                    labelled = true;
+                    let index = names.iter().position(|name| *name == label.name);
+                    index.ok_or_else(|| TypeErrorKind::UnknownLabel(label.name.clone()))
+                }
+            };
+            let index = index.and_then(|i| match given[i] {
+                Some(_) => Err(TypeErrorKind::DuplicateArg(names[i].clone())),
+                None => Ok(i),
+            });
+            match index {
+                Ok(i) => given[i] = Some(ty),
+                Err(kind) => {
+                    self.error(kind, arg.ty.span);
+                    failed = true;
+                }
+            }
+        }
+        let mut settled = vec![Ty::Error; params.len()];
+        for i in 0..params.len() {
+            settled[i] = match (given[i], defaults[i]) {
+                (Some(ty), _) => ty,
+                (None, Some(default)) => self.substitute(default, &settled, span),
+                // One that an argument reported above was meant for, maybe.
+                (None, None) if failed => Ty::Error,
+                (None, None) => {
+                    let (ty, param) = (name.to_string(), names[i].clone());
+                    self.error(TypeErrorKind::MissingTypeArg { ty, param }, span);
+                    failed = true;
+                    Ty::Error
+                }
+            };
+        }
+        (!failed && !settled.contains(&Ty::Error)).then_some(settled)
+    }
+
+    /// The instance of generic struct or union `generic` with type
+    /// arguments `args`, first used at `site`, as it is written with the
+    /// fewest type arguments: one that is the default of its type parameter
+    /// is left out, and those after one left out are labelled.
+    fn instance_name(&mut self, generic: StructId, args: &[Ty], site: Span) -> String {
+        let defaults = self.param_defaults(generic, site);
+        let params = self.structs[generic.0 as usize].params.clone();
+        let mut written = Vec::new();
+        let mut skipped = false;
+        for (i, arg) in args.iter().enumerate() {
+            let default = defaults.get(i).copied().flatten();
+            let default = default.map(|default| self.substitute(default, args, site));
+            if default == Some(*arg) {
+                skipped = true;
+                continue;
+            }
+            let ty = self.ty_name(*arg);
+            written.push(match (skipped, params.get(i)) {
+                (true, Some(param)) => format!("{}: {ty}", self.param_name(*param)),
+                _ => ty,
+            });
+        }
+        let name = &self.structs[generic.0 as usize].name;
+        format!("{name}({})", written.join(", "))
     }
 
     /// Which lists of type arguments the type `name` takes. `None` for names
@@ -711,10 +917,15 @@ impl Checker {
     /// generic one has none to name, which is reported where it's resolved.
     pub(super) fn item_arity(&self, item: Item) -> Option<Arity> {
         match item {
-            Item::Struct(id) => match self.structs[id.0 as usize].params.len() {
-                0 => Some(Arity::Plain),
-                n => Some(Arity::Exactly(n)),
-            },
+            Item::Struct(id) => {
+                let def = &self.structs[id.0 as usize];
+                let defaulted = def.defaults.written.iter().any(Option::is_some);
+                match def.params.len() {
+                    0 => Some(Arity::Plain),
+                    n if defaulted => Some(Arity::AtMost(n)),
+                    n => Some(Arity::Exactly(n)),
+                }
+            }
             Item::Enum(_) | Item::Func(_) | Item::GenericFn(_) | Item::Alias(_) => {
                 Some(Arity::Plain)
             }
@@ -744,15 +955,16 @@ impl Checker {
             Some(id) => *id,
             None => {
                 let id = StructId(self.structs.len() as u32);
-                let names: Vec<_> = args.iter().map(|arg| self.ty_name(*arg)).collect();
+                let name = self.instance_name(generic, &args, site);
                 let decl = &self.structs[generic.0 as usize];
                 self.structs.push(StructDef {
-                    name: format!("{}({})", decl.name, names.join(", ")),
+                    name,
                     module: decl.module,
                     item: decl.item,
                     is_pub: decl.is_pub,
                     union: decl.union,
                     params: Vec::new(),
+                    defaults: ParamDefaults::default(),
                     instance: Some(Instance {
                         generic,
                         args: args.clone(),
@@ -924,7 +1136,16 @@ impl Body<'_> {
         args: &[Arg],
         span: Span,
     ) -> (Ty, Value) {
-        if args.iter().all(|arg| arg.label.is_none()) {
+        // A label that names a type parameter labels a type argument.
+        let params: Vec<_> = match self.named(callee) {
+            Some(Item::Struct(id)) => {
+                let params = &self.ck.structs[id.0 as usize].params;
+                params.iter().map(|p| self.ck.param_name(*p)).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut labels = args.iter().filter_map(|arg| arg.label.as_ref());
+        if labels.all(|label| params.contains(&label.name)) {
             let ty = match self.ck.applied_type_syntax(callee, args, span) {
                 Some(ty) => self.ck.resolve_ty(&ty),
                 None => Ty::Error,

@@ -1897,7 +1897,7 @@ impl<'p> Walk<'p> {
         }
         match &last.kind {
             TypeKind::Named(name, args) => {
-                if args.iter().flatten().any(|arg| self.ty(arg)) {
+                if args.iter().flatten().any(|arg| self.ty(&arg.ty)) {
                     return true;
                 }
                 let span = Span {
@@ -2066,17 +2066,24 @@ fn sig_text(src: &mut Sources, sig: &FnSig) -> String {
     )
 }
 
-/// The `(A, B: Bound)` that declares `params`, if there are any.
+/// The `(A, B: Bound, C = Default)` that declares `params`, if there are
+/// any.
 fn type_params_text(params: &[TypeParam]) -> String {
     if params.is_empty() {
         return String::new();
     }
-    let param = |param: &TypeParam| match &param.bound[..] {
-        [] => param.name.name.clone(),
-        [bound] => format!("{}: {bound}", param.name.name),
-        bounds => {
-            let bounds: Vec<_> = bounds.iter().map(|bound| bound.to_string()).collect();
-            format!("{}: ({})", param.name.name, bounds.join(", "))
+    let param = |param: &TypeParam| {
+        let bounded = match &param.bound[..] {
+            [] => param.name.name.clone(),
+            [bound] => format!("{}: {bound}", param.name.name),
+            bounds => {
+                let bounds: Vec<_> = bounds.iter().map(|bound| bound.to_string()).collect();
+                format!("{}: ({})", param.name.name, bounds.join(", "))
+            }
+        };
+        match &param.default {
+            Some(default) => format!("{bounded} = {default}"),
+            None => bounded,
         }
     };
     let params: Vec<_> = params.iter().map(param).collect();
@@ -2968,6 +2975,34 @@ fn(R: Make) take(make: R) -> &var u8:
         let unused = analysis.unused(&mut files);
         let unused: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
         assert_eq!(unused, ["Unused", "take"]);
+    }
+
+    #[test]
+    fn a_type_is_described_with_the_defaults_of_its_type_parameters() {
+        let src = "\
+struct(T, R: fn(uint) -> &var u8 = bump, N = u8) Vec:
+    make: R
+    extra: N
+fn bump(size: uint) -> &var u8:
+    return 8
+fn f(plain: &Vec(i32), same: &Vec(i32, R: bump)):
+    pass
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let (file, offset) = files.at("main", "Vec(i32)");
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(
+            hover.text,
+            "struct(T, R: fn(uint) -> &var u8 = bump, N = u8) Vec:\n\tmake: R\n\textra: N"
+        );
+        // A type argument is found under its label.
+        let (file, offset) = files.at("main", "bump))");
+        let bump = analysis.definition(file, offset).unwrap();
+        assert_eq!(
+            src[bump.start..].lines().next().unwrap(),
+            "bump(size: uint) -> &var u8:"
+        );
     }
 
     /// Where each name is written that stands for what `name` does, in the

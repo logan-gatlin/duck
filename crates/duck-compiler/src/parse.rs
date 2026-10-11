@@ -73,13 +73,16 @@ pub struct FnSig {
     pub ret: Option<Type>,
 }
 
-/// A type parameter in the `(A, B: Bound)` after `struct`, `union` or `fn`.
+/// A type parameter in the `(A, B: Bound, C = Default)` after `struct`,
+/// `union` or `fn`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
     pub name: Ident,
     /// The types its type arguments use, first and in order: one for
     /// `: Bound`, each of a list `: (A, B)`, and none if it isn't bounded.
     pub bound: Vec<Type>,
+    /// The type it is where a list of type arguments gives it none.
+    pub default: Option<Type>,
 }
 
 /// `extern "module":` and the host functions it imports. The module name is
@@ -229,11 +232,19 @@ pub struct Type {
     pub span: Span,
 }
 
+/// A type argument, optionally labelled with the type parameter it is given
+/// to, as in `Name(A, T: B)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeArg {
+    pub label: Option<Ident>,
+    pub ty: Type,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeKind {
     /// `Name`, or `Name(A, B)` given a list of type arguments, which may be
     /// empty as in `Name()`. `None` is no list at all.
-    Named(String, Option<Vec<Type>>),
+    Named(String, Option<Vec<TypeArg>>),
     /// `&T`, or `&var T`, which can be written through.
     Pointer(Mutability, Box<Type>),
     /// `module.T`, a type in another module, where `T` is a name or itself
@@ -530,8 +541,15 @@ impl fmt::Display for Type {
         match &self.kind {
             TypeKind::Named(name, None) => write!(f, "{name}"),
             TypeKind::Named(name, Some(args)) => {
-                write!(f, "{name}")?;
-                list(f, args)
+                write!(f, "{name}(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    let comma = if i == 0 { "" } else { ", " };
+                    match &arg.label {
+                        Some(label) => write!(f, "{comma}{}: {}", label.name, arg.ty)?,
+                        None => write!(f, "{comma}{}", arg.ty)?,
+                    }
+                }
+                write!(f, ")")
             }
             TypeKind::Pointer(Mutability::Let, pointee) => write!(f, "&{pointee}"),
             TypeKind::Pointer(Mutability::Var, pointee) => write!(f, "&var {pointee}"),
@@ -891,9 +909,9 @@ impl<'a> Parser<'a> {
         Ok(entry)
     }
 
-    /// The `(A, B: Bound)` after `struct`, `union` or `fn` that makes a
-    /// declaration generic, if there is one. A bound is a type, or a list
-    /// of them in brackets.
+    /// The `(A, B: Bound, C = Default)` after `struct`, `union` or `fn` that
+    /// makes a declaration generic, if there is one. A bound is a type, or
+    /// a list of them in brackets, and a default is a type.
     fn type_params(&mut self) -> PResult<Vec<TypeParam>> {
         if !self.eat(TokenKind::LParen) {
             return Ok(Vec::new());
@@ -908,7 +926,34 @@ impl<'a> Parser<'a> {
                 true => vec![p.ty()?],
                 false => Vec::new(),
             };
-            Ok(TypeParam { name, bound })
+            let default = match p.eat(TokenKind::Eq) {
+                true => Some(p.ty()?),
+                false => None,
+            };
+            Ok(TypeParam {
+                name,
+                bound,
+                default,
+            })
+        })
+    }
+
+    /// A type argument: a type, or `Param: Type`, which gives it to the
+    /// type parameter so named.
+    fn type_arg(&mut self) -> PResult<TypeArg> {
+        let labelled = matches!(self.peek().kind, TokenKind::Ident(_))
+            && self.peek_second().kind == TokenKind::Colon;
+        let label = match labelled {
+            true => {
+                let label = self.ident()?;
+                self.bump();
+                Some(label)
+            }
+            false => None,
+        };
+        Ok(TypeArg {
+            label,
+            ty: self.ty()?,
         })
     }
 
@@ -1064,7 +1109,7 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => {
                 self.bump();
                 let args = match self.eat(TokenKind::LParen) {
-                    true => Some(self.comma_list(TokenKind::RParen, Self::ty)?),
+                    true => Some(self.comma_list(TokenKind::RParen, Self::type_arg)?),
                     false => None,
                 };
                 TypeKind::Named(name.clone(), args)
@@ -1966,7 +2011,11 @@ mod tests {
         match &ty.kind {
             TypeKind::Named(name, None) => name.clone(),
             TypeKind::Named(name, Some(args)) => {
-                let args: Vec<_> = args.iter().map(render_ty).collect();
+                let arg = |arg: &TypeArg| match &arg.label {
+                    Some(label) => format!("{}: {}", label.name, render_ty(&arg.ty)),
+                    None => render_ty(&arg.ty),
+                };
+                let args: Vec<_> = args.iter().map(arg).collect();
                 format!("{name}({})", args.join(", "))
             }
             TypeKind::Pointer(Mutability::Let, pointee) => format!("&{}", render_ty(pointee)),
@@ -3134,6 +3183,44 @@ enum(u8) Color:
         assert_eq!(
             errors("fn f(x: (A, B)):\n    pass\n"),
             vec![expected("type", TokenKind::LParen)]
+        );
+    }
+
+    #[test]
+    fn a_type_parameter_has_a_default_and_a_type_argument_a_label() {
+        let src = "struct(T, R: Make = lib.bump, N = tuple(T, u8)) Vec:
+    next: &Vec(T, N: i32)
+    all: Vec(R: fn(uint), T: u8,)
+";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Struct(vec) = &module.items[0].kind else {
+            panic!()
+        };
+        let defaults: Vec<_> = (vec.params.iter())
+            .map(|p| p.default.as_ref().map(render_ty))
+            .collect();
+        let want = [None, Some("lib.bump"), Some("tuple(T, u8)")];
+        assert_eq!(defaults, want.map(|d| d.map(str::to_string)));
+        let fields: Vec<_> = (vec.entries.iter().filter_map(Entry::own))
+            .map(|field| render_ty(&field.ty))
+            .collect();
+        assert_eq!(fields, ["&Vec(T, N: i32)", "Vec(R: fn(uint), T: u8)"]);
+        // A type is displayed as it is written.
+        let ItemKind::Struct(vec) = &module.items[0].kind else {
+            panic!()
+        };
+        let shown: Vec<_> = (vec.entries.iter().filter_map(Entry::own))
+            .map(|field| field.ty.to_string())
+            .collect();
+        assert_eq!(shown, fields);
+        // A label is a name, and is followed by a type.
+        assert_eq!(
+            errors("fn f(x: Vec(u8, R:)):\n    pass\n"),
+            vec![expected("type", TokenKind::RParen)]
+        );
+        assert_eq!(
+            errors("struct(T =) S:\n    pass\n"),
+            vec![expected("type", TokenKind::RParen)]
         );
     }
 

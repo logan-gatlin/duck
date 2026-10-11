@@ -638,6 +638,44 @@ fn demo(n: &Named) -> i32:
 - `p: &T` takes a `&var i32` with `T` as `i32`, and `array(T)` a `varray(i32)`.
   Nothing is generic over writability: write both, or cast.
 
+### Defaults of type parameters
+
+```duck
+struct(K, V = K, N = u8) Entry:
+	key: K
+	value: V
+	uses: N
+
+fn(K) key_of(e: &Entry(K)) -> K:     # of an `Entry(K, K, u8)` only
+	return e.key
+
+fn demo(e: &Entry(i32)) -> uint:
+	let named = Entry(u8, N: u16)(key: 1, value: 2, uses: 3)
+	let k = key_of(e)
+	return Entry(i32).size + Entry(V: bool, K: u8).size
+```
+
+- `struct(K, V = K)`, `union(T, E = u8)`: a type parameter of a struct or a
+  union may have a default, which it is where a list of type arguments gives
+  it none. Any in the list may have one, as a parameter of a function may.
+- A type argument is given to the next type parameter, or labelled with the
+  one it is for: `Entry(u8, N: u16)` leaves `V` its default, and
+  `Entry(V: bool, K: u8)` gives them in another order. Labelled ones come
+  after the others, and any generic struct or union takes them:
+  `Box(T: i32)`.
+- A default is a type, and names only the type parameters before its own:
+  `V` is whatever `K` is given. It meets the bound of its type parameter in
+  each list that leaves it out, which is checked there, unless neither
+  names a type parameter: then it is checked where it is declared.
+- A type with a default written out is the type without it: `Entry(i32)`
+  is `Entry(i32, i32, u8)`, and is named `Entry(i32)`.
+- A type that leaves a default out names that default: a function taking
+  an `&Entry(K)` takes no `Entry(K, bool)`. Give it a type parameter of its
+  own, `fn(K, V) f(e: &Entry(K, V))`, to take any.
+- A type parameter without a default is given a type argument in every
+  list: `Entry()` is an error. And one of a function has no default, as
+  each call infers it.
+
 ### Wider unions and enums
 
 ```duck
@@ -968,7 +1006,8 @@ fn demo(p: fn(i32) -> i64) -> i64:
   `f` out is of `wide`.
 - A type argument is written as any type is: `Pool(u8, bump)` for the
   function `bump`, and `Pool(u8, fn(uint) -> &var u8)` for a pointer to
-  any, which is 4 bytes wider.
+  any, which is 4 bytes wider. With a default, as in
+  `struct(T, A: Make = bump) Pool`, `Pool(u8)` is the pool of `bump`.
 - A function type bounds alone: it is in no list, as `(fn(T) -> U, Head)`.
 - Nothing of the host is of a function's type: no parameter or result of
   an `extern` function or of one that a world exports.

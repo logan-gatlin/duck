@@ -28,7 +28,7 @@ use alias::AliasDef;
 use defaults::DefaultValue;
 use enums::EnumDef;
 use evaluate::Dep;
-use generic::{Arity, Instance, ParamDef, param_names};
+use generic::{Arity, Instance, ParamDef, ParamDefaults, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
@@ -772,8 +772,27 @@ pub enum TypeErrorKind {
     UntypedEmptyArray,
     /// An expression where a type argument should be.
     NotAType,
-    /// A type argument given a label, as only fields and parameters are.
+    /// A type argument given a label where the type isn't a generic struct
+    /// or union, whose type parameters are what label one.
     LabelledTypeArg,
+    /// A generic struct or union given no type argument for `param`, which
+    /// has no default.
+    MissingTypeArg {
+        ty: String,
+        param: String,
+    },
+    /// The default of a type parameter that names its own type parameter,
+    /// or one declared after it in the list.
+    DefaultNamesLater {
+        default: String,
+        param: String,
+    },
+    /// The default of a type parameter of a struct or union that is written
+    /// with that struct or union given no type argument for it.
+    RecursiveDefault(String),
+    /// A type parameter of a generic function given a default, which only
+    /// one of a struct or union has.
+    FnTypeDefault(String),
     /// An error in the body of an instance of a generic function, whose
     /// declaration was found to be right for every type argument. A bug in
     /// the compiler.
@@ -1018,6 +1037,8 @@ struct StructDef {
     union: bool,
     /// The [`Ty::Param`] of each type parameter of a generic declaration.
     params: Vec<Ty>,
+    /// What each of them is where a list of type arguments gives it none.
+    defaults: ParamDefaults,
     /// Set for instances of generic declarations.
     instance: Option<Instance>,
     /// The type that each of its `use` lines names, in order, of which it
@@ -1834,7 +1855,29 @@ impl fmt::Display for TypeErrorKind {
             ),
             Self::UntypedEmptyArray => write!(f, "can't infer the element type of `[]`"),
             Self::NotAType => write!(f, "expected a type"),
-            Self::LabelledTypeArg => write!(f, "type arguments can't be labelled"),
+            Self::LabelledTypeArg => write!(
+                f,
+                "only the type arguments of a generic struct or union are labelled, by its type \
+                 parameters"
+            ),
+            Self::MissingTypeArg { ty, param } => write!(
+                f,
+                "`{ty}` is given no type for `{param}`, which has no default"
+            ),
+            Self::DefaultNamesLater { default, param } => write!(
+                f,
+                "the default `{default}` names `{param}`, which isn't declared before the type \
+                 parameter it is the default of"
+            ),
+            Self::RecursiveDefault(name) => write!(
+                f,
+                "a default of `{name}` is written with `{name}` itself, given no type argument \
+                 in its place"
+            ),
+            Self::FnTypeDefault(name) => write!(
+                f,
+                "type parameter `{name}` of a function has no default: each call infers it"
+            ),
             Self::Unchecked { instance, error } => write!(
                 f,
                 "internal error: checking the declaration of `{instance}` missed an error in its body: \
@@ -2075,6 +2118,7 @@ impl Checker {
                 ItemKind::Struct(StructDecl { name, params, .. })
                 | ItemKind::Union(UnionDecl { name, params, .. }) => {
                     let id = StructId(self.structs.len() as u32);
+                    let defaults = ParamDefaults::written(params);
                     let params = self.new_params(&param_names(params));
                     self.structs.push(StructDef {
                         name: name.name.clone(),
@@ -2083,6 +2127,7 @@ impl Checker {
                         is_pub: item.is_pub,
                         union: matches!(item.kind, ItemKind::Union(_)),
                         params,
+                        defaults,
                         instance: None,
                         uses: Vec::new(),
                         fields: Vec::new(),
@@ -2415,6 +2460,7 @@ impl Checker {
         let tys = self.structs[id].params.clone();
         self.declare_type_params(&param_names(params), &tys);
         self.resolve_bounds(params, &tys);
+        self.check_param_defaults(StructId(id as u32), item.span);
         let fields = match &item.kind {
             ItemKind::Union(decl) => self.union_variants(program, id, decl, visits),
             ItemKind::Struct(decl) => self.struct_fields(program, id, decl, visits),
@@ -3203,7 +3249,7 @@ impl Checker {
         &mut self,
         member: Option<Item>,
         name: &str,
-        args: &Option<Vec<parse::Type>>,
+        args: &Option<Vec<parse::TypeArg>>,
         span: Span,
     ) -> Ty {
         let param = match member {
@@ -3226,17 +3272,30 @@ impl Checker {
         if let Some((_, param)) = param {
             return *param;
         }
-        let args: Vec<_> = args
-            .iter()
-            .flatten()
-            .map(|arg| self.resolve_ty(arg))
-            .collect();
         // Built-in types win over items of the same name.
         let item = match member {
             Some(_) => member,
             None if is_builtin_type(name) => None,
             None => self.item(name),
         };
+        // A generic struct or union gives each type argument to one of its
+        // type parameters, and those given none their defaults.
+        if let (Some(Item::Struct(id)), Some(written)) = (item, args) {
+            return match self.bound_type_args(id, name, written, span) {
+                Some(args) => self.instantiate(id, args, span),
+                None => Ty::Error,
+            };
+        }
+        // No other type has type parameters to label one by.
+        let labels = args.iter().flatten().filter_map(|arg| arg.label.as_ref());
+        for label in labels {
+            self.error(TypeErrorKind::LabelledTypeArg, label.span);
+        }
+        let args: Vec<_> = args
+            .iter()
+            .flatten()
+            .map(|arg| self.resolve_ty(&arg.ty))
+            .collect();
         if args.contains(&Ty::Error) {
             Ty::Error
         } else if let Some(Item::Struct(id)) = item {
@@ -11712,10 +11771,10 @@ fn g(a: i32(), b: P(), c: Box(), d: array(), e: Foo(), f: Foo):
                 UnknownType("Foo".into()),
                 NotAValue("Box(i32)".into()),
                 MissingTypeArgs("Box".into()),
-                LabelledTypeArg,
                 NotAType,
                 MissingTypeArgs("array".into()),
-                MissingTypeArgs("Box".into()),
+                // A type argument labelled by its type parameter is one.
+                NotAValue("Box(i32)".into()),
                 NotCallable("expression".into()),
             ]
         );
@@ -15695,6 +15754,146 @@ fn f(c: C):
             TypeOutsideParam.to_string(),
             "`type` is only the type of a function's parameter, which it makes a type parameter, \
              and of a global `let` of one name, which it makes a name of the type it is bound to"
+        );
+    }
+
+    #[test]
+    fn a_type_parameter_given_no_type_argument_has_its_default() {
+        let src = "\
+let Make: type = fn(uint) -> &var u8
+struct(T, R: Make = bump, N = tuple(T, u8)) Vec:
+    make: R
+    extra: N
+    cap: uint = 0
+union(T, E = u8) Res:
+    ok: T
+    err: E
+fn bump(size: uint) -> &var u8:
+    return 8
+fn other(size: uint) -> &var u8:
+    return 16
+fn(T) cap(v: &Vec(T)) -> uint:
+    return v.cap
+fn f(a: &Vec(u8), e: &Vec(u8, bump, tuple(u8, u8)), r: Res(i32)) -> uint:
+    let x = Vec(u8, N: i64)(make: bump, extra: 1)
+    let y: Res(i32, u8) = r
+    return cap(a) + cap(e) + Vec(u8).size + Vec(u8, N: i64).size + Vec(i32, R: Make).size
+";
+        let module = lower(src);
+        // One given its default is the one given none.
+        let caps = module.funcs.iter().filter(|f| f.name.starts_with("cap"));
+        let caps: Vec<_> = caps.map(|f| f.name.as_str()).collect();
+        assert_eq!(caps, ["cap(u8)"]);
+        let f = body(&module, "f");
+        let sizes = "(I32.Add (I32.Add (I32.Add (I32.Add \
+                     (call cap(u8) a) (call cap(u8) e)) 8) 16) 16)";
+        assert!(f.contains(sizes), "{f}");
+
+        // A type is named as it is written with the fewest type arguments.
+        use TypeErrorKind::*;
+        let decls = "\
+let Make: type = fn(uint) -> &var u8
+struct(T, R: Make = bump, N = tuple(T, u8)) Vec:
+    make: R
+    extra: N
+struct(T) Plain:
+    value: T
+fn bump(size: uint) -> &var u8:
+    return 8
+fn other(size: uint) -> &var u8:
+    return 16
+fn wide(size: u64) -> &var u8:
+    return 16
+";
+        let src = format!(
+            "{decls}\
+fn f(a: &Vec(u8), b: &Vec(u8, other), c: &Vec(u8, N: i64), d: &Vec(N: i32, T: u8)):
+    let m: bool = a.*
+    let n: bool = b.*
+    let o: bool = c.*
+    let p: bool = d.*
+fn g(e: &Vec(u8, other, i64), f: &Vec(T: u8, R: bump), g: Plain(T: u8)):
+    let q: bool = e.*
+    let r: bool = f.*
+    let s: bool = g
+"
+        );
+        assert_eq!(
+            errors(&src),
+            vec![
+                mismatch("bool", "Vec(u8)"),
+                mismatch("bool", "Vec(u8, other)"),
+                mismatch("bool", "Vec(u8, N: i64)"),
+                mismatch("bool", "Vec(u8, N: i32)"),
+                mismatch("bool", "Vec(u8, other, i64)"),
+                mismatch("bool", "Vec(u8)"),
+                mismatch("bool", "Plain(u8)"),
+            ]
+        );
+
+        let src = format!(
+            "{decls}\
+struct(T = U, U = u8) Later:
+    pass
+struct(T = Loop()) Loop:
+    pass
+struct(R: Make = wide) Bad:
+    pass
+fn(T = u8) generic(x: T):
+    pass
+fn f(a: Vec(), b: Vec(u8, T: i32), c: Vec(u8, Q: i32), d: Vec(N: i32, u8)):
+    pass
+fn g(a: Vec(u8, bump, i32, i32), b: array(T: u8), c: Vec(u8, wide), d: Plain()):
+    let e = Vec(u8, N: i64)
+    let h = Vec(make: bump)
+"
+        );
+        let not_called = NotCalledAs {
+            ty: "wide".into(),
+            called: Some("fn(u64) -> &var u8".into()),
+            bound: "fn(uint) -> &var u8".into(),
+        };
+        let count = |name: &str, expected, found| TypeArgCount {
+            name: name.into(),
+            expected,
+            found,
+        };
+        assert_eq!(
+            errors(&src),
+            vec![
+                DefaultNamesLater {
+                    default: "U".into(),
+                    param: "U".into()
+                },
+                RecursiveDefault("Loop".into()),
+                MissingTypeArg {
+                    ty: "Vec".into(),
+                    param: "T".into()
+                },
+                DuplicateArg("T".into()),
+                UnknownLabel("Q".into()),
+                PositionalAfterLabel,
+                count("Vec", 3, 4),
+                LabelledTypeArg,
+                count("Plain", 1, 0),
+                not_called.clone(),
+                not_called,
+                FnTypeDefault("T".into()),
+                NotAValue("Vec(u8, N: i64)".into()),
+                MissingTypeArgs("Vec".into()),
+            ]
+        );
+        assert_eq!(
+            MissingTypeArg {
+                ty: "Vec".into(),
+                param: "T".into()
+            }
+            .to_string(),
+            "`Vec` is given no type for `T`, which has no default"
+        );
+        assert_eq!(
+            FnTypeDefault("T".into()).to_string(),
+            "type parameter `T` of a function has no default: each call infers it"
         );
     }
 

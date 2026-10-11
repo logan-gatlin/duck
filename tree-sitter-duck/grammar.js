@@ -110,12 +110,25 @@ module.exports = grammar({
 
     type_parameters: $ => seq('(', commaSep1($._type_parameter), ')'),
 
-    _type_parameter: $ => choice($.identifier, $.bounded_type_parameter),
+    _type_parameter: $ => choice(
+      $.identifier,
+      $.bounded_type_parameter,
+      $.default_type_parameter,
+    ),
 
     bounded_type_parameter: $ => seq(
       field('name', $.identifier),
       ':',
       field('bound', choice($._type, $.bound_list)),
+    ),
+
+    // `T = Default`, or `T: Bound = Default`: the type that `T` is where a
+    // list of type arguments gives it none.
+    default_type_parameter: $ => seq(
+      field('name', $.identifier),
+      optional(seq(':', field('bound', choice($._type, $.bound_list)))),
+      '=',
+      field('default', $._type),
     ),
 
     // `(A, B)`: the types that a type argument uses, first and in order.
@@ -334,7 +347,16 @@ module.exports = grammar({
       field('type', choice($.named_type, $.qualified_type)),
     )),
 
-    type_arguments: $ => prec(PREC.type, seq('(', commaSep($._type), ')')),
+    type_arguments: $ => prec(PREC.type, seq('(', commaSep($._type_argument), ')')),
+
+    _type_argument: $ => choice($._type, $.labeled_type_argument),
+
+    // `T: Type`, a type argument given to the type parameter `T`.
+    labeled_type_argument: $ => seq(
+      field('label', $.identifier),
+      ':',
+      field('type', $._type),
+    ),
 
     // `&T`, or `&var T`, which can be written through.
     pointer_type: $ => seq(

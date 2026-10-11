@@ -96,6 +96,13 @@ impl Checker {
             let tys = self.generic_fns[i].params.clone();
             self.declare_type_params(&decl.sig.type_param_names(), &tys);
             self.resolve_bounds(&decl.sig.type_params, &tys);
+            // A call infers each, so none has a default to be left with.
+            for param in &decl.sig.type_params {
+                if let Some(default) = &param.default {
+                    let kind = TypeErrorKind::FnTypeDefault(param.name.name.clone());
+                    self.error(kind, default.span);
+                }
+            }
             let (params, ret) = self.resolve_sig(&decl.sig);
             if item.is_pub {
                 self.check_public_sig(&decl.sig, &params, ret);

@@ -657,6 +657,46 @@
     }
   },
   {
+    "type": "default_type_parameter",
+    "named": true,
+    "fields": {
+      "bound": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "_type",
+            "named": true
+          },
+          {
+            "type": "bound_list",
+            "named": true
+          }
+        ]
+      },
+      "default": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_type",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "defer_statement",
     "named": true,
     "fields": {
@@ -1234,6 +1274,32 @@
     }
   },
   {
+    "type": "labeled_type_argument",
+    "named": true,
+    "fields": {
+      "label": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "list",
     "named": true,
     "fields": {},
@@ -1725,6 +1791,10 @@
         {
           "type": "_type",
           "named": true
+        },
+        {
+          "type": "labeled_type_argument",
+          "named": true
         }
       ]
     }
@@ -1739,6 +1809,10 @@
       "types": [
         {
           "type": "bounded_type_parameter",
+          "named": true
+        },
+        {
+          "type": "default_type_parameter",
           "named": true
         },
         {

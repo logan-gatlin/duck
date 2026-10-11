@@ -15,8 +15,8 @@ use crate::load::Program;
 use crate::parse::{self, Arg, ExprKind, Ident, UnionDecl};
 
 use super::{
-    Body, Checker, FieldDef, Item, Leaf, OPTION, Prim, RESULT, StructDef, StructId, TYPE_FIELDS,
-    Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_pure, never, zero,
+    Body, Checker, FieldDef, Item, Leaf, OPTION, ParamDefaults, Prim, RESULT, StructDef, StructId,
+    TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, binary, fold_unary, is_pure, never, zero,
 };
 
 /// The type of a union's tag in memory, which counts its variants from 0.
@@ -135,6 +135,7 @@ impl Checker {
                 uses: Vec::new(),
                 fields: variants.iter().map(variant).collect(),
                 params,
+                defaults: ParamDefaults::default(),
                 instance: None,
                 depth: None,
             });

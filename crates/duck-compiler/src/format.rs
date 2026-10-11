@@ -888,6 +888,10 @@ mod tests {
             "pub let Make: type = fn(uint) -> &var u8\n\nfn(R: Make) f(make: R):\n\tpass\n"
         );
         assert_eq!(
+            formatted("struct(T,R:Make=lib.bump,N=u8)Vec:\n\tnext:&Vec(T,N:i32)\n"),
+            "struct(T, R: Make = lib.bump, N = u8) Vec:\n\tnext: &Vec(T, N: i32)\n"
+        );
+        assert_eq!(
             formatted("use geo . { Point ,len  as length }\n"),
             "use geo.{Point, len as length}\n"
         );
