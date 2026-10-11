@@ -31,18 +31,18 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesRegistrationOptions,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentChangeOperation, DocumentChanges, DocumentFormattingParams, DocumentHighlight,
-    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, FileSystemWatcher, GlobPattern,
-    GotoDefinitionParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InlayHint, InlayHintKind,
-    InlayHintLabel, InlayHintParams, Location, MarkupContent, MarkupKind, NumberOrString, OneOf,
-    OptionalVersionedTextDocumentIdentifier, ParameterInformation, ParameterLabel, Position,
-    PublishDiagnosticsParams, Range, ReferenceParams, Registration, RegistrationParams, RenameFile,
-    RenameOptions, RenameParams, ResourceOp, ResourceOperationKind, ServerCapabilities, ServerInfo,
-    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
-    SymbolInformation, TextDocumentEdit, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit,
-    TypeDefinitionProviderCapability, Uri, WorkspaceEdit, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, Documentation,
+    FileSystemWatcher, GlobPattern, GotoDefinitionParams, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, MarkupContent, MarkupKind,
+    NumberOrString, OneOf, OptionalVersionedTextDocumentIdentifier, ParameterInformation,
+    ParameterLabel, Position, PublishDiagnosticsParams, Range, ReferenceParams, Registration,
+    RegistrationParams, RenameFile, RenameOptions, RenameParams, ResourceOp, ResourceOperationKind,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SignatureInformation, SymbolInformation, TextDocumentEdit, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -295,13 +295,7 @@ impl Server<'_> {
         let (range, text, docs) = self.ask(at, Project::hover)?;
         let mut value = format!("```{LANGUAGE}\n{text}\n```");
         if !docs.is_empty() {
-            // Each line of a comment is a line, indented as it is.
-            let line = |line: &str| {
-                let said = line.trim_start_matches(' ');
-                format!("{}{said}", "\u{a0}".repeat(line.len() - said.len()))
-            };
-            let lines: Vec<_> = docs.lines().map(line).collect();
-            value = format!("{value}\n\n---\n\n{}", lines.join("  \n"));
+            value = format!("{value}\n\n---\n\n{}", said(&docs));
         }
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -719,6 +713,7 @@ impl Server<'_> {
                     CompletionKind::Type => CompletionItemKind::TYPE_PARAMETER,
                 }),
                 detail: (!completion.detail.is_empty()).then_some(completion.detail),
+                documentation: documentation(&completion.docs),
                 insert_text: insert,
                 additional_text_edits: import.map(|import| vec![import]),
                 // The nearest are first, where the editor has nothing else
@@ -752,18 +747,22 @@ impl Server<'_> {
         let buffers = |path: &Path| Some(documents.get(path)?.text.as_str());
         let text = &documents[&path].text;
         let (signature, active) = project.signature(&buffers, &path, text, position)?;
-        let ty::Signature { label, params } = signature;
+        let ty::Signature {
+            label,
+            params,
+            docs,
+        } = signature;
         // The editor counts in UTF-16 code units here, too.
         let units = |end: usize| label[..end].encode_utf16().count() as u32;
         let params = params.iter().map(|param| ParameterInformation {
             label: ParameterLabel::LabelOffsets([units(param.range.start), units(param.range.end)]),
-            documentation: None,
+            documentation: documentation(&param.docs),
         });
         let active = active.map(|active| active as u32);
         let signature = SignatureInformation {
             parameters: Some(params.collect()),
             label,
-            documentation: None,
+            documentation: documentation(&docs),
             active_parameter: active,
         };
         Some(SignatureHelp {
@@ -1024,6 +1023,27 @@ fn capabilities() -> ServerCapabilities {
         }),
         ..ServerCapabilities::default()
     }
+}
+
+/// The comment `docs` as an editor shows it: each line of it a line,
+/// indented as it is.
+fn said(docs: &str) -> String {
+    let line = |line: &str| {
+        let said = line.trim_start_matches(' ');
+        format!("{}{said}", "\u{a0}".repeat(line.len() - said.len()))
+    };
+    let lines: Vec<_> = docs.lines().map(line).collect();
+    lines.join("  \n")
+}
+
+/// The comment `docs` as what an editor shows beside something it
+/// suggests, if there is any.
+fn documentation(docs: &str) -> Option<Documentation> {
+    let markup = || MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: said(docs),
+    };
+    (!docs.is_empty()).then(|| Documentation::MarkupContent(markup()))
 }
 
 /// The directories the editor has open.
@@ -1585,7 +1605,7 @@ mod tests {
         editor.stop();
     }
 
-    const KIT: &str = "# A point in the plane.\n#   Flat.\npub struct Point:\n    pub x: f32\n    pub y: f32 = 0.0\npub enum(u8) Color:\n    red\n    green\npub fn len(p: Point, scale: f32 = 1.0) -> f32:\n    return p.x * scale\n";
+    const KIT: &str = "# A point in the plane.\n#   Flat.\npub struct Point:\n    pub x: f32\n    pub y: f32 = 0.0  # Up.\npub enum(u8) Color:\n    red\n    green\npub fn len(p: Point, scale: f32 = 1.0) -> f32:\n    return p.x * scale\n";
 
     const PICK: &str = "use kit\npub fn pick(c: kit.Color, wide: i64) -> i32:\n    let p = kit.Point(x: 1.0)\n    let far = kit.len(p, 2.0)\n    match c:\n        .red:\n            return 1\n    let n: i32 = wide\n    return n\n";
 
@@ -1793,6 +1813,22 @@ mod tests {
         assert_eq!(argument[0]["detail"], "scale: f32 = 1.0");
         let field = typed("    kit.Point(y: 1.0, ", Completion::METHOD, &mut editor);
         assert_eq!(labels(&field)[..2], ["x:", "n"]);
+        // What a declaration is said to be is told with what is suggested
+        // of it, and with what a call of it takes.
+        let flat = "A point in the plane.  \n\u{a0}\u{a0}Flat.";
+        let items = typed("    kit.", Completion::METHOD, &mut editor);
+        let mut items = items.as_array().unwrap().iter();
+        let point = items.find(|item| item["label"] == "Point").unwrap();
+        assert_eq!(
+            point["documentation"],
+            json!({ "kind": "markdown", "value": flat })
+        );
+        assert_eq!(items.next().unwrap()["documentation"], Value::Null);
+        let built = typed("    kit.Point(", SignatureHelpRequest::METHOD, &mut editor);
+        let built = &built["signatures"][0];
+        assert_eq!(built["documentation"]["value"], flat);
+        assert_eq!(built["parameters"][0]["documentation"], Value::Null);
+        assert_eq!(built["parameters"][1]["documentation"]["value"], "Up.");
         // What a `use` would bring is last of them, with the `use`.
         let named = typed("    le", Completion::METHOD, &mut editor);
         let len = named.as_array().unwrap().iter();

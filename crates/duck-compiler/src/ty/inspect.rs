@@ -65,6 +65,9 @@ pub struct Completion {
     /// What is written with it for it to be in scope: a `use`, on a line of
     /// its own that starts at this byte of the file.
     pub import: Option<(usize, String)>,
+    /// The comment on its declaration, as [`Hover::docs`] is. Empty if it
+    /// has none, or if no item declares it.
+    pub docs: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +95,9 @@ pub struct Signature {
     /// The whole of it, as source: `fn area(w: f64, h: f64 = 1.0) -> f64`.
     pub label: String,
     pub params: Vec<Parameter>,
+    /// The comment on the declaration of what is called, as [`Hover::docs`]
+    /// is. Empty if it has none.
+    pub docs: String,
 }
 
 /// A parameter of a [`Signature`].
@@ -102,6 +108,10 @@ pub struct Parameter {
     pub name: Option<String>,
     /// Where in the label it is written.
     pub range: Range<usize>,
+    /// The comment on the field that it is, or on the line of its own that
+    /// it is declared on. Empty if it has none: one declared on the line of
+    /// its function has that line's comment said of the function.
+    pub docs: String,
 }
 
 /// A name that the body of a function binds.
@@ -270,6 +280,7 @@ pub fn module_members() -> Vec<Completion> {
                 None => Prim::Uint.name().to_string(),
             },
             import: None,
+            docs: String::new(),
         }
     };
     let funcs = MODULE_FUNCS.iter().map(member(CompletionKind::Function));
@@ -364,10 +375,7 @@ impl Analysis {
             Some(Target::Item(_) | Target::Entry(..)) => self.definition(file, offset),
             _ => None,
         };
-        let docs = match declared.filter(|declared| declared.start < declared.end) {
-            Some(declared) => docs(src.file(declared.file), declared.start),
-            None => String::new(),
-        };
+        let docs = src.docs(declared);
         Some(Hover { span, text, docs })
     }
 
@@ -582,6 +590,7 @@ impl Analysis {
                 kind,
                 detail,
                 import: None,
+                docs: String::new(),
             });
         }
         let mut items: Vec<_> = self.ck.scopes.get(&file).into_iter().flatten().collect();
@@ -600,6 +609,7 @@ impl Analysis {
                 kind: CompletionKind::Type,
                 detail: String::new(),
                 import: None,
+                docs: String::new(),
             });
         }
         // Last, what a `use` would bring into scope.
@@ -621,10 +631,16 @@ impl Analysis {
     /// The variants or members that the `.name` at byte `offset` of `file`
     /// may name: those of the type expected of it, or of the value that a
     /// pattern there is matched against.
-    pub fn expected(&self, file: FileId, offset: usize) -> Vec<Completion> {
+    pub fn expected(
+        &self,
+        files: &mut impl FileManager,
+        file: FileId,
+        offset: usize,
+    ) -> Vec<Completion> {
         let site = self.locate(file, offset, false);
+        let mut read = |id| files.contents(id);
         match self.expected_at(&site) {
-            Some((ty, _)) => self.sum_members(ty),
+            Some((ty, _)) => self.sum_members(&mut Sources::new(&mut read), ty),
             None => Vec::new(),
         }
     }
@@ -669,17 +685,17 @@ impl Analysis {
             return self.items_of(&mut src, file, module);
         }
         if let Some(ty) = self.type_named(&site, expr) {
-            return self.type_members(ty);
+            return self.type_members(&mut src, ty);
         }
         if let ExprKind::Name(name) = &expr.kind
             && site.local(name).is_none()
             && self.item(file, name).is_none()
             && (site.type_param(name).is_some() || is_builtin_type(name))
         {
-            return self.type_members(Ty::Type);
+            return self.type_members(&mut src, Ty::Type);
         }
         match self.ty_at(expr.span) {
-            Some(ty) => self.value_members(file, ty),
+            Some(ty) => self.value_members(&mut src, file, ty),
             None => Vec::new(),
         }
     }
@@ -713,7 +729,7 @@ impl Analysis {
             Some(Item::Struct(id))
                 if ptr::eq(named, expr) && !self.ck.structs[id.0 as usize].params.is_empty() =>
             {
-                return self.type_signature(id);
+                return self.type_signature(&mut src, id);
             }
             Some(Item::Struct(id)) if !self.ck.structs[id.0 as usize].union => {
                 return Some(self.struct_signature(&mut src, id));
@@ -728,14 +744,9 @@ impl Analysis {
             return Some(self.struct_signature(&mut src, id));
         }
         if let ExprKind::Field(inner, field) = &expr.kind
-            && let Some((def, variant)) = self.variant(&site, inner, field)
+            && let Some((id, variant)) = self.variant(&site, inner, field)
         {
-            if variant.bare {
-                return None;
-            }
-            let head = format!("{}.{}", def.name, variant.name);
-            let holds = (None, self.ck.ty_name(variant.ty));
-            return Some(signature(head, vec![holds], ""));
+            return self.variant_signature(&mut src, id, variant);
         }
         let (params, ret) = self.ck.called_as(self.ty_at(expr.span)?)?;
         let params = params.iter().map(|param| (None, self.ck.ty_name(*param)));
@@ -748,17 +759,46 @@ impl Analysis {
 
     /// What a call takes of the `.name` at byte `offset` of `file`: the
     /// value of the variant so named of the union expected of it.
-    pub fn expected_signature(&self, file: FileId, offset: usize) -> Option<Signature> {
+    pub fn expected_signature(
+        &self,
+        files: &mut impl FileManager,
+        file: FileId,
+        offset: usize,
+    ) -> Option<Signature> {
         let site = self.locate(file, offset, false);
         let (ty, name) = self.expected_at(&site)?;
-        let def = &self.ck.structs[self.ck.union_id(ty)?.0 as usize];
-        let variant = def.fields.iter().find(|variant| variant.name == name)?;
+        let id = self.ck.union_id(ty)?;
+        let variants = self.ck.structs[id.0 as usize].fields.iter();
+        let variant = variants.into_iter().find(|variant| variant.name == name)?;
+        let mut read = |id| files.contents(id);
+        self.variant_signature(&mut Sources::new(&mut read), id, variant)
+    }
+
+    /// What a call takes of `variant`, a variant of union `id`: the value
+    /// it holds, if it holds one.
+    fn variant_signature(
+        &self,
+        src: &mut Sources,
+        id: StructId,
+        variant: &super::FieldDef,
+    ) -> Option<Signature> {
         if variant.bare {
             return None;
         }
-        let head = format!("{}.{}", def.name, variant.name);
+        let head = format!("{}.{}", self.ck.structs[id.0 as usize].name, variant.name);
         let holds = (None, self.ck.ty_name(variant.ty));
-        Some(signature(head, vec![holds], ""))
+        Some(Signature {
+            docs: src.docs(self.field_span(id, &variant.name)),
+            ..signature(head, vec![holds], "")
+        })
+    }
+
+    /// Where the field or variant `name` of struct or union `id` is
+    /// written. `None` for one of the language's own, which no item
+    /// declares.
+    fn field_span(&self, id: StructId, name: &str) -> Option<Span> {
+        let item = self.ck.structs[id.0 as usize].item;
+        (!self.is_builtin(id)).then(|| self.entry_span(item, name, MAX_USES))?
     }
 
     /// The type expected of the `.name` found at `site`, or matched by a
@@ -1208,7 +1248,7 @@ impl Analysis {
         site: &Site,
         expr: &parse::Expr,
         name: &parse::Ident,
-    ) -> Option<(&super::StructDef, &super::FieldDef)> {
+    ) -> Option<(StructId, &super::FieldDef)> {
         let Ty::Struct(id) = self.type_named(site, expr)? else {
             return None;
         };
@@ -1217,7 +1257,7 @@ impl Analysis {
             .fields
             .iter()
             .find(|variant| variant.name == name.name)?;
-        Some((def, variant))
+        Some((id, variant))
     }
 
     /// The item that the last of `names` names in the module `from`, each
@@ -1478,25 +1518,27 @@ impl Analysis {
             kind,
             detail,
             import: None,
+            docs: src.docs(self.item_span(item)),
         }
     }
 
     /// What can follow the `.` after the type `ty`: the members of an enum
     /// or the variants of a union, and then the fields every type has.
-    fn type_members(&self, ty: Ty) -> Vec<Completion> {
-        let mut members = self.sum_members(ty);
+    fn type_members(&self, src: &mut Sources, ty: Ty) -> Vec<Completion> {
+        let mut members = self.sum_members(src, ty);
         members.extend(TYPE_FIELDS.iter().map(|name| Completion {
             name: name.to_string(),
             kind: CompletionKind::Field,
             detail: Prim::Uint.name().to_string(),
             import: None,
+            docs: String::new(),
         }));
         members
     }
 
     /// The members of `ty` if it is an enum, or its variants if it is a
     /// union, as things to write.
-    fn sum_members(&self, ty: Ty) -> Vec<Completion> {
+    fn sum_members(&self, src: &mut Sources, ty: Ty) -> Vec<Completion> {
         let mut members = Vec::new();
         match ty {
             Ty::Enum(id) => {
@@ -1506,6 +1548,7 @@ impl Analysis {
                     kind: CompletionKind::Member,
                     detail: def.name.clone(),
                     import: None,
+                    docs: src.docs(self.entry_span(def.item, &member.name, MAX_USES)),
                 }));
             }
             Ty::Struct(id) if self.ck.structs[id.0 as usize].union => {
@@ -1518,6 +1561,7 @@ impl Analysis {
                         false => self.ck.ty_name(variant.ty),
                     },
                     import: None,
+                    docs: src.docs(self.field_span(id, &variant.name)),
                 }));
             }
             _ => {}
@@ -1528,18 +1572,19 @@ impl Analysis {
     /// What can follow the `.` after a value of type `ty` in `file`: `*`
     /// for a pointer, and the fields of what it points to through any
     /// number of pointers, those of them that `file` sees.
-    fn value_members(&self, file: FileId, mut ty: Ty) -> Vec<Completion> {
-        let field = |name: &str, ty: Ty| Completion {
+    fn value_members(&self, src: &mut Sources, file: FileId, mut ty: Ty) -> Vec<Completion> {
+        let field = |name: &str, ty: Ty, docs: String| Completion {
             name: name.to_string(),
             kind: CompletionKind::Field,
             detail: self.ck.ty_name(ty),
             import: None,
+            docs,
         };
         let mut members = Vec::new();
         while let Ty::Ptr(id) = ty {
             let pointee = self.ck.pointee(id);
             if members.is_empty() {
-                members.push(field("*", pointee));
+                members.push(field("*", pointee, String::new()));
             }
             ty = pointee;
         }
@@ -1549,15 +1594,18 @@ impl Analysis {
             Ty::Struct(id) if !self.ck.structs[id.0 as usize].union => {
                 let fields = self.ck.structs[id.0 as usize].fields.iter().enumerate();
                 let seen = fields.filter(|(i, _)| self.ck.sees_field(id, *i, file));
-                members.extend(seen.map(|(_, def)| field(&def.name, def.ty)));
+                members.extend(seen.map(|(_, def)| {
+                    let docs = src.docs(self.field_span(id, &def.name));
+                    field(&def.name, def.ty, docs)
+                }));
             }
             Ty::Tuple(id) => {
                 let elems = self.ck.tuples[id.0 as usize].iter().enumerate();
-                members.extend(elems.map(|(i, elem)| field(&i.to_string(), *elem)));
+                members.extend(elems.map(|(i, elem)| field(&i.to_string(), *elem, String::new())));
             }
             Ty::Array(_) => {
                 let fields = ARRAY_FIELDS.iter().zip(self.ck.members(ty));
-                members.extend(fields.map(|(name, ty)| field(name, ty)));
+                members.extend(fields.map(|(name, ty)| field(name, ty, String::new())));
             }
             _ => {}
         }
@@ -1570,7 +1618,12 @@ impl Analysis {
         let param = |param: &Param| (Some(param.name.name.clone()), param_text(src, param));
         let params = sig.params.iter().map(param).collect();
         let tail = sig.ret.as_ref().map(|ret| format!(" -> {ret}"));
-        signature(head, params, &tail.unwrap_or_default())
+        let mut signature = signature(head, params, &tail.unwrap_or_default());
+        signature.docs = src.docs(Some(sig.name.span));
+        for (param, declared) in signature.params.iter_mut().zip(&sig.params) {
+            param.docs = src.line_docs(declared.name.span);
+        }
+        signature
     }
 
     /// What a constructor of struct `id` takes: its fields, each as it is
@@ -1601,12 +1654,17 @@ impl Analysis {
             (Some(field.name.clone()), text)
         };
         let name = decl.map_or(&def.name, |decl| &decl.name.name);
-        signature(name.clone(), def.fields.iter().map(field).collect(), "")
+        let mut signature = signature(name.clone(), def.fields.iter().map(field).collect(), "");
+        signature.docs = src.docs(decl.map(|decl| decl.name.span));
+        for (param, field) in signature.params.iter_mut().zip(&def.fields) {
+            param.docs = src.docs(self.field_span(id, &field.name));
+        }
+        signature
     }
 
     /// What a list of type arguments of struct or union `id` takes: its
     /// type parameters, each as it is declared.
-    fn type_signature(&self, id: StructId) -> Option<Signature> {
+    fn type_signature(&self, src: &mut Sources, id: StructId) -> Option<Signature> {
         let def = &self.ck.structs[id.0 as usize];
         let (name, params) = match &self.program.items.get(def.item)?.kind {
             ItemKind::Struct(decl) => (&decl.name, &decl.params),
@@ -1614,11 +1672,10 @@ impl Analysis {
             _ => return None,
         };
         let param = |param: &TypeParam| (Some(param.name.name.clone()), type_param_text(param));
-        Some(signature(
-            name.name.clone(),
-            params.iter().map(param).collect(),
-            "",
-        ))
+        Some(Signature {
+            docs: src.docs(Some(name.span)),
+            ..signature(name.name.clone(), params.iter().map(param).collect(), "")
+        })
     }
 }
 
@@ -2052,6 +2109,27 @@ impl<'f> Sources<'f> {
         let text = text.get(span.start..span.end).unwrap_or_default();
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
+
+    /// The comment on what is declared at `declared`, if something is. A
+    /// module is declared by its file, at no place in it, which says
+    /// nothing.
+    fn docs(&mut self, declared: Option<Span>) -> String {
+        match declared.filter(|declared| declared.start < declared.end) {
+            Some(declared) => docs(self.file(declared.file), declared.start),
+            None => String::new(),
+        }
+    }
+
+    /// The comment on what is declared at `declared`, if it starts its
+    /// line: the comment of a line is on what the line declares first.
+    fn line_docs(&mut self, declared: Span) -> String {
+        let text = self.file(declared.file);
+        let before = text.get(line_start(text, declared.start)..declared.start);
+        match before.is_some_and(|before| before.trim().is_empty()) {
+            true => docs(text, declared.start),
+            false => String::new(),
+        }
+    }
 }
 
 /// The byte that the line of byte `at` of `text` starts at.
@@ -2159,6 +2237,7 @@ fn signature(head: String, params: Vec<(Option<String>, String)>, tail: &str) ->
         placed.push(Parameter {
             name,
             range: start..label.len(),
+            docs: String::new(),
         });
     }
     label += ")";
@@ -2166,6 +2245,7 @@ fn signature(head: String, params: Vec<(Option<String>, String)>, tail: &str) ->
     Signature {
         label,
         params: placed,
+        docs: String::new(),
     }
 }
 
@@ -2454,7 +2534,9 @@ fn bytes(T: type, count: uint) -> uint:
         let analysis = analysis(&mut files);
         let (file, offset) = files.at("main", line);
         let offset = offset + line.len() - line.trim_start().len();
-        let Signature { mut label, params } = analysis.signature(&mut files, file, offset)?;
+        let Signature {
+            mut label, params, ..
+        } = analysis.signature(&mut files, file, offset)?;
         for param in params.iter().rev() {
             label.insert(param.range.end, ']');
             label.insert(param.range.start, '[');
@@ -3623,6 +3705,107 @@ fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
     }
 
     #[test]
+    fn what_can_be_written_says_what_its_declaration_is_said_to_be() {
+        let src = "\
+# A point in the plane.
+struct Point:
+    # Across.
+    x: f32
+    y: f32 = 0.0  # Up.
+union Shape:
+    # Round,
+    # and so of one size.
+    circle: f32
+    empty
+enum(u8) Color:
+    red  # Warm.
+    green
+# How far `p` is from the origin.
+fn len(p: Point, scale: f32 = 1.0) -> f32:
+    return p.x * scale
+# Draws a shape.
+fn draw(
+    # What is drawn.
+    s: Shape,
+    c: Color,  # In what.
+    thick: bool = false,
+):
+    pass
+fn main(p: Point):
+    p
+    Shape
+    Color
+    len
+    draw
+    Point
+    Shape.circle
+    let c: Color = .red
+    pass
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let said = |completions: Vec<Completion>| -> Vec<(String, String)> {
+            let said = completions.into_iter().filter(|c| !c.docs.is_empty());
+            said.map(|c| (c.name, c.docs)).collect()
+        };
+        let says = |said: &[(&str, &str)]| -> Vec<(String, String)> {
+            let said = said.iter();
+            said.map(|(name, docs)| (name.to_string(), docs.to_string()))
+                .collect()
+        };
+        let (file, at) = files.at("main", "    p\n");
+        let fields = analysis.members(&mut files, file, at + 4);
+        assert_eq!(said(fields), says(&[("x", "Across."), ("y", "Up.")]));
+        let (_, at) = files.at("main", "    Shape\n");
+        let variants = analysis.members(&mut files, file, at + 4);
+        let round = "Round,\nand so of one size.";
+        assert_eq!(said(variants), says(&[("circle", round)]));
+        let (_, at) = files.at("main", "    Color\n");
+        let members = analysis.members(&mut files, file, at + 4);
+        assert_eq!(said(members), says(&[("red", "Warm.")]));
+        let (_, at) = files.at("main", ".red");
+        let expected = analysis.expected(&mut files, file, at + 1);
+        assert_eq!(said(expected), says(&[("red", "Warm.")]));
+        // A variable says nothing, nor does a type of the language.
+        let (_, at) = files.at("main", "    let c: Color");
+        let names = analysis.names(&mut files, file, at + 4);
+        assert_eq!(
+            said(names),
+            says(&[
+                ("Point", "A point in the plane."),
+                ("draw", "Draws a shape."),
+                ("len", "How far `p` is from the origin."),
+            ])
+        );
+
+        // What a call takes says it too, and so does each field, and each
+        // parameter that is declared on a line of its own.
+        let mut taken = |line: &str| {
+            let (_, at) = files.at("main", line);
+            let signature = analysis.signature(&mut files, file, at + 4).unwrap();
+            let params: Vec<_> = signature.params.into_iter().map(|p| p.docs).collect();
+            (signature.docs, params)
+        };
+        let docs = |docs: &str, params: &[&str]| {
+            let params = params.iter().map(|param| param.to_string());
+            (docs.to_string(), params.collect::<Vec<_>>())
+        };
+        assert_eq!(
+            taken("    len\n"),
+            docs("How far `p` is from the origin.", &["", ""])
+        );
+        assert_eq!(
+            taken("    draw\n"),
+            docs("Draws a shape.", &["What is drawn.", "In what.", ""])
+        );
+        assert_eq!(
+            taken("    Point\n"),
+            docs("A point in the plane.", &["Across.", "Up."])
+        );
+        assert_eq!(taken("    Shape.circle\n"), docs(round, &[""]));
+    }
+
+    #[test]
     fn the_type_of_a_value_is_defined_where_it_is_declared() {
         let mut files = user();
         let analysis = used(&mut files);
@@ -3858,21 +4041,27 @@ fn main():
         let mut files = user();
         let analysis = used(&mut files);
         let (main, some) = place(&files, ".some(1)", "some");
-        assert_eq!(shown(analysis.expected(main, some)), ["none", "some: i32"]);
+        assert_eq!(
+            shown(analysis.expected(&mut files, main, some)),
+            ["none", "some: i32"]
+        );
         let (_, circle) = place(&files, ".circle(r)", "circle");
         assert_eq!(
-            shown(analysis.expected(main, circle)),
+            shown(analysis.expected(&mut files, main, circle)),
             ["circle: f32", "empty"]
         );
         let (_, red) = place(&files, ".red:", "red");
         assert_eq!(
-            shown(analysis.expected(main, red)),
+            shown(analysis.expected(&mut files, main, red)),
             ["red: Color", "green: Color"]
         );
-        assert_eq!(shown(analysis.expected(main, 0)), [] as [&str; 0]);
-        let signature = analysis.expected_signature(main, some).unwrap();
+        assert_eq!(
+            shown(analysis.expected(&mut files, main, 0)),
+            [] as [&str; 0]
+        );
+        let signature = analysis.expected_signature(&mut files, main, some).unwrap();
         assert_eq!(signature.label, "option(i32).some(i32)");
-        assert_eq!(analysis.expected_signature(main, red), None);
+        assert_eq!(analysis.expected_signature(&mut files, main, red), None);
 
         // The items of the module that a path names.
         let (_, kit) = place(&files, "use kit.Point", "kit");
