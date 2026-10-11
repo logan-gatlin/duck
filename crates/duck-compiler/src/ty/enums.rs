@@ -41,7 +41,7 @@ pub(super) struct MemberDef {
     pub(super) value: Vec<Const>,
     /// Whether `value` is its value, rather than zeros in place of one that
     /// failed to check or isn't folded yet.
-    known: bool,
+    pub(super) known: bool,
     /// Whether it is given no value, so that an integer counts up to it.
     counts: bool,
     /// The member of another enum that a `use` makes it one of, if any.

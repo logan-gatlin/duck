@@ -49,7 +49,9 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use super::changes;
-use super::project::{self, Mend, Outline, Place, Problem, Project, Renaming, Suggestion};
+use super::project::{
+    self, Described, Mend, Outline, Place, Problem, Project, Renaming, Suggestion,
+};
 
 type Fallible = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -289,10 +291,19 @@ impl Server<'_> {
     }
 
     /// What is written at a place in a file: its declaration or its type,
-    /// as source.
+    /// as source, with what a constant is evaluated to as a comment on it.
     fn hover(&mut self, params: HoverParams) -> Option<Hover> {
         let at = params.text_document_position_params;
-        let (range, text, docs) = self.ask(at, Project::hover)?;
+        let described = self.ask(at, Project::hover)?;
+        let Described {
+            at: range,
+            mut text,
+            value,
+            docs,
+        } = described;
+        if !value.is_empty() {
+            text = format!("{text}\n# = {value}");
+        }
         let mut value = format!("```{LANGUAGE}\n{text}\n```");
         if !docs.is_empty() {
             value = format!("{value}\n\n---\n\n{}", said(&docs));
@@ -1958,6 +1969,30 @@ mod tests {
             editor.diagnostics(&dir),
             published("other/lib.duck", None, &[])
         );
+        editor.stop();
+    }
+
+    #[test]
+    fn a_constant_is_described_with_what_it_is_evaluated_to() {
+        let dir = TempDir::new("server-constant");
+        let src = "let side = 4\n# How much of it there is.\nlet area = side * side\npub fn main() -> i32:\n    return area\n";
+        dir.write(&[("Duck.toml", MODULE), ("main.duck", src)]);
+        let main = dir.0.join("main.duck");
+        let mut editor = Editor::start(&dir, json!({}));
+        editor.open(&main, src);
+        let mut hover = |line: u32, character: u32| {
+            let params = json!({
+                "textDocument": { "uri": uri(&main) },
+                "position": { "line": line, "character": character },
+            });
+            editor.request(HoverRequest::METHOD, params)["contents"]["value"].clone()
+        };
+        assert_eq!(
+            hover(4, 11),
+            "```duck\nlet area: i32 = side * side\n# = 16\n```\n\n---\n\nHow much of it there is."
+        );
+        // What is written with it says what a literal is.
+        assert_eq!(hover(2, 11), "```duck\nlet side: i32 = 4\n```");
         editor.stop();
     }
 

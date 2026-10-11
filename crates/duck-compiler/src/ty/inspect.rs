@@ -33,6 +33,7 @@ mod actions;
 mod hints;
 mod lints;
 mod symbols;
+mod values;
 pub(super) mod visit;
 
 /// A program as checked, with the type of all that is written in it.
@@ -50,6 +51,10 @@ pub struct Hover {
     pub span: Span,
     /// Its declaration or its type, as source.
     pub text: String,
+    /// What it is evaluated to, as it would be written, if it is a `let`
+    /// global or a member of an enum whose value is known. Empty if it
+    /// isn't, and where `text` writes that already.
+    pub value: String,
     /// The comment on its declaration: the lines above it, or else the one
     /// that ends its line. Empty if it has none.
     pub docs: String,
@@ -376,7 +381,20 @@ impl Analysis {
             _ => None,
         };
         let docs = src.docs(declared);
-        Some(Hover { span, text, docs })
+        // A constant is what it was evaluated to when the program was
+        // last checked: nothing is run to describe it.
+        let value = match self.target(&site) {
+            Some(Target::Item(Item::Global(index))) => self.global_value(index),
+            Some(Target::Entry(index, name)) => self.member_value(index, name),
+            _ => None,
+        };
+        let value = value.filter(|value| !text.ends_with(&format!("= {value}")));
+        Some(Hover {
+            span,
+            text,
+            value: value.unwrap_or_default(),
+            docs,
+        })
     }
 
     /// Where the type of what is at byte `offset` of `file` is declared: of
@@ -3702,6 +3720,104 @@ fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
         assert_eq!(docs("kit.len(p", "p"), "");
         assert_eq!(docs("kit.Shape,", "Shape"), "");
         assert_eq!(docs("c: kit.Color", "Color"), "");
+    }
+
+    #[test]
+    fn hovering_a_constant_gives_what_it_is_evaluated_to() {
+        let src = "\
+enum(u8) Color:
+    red
+    green = 5
+    blue
+struct Point:
+    x: f32
+    y: f32 = 0.5
+    on: bool = true
+fn twice(n: i32) -> i32:
+    return n * 2
+let side = 4
+let area = side * side
+let big = twice(21) - 100
+let byte: u8 = 200
+let wide: u64 = 1 << 40
+let half = 1.0 / 2.0
+let warm: Color = .blue
+let (low, high) = (1, area > 9)
+let origin = Point(x: 0.0)
+let name = \"duck\"
+let nothing = 1.0 / 0.0
+var count = side
+fn main() -> i32:
+    let local = area
+    count = count + byte as i32
+    let c = Color.blue
+    let p = origin
+    return local + big + low
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let mut value = |text: &str| {
+            let (file, offset) = files.at("main", text);
+            analysis.hover(&mut files, file, offset).unwrap().value
+        };
+        assert_eq!(value("area ="), "16");
+        assert_eq!(value("area\n"), "16");
+        assert_eq!(value("big ="), "-58");
+        assert_eq!(value("byte:"), "200");
+        assert_eq!(value("wide:"), "1099511627776");
+        assert_eq!(value("half ="), "0.5");
+        assert_eq!(value("warm:"), ".blue");
+        assert_eq!(value("low,"), "1");
+        assert_eq!(value("high)"), "true");
+        assert_eq!(value("origin\n"), "Point(x: 0.0, y: 0.5, on: true)");
+        // A member is what it counts up to, where it is given no value.
+        assert_eq!(value("red\n"), "0");
+        assert_eq!(value("blue\nstruct"), "6");
+        assert_eq!(value("blue\n    let p"), "6");
+        // What is written with it says it already, where that is all there
+        // is to it.
+        assert_eq!(value("side ="), "4");
+        assert_eq!(value("side * side"), "");
+        assert_eq!(value("green ="), "");
+        // An address says nothing of what is there, no number is written
+        // for what isn't one, and a `var` or a variable is what it is when
+        // the program runs.
+        assert_eq!(value("name ="), "");
+        assert_eq!(value("nothing ="), "");
+        assert_eq!(value("count ="), "");
+        assert_eq!(value("local ="), "");
+        assert_eq!(value("x: f32"), "");
+    }
+
+    #[test]
+    fn a_constant_that_was_not_evaluated_has_no_value_to_give() {
+        let src = "\
+fn spin(n: i32) -> i32:
+    var i = 0
+    while i < n:
+        i = i + 1
+    return i
+let slow = spin(1000000)
+let wrong: i32 = nope
+let after = spin(3)
+";
+        let mut files = Memory(vec![("main", src)]);
+        let (program, errors) = load::load_partial(&mut files);
+        assert_eq!(errors, []);
+        let settings = Settings {
+            fuel: Some(1000),
+            ..Settings::default()
+        };
+        let analysis = analyze(program, &settings);
+        let mut value = |text: &str| {
+            let (file, offset) = files.at("main", text);
+            analysis.hover(&mut files, file, offset).unwrap().value
+        };
+        // One that ran out of fuel, one that didn't check, and one that
+        // wasn't run for the errors before it.
+        assert_eq!(value("slow ="), "");
+        assert_eq!(value("wrong:"), "");
+        assert_eq!(value("after ="), "");
     }
 
     #[test]

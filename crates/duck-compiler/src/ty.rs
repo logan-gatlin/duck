@@ -1192,6 +1192,9 @@ struct GlobalDef {
     mutable: bool,
     /// [`Slots::Global`] for a `var`, and [`Slots::Const`] for a `let`.
     slots: Slots,
+    /// Whether its initializer has a value, rather than zeros in place of
+    /// one that failed to check or wasn't run.
+    known: bool,
 }
 
 /// What an item of the program has that is folded when first used: the
@@ -3110,11 +3113,15 @@ impl Checker {
         decl: &parse::Binding,
         mut index: usize,
     ) {
+        let reported = self.errors.len();
         let mut body = Body::new(self, Ty::Unit);
         body.global = Some(program);
         let (ty, value) = body.binding_value(decl);
         let mutable = decl.mutability == Mutability::Var;
-        let inits = body.evaluate(value, decl.value.span).unwrap_or_default();
+        let inits = body.evaluate(value, decl.value.span);
+        // What an error leaves of an initializer is not its value.
+        let known = inits.is_some() && self.errors.len() == reported;
+        let inits = inits.unwrap_or_default();
         let exported = self.exports(item);
         // Each name gets its own globals, in the order `declare` gave them.
         for bound in self.destructure(&decl.pattern, ty) {
@@ -3149,7 +3156,12 @@ impl Checker {
             if item.is_pub {
                 self.check_public(ty, bound.span, bound.name);
             }
-            self.globals[index] = Some(GlobalDef { ty, mutable, slots });
+            self.globals[index] = Some(GlobalDef {
+                ty,
+                mutable,
+                slots,
+                known,
+            });
             index += 1;
         }
     }
