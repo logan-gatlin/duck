@@ -1087,6 +1087,9 @@ struct Checker {
     /// Whether code run for a constant failed. None is run after that, as
     /// it left the state half made.
     failed: bool,
+    /// Whether the initializer being checked read a global whose own has no
+    /// value, so that what is made of it is no value either.
+    unknown: bool,
     /// The fuel the constants of one item run on, and what is left of it
     /// for the item being folded.
     fuel_limit: u64,
@@ -3334,13 +3337,18 @@ impl Checker {
         mut index: usize,
     ) {
         let reported = self.errors.len();
+        // One that is folded where this one first reads it has read what it
+        // has by then.
+        let outer = mem::replace(&mut self.unknown, false);
         let mut body = Body::new(self, Ty::Unit);
         body.global = Some(program);
         let (ty, value) = body.binding_value(decl);
         let mutable = decl.mutability == Mutability::Var;
         let inits = body.evaluate(value, decl.value.span);
-        // What an error leaves of an initializer is not its value.
-        let known = inits.is_some() && self.errors.len() == reported;
+        // What an error leaves of an initializer is not its value, nor is
+        // what is made of a global that has none.
+        let unknown = mem::replace(&mut self.unknown, outer);
+        let known = inits.is_some() && self.errors.len() == reported && !unknown;
         let inits = inits.unwrap_or_default();
         let exported = self.exports(item);
         // Each name gets its own globals, in the order `declare` gave them.
@@ -5456,14 +5464,16 @@ impl<'c> Body<'c> {
             return None;
         }
         let global = self.ck.globals[index].as_ref()?;
-        Some(Place {
+        let place = Place {
             name: name.to_string(),
             ty: global.ty,
             mutable: global.mutable,
             behind: None,
             pre: Vec::new(),
             slots: global.slots.clone(),
-        })
+        };
+        self.ck.unknown |= !global.known;
+        Some(place)
     }
 
     /// `array`, which brackets follow, as the type it's written as, and what

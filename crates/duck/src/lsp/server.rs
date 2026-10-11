@@ -856,13 +856,15 @@ impl Server<'_> {
     }
 
     /// Keeps up with what the editor says has changed. What it has open is
-    /// checked again, as it is there. Only what a change may resolve
+    /// checked again, as it is there. Only a package that may be resolved
     /// otherwise is resolved again: a manifest is read as it is saved, so
-    /// neither opening a file nor changing one in the editor is one.
+    /// a file that changes in the editor is no reason to.
     fn notified(&mut self, notification: Notification) {
         let Notification { method, params } = notification;
         // The file that changed, if one did and only in the editor.
         let mut edited = None;
+        // The files that the editor says are written anew, or are gone.
+        let mut written = Vec::new();
         match method.as_str() {
             DidOpenTextDocument::METHOD => {
                 let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(params) else {
@@ -937,7 +939,7 @@ impl Server<'_> {
                 let Ok(params) = serde_json::from_value::<DidSaveTextDocumentParams>(params) else {
                     return;
                 };
-                self.written(path_of(&params.text_document.uri).as_slice());
+                written.extend(path_of(&params.text_document.uri));
             }
             DidChangeWatchedFiles::METHOD => {
                 let Ok(params) = serde_json::from_value::<DidChangeWatchedFilesParams>(params)
@@ -945,10 +947,12 @@ impl Server<'_> {
                     return;
                 };
                 let changed = params.changes.iter();
-                let paths: Vec<_> = changed.filter_map(|change| path_of(&change.uri)).collect();
-                self.written(&paths);
+                written.extend(changed.filter_map(|change| path_of(&change.uri)));
             }
             _ => return,
+        }
+        if edited.is_none() {
+            self.outdated(&written);
         }
         // What was checked to answer what is being written was of the
         // files as they were.
@@ -958,14 +962,16 @@ impl Server<'_> {
         self.stale = true;
     }
 
-    /// Has each package resolved again that may be resolved otherwise now
-    /// that the files at `paths` are written anew, or are no longer there:
-    /// one that read a manifest among them, and one that didn't resolve, as
-    /// what it lacked may be there now. A package that the editor comes to
-    /// have a file of is resolved when the packages are next checked, and
-    /// one that it has none of any longer is dropped then.
-    fn written(&mut self, paths: &[PathBuf]) {
-        let manifests = paths
+    /// Has each package resolved again that may be resolved otherwise now:
+    /// one that read a manifest among `written`, which are the files that
+    /// the editor says are written anew or are no longer there, one whose
+    /// manifests have been written since it read them without the editor
+    /// saying so, and one that didn't resolve, as what it lacked may be
+    /// there now. A package that the editor comes to have a file of is
+    /// resolved when the packages are next checked, and one that it has
+    /// none of any longer is dropped then.
+    fn outdated(&mut self, written: &[PathBuf]) {
+        let manifests = written
             .iter()
             .filter(|path| path.file_name().is_some_and(|name| name == MANIFEST));
         // By its directory, which is there still if the manifest isn't.
@@ -973,7 +979,8 @@ impl Server<'_> {
             .filter_map(|path| Some(project::canonical(path.parent()?)))
             .collect();
         self.projects.retain(|_, project| {
-            !project.unresolved() && !dirs.iter().any(|dir| project.reads(dir))
+            let named = dirs.iter().any(|dir| project.reads(dir));
+            !project.unresolved() && !project.outdated() && !named
         });
     }
 
@@ -1217,6 +1224,7 @@ fn path_of(uri: &Uri) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::thread;
     use std::time::Duration;
 
@@ -1484,55 +1492,75 @@ mod tests {
     fn a_package_is_resolved_again_only_for_what_may_change_it() {
         let dir = TempDir::new("server-resolved");
         let library = "[library]\nentry = \"lib.duck\"\n";
+        let app = format!("{MODULE}[dependencies]\nutil = {{ path = \"../util\" }}\n");
+        let src = "use util\npub let a = util.one\n";
         dir.write(&[
-            ("Duck.toml", library),
-            ("lib.duck", "pub let a = 1\n"),
-            ("other.duck", ""),
+            ("app/Duck.toml", &app),
+            ("app/main.duck", src),
+            ("app/other.duck", ""),
+            ("util/Duck.toml", library),
+            ("util/lib.duck", "pub let one = 1\n"),
         ]);
-        let (lib, other) = (dir.0.join("lib.duck"), dir.0.join("other.duck"));
-        let manifest = dir.0.join("Duck.toml");
+        let (main, other) = (dir.0.join("app/main.duck"), dir.0.join("app/other.duck"));
         let mut editor = Editor::start(&dir, json!({}));
         let watched = |path: &Path| json!({ "changes": [{ "uri": uri(path), "type": 2 }] });
-        // What is asked for after everything that was said is answered
-        // once that is checked, and before anything is said of it only if
-        // nothing is.
+        let document = json!({ "textDocument": { "uri": uri(&main) } });
+        // What is asked of the package as it was last checked is answered
+        // once everything said before it is checked, and before anything
+        // is said of that only if nothing is.
         let settle = |editor: &mut Editor| {
-            let params = json!({ "textDocument": { "uri": uri(&other) } });
-            editor.request(DocumentSymbolRequest::METHOD, params);
+            editor.request(DocumentSymbolRequest::METHOD, document.clone());
         };
-
-        // A manifest is as it was read until the editor says it has
-        // changed: not for a file that is opened, changed, saved or closed,
-        // nor for one that is written anew where it is kept.
+        editor.open(&main, src);
         settle(&mut editor);
-        dir.write(&[("Duck.toml", "[library]\n")]);
-        editor.open(&lib, "pub let a = 1\n");
-        editor.change(&lib, 2, "pub let a: Nope = 1\n");
-        let error = "0:11 unknown type `Nope`";
-        assert_eq!(
-            editor.diagnostics(&dir),
-            published("lib.duck", Some(2), &[error])
-        );
-        let document = json!({ "textDocument": { "uri": uri(&lib) } });
+
+        // What resolving a package found is kept while its manifests are
+        // as they were read: a library that is gone is missed by the file
+        // that uses it, and by no manifest, whatever is opened, changed,
+        // saved or closed, and whatever else is written anew.
+        fs::remove_file(dir.0.join("util/lib.duck")).unwrap();
         editor.notify(DidSaveTextDocument::METHOD, document.clone());
-        settle(&mut editor);
-        editor.notify(DidChangeWatchedFiles::METHOD, watched(&other));
-        settle(&mut editor);
-        editor.notify(DidCloseTextDocument::METHOD, document);
-        assert_eq!(editor.diagnostics(&dir), published("lib.duck", None, &[]));
-        settle(&mut editor);
-
-        // It is read again once it is said to have.
-        editor.notify(DidChangeWatchedFiles::METHOD, watched(&manifest));
-        let error = "0:0 missing field `entry`";
+        let missed = "0:4 cannot find `util` in this package or its dependencies";
         assert_eq!(
             editor.diagnostics(&dir),
-            published("Duck.toml", None, &[error])
+            published("app/main.duck", Some(1), &[missed])
         );
-        // A package that didn't resolve may, once anything is written.
-        dir.write(&[("Duck.toml", library)]);
         editor.notify(DidChangeWatchedFiles::METHOD, watched(&other));
-        assert_eq!(editor.diagnostics(&dir), published("Duck.toml", None, &[]));
+        settle(&mut editor);
+        editor.open(&other, "");
+        settle(&mut editor);
+        let closed = json!({ "textDocument": { "uri": uri(&other) } });
+        editor.notify(DidCloseTextDocument::METHOD, closed);
+        settle(&mut editor);
+
+        // It is resolved again once a manifest that it read is said to be
+        // written anew, which finds what that says of the library.
+        let util = dir.0.join("util/Duck.toml");
+        editor.notify(DidChangeWatchedFiles::METHOD, watched(&util));
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("app/main.duck", Some(1), &[])
+        );
+        let (path, _, problems) = editor.diagnostics(&dir);
+        assert_eq!(path, "util/Duck.toml");
+        assert!(problems[0].starts_with("1:0 cannot read "), "{problems:?}");
+        // A package that didn't resolve may, once anything is written.
+        dir.write(&[("util/lib.duck", "pub let one = 1\n")]);
+        editor.notify(DidChangeWatchedFiles::METHOD, watched(&other));
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("util/Duck.toml", None, &[])
+        );
+        // And one whose manifest is written anew without the editor saying
+        // so is, when it next says that anything is.
+        dir.write(&[("app/Duck.toml", "[component]\n")]);
+        editor.notify(DidSaveTextDocument::METHOD, document);
+        let (path, _, problems) = editor.diagnostics(&dir);
+        assert_eq!(path, "app/Duck.toml");
+        assert!(
+            problems[0].starts_with("0:0 missing field "),
+            "{problems:?}"
+        );
         editor.stop();
     }
 
@@ -1554,7 +1582,7 @@ mod tests {
         let Message::Notification(_) = editor.receive() else {
             panic!("not the diagnostics of the change")
         };
-        let mut suggested = |editor: &mut Editor| -> Vec<String> {
+        let suggested = |editor: &mut Editor| -> Vec<String> {
             let params = json!({
                 "textDocument": { "uri": uri(&main) },
                 "position": { "line": 2, "character": 8 },

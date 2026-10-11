@@ -8,6 +8,7 @@ use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
+use std::time::SystemTime;
 
 use duck::files::{self, Files};
 use duck::git::Cache;
@@ -35,6 +36,9 @@ pub struct Project {
     /// The directory holding the package's manifest.
     root: PathBuf,
     packages: Result<Packages, ResolveError>,
+    /// Each manifest that the package was resolved by reading, and when it
+    /// was written and how long it was then.
+    manifests: Vec<(PathBuf, Option<(SystemTime, u64)>)>,
     /// The package's module and its library, as each was last checked.
     checked: Vec<Checked>,
     /// What was then found to be declared in the package and never used.
@@ -221,8 +225,15 @@ impl Project {
     /// dependencies, fetching git dependencies into `cache`.
     pub fn resolve(root: PathBuf, cache: &Cache) -> Self {
         let packages = package::resolve(&root, cache);
+        let read = packages.iter().flat_map(Packages::iter);
+        let manifests = read.map(|package| {
+            let manifest = package.dir.join(MANIFEST);
+            let written = written(&manifest);
+            (manifest, written)
+        });
         Self {
             root,
+            manifests: manifests.collect(),
             packages,
             checked: Vec::new(),
             warnings: Vec::new(),
@@ -246,6 +257,14 @@ impl Project {
     /// lacked is there.
     pub fn unresolved(&self) -> bool {
         self.packages.is_err()
+    }
+
+    /// Whether a manifest that the package was resolved by reading has been
+    /// written since, or is no longer there, whether or not anything said
+    /// so.
+    pub fn outdated(&self) -> bool {
+        let mut manifests = self.manifests.iter();
+        manifests.any(|(manifest, read)| written(manifest) != *read)
     }
 
     /// Forgets what was checked to answer what is being written, of files
@@ -877,6 +896,11 @@ impl Project {
                 checked: self.builds(&buffers, Some(path)).1,
             },
         };
+        // A check of no build is of the package before it was last checked,
+        // which may use the file once it is.
+        if probe.checked.is_empty() {
+            return None;
+        }
         self.probes.push(probe);
         let excess = self.probes.len().saturating_sub(MAX_PROBES);
         self.probes.drain(..excess);
@@ -1138,6 +1162,13 @@ pub fn root_of(path: &Path) -> Option<PathBuf> {
     root.map(Path::to_path_buf)
 }
 
+/// When the file at `path` was last written and how long it is, if it is
+/// there: what tells whether it has been written since.
+fn written(path: &Path) -> Option<(SystemTime, u64)> {
+    let file = fs::metadata(path).ok()?;
+    Some((file.modified().ok()?, file.len()))
+}
+
 /// The canonical path of `path`, or `path` itself if nothing is there.
 pub fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -1202,7 +1233,7 @@ pub fn range(src: &str, start: usize, end: usize) -> Range {
 /// Where byte `offset` of `src` is, with the column in UTF-16 code units, as
 /// editors count them unless asked otherwise.
 pub fn position(src: &str, offset: usize) -> Position {
-    let before = &src[..offset.min(src.len())];
+    let before = &src[..src.floor_char_boundary(offset)];
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
     let line = before.matches('\n').count();
     let column = before[line_start..].encode_utf16().count();
