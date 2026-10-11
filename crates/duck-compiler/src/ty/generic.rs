@@ -9,7 +9,7 @@ use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeArg, TypeKind, TypeParam};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Body, Checker, FieldDef, Item, OPTION, ParamId, RESULT, StructDef,
+    ARRAY, ARRAY_FIELDS, Body, Checker, FieldDef, Item, OPAQUE, OPTION, ParamId, RESULT, StructDef,
     StructId, TUPLE, Ty, TypeErrorKind, VARRAY, Value, Visit, is_builtin_type, module_path,
     path_text,
 };
@@ -38,6 +38,9 @@ pub(super) struct ParamDef {
     /// struct uses, or a function type, which they are
     /// [called as](Checker::called_as).
     pub(super) bound: Option<Ty>,
+    /// Whether it stands for a type that a result hides, until a `return`
+    /// settles which, rather than for a type argument.
+    pub(super) hole: bool,
 }
 
 /// The defaults of a generic struct's or union's type parameters: what each
@@ -143,6 +146,7 @@ impl Checker {
                     name: param.name.clone(),
                     index,
                     bound: None,
+                    hole: false,
                 });
                 Ty::Param(ParamId(self.params.len() as u32 - 1))
             })
@@ -197,27 +201,8 @@ impl Checker {
                 end: last.span.end,
                 ..first.span
             };
-            let bound = match &param.bound[..] {
-                [written] => {
-                    let bound = self.resolve_ty(written);
-                    if !matches!(
-                        bound,
-                        Ty::Struct(_) | Ty::Enum(_) | Ty::Array(_) | Ty::Fn(_) | Ty::Error
-                    ) {
-                        self.error(TypeErrorKind::NotABound(self.ty_name(bound)), span);
-                        continue;
-                    }
-                    bound
-                }
-                listed => {
-                    let uses = listed.iter().map(|written| self.listed_ty(written));
-                    let uses: Vec<_> = uses.collect();
-                    let list = self.list_of(uses, span);
-                    if let Ty::Struct(id) = list {
-                        self.list_bounds.push((id, span));
-                    }
-                    list
-                }
+            let Some(bound) = self.bound_of(&param.bound, span) else {
+                continue;
             };
             let later = &tys[i..params.len()];
             if let Some(later) = later.iter().find(|later| self.holds(bound, **later)) {
@@ -227,6 +212,35 @@ impl Checker {
                 continue;
             }
             self.params[id.0 as usize].bound = Some(bound);
+        }
+    }
+
+    /// Resolves `written`, what bounds a type parameter or a type that a
+    /// result hides, spanning `span`: a struct, a union, an enum, an array
+    /// or a function type, or a list of structs and arrays. `None` after
+    /// reporting any other, which bounds nothing.
+    pub(super) fn bound_of(&mut self, written: &[parse::Type], span: Span) -> Option<Ty> {
+        match written {
+            [written] => {
+                let bound = self.resolve_ty(written);
+                if !matches!(
+                    bound,
+                    Ty::Struct(_) | Ty::Enum(_) | Ty::Array(_) | Ty::Fn(_) | Ty::Error
+                ) {
+                    self.error(TypeErrorKind::NotABound(self.ty_name(bound)), span);
+                    return None;
+                }
+                Some(bound)
+            }
+            listed => {
+                let uses = listed.iter().map(|written| self.listed_ty(written));
+                let uses: Vec<_> = uses.collect();
+                let list = self.list_of(uses, span);
+                if let Ty::Struct(id) = list {
+                    self.list_bounds.push((id, span));
+                }
+                Some(list)
+            }
         }
     }
 
@@ -319,13 +333,23 @@ impl Checker {
     /// which says how a type argument is called and nothing of what it
     /// holds.
     pub(super) fn known(&self, ty: Ty) -> Ty {
-        match ty {
-            Ty::Param(id) => match self.params[id.0 as usize].bound {
-                Some(Ty::Fn(_)) | None => ty,
-                Some(bound) => bound,
-            },
-            _ => ty,
+        let bound = match ty {
+            Ty::Param(id) => self.params[id.0 as usize].bound,
+            // Only its bound is known of a type that a result hides.
+            Ty::Opaque(id) => self.opaque_bound(id),
+            _ => None,
+        };
+        match bound {
+            Some(Ty::Fn(_)) | None => ty,
+            Some(bound) => bound,
         }
+    }
+
+    /// What a `ty` is laid out as: the type that it hides, if it is one
+    /// that a result hides and that is found, and otherwise what is known
+    /// of it.
+    pub(super) fn laid_out(&self, ty: Ty) -> Ty {
+        self.known(self.hiding(ty))
     }
 
     /// The parameter types and result type that a value of `ty` is called
@@ -337,6 +361,10 @@ impl Checker {
             Ty::Fn(id) => Some(self.fn_tys[id.0 as usize].clone()),
             Ty::Func(id) => Some(self.func_shape(id)),
             Ty::Param(id) => match self.params[id.0 as usize].bound {
+                Some(bound @ Ty::Fn(_)) => self.called_as(bound),
+                _ => None,
+            },
+            Ty::Opaque(id) => match self.opaque_bound(id) {
                 Some(bound @ Ty::Fn(_)) => self.called_as(bound),
                 _ => None,
             },
@@ -581,6 +609,7 @@ impl Checker {
     pub(super) fn has_param(&self, ty: Ty) -> bool {
         match ty {
             Ty::Param(_) => true,
+            Ty::Opaque(id) => self.is_open_opaque(id),
             Ty::Struct(id) => self.is_open(id) && self.structs[id.0 as usize].instance.is_some(),
             _ => self
                 .components(ty)
@@ -919,7 +948,7 @@ impl Checker {
         match self.item(name) {
             _ if name == ARRAY || name == VARRAY || name == OPTION => Some(Arity::Exactly(1)),
             _ if name == RESULT => Some(Arity::Exactly(2)),
-            _ if name == TUPLE => Some(Arity::Any),
+            _ if name == TUPLE || name == OPAQUE => Some(Arity::Any),
             Some(item @ (Item::Struct(_) | Item::Enum(_))) => self.item_arity(item),
             _ if is_builtin_type(name) => Some(Arity::Plain),
             Some(item @ (Item::Func(_) | Item::GenericFn(_) | Item::Alias(_))) => {
@@ -1113,6 +1142,7 @@ impl Checker {
     pub(super) fn substitute(&mut self, ty: Ty, args: &[Ty], site: Span) -> Ty {
         match ty {
             Ty::Param(id) => args[self.params[id.0 as usize].index],
+            Ty::Opaque(id) => self.opaque_instance(id, args, site),
             Ty::Struct(id) => match &self.structs[id.0 as usize].instance {
                 Some(instance) if self.is_open(id) => {
                     let (generic, inner) = (instance.generic, instance.args.clone());

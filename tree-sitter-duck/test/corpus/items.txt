@@ -858,3 +858,50 @@ fn f(a: json.Value, b: &a.b.List(geo.Point)):
                       name: (identifier))))))))))
     body: (block
       (pass_statement))))
+
+====================
+Opaque results
+====================
+
+fn make(n: i32) -> option(opaque(fn(i32) -> i32)):
+    pass
+
+fn first() -> opaque(Head, Meta):
+    pass
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (named_type
+      (identifier)
+      (type_arguments
+        (named_type
+          (identifier)
+          (type_arguments
+            (function_type
+              (parameter_types
+                (named_type
+                  (identifier)))
+              (named_type
+                (identifier)))))))
+    (block
+      (pass_statement)))
+  (function_declaration
+    (identifier)
+    (parameters)
+    (named_type
+      (identifier)
+      (type_arguments
+        (named_type
+          (identifier))
+        (named_type
+          (identifier))))
+    (block
+      (pass_statement))))

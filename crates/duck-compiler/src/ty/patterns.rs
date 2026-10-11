@@ -222,17 +222,25 @@ impl Body<'_> {
     /// argument casts to.
     fn as_bound(&mut self, ty: Ty, value: Value, span: Span) -> (Ty, Value) {
         let key = (span.file, span.start);
+        let recorded = match self.ck.bound_uses.get(&key) {
+            Some(bound) if !self.ck.instance_chain.is_empty() => Some(*bound),
+            _ => None,
+        };
         let bound = self.ck.known(ty);
-        if bound != ty && self.ck.is_sum(bound) {
-            self.ck.bound_uses.insert(key, bound);
-            return (bound, value);
-        }
-        let bound = match self.ck.bound_uses.get(&key) {
-            Some(bound) if !self.ck.instance_chain.is_empty() => *bound,
-            _ => return (ty, value),
+        let Some(recorded) = recorded else {
+            if bound != ty && self.ck.is_sum(bound) {
+                self.ck.bound_uses.insert(key, bound);
+                return (bound, self.as_opaque_bound(ty, value));
+            }
+            return (ty, value);
+        };
+        // A type argument that a result hides is its own bound first.
+        let (ty, value) = match ty {
+            Ty::Opaque(_) if self.ck.is_sum(bound) => (bound, self.as_opaque_bound(ty, value)),
+            _ => (ty, value),
         };
         let args: Vec<_> = self.ck.type_params.iter().map(|(_, arg)| *arg).collect();
-        let bound = self.ck.substitute(bound, &args, span);
+        let bound = self.ck.substitute(recorded, &args, span);
         match self.ck.is_sum(ty) && self.ck.meets(ty, bound) {
             true => self.ck.cast_value(ty, bound, value).unwrap(),
             false => (ty, value),

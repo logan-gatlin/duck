@@ -59,7 +59,7 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - Keywords: `pub fn let var return if else while for in break continue todo
   pass defer match struct enum union extern use module and or not true false
   as as!`. No item is named `array`, `varray`, `string`, `tuple`, `type`,
-  `option`, `result` or `never`.
+  `option`, `result`, `never` or `opaque`.
 
 ## Types
 
@@ -95,6 +95,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   accepted as any type, and nothing else is accepted as it, so no value of
   it is made: a function that returns it never returns. It is never stored
   in memory, so it has no `size`, and is no type argument of a function.
+- `opaque(Bound)`: a type that the result of a function hides, of which
+  only what bounds it is known. See "Results that hide their type".
 - `Name`, `Name(T)`, `mod.Name`: structs, unions and enums, passed by value
   like tuples and arrays.
 - A struct or union holds itself only behind a pointer, whatever its type
@@ -1090,6 +1092,87 @@ fn demo(p: fn(i32) -> i64) -> i64:
 - A function type bounds alone: it is in no list, as `(fn(T) -> U, Head)`.
 - Nothing of the host is of a function's type: no parameter or result of
   an `extern` function or of one that a world exports.
+
+### Results that hide their type
+
+```duck
+struct Head:
+	id: i32
+
+struct Named:
+	use Head
+	name: array(u8)
+
+union ReadError:
+	closed
+	timeout: u32
+
+fn(T, U, F: fn(T) -> U) apply(x: T, f: F) -> U:
+	return f(x)
+
+fn make_adder(n: i32) -> opaque(fn(i32) -> i32):  # the type of `add`
+	fn add(x: i32) -> i32:
+		return x + n
+	return add
+
+fn(T) hold(x: T) -> opaque(fn() -> T):   # a type for each `T`
+	fn get() -> T:
+		return x
+	return get
+
+fn first() -> opaque(Head):              # a `Named`, as only `first` knows
+	return Named(id: 1, name: "a")
+
+fn failed(ms: u32) -> option(opaque(ReadError)):
+	if ms == 0:
+		return option(ReadError).none    # `.none` alone says no type
+	return .some(.timeout(ms))           # of the type that is settled
+
+fn demo() -> i32:
+	var add = make_adder(2)              # 4 bytes: the `n` it captured
+	add = make_adder(3)                  # of the same type
+	let named = first()
+	let get = hold(named.id)
+	return apply(get(), add) + (named as Head).id
+```
+
+- `opaque(Bound)` in the result of a function is one type, which the body
+  of the function gives it and nothing outside the body is told. So a
+  function returns a closure, whose type nothing writes, or a type that
+  isn't `pub`.
+- It is bounded as a type parameter is, by what its brackets hold: a
+  struct, a list as in `opaque(Head, Meta)`, an array, a function type, a
+  union or an enum that is wider than what it hides, or nothing, as in
+  `opaque()`. A bound names the type parameters of the function.
+- **Each `return` settles it as an argument settles a type parameter**: it
+  is the type of what the `return` gives in its place, of which nothing is
+  expected. So `return 1` hides an `i32`, and a `.name` there is an error
+  until a `return` before it has settled the type: name its type, as in
+  `option(ReadError).none`.
+- Every `return` gives the same type. Two closures are of two types, so a
+  function that would return either returns neither: the error names both.
+- A `return` of a `never` settles nothing, and a function that no `return`
+  settles is an error: write `-> todo` until one does.
+- Outside the body a value of it is as one of a type parameter so bounded:
+  it is called, or has the fields of its bound, is matched and cast as its
+  bound, and is bound, passed, returned and held. `named.name`, `named as
+  Named`, `add == add` and `let p: fn(i32) -> i32 = add` are errors,
+  whatever the type is.
+- It is a type of its own, of that function: every call of `make_adder`
+  gives one type, each instance of a generic function has its own, and two
+  functions hide two types, whatever each is. An error names it `opaque(Head)
+  of first`.
+- It is laid out as the type it hides, which is what a type parameter given
+  it is: `T.size` is that type's.
+- It is written in the result of a function with a body, anywhere within
+  it: `-> option(opaque(Head))`, `-> Pool(u8, opaque(Make))`. No parameter,
+  variable, field or `let Name: type` is of it, and nothing of the host. A
+  function takes one by a type parameter: `fn(F: fn(i32) -> i32) keep(f: F)`.
+- A function isn't called to find the type that its own result hides:
+  `return make(n - 1)` is an error before a `return` settles it, directly
+  or through another function.
+- A `pub` function bounds it by `pub` types, and hides any. The type is as
+  `pub` as its function, so a `pub let` holds one of a `pub` function only.
 
 ## Pipes
 

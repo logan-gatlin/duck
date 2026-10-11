@@ -390,6 +390,20 @@ fn private():
     }
 
     #[test]
+    fn what_the_world_exports_hides_no_type() {
+        let src = APP.replace(
+            "pub fn poll() -> i32:\n    return add(1, negate(1))",
+            "pub fn poll() -> opaque():\n    return add(1, negate(1))",
+        );
+        // The host takes a type that its world names, which none hidden is.
+        let found = "the WIT has `s32` here, which is `i32`: found `opaque() of poll`";
+        assert_eq!(
+            errors_in(&src, "app", None),
+            [(found.to_string(), "opaque()")]
+        );
+    }
+
+    #[test]
     fn what_the_world_exports_is_defined() {
         let src = "
 pub \"my:pkg/math@0.1.0\":

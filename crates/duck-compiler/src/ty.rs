@@ -31,6 +31,7 @@ use evaluate::Dep;
 use generic::{Arity, Instance, ParamDef, ParamDefaults, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
 use nested::Closure;
+use opaque::{Hiding, OpaqueDef, Owner};
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
 mod alias;
@@ -45,6 +46,7 @@ mod generic;
 mod generic_fn;
 mod inspect;
 mod nested;
+mod opaque;
 mod patterns;
 mod unions;
 mod wit;
@@ -173,6 +175,9 @@ const TYPE: &str = "type";
 /// The name of the built-in type of what has no value.
 const NEVER: &str = "never";
 
+/// The name of the built-in type that a function's result hides.
+const OPAQUE: &str = "opaque";
+
 /// The fields of every array, in order.
 const ARRAY_FIELDS: [&str; 2] = ["ptr", "len"];
 
@@ -251,6 +256,10 @@ pub struct FnId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParamId(u32);
 
+/// Index of a type that the result of a function hides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpaqueId(u32);
+
 /// Index of a generic function declaration, in declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GenericFnId(u32);
@@ -292,6 +301,10 @@ pub enum Ty {
     /// have, and the body of its generic function's while that is checked as
     /// declared. Uses of either replace it with a type argument.
     Param(ParamId),
+    /// `opaque(Bound)`, a type that the result of a function hides. Only
+    /// what bounds it is known of it, as of a type parameter, and it is
+    /// laid out as the type it hides.
+    Opaque(OpaqueId),
     /// `tuple()`, the return type of functions without one. Its values have no
     /// scalars, so they take no storage in wasm.
     Unit,
@@ -588,6 +601,20 @@ pub enum TypeErrorKind {
         name: String,
         captures: Vec<String>,
     },
+    /// `opaque` written anywhere but in the result of a function with a
+    /// body, which is what gives it the type it hides.
+    OpaqueOutsideResult,
+    /// A `return` that gives nothing in the place of a type that the result
+    /// hides, before any `return` has settled which type that is.
+    ReturnBeforeOpaque(String),
+    /// A function whose result hides a type that no `return` of it
+    /// settles.
+    NoOpaqueType {
+        func: String,
+        opaque: String,
+    },
+    /// A function that is called to find the type its own result hides.
+    OpaqueCycle(String),
     /// A function declared in a function that has type parameters of its
     /// own: it has those of the function around it.
     NestedTypeParams(String),
@@ -937,6 +964,15 @@ struct Checker {
     /// What each function that is declared in another is beyond its
     /// signature: what it is named and what it captures.
     closures: HashMap<FuncId, Closure>,
+    /// Every type that the result of a function hides, indexed by
+    /// [`OpaqueId`].
+    opaques: Vec<OpaqueDef>,
+    /// The result being resolved, if it's that of a function with a body:
+    /// nothing else hides a type.
+    opaque_site: Option<Hiding>,
+    /// Each opaque type of an instance of a generic function, by the one
+    /// that the declaration has in its place and the type arguments.
+    opaque_instances: HashMap<(OpaqueId, Vec<Ty>), OpaqueId>,
     /// The function `==` compares each array type through.
     eq_funcs: HashMap<Ty, FuncId>,
     /// The functions that pointers call, in the order their pointers are
@@ -1183,6 +1219,9 @@ struct Body<'c> {
     name: String,
     /// How many variables it has bound.
     bound: usize,
+    /// The opaque types that the result of its function hides, which its
+    /// `return`s settle.
+    opaques: Vec<OpaqueId>,
     ret: Ty,
     locals: Vec<ir::Local>,
     scopes: Vec<HashMap<String, Var>>,
@@ -1716,6 +1755,25 @@ impl fmt::Display for TypeErrorKind {
                     captures.join(", ")
                 )
             }
+            Self::OpaqueOutsideResult => write!(
+                f,
+                "`opaque` is the type that a function's body gives its result, so it is \
+                 written only in the result of a function that has a body"
+            ),
+            Self::ReturnBeforeOpaque(opaque) => write!(
+                f,
+                "this `return` doesn't say which type `{opaque}` is, and none before it does"
+            ),
+            Self::NoOpaqueType { func, opaque } => write!(
+                f,
+                "no `return` of `{func}` says which type `{opaque}` is: \
+                 write `-> todo` until one does"
+            ),
+            Self::OpaqueCycle(func) => write!(
+                f,
+                "`{func}` is called to find the type that its own result hides, \
+                 before a `return` of it says"
+            ),
             Self::NestedTypeParams(name) => write!(
                 f,
                 "`{name}` is declared in a function, so it has no type parameters of its own: \
@@ -2372,8 +2430,10 @@ impl Checker {
     fn declare_name(&mut self, name: &Ident, item: Item, is_pub: bool) {
         let scope = self.scopes.entry(self.module).or_default();
         if scope.contains_key(&name.name)
-            || [ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT, NEVER]
-                .contains(&name.name.as_str())
+            || [
+                ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT, NEVER, OPAQUE,
+            ]
+            .contains(&name.name.as_str())
         {
             self.error(TypeErrorKind::DuplicateItem(name.name.clone()), name.span);
         } else {
@@ -2828,11 +2888,18 @@ impl Checker {
     fn define_funcs(&mut self, program: &Program) {
         for (id, (is_pub, decl)) in fn_sigs(program).enumerate() {
             self.module = decl.name.span.file;
-            let (params, ret) = self.resolve_sig(decl);
+            // The host gives a value of no type that it can't name.
+            let imported = (id as u32) < self.import_count;
+            let owner = (
+                Owner::Func(FuncId(id as u32)),
+                decl.name.name.clone(),
+                is_pub,
+            );
+            let (params, ret) = self.resolve_sig(decl, (!imported).then_some(owner));
             if is_pub {
                 self.check_public_sig(decl, &params, ret);
             }
-            if (id as u32) < self.import_count {
+            if imported {
                 self.check_host_sig(decl, &params, ret);
             }
             self.funcs[id].params = params;
@@ -2887,6 +2954,7 @@ impl Checker {
                 let def = &self.enums[id.0 as usize];
                 (!def.is_pub && within != Some(def.module)).then_some(ty)
             }
+            Ty::Opaque(id) => self.private_opaque(id, within),
             _ => self
                 .components(ty)
                 .into_iter()
@@ -2894,8 +2962,15 @@ impl Checker {
         }
     }
 
-    /// The types of the parameters and result of `sig`.
-    fn resolve_sig(&mut self, sig: &FnSig) -> (Vec<(String, Ty)>, Ty) {
+    /// The types of the parameters and result of `sig`. If it `hides`, as
+    /// the signature of a function with a body may, its result is where
+    /// `opaque` is written: that of the function given, and whether it is
+    /// `pub`.
+    fn resolve_sig(
+        &mut self,
+        sig: &FnSig,
+        hides: Option<(Owner, String, bool)>,
+    ) -> (Vec<(String, Ty)>, Ty) {
         let mut params: Vec<(String, Ty)> = Vec::new();
         for param in &sig.params {
             if params.iter().any(|(name, _)| *name == param.name.name) {
@@ -2909,7 +2984,14 @@ impl Checker {
             };
             params.push((param.name.name.clone(), ty));
         }
+        self.opaque_site = hides.map(|(owner, func, is_pub)| Hiding {
+            owner,
+            func,
+            is_pub,
+            count: 0,
+        });
         let ret = sig.ret.as_ref().map_or(Ty::Unit, |ty| self.resolve_ty(ty));
+        self.opaque_site = None;
         (params, ret)
     }
 
@@ -3213,10 +3295,15 @@ impl Checker {
         span: Span,
         exports: Vec<String>,
     ) -> ir::Func {
+        // Its `return`s settle what its result hides.
+        let own = self.own_opaques(id, sig.ret);
+        self.open_opaques(&own);
+        let errors = self.errors.len();
         let mut body = Body::new(self, sig.ret);
         body.program = Some(program);
         body.func = id;
         body.name = sig.name.clone();
+        body.opaques = own.clone();
         // What one declared in a function captures is passed before what
         // it takes.
         if let Some(id) = id {
@@ -3231,6 +3318,8 @@ impl Checker {
         let mut stmts = body.block(block);
         let returns = body.ended;
         let locals = body.locals;
+        let failed = self.errors.len() > errors;
+        self.close_opaques(&own, &sig.name, failed, span);
         let results = self.val_types(sig.ret);
         if !matches!(sig.ret, Ty::Unit | Ty::Error) && !returns {
             self.error(TypeErrorKind::MissingReturn(sig.name.clone()), span);
@@ -3378,6 +3467,9 @@ impl Checker {
         if let Some((_, param)) = param {
             return *param;
         }
+        if member.is_none() && name == OPAQUE {
+            return self.resolve_opaque(args, span);
+        }
         // Built-in types win over items of the same name.
         let item = match member {
             Some(_) => member,
@@ -3459,8 +3551,8 @@ impl Checker {
                 .members(ty)
                 .into_iter()
                 .all(|member| self.storable(member)),
-            // A type argument is storable.
-            Ty::Param(_) => true,
+            // A type argument is storable, and so is what a result hides.
+            Ty::Param(_) | Ty::Opaque(_) => true,
             // Only the index of a function is stored, whatever it takes,
             // and nothing is of one that is its own type.
             Ty::Fn(_) | Ty::Func(_) => true,
@@ -3704,6 +3796,7 @@ impl Checker {
             }
             Ty::Func(id) => self.sig(id).name.clone(),
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
+            Ty::Opaque(id) => self.opaque_name(id),
             Ty::Type => TYPE.to_string(),
             Ty::Unit => format!("{TUPLE}()"),
             Ty::Never => NEVER.to_string(),
@@ -3720,7 +3813,7 @@ impl Checker {
     }
 
     fn push_leaves(&self, ty: Ty, name: String, out: &mut Vec<(String, ValType)>) {
-        let ty = self.known(ty);
+        let ty = self.laid_out(ty);
         match ty {
             // A function holds what it captures, each by its name.
             Ty::Func(id) => {
@@ -3754,7 +3847,7 @@ impl Checker {
                     self.push_leaves(member, format!("{name}.{field}"), out);
                 }
             }
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Param(_) | Ty::Opaque(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -4049,7 +4142,7 @@ impl Checker {
 
     /// Size and alignment of `ty` in memory.
     fn layout(&self, ty: Ty) -> (u32, u32) {
-        let ty = self.known(ty);
+        let ty = self.laid_out(ty);
         match ty {
             Ty::Prim(prim) => {
                 let size = self.fixed(prim).size();
@@ -4070,7 +4163,7 @@ impl Checker {
             Ty::Func(id) => self.held(id).map_or((0, 1), |held| self.layout(held)),
             // Never in memory, but a struct holding one still has a layout
             // that `field` asks for.
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
+            Ty::Param(_) | Ty::Opaque(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
         }
     }
 
@@ -4109,7 +4202,7 @@ impl Checker {
         out: &mut Vec<Cell>,
     ) {
         let when = when.to_vec();
-        let ty = self.known(ty);
+        let ty = self.laid_out(ty);
         match ty {
             Ty::Prim(prim) => {
                 let fixed = self.fixed(prim);
@@ -4155,7 +4248,7 @@ impl Checker {
                     self.push_cells(held, offset, leaves, &when, out);
                 }
             }
-            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Param(_) | Ty::Opaque(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -4326,6 +4419,7 @@ impl<'c> Body<'c> {
             func: None,
             name: String::new(),
             bound: 0,
+            opaques: Vec::new(),
             ret,
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
@@ -5316,7 +5410,7 @@ impl<'c> Body<'c> {
             self.error(TypeErrorKind::LeavesDefer("return"), span);
         }
         let mut value = match value {
-            Some(value) => self.check(value, self.ret),
+            Some(value) => self.returned(value),
             None => {
                 self.expect(Ty::Unit, self.ret, span);
                 Value::default()
@@ -6035,8 +6129,11 @@ impl<'c> Body<'c> {
         let prim = match ty {
             Ty::Prim(prim) => self.ck.fixed(prim),
             Ty::Never => return never(self.seq(vec![lhs, rhs]).pre),
-            // A type parameter is no type that an operator takes.
-            Ty::Param(_) => return self.invalid_operand(binop_symbol(op), ty, span),
+            // A type parameter is no type that an operator takes, and nor
+            // is one that a result hides.
+            Ty::Param(_) | Ty::Opaque(_) => {
+                return self.invalid_operand(binop_symbol(op), ty, span);
+            }
             // Pointers compare as unsigned addresses.
             Ty::Ptr(_) if is_comparison(op) => self.ck.fixed(Prim::Uint),
             _ if matches!(op, BinOp::Eq | BinOp::NotEq) => {
@@ -6167,6 +6264,7 @@ impl<'c> Body<'c> {
         // A bounded type parameter casts as its bound does, which every
         // type argument casts to.
         let written = from;
+        let value = self.as_opaque_bound(from, value);
         let from = match self.ck.known(from) {
             bound if !matches!(to, Ty::Param(_)) => bound,
             _ => from,
@@ -6393,6 +6491,7 @@ impl<'c> Body<'c> {
                 }
                 let checked = args.iter().map(|_| None).collect();
                 let value = self.bound_args(&sig.params, &sig.defaults, args, binding, checked);
+                self.settle(sig.ret, span);
                 self.call_func(id, value)
             }
             Ok(Item::GenericFn(generic)) => self.generic_fn_call(generic, args, span),
@@ -7341,7 +7440,10 @@ fn module_path(expr: &parse::Expr) -> Option<Vec<Ident>> {
 /// Whether `name` is a type the language defines, which no type parameter
 /// may take.
 fn is_builtin_type(name: &str) -> bool {
-    [ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT, NEVER].contains(&name)
+    [
+        ARRAY, VARRAY, STRING, TUPLE, TYPE, OPTION, RESULT, NEVER, OPAQUE,
+    ]
+    .contains(&name)
         || Prim::from_name(name).is_some()
 }
 
@@ -18434,5 +18536,427 @@ fn(T) either(a: T) -> T:
             captures: vec!["a".into()],
         };
         assert_eq!(errors_at(src), vec![(pointer, "pick")]);
+    }
+
+    #[test]
+    fn an_opaque_result_hides_the_type_a_function_returns() {
+        let src = "\
+fn make_adder(n: i32) -> opaque(fn(i32) -> i32):
+    fn add(x: i32) -> i32:
+        return x + n
+    return add
+fn main() -> i32:
+    var add2 = make_adder(2)
+    add2 = make_adder(3)
+    return add2(1)
+";
+        let module = lower(src);
+        // It is the closure, by a type that only says what it is called as.
+        assert_eq!(body(&module, "make_adder"), "(set add.n n) (return add.n)");
+        assert_eq!(
+            body(&module, "main"),
+            "(set add2.n (call make_adder 2)) (set add2.n (call make_adder 3)) \
+             (return (call make_adder.add add2.n 1))"
+        );
+    }
+
+    #[test]
+    fn an_opaque_type_is_only_what_bounds_it() {
+        let src = "\
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    name: array(u8)
+fn(T: Head) id_of(x: T) -> i32:
+    return x.id
+fn first() -> opaque(Head):
+    return Named(id: 1, name: \"a\")
+fn other() -> opaque(Head):
+    return Named(id: 2, name: \"b\")
+fn double(x: i32) -> i32:
+    return x * 2
+fn doubler() -> opaque(fn(i32) -> i32):
+    return double
+fn main() -> i32:
+    var named = first()
+    named = first()
+    let head = named as Head
+    let ids = named.id + head.id + id_of(named)
+    let f = doubler()
+    let name = named.name
+    let whole = named as Named
+    named = other()
+    let same = named == named
+    let p: fn(i32) -> i32 = f
+    let n: Named = named
+    return ids + f(1)
+";
+        let no_field = TypeErrorKind::NoField {
+            ty: "opaque(Head) of first".into(),
+            field: "name".into(),
+        };
+        let cast = TypeErrorKind::InvalidCast {
+            from: "opaque(Head) of first".into(),
+            to: "Named".into(),
+        };
+        let operand = TypeErrorKind::InvalidOperand {
+            op: "==",
+            ty: "opaque(Head) of first".into(),
+        };
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (no_field, "name"),
+                (cast, "named as Named"),
+                // Two functions hide two types, whatever each is.
+                (
+                    mismatch("opaque(Head) of first", "opaque(Head) of other"),
+                    "other()"
+                ),
+                (operand, "named == named"),
+                (
+                    mismatch("fn(i32) -> i32", "opaque(fn(i32) -> i32) of doubler"),
+                    "f"
+                ),
+                (mismatch("Named", "opaque(Head) of first"), "named"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_opaque_type_is_laid_out_as_what_it_hides() {
+        let src = "\
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    more: i64
+union ReadError:
+    closed
+    timeout: u32
+union IoError:
+    use ReadError
+    denied: i64
+fn(T: Head) id_of(x: T) -> i32:
+    return x.id
+fn(E: IoError) code(e: E) -> i32:
+    match e:
+        .timeout(ms):
+            return ms as i32
+        else:
+            return 0
+fn first() -> opaque(Head):
+    return Named(id: 1, more: 2)
+fn failed() -> opaque(IoError):
+    return ReadError.timeout(3)
+fn main() -> i64:
+    let named = first()
+    let head = named as Head
+    let wide = failed() as IoError
+    match failed():
+        .timeout(ms):
+            return ms as i64
+        .denied(at):
+            return at
+        .closed:
+            pass
+    return (named.id + head.id + id_of(named) + code(failed())) as i64
+";
+        let module = lower(src);
+        let main = module.funcs.iter().find(|f| f.name == "main").unwrap();
+        let local = |name: &str| main.locals.iter().find(|l| l.name == name).map(|l| l.ty);
+        // A value of it has the scalars of the type it hides, and is its
+        // bound where that is asked: the fields it starts with, or the
+        // wider union, whose variants share a wider scalar.
+        assert_eq!(local("named.more"), Some(ValType::I64));
+        assert_eq!(local("head.id"), Some(ValType::I32));
+        assert_eq!(local("head.more"), None);
+        assert_eq!(local("wide.0"), Some(ValType::I64));
+        let instance = module
+            .funcs
+            .iter()
+            .find(|f| f.name.starts_with("id_of("))
+            .unwrap();
+        assert_eq!(instance.name, "id_of(opaque(Head) of first)");
+        assert_eq!(instance.params, [ValType::I32, ValType::I64]);
+    }
+
+    #[test]
+    fn opaque_is_written_in_the_result_of_a_function_with_a_body() {
+        let src = "\
+extern:
+    fn host() -> opaque()
+struct Holds:
+    f: opaque(fn())
+struct Named:
+    id: i32 = 0
+let Alias: type = opaque()
+fn takes(f: opaque(fn())):
+    pass
+fn bounded() -> opaque(i32):
+    return 1
+fn labelled() -> opaque(T: Named):
+    return Named()
+fn within() -> opaque(fn() -> opaque()):
+    return todo
+fn(T: opaque()) generic(x: T):
+    pass
+fn main():
+    let x: opaque() = 1
+    let y = 1 as opaque()
+";
+        let outside = TypeErrorKind::OpaqueOutsideResult;
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (outside.clone(), "opaque(fn())"),
+                (outside.clone(), "opaque()"),
+                (outside.clone(), "opaque()"),
+                (outside.clone(), "opaque(fn())"),
+                (TypeErrorKind::NotABound("i32".into()), "opaque(i32)"),
+                (TypeErrorKind::LabelledTypeArg, "T"),
+                (outside.clone(), "opaque()"),
+                (outside.clone(), "opaque()"),
+                (outside.clone(), "opaque()"),
+                (outside, "opaque()"),
+            ]
+        );
+        // No item is named as it is.
+        assert_eq!(
+            errors("struct opaque:\n    x: i32\n"),
+            vec![TypeErrorKind::DuplicateItem("opaque".into())]
+        );
+    }
+
+    #[test]
+    fn every_return_settles_what_a_result_hides_as_one_type() {
+        let src = "\
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    name: array(u8)
+struct Other:
+    id: i32
+union Fault:
+    closed
+    late: u32
+fn(T) id(x: T) -> T:
+    return x
+fn two(first: bool, n: i32) -> opaque(fn(i32) -> i32):
+    fn add(x: i32) -> i32:
+        return x + n
+    fn sub(x: i32) -> i32:
+        return x - n
+    if first:
+        return add
+    return sub
+fn unmet() -> opaque(Head):
+    return Other(id: 1)
+fn uncalled() -> opaque(fn(i32) -> i32):
+    return unmet
+fn dotted() -> opaque(Fault):
+    return .closed
+fn early(some: bool) -> option(opaque(Head)):
+    if some:
+        return .none
+    return .some(Named(id: 1, name: \"\"))
+fn empty() -> array(opaque(Head)):
+    return []
+fn none() -> opaque(Head):
+    todo
+fn skipped(n: i32) -> opaque():
+    if n > 0:
+        return todo
+    return n
+fn own(n: i32) -> opaque():
+    if n > 0:
+        return own(n - 1)
+    return n
+fn ping(n: i32) -> opaque():
+    return pong(n)
+fn pong(n: i32) -> opaque():
+    return ping(n)
+fn after(n: i32) -> opaque():
+    if n == 0:
+        return n
+    return after(n - 1)
+fn picked() -> opaque(fn(u8) -> u8):
+    return id
+fn main():
+    pass
+";
+        let found = errors_at(src);
+        let shown: Vec<_> = found
+            .iter()
+            .map(|(kind, at)| (kind.to_string(), *at))
+            .collect();
+        let expected = [
+            // Each of two closures is of a type of its own.
+            ("expected `two.add`, found `two.sub`", "sub"),
+            (
+                "`Other` has the fields of `Head`, but doesn't `use` it first",
+                "Other(id: 1)",
+            ),
+            (
+                "`unmet` is called as a `fn() -> opaque(Head) of unmet` is, \
+                 and not as a `fn(i32) -> i32`",
+                "unmet",
+            ),
+            // Nothing is expected of a value that settles the type.
+            (
+                "nothing says what type `.closed` is of; name it, as in `Type.closed`",
+                "closed",
+            ),
+            (
+                "nothing says what type `.none` is of; name it, as in `Type.none`",
+                "none",
+            ),
+            (
+                "nothing says what type `.some` is of; name it, as in `Type.some`",
+                "some",
+            ),
+            (
+                "this `return` doesn't say which type `opaque(Head)` is, \
+                 and none before it does",
+                "[]",
+            ),
+            (
+                "no `return` of `none` says which type `opaque(Head)` is: \
+                 write `-> todo` until one does",
+                "fn none() -> opaque(Head):\n    todo",
+            ),
+            (
+                "`own` is called to find the type that its own result hides, \
+                 before a `return` of it says",
+                "own(n - 1)",
+            ),
+            (
+                "`ping` is called to find the type that its own result hides, \
+                 before a `return` of it says",
+                "ping(n)",
+            ),
+        ];
+        let shown: Vec<_> = shown
+            .iter()
+            .map(|(shown, at)| (shown.as_str(), *at))
+            .collect();
+        assert_eq!(shown, expected);
+    }
+
+    #[test]
+    fn an_opaque_type_is_of_each_instance_of_a_generic_function() {
+        let src = "\
+fn(T) hold(x: T) -> opaque(fn() -> T):
+    fn get() -> T:
+        return x
+    return get
+fn(A, R, F: fn(A) -> R) call(f: F, a: A) -> R:
+    return f(a)
+fn(T) twice(x: T) -> opaque(fn() -> T):
+    return hold(x)
+fn main() -> i64:
+    var a = hold(1)
+    a = hold(2)
+    let wide = hold(3 as i64)
+    let made = call(hold, 4 as u8)
+    return a() as i64 + wide() + made() as i64 + twice(5 as i64)()
+";
+        let module = lower(src);
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        for name in [
+            "hold(i32).get",
+            "hold(i64).get",
+            "hold(u8).get",
+            "call(u8, opaque(fn() -> u8) of hold(u8), hold(u8))",
+            "twice(i64)",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        assert_eq!(body(&module, "twice(i64)"), "(return (call hold(i64) x))");
+        let main = body(&module, "main");
+        assert!(
+            main.starts_with("(set a.x (call hold(i32) 1)) (set a.x (call hold(i32) 2))"),
+            "{main}"
+        );
+        // One instance's is no other's, and a generic function that uses
+        // its own result is reported as it is declared.
+        let src = "\
+fn(T) hold(x: T) -> opaque(fn() -> T):
+    fn get() -> T:
+        return x
+    return get
+fn(T) own(x: T) -> opaque():
+    return own(x)
+fn main():
+    var a = hold(1)
+    a = hold(2 as i64)
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (TypeErrorKind::OpaqueCycle("own".into()), "own(x)"),
+                (
+                    mismatch(
+                        "opaque(fn() -> i32) of hold(i32)",
+                        "opaque(fn() -> i64) of hold(i64)"
+                    ),
+                    "hold(2 as i64)"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_opaque_type_is_as_public_as_its_function_and_its_bound() {
+        let src = "\
+struct Hidden:
+    h: i32
+pub struct Shown:
+    x: i32
+struct Secret:
+    use Shown
+    use Hidden
+    key: i32
+struct(T) Box:
+    value: T
+fn private() -> opaque():
+    return 1
+pub fn shown() -> opaque(Shown):
+    return Secret(x: 1, h: 2, key: 3)
+pub fn bounded() -> opaque(Hidden):
+    return Hidden(h: 1)
+pub fn listed() -> opaque(Shown, Hidden):
+    return Secret(x: 1, h: 2, key: 3)
+pub fn boxed() -> Box(opaque()):
+    return Box(i32)(value: 1)
+pub let leaked = private()
+pub let fine = shown()
+pub fn passes() -> opaque():
+    return private()
+";
+        let private = |ty: &str, item: &str| TypeErrorKind::PrivateInPublic {
+            ty: ty.into(),
+            item: item.into(),
+        };
+        let found = errors_at(src);
+        let shown: Vec<_> = found
+            .iter()
+            .map(|(kind, at)| (kind.to_string(), *at))
+            .collect();
+        assert_eq!(
+            found
+                .iter()
+                .map(|(kind, _)| kind.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                private("Hidden", "bounded"),
+                private("Hidden", "listed"),
+                private("Box(opaque() of boxed)", "boxed"),
+                private("opaque() of private", "leaked"),
+            ],
+            "{shown:#?}"
+        );
     }
 }

@@ -367,7 +367,11 @@ impl Body<'_> {
         expected: Option<Ty>,
     ) -> (Ty, Value) {
         match expected {
-            Some(ty) if self.ck.union_id(ty).is_some() => return self.variant(ty, name, args),
+            // A union that a result has yet to settle is expected of
+            // nothing, which is to say what it is.
+            Some(ty) if self.ck.union_id(ty).is_some() && !self.ck.has_hole(ty) => {
+                return self.variant(ty, name, args);
+            }
             Some(Ty::Enum(id)) if args.is_none() => match self.enum_member(id, name) {
                 Some(member) => return member,
                 // A field of the enum as a `type`.

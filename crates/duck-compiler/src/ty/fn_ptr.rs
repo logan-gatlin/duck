@@ -224,6 +224,7 @@ impl Body<'_> {
             }
             return (Ty::Error, Value::default());
         };
+        self.settle(ret, span);
         let (expected, found) = (params.len(), args.len());
         if found > expected {
             self.error(TypeErrorKind::TooManyArgs { expected, found }, span);
@@ -242,6 +243,8 @@ impl Body<'_> {
                 }
             }
         }
+        // What a result hides is called, once that is found.
+        let ty = self.ck.hiding(ty);
         // A function itself is called as it is by name, and nothing is
         // evaluated of it but what led to it.
         if let Ty::Func(id) = ty {
@@ -250,8 +253,9 @@ impl Body<'_> {
             return self.call_func(id, args);
         }
         // A type parameter is called only where a generic function is
-        // checked as declared, which calls nothing.
-        if let Ty::Param(_) = ty {
+        // checked as declared, which calls nothing, as is a type that
+        // nothing has settled.
+        if let Ty::Param(_) | Ty::Opaque(_) = ty {
             values.insert(0, callee_value);
             let pre = self.seq(values).pre;
             let scalars = self.blank(ret).scalars;

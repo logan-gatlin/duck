@@ -19,7 +19,9 @@ use crate::load::Program;
 use crate::parse::{self, ExprKind, Pattern, PatternKind, StmtKind};
 
 use super::inspect::visit::{self, Node};
-use super::{Body, Checker, Expr, FuncSig, OPEN_FUNCS, Stmt, Synth, Ty, TypeErrorKind, Value, Var};
+use super::{
+    Body, Checker, Expr, FuncSig, OPEN_FUNCS, Owner, Stmt, Synth, Ty, TypeErrorKind, Value, Var,
+};
 
 /// What a function declared in a function is beyond its signature.
 #[derive(Clone)]
@@ -204,7 +206,9 @@ impl Checker {
                 members.any(|member| self.holds_value(member))
             }
             Ty::Type | Ty::Unit | Ty::Never | Ty::Error => false,
-            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Fn(_) | Ty::Param(_) => true,
+            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Fn(_) => true,
+            // What stands for a type may stand for one that does.
+            Ty::Param(_) | Ty::Opaque(_) => true,
         }
     }
 
@@ -221,6 +225,8 @@ impl Checker {
     pub(super) fn closure_part(&self, ty: Ty) -> Option<Ty> {
         match ty {
             Ty::Func(id) => self.is_closure(id).then_some(ty),
+            // What a result hides may be one, and is its own to know.
+            Ty::Opaque(_) => Some(ty),
             Ty::Enum(id) => self.closure_part(self.enum_ty(id)),
             Ty::Struct(_) | Ty::Tuple(_) => {
                 let mut members = self.members(ty).into_iter();
@@ -267,6 +273,16 @@ impl Checker {
             _ => String::new(),
         };
         Some(format!("captures {}{size}", held.join(", ")))
+    }
+
+    /// The function that the body of `parent` declares at `span`, which
+    /// [`Self::nested_id`] gives next if it has yet to.
+    fn nested_at(&self, parent: Option<FuncId>, span: Span) -> FuncId {
+        match (self.nested.get(&(parent, span)), self.open) {
+            (Some(id), _) => *id,
+            (None, true) => FuncId(OPEN_FUNCS + self.open_funcs.len() as u32),
+            (None, false) => FuncId(self.funcs.len() as u32),
+        }
     }
 
     /// The function with signature `sig` that the body of `parent` declares
@@ -440,7 +456,9 @@ impl Body<'_> {
             self.bind_fn(&name.name, Ty::Error, Vec::new());
             return;
         }
-        let (params, ret) = self.naming_fns(|ck| ck.resolve_sig(&decl.sig));
+        let func = format!("{}.{}", self.name, name.name);
+        let owner = (Owner::Func(self.ck.nested_at(self.func, span)), func, false);
+        let (params, ret) = self.naming_fns(|ck| ck.resolve_sig(&decl.sig, Some(owner)));
         // A signature that failed to resolve is already reported.
         let failed = ret == Ty::Error || params.iter().any(|(_, ty)| *ty == Ty::Error);
         let sig = FuncSig {

@@ -21,8 +21,8 @@ use crate::load::Program;
 use crate::parse::{self, Arg, FnSig};
 
 use super::{
-    Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Synth, Ty, TypeErrorKind, Value,
-    generic_fn_decls, is_typed_by_other, never, pending_defaults,
+    Body, Checker, DefaultValue, FuncSig, GenericFnId, Item, Owner, Synth, Ty, TypeErrorKind,
+    Value, generic_fn_decls, is_typed_by_other, never, pending_defaults,
 };
 
 /// The most instances of generic functions that can be nested, each
@@ -70,6 +70,11 @@ pub(super) struct InstanceCall {
 }
 
 impl Checker {
+    /// The name that generic function `id` is declared by.
+    pub(super) fn generic_fn_name(&self, id: GenericFnId) -> &str {
+        &self.generic_fns[id.0 as usize].sig.name
+    }
+
     /// Declares generic function `decl`.
     pub(super) fn declare_generic_fn(&mut self, decl: &parse::FnDecl) -> GenericFnId {
         let params = self.new_params(&decl.sig.type_param_names());
@@ -103,7 +108,9 @@ impl Checker {
                     self.error(kind, default.span);
                 }
             }
-            let (params, ret) = self.resolve_sig(&decl.sig);
+            let owner = Owner::Generic(GenericFnId(i as u32));
+            let owner = (owner, decl.sig.name.name.clone(), item.is_pub);
+            let (params, ret) = self.resolve_sig(&decl.sig, Some(owner));
             if item.is_pub {
                 self.check_public_sig(&decl.sig, &params, ret);
             }
@@ -322,7 +329,8 @@ impl Checker {
                 // to it.
                 if let TypeErrorKind::InstanceTooDeep(_)
                 | TypeErrorKind::InstanceTooLarge(_)
-                | TypeErrorKind::NestedTooDeep(_) = error.kind
+                | TypeErrorKind::NestedTooDeep(_)
+                | TypeErrorKind::OpaqueCycle(_) = error.kind
                 {
                     continue;
                 }
@@ -503,7 +511,7 @@ impl Checker {
 
     /// The types `ty` is written with: the type arguments of an instance of
     /// a generic struct, or else its components.
-    fn written_parts(&self, ty: Ty) -> Vec<Ty> {
+    pub(super) fn written_parts(&self, ty: Ty) -> Vec<Ty> {
         match ty {
             Ty::Struct(id) => match &self.structs[id.0 as usize].instance {
                 Some(instance) => instance.args.clone(),
@@ -577,8 +585,14 @@ impl Body<'_> {
         }
         let value = self.bound_args(&instance.params, &sig.defaults, args, binding, checked);
         match id {
-            Some(id) => self.call_func(id, value),
-            None => (instance.ret, self.blank(instance.ret)),
+            Some(id) => {
+                self.settle(instance.ret, span);
+                self.call_func(id, value)
+            }
+            None => {
+                self.settle(instance.ret, span);
+                (instance.ret, self.blank(instance.ret))
+            }
         }
     }
 
@@ -610,7 +624,7 @@ impl Body<'_> {
     /// it gives. It is of its own type, as any function is, and where a
     /// generic function is checked as declared, which has no instance, of
     /// the type of the pointers to it.
-    fn generic_fn_called(
+    pub(super) fn generic_fn_called(
         &mut self,
         generic: GenericFnId,
         called: Option<(Vec<Ty>, Option<Ty>)>,

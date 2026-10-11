@@ -23,9 +23,9 @@ pub use lints::{Unused, UnusedKind};
 pub use symbols::{Symbol, SymbolKind};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, NEVER, OPTION, Prim,
-    RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY, is_builtin_type,
-    lower_program,
+    ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, NEVER, OPAQUE, OPTION,
+    Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError, VARRAY,
+    is_builtin_type, lower_program,
 };
 
 mod actions;
@@ -583,7 +583,9 @@ impl Analysis {
         }
         let type_params = site.type_params.iter().map(|param| param.name.as_str());
         let prims = PRIMS.iter().map(|prim| prim.name());
-        let builtins = [ARRAY, VARRAY, STRING, TUPLE, OPTION, RESULT, NEVER, TYPE];
+        let builtins = [
+            ARRAY, VARRAY, STRING, TUPLE, OPTION, RESULT, NEVER, TYPE, OPAQUE,
+        ];
         for name in type_params.chain(prims).chain(builtins) {
             names.push(Completion {
                 name: name.to_string(),
@@ -712,11 +714,7 @@ impl Analysis {
             let holds = (None, self.ck.ty_name(variant.ty));
             return Some(signature(head, vec![holds], ""));
         }
-        let (params, ret) = match self.ty_at(expr.span)? {
-            Ty::Fn(id) => self.ck.fn_tys[id.0 as usize].clone(),
-            Ty::Func(id) => self.ck.func_shape(id),
-            _ => return None,
-        };
+        let (params, ret) = self.ck.called_as(self.ty_at(expr.span)?)?;
         let params = params.iter().map(|param| (None, self.ck.ty_name(*param)));
         let tail = match ret {
             Ty::Unit => String::new(),
@@ -3122,6 +3120,59 @@ fn one(flag: bool) -> bool:
         let unused = analysis.unused(&mut files);
         let unused: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
         assert_eq!(unused, ["outer", "held", "unused", "one"]);
+    }
+
+    #[test]
+    fn what_a_result_hides_is_described_by_its_bound() {
+        let src = "\
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    name: array(u8)
+fn first() -> opaque(Head):
+    return Named(id: 1, name: \"a\")
+fn make_adder(n: i32) -> opaque(fn(i32) -> i32):
+    fn add(x: i32) -> i32:
+        return x + n
+    return add
+fn main() -> i32:
+    let named = first()
+    let add2 = make_adder(2)
+    named
+    add2
+    return add2(named.id)
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let (file, _) = files.at("main", "struct");
+        // The type of a name is said as an error says it, though nothing
+        // writes it so.
+        let hints = analysis.hints(file, 0..src.len());
+        let hints = hints.iter().filter(|hint| hint.kind == HintKind::Type);
+        let labels: Vec<_> = hints.map(|hint| hint.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                ": opaque(Head) of first",
+                ": opaque(fn(i32) -> i32) of make_adder"
+            ]
+        );
+        let (file, offset) = files.at("main", "add2(named");
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(hover.text, "let add2: opaque(fn(i32) -> i32) of make_adder");
+        // A value of it has what its bound has, and no more.
+        let (file, offset) = files.at("main", "named\n");
+        assert_eq!(
+            shown(analysis.members(&mut files, file, offset)),
+            ["id: i32"]
+        );
+        let (file, offset) = files.at("main", "add2\n");
+        let signature = analysis.signature(&mut files, file, offset).unwrap();
+        assert_eq!(signature.label, "fn(i32) -> i32");
+        // It is a type to write, in a result.
+        let names = analysis.names(&mut files, file, offset);
+        assert!(names.iter().any(|name| name.name == "opaque"));
     }
 
     #[test]

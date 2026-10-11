@@ -51,10 +51,10 @@ pub(super) enum Dep {
 }
 
 impl Checker {
-    /// Lowers function `id` for a constant to call, while constants are
-    /// still being folded: those its body is first to read are folded for
-    /// it.
-    fn lower_for_constant(&mut self, program: &Program, id: FuncId) {
+    /// Lowers function `id` before its turn: for a constant to call, while
+    /// constants are still being folded, or for what its result hides.
+    /// The constants that its body is first to read are folded for it.
+    pub(super) fn lower_early(&mut self, program: &Program, id: FuncId) {
         self.lowering.insert(id);
         self.deps.push(Vec::new());
         // What is folding may be in another module, or a generic function's.
@@ -119,7 +119,7 @@ impl Checker {
                 return None;
             }
             if !self.lowered.contains_key(&id) {
-                self.lower_for_constant(program, id);
+                self.lower_early(program, id);
             }
             work.extend(self.func_deps.get(&id).into_iter().flatten());
             push_calls(&self.lowered[&id].body, &mut work);
@@ -1295,5 +1295,153 @@ pub let constant = folded()
         // Its captures are stored and read as a struct of them is.
         assert_eq!(started.call("held", &[1]), 18);
         assert_eq!(started.call("deep", &[10]), 30);
+    }
+
+    #[test]
+    fn what_an_opaque_result_hides_runs_as_itself() {
+        let src = "\
+struct Head:
+    id: i32
+struct Named:
+    use Head
+    more: i32
+union ReadError:
+    closed
+    timeout: u32
+union IoError:
+    use ReadError
+    denied: i64
+struct(F: fn(i32) -> i32) Held:
+    tag: u8
+    f: F
+let slot = &var 0
+fn(T: Head) id_of(x: T) -> i32:
+    return x.id
+fn(E: IoError) code(e: E) -> i32:
+    match e:
+        .timeout(ms):
+            return ms as i32
+        .denied(at):
+            return at as i32
+        .closed:
+            return -1
+fn(F: fn(i32) -> i32) call(x: i32, f: F) -> i32:
+    return f(x)
+fn(T) hold(x: T) -> opaque(fn() -> T):
+    fn get() -> T:
+        return x
+    return get
+fn first(id: i32) -> opaque(Head):
+    return Named(id: id, more: 40)
+fn failed(ms: u32) -> opaque(IoError):
+    if ms == 0:
+        return ReadError.closed
+    return ReadError.timeout(ms)
+fn make_adder(n: i32) -> opaque(fn(i32) -> i32):
+    fn add(x: i32) -> i32:
+        return x + n
+    return add
+fn counter(at: &var i32) -> opaque(fn(i32) -> i32):
+    fn count(by: i32) -> i32:
+        at.* += by
+        return at.*
+    return count
+fn pair(n: i32) -> tuple(opaque(fn(i32) -> i32), option(opaque(Head))):
+    if n < 0:
+        return (make_adder(0), option(Named).none)
+    return (make_adder(n), .some(Named(id: n, more: 1)))
+fn held(n: i32) -> Held(opaque(fn(i32) -> i32)):
+    fn scale(x: i32) -> i32:
+        return x * n
+    return Held(scale)(tag: 9, f: scale)
+fn again(n: i32) -> opaque(fn(i32) -> i32):
+    return make_adder(n + 1)
+let add10 = make_adder(10)
+pub let folded = add10(5) + call(1, add10)
+pub fn adds(n: i32) -> i32:
+    var add = make_adder(n)
+    let first = add(1)
+    add = make_adder(n * 2)
+    return first * 100 + call(1, add) + add10(0)
+pub fn heads(n: i32) -> i32:
+    let named = first(n)
+    let head = named as Head
+    return named.id * 100 + head.id * 10 + id_of(named)
+pub fn fails(ms: i32) -> i32:
+    let wide = failed(ms as u32) as IoError
+    match failed(ms as u32):
+        .timeout(got):
+            return got as i32 * 100 + code(failed(ms as u32)) * 10 + code(wide)
+        .closed:
+            return code(failed(0))
+        .denied(_):
+            return -2
+pub fn counts() -> i32:
+    let count = counter(slot)
+    let a = count(2)
+    return a * 10 + count(3)
+pub fn pairs(n: i32) -> i32:
+    let (add, head) = pair(n)
+    match head:
+        .some(named):
+            return add(1) * 10 + named.id
+        .none:
+            return add(7)
+pub fn holds(n: i32) -> i32:
+    let h = held(n)
+    let get = hold(n)
+    let wide = hold(n as i64 * 2)
+    return h.f(3) * 100 + h.tag as i32 * 10 + get() + wide() as i32 + again(n)(0)
+";
+        assert_eq!(consts(src), "folded=26");
+        let mut started = Started::of(src);
+        assert_eq!(started.call("adds", &[3]), 417);
+        assert_eq!(started.call("heads", &[4]), 444);
+        assert_eq!(started.call("fails", &[5]), 555);
+        assert_eq!(started.call("fails", &[0]), -1);
+        assert_eq!(started.call("counts", &[]), 25);
+        assert_eq!(started.call("pairs", &[4]), 54);
+        assert_eq!(started.call("pairs", &[-1]), 7);
+        assert_eq!(started.call("holds", &[2]), 699);
+    }
+
+    #[test]
+    fn an_opaque_type_is_called_and_captured_wherever_it_goes() {
+        let src = "\
+fn make_adder(n: i32) -> opaque(fn(i32) -> i32):
+    fn add(x: i32) -> i32:
+        return x + n
+    return add
+fn(A, R, F: fn(A) -> R) call(f: F, a: A) -> R:
+    return f(a)
+fn(T) through(x: T, by: i32) -> i32:
+    let add = make_adder(by)
+    fn apply(n: i32) -> i32:
+        return add(n)
+    return apply(1) + T.size as i32
+fn compose(n: i32) -> opaque(fn(i32) -> i32):
+    fn inner(by: i32) -> opaque(fn(i32) -> i32):
+        fn scale(x: i32) -> i32:
+            return x * by + n
+        return scale
+    let double = inner(2)
+    let add = make_adder(n)
+    fn both(x: i32) -> i32:
+        return double(add(x))
+    return both
+pub fn pointed(n: i32) -> i32:
+    let make: fn(i32) -> i32 = pointed
+    let made = call(make_adder, n)
+    return made(1) + (make == pointed) as i32
+pub fn generic(n: i32) -> i32:
+    return through(n as i64, n) * 10 + through(n as u8, n)
+pub fn composed(n: i32) -> i32:
+    return compose(n)(1)
+";
+        let mut started = Started::of(src);
+        // A pointer to a function gives what the function hides.
+        assert_eq!(started.call("pointed", &[4]), 6);
+        assert_eq!(started.call("generic", &[2]), 114);
+        assert_eq!(started.call("composed", &[3]), 11);
     }
 }
