@@ -151,7 +151,7 @@ impl Checker {
 
     /// The type that type parameter `name` stands for, if one is in scope.
     pub(super) fn type_param(&self, name: &str) -> Option<Ty> {
-        let param = self.type_params.iter().find(|(param, _)| param == name);
+        let param = self.type_params.iter().rfind(|(param, _)| param == name);
         param.map(|(_, ty)| *ty)
     }
 
@@ -1167,7 +1167,7 @@ impl Body<'_> {
         let mut labels = args.iter().filter_map(|arg| arg.label.as_ref());
         if labels.all(|label| params.contains(&label.name)) {
             let ty = match self.ck.applied_type_syntax(callee, args, span) {
-                Some(ty) => self.ck.resolve_ty(&ty),
+                Some(ty) => self.resolve_ty(&ty),
                 None => Ty::Error,
             };
             return self.type_value(ty, span);
@@ -1184,7 +1184,7 @@ impl Body<'_> {
     /// Resolves a type written as an expression.
     pub(super) fn expr_type(&mut self, expr: &parse::Expr) -> Ty {
         match self.ck.type_syntax(expr) {
-            Some(ty) => self.ck.resolve_ty(&ty),
+            Some(ty) => self.resolve_ty(&ty),
             None => Ty::Error,
         }
     }

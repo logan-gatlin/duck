@@ -31,7 +31,7 @@ impl Checker {
     /// The parameter types and result type of the pointers to function
     /// `id`.
     pub(super) fn func_shape(&self, id: FuncId) -> (Vec<Ty>, Ty) {
-        let sig = &self.funcs[id.0 as usize];
+        let sig = self.sig(id);
         // A type parameter of an instance is no parameter of its pointer.
         let params = sig.params.iter().map(|(_, ty)| *ty);
         (params.filter(|ty| *ty != Ty::Type).collect(), sig.ret)

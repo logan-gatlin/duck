@@ -2047,6 +2047,10 @@
         {
           "type": "SYMBOL",
           "name": "defer_statement"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "function_declaration"
         }
       ]
     },

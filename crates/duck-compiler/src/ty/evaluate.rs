@@ -1183,4 +1183,37 @@ pub let stepped = steps(6)
         // Those of one that none called are placed after it ran.
         assert_eq!(started.call("late", &[3]), 14);
     }
+
+    #[test]
+    fn a_function_in_a_function_runs_for_a_constant_and_for_the_host() {
+        let src = "\
+var trace = 0
+fn note(n: i32):
+    trace = trace * 10 + n
+fn word(s: array(u8)) -> i32:
+    fn number(s: array(u8)) -> i32:
+        defer note(1)
+        match s:
+            \"two\":
+                return 2
+            else:
+                return 0
+    return number(s) + number(\"one\")
+pub fn factorial(n: i32) -> i32:
+    fn fact(n: i32) -> i32:
+        if n < 2:
+            return 1
+        return n * fact(n - 1)
+    var total = 0
+    for step in [1, 1]:
+        fn times(a: i32, b: i32) -> i32:
+            return a * b
+        total += times(step, fact(n))
+    return total
+pub let two = word(\"two\")
+pub let ran = trace
+";
+        assert_eq!(consts(src), "two=2 ran=11");
+        assert_eq!(Started::of(src).call("factorial", &[5]), 240);
+    }
 }

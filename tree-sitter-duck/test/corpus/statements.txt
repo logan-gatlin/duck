@@ -448,3 +448,55 @@ fn f():
               (array_pattern)))
           (block
             (pass_statement)))))))
+
+====================
+Function in a function
+====================
+
+fn f(n: i32) -> i32:
+    fn double(x: i32) -> i32:
+        return x * 2
+    fn(i32).size
+    return double(n)
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (named_type
+      (identifier))
+    (block
+      (function_declaration
+        (identifier)
+        (parameters
+          (parameter
+            (identifier)
+            (named_type
+              (identifier))))
+        (named_type
+          (identifier))
+        (block
+          (expression_statement
+            (return_expression
+              (binary_expression
+                (identifier)
+                (integer))))))
+      (expression_statement
+        (field_expression
+          (function_type
+            (parameter_types
+              (named_type
+                (identifier))))
+          (identifier)))
+      (expression_statement
+        (return_expression
+          (call_expression
+            (identifier)
+            (arguments
+              (identifier))))))))

@@ -1091,6 +1091,18 @@ mod tests {
     }
 
     #[test]
+    fn a_function_in_a_function_is_laid_out_as_a_statement_is() {
+        // Blank lines around it are the author's, and it is broken at its
+        // parameters as any function is.
+        let src = "fn f()->i32:\n  let a=1\n  fn  g( x:i32 )->i32:\n      return x\n\n  fn h():\n      pass\n  return g(a)\n";
+        let expected = "fn f() -> i32:\n\tlet a = 1\n\tfn g(x: i32) -> i32:\n\t\treturn x\n\n\tfn h():\n\t\tpass\n\treturn g(a)\n";
+        assert_eq!(formatted(src), expected);
+        let src = "fn f():\n\tfn sum(first: i32, second: i32) -> i32:\n\t\treturn first\n\tpass\n";
+        let expected = "fn f():\n\tfn sum(\n\t\tfirst: i32,\n\t\tsecond: i32,\n\t) -> i32:\n\t\treturn first\n\tpass\n";
+        assert_eq!(within(30, src), expected);
+    }
+
+    #[test]
     fn a_comma_ends_a_broken_list_only() {
         // A call of one argument is a list, and so is an array of one.
         let src = "let x = f(first + second)[first + second]\n";

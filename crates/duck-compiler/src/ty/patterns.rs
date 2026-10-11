@@ -756,6 +756,7 @@ fn push_pattern_strings<'p>(block: &'p [parse::Stmt], out: &mut Vec<&'p str>) {
             StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Defer(body) => {
                 push_pattern_strings(body, out);
             }
+            StmtKind::Fn(decl) => push_pattern_strings(&decl.body, out),
             StmtKind::Match { arms, .. } => {
                 for arm in arms {
                     push(&arm.pattern, out);

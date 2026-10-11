@@ -111,6 +111,10 @@ impl Analysis {
                 };
                 let mut bindings = Vec::new();
                 match &stmt.kind {
+                    StmtKind::Fn(decl) => {
+                        let name = &decl.sig.name;
+                        return declares(&name.name, name.span, UnusedKind::Function);
+                    }
                     StmtKind::Binding(binding) => bound(&binding.pattern, &mut bindings),
                     StmtKind::For { var, .. } => bindings.push((&var.name, var.span)),
                     StmtKind::Match { arms, .. } => {

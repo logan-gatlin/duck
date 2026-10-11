@@ -191,7 +191,7 @@ impl Checker {
             self.record_params(&decl.sig, &sig);
             let errors = self.errors.len();
             self.open = true;
-            self.lower_body(program, sig, &decl.body, item.span, Vec::new());
+            self.lower_body(program, None, &[], sig, &decl.body, item.span, Vec::new());
             self.open = false;
             self.type_params.clear();
             self.generic_fns[i].failed |= self.errors.len() > errors;
@@ -315,7 +315,15 @@ impl Checker {
                 body: Vec::new(),
             }
         } else {
-            let func = self.lower_body(program, sig, &decl.body, item.span, Vec::new());
+            let func = self.lower_body(
+                program,
+                Some(id),
+                &[],
+                sig,
+                &decl.body,
+                item.span,
+                Vec::new(),
+            );
             for error in &mut self.errors[errors..] {
                 // Only what an instance is too deep or too large for is its
                 // type arguments' doing, and is reported at the call that led

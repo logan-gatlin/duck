@@ -294,6 +294,9 @@ pub enum StmtKind {
     /// `defer expr`, whose block is that one expression, or `defer:` and a
     /// block. It runs when the block that the `defer` is in is left.
     Defer(Block),
+    /// A function declared in a function, which the rest of the block
+    /// names.
+    Fn(FnDecl),
 }
 
 /// `pattern:` and the block a `match` runs for a value that matches it.
@@ -1198,6 +1201,7 @@ impl<'a> Parser<'a> {
                 StmtKind::Match { value, arms }
             }
             TokenKind::Pass => self.keyword_stmt(StmtKind::Pass)?,
+            TokenKind::Fn if self.declares_fn() => StmtKind::Fn(self.fn_decl()?),
             TokenKind::Defer => {
                 self.bump();
                 if self.at(TokenKind::Colon) {
@@ -1221,6 +1225,33 @@ impl<'a> Parser<'a> {
             kind,
             span: self.span_from(start),
         })
+    }
+
+    /// Whether the `fn` at [`Self::peek`] declares a function, rather than
+    /// starting a function type: its name follows, or follows the type
+    /// parameters in brackets after it.
+    fn declares_fn(&self) -> bool {
+        let rest = &self.tokens[self.pos + 1..];
+        let named = |token: Option<&Token>| {
+            token.is_some_and(|token| matches!(token.kind, TokenKind::Ident(_)))
+        };
+        if rest
+            .first()
+            .is_none_or(|token| token.kind != TokenKind::LParen)
+        {
+            return named(rest.first());
+        }
+        let mut depth = 0usize;
+        for (i, token) in rest.iter().enumerate() {
+            match token.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen if depth == 1 => return named(rest.get(i + 1)),
+                TokenKind::RParen => depth -= 1,
+                TokenKind::Newline | TokenKind::Eof => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn if_stmt(&mut self) -> PResult<Stmt> {
@@ -2052,6 +2083,7 @@ mod tests {
                 StmtKind::Match { .. } => "match",
                 StmtKind::Pass => "pass",
                 StmtKind::Defer(_) => "defer",
+                StmtKind::Fn(_) => "fn",
             })
             .collect()
     }
@@ -2822,6 +2854,51 @@ fn f():
                 expected("expression", TokenKind::Pass),
                 expected("expression", TokenKind::Newline),
             ]
+        );
+    }
+
+    #[test]
+    fn functions_in_functions() {
+        let src = "\
+fn f() -> i32:
+    fn double(x: i32) -> i32:
+        fn one() -> i32:
+            return 1
+        return x * 2
+    if true:
+        fn(T) id(x: T) -> T:
+            return x
+    let size = fn(i32).size
+    return double(4)
+";
+        let module = parse_src(src).unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(stmt_kinds(&f.body), vec!["fn", "if", "binding", "return"]);
+        let StmtKind::Fn(double) = &f.body[0].kind else {
+            panic!()
+        };
+        assert_eq!(double.sig.name.name, "double");
+        assert_eq!(stmt_kinds(&double.body), vec!["fn", "return"]);
+        // One with type parameters is told from a function type by the
+        // name after them.
+        let StmtKind::If { then_body, .. } = &f.body[1].kind else {
+            panic!()
+        };
+        let StmtKind::Fn(id) = &then_body[0].kind else {
+            panic!()
+        };
+        assert_eq!(id.sig.type_params.len(), 1);
+        // A function type still starts a statement.
+        let module = parse_src("fn f():\n    fn(i32).size\n").unwrap();
+        let ItemKind::Fn(f) = &module.items[0].kind else {
+            panic!()
+        };
+        assert_eq!(stmt_kinds(&f.body), vec!["expr"]);
+        assert_eq!(
+            errors("fn f():\n    fn g()\n    pass\n"),
+            vec![ParseErrorKind::MissingFnBody]
         );
     }
 

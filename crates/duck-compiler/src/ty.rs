@@ -30,6 +30,7 @@ use enums::EnumDef;
 use evaluate::Dep;
 use generic::{Arity, Instance, ParamDef, ParamDefaults, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
+use nested::Around;
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
 mod alias;
@@ -43,6 +44,7 @@ mod fn_ptr;
 mod generic;
 mod generic_fn;
 mod inspect;
+mod nested;
 mod patterns;
 mod unions;
 mod wit;
@@ -188,6 +190,11 @@ const TEMP: &str = "tmp";
 
 /// The keyword that a `defer` starts with.
 const DEFER: &str = "defer";
+
+/// The first [`FuncId`] of the functions that are declared in the body of a
+/// generic function checked as declared, which are of no instance: each is
+/// one of [`Checker::open_funcs`], and no function of the module.
+const OPEN_FUNCS: u32 = 1 << 31;
 
 /// The most constants that can be nested, each folded where the last is
 /// first to use it.
@@ -572,6 +579,15 @@ pub enum TypeErrorKind {
     /// A `defer` that no statement but a `defer` follows in its block, so
     /// that it would run where it is written.
     TrailingDefer,
+    /// A function declared in a function that has type parameters of its
+    /// own: it has those of the function around it.
+    NestedTypeParams(String),
+    /// A parameter of a function declared in a function that has a default,
+    /// which only a call by the name of a module's function takes.
+    NestedDefault(String),
+    /// A function declared in a function that is given a name for the host,
+    /// which calls none.
+    NestedHostName(String),
     /// A global initializer that traps, such as dividing by zero.
     ConstTrap,
     /// Code that traps while it's run to evaluate a constant.
@@ -902,6 +918,13 @@ struct Checker {
     /// The functions the checker creates as they are used, whose signatures
     /// end `funcs` in the same order.
     synths: Vec<Synth>,
+    /// The functions declared in the body of a generic function checked as
+    /// declared, each of the [`FuncId`] that is its place here counted from
+    /// [`OPEN_FUNCS`]. None is lowered: each instance has its own.
+    open_funcs: Vec<FuncSig>,
+    /// Each function that is declared in another, by the function whose
+    /// body declares it, if that is one, and where it is declared.
+    nested: HashMap<(Option<FuncId>, Span), FuncId>,
     /// The function `==` compares each array type through.
     eq_funcs: HashMap<Ty, FuncId>,
     /// The functions that pointers call, in the order their pointers are
@@ -1105,6 +1128,9 @@ enum Synth {
     /// Calls this function, which the world exports as the name, taking
     /// what the host passes in memory and giving what it returns there.
     Export(FuncId, String),
+    /// A function declared in the body of another, which is lowered where
+    /// it is declared.
+    Nested,
 }
 
 struct GlobalDef {
@@ -1139,6 +1165,10 @@ struct Bound<'p> {
 /// initializer.
 struct Body<'c> {
     ck: &'c mut Checker,
+    /// The function this is the body of, if it's one of the module.
+    func: Option<FuncId>,
+    /// The name of the function this is the body of, if it's one.
+    name: String,
     ret: Ty,
     locals: Vec<ir::Local>,
     scopes: Vec<HashMap<String, Var>>,
@@ -1178,6 +1208,9 @@ struct Body<'c> {
 struct Var {
     ty: Ty,
     mutable: bool,
+    /// Whether a `fn` in a function declares it, so that its name is its
+    /// type where a type is written.
+    func: bool,
     /// One local per scalar leaf of `ty`.
     slots: Vec<LocalId>,
 }
@@ -1647,6 +1680,20 @@ impl fmt::Display for TypeErrorKind {
             Self::TrailingDefer => write!(
                 f,
                 "this `defer` defers nothing: no statement but a `defer` follows it in its block"
+            ),
+            Self::NestedTypeParams(name) => write!(
+                f,
+                "`{name}` is declared in a function, so it has no type parameters of its own: \
+                 it names those of the function around it"
+            ),
+            Self::NestedDefault(name) => write!(
+                f,
+                "`{name}` is declared in a function, so its parameters have no defaults: \
+                 it is called as a value is, with every argument"
+            ),
+            Self::NestedHostName(name) => write!(
+                f,
+                "`{name}` is declared in a function, so the host has no name for it"
             ),
             Self::ConstTrap => write!(f, "constant evaluation traps"),
             Self::ConstTraps { trap, stack } => {
@@ -3115,15 +3162,19 @@ impl Checker {
         self.record_params(&decl.sig, &sig);
         let own = self.exports(item).then_some(sig.name.as_str());
         let exports = self.export_names(Item::Func(id), own);
-        self.lower_body(program, sig, &decl.body, item.span, exports)
+        self.lower_body(program, Some(id), &[], sig, &decl.body, item.span, exports)
     }
 
     /// Lowers a function of `program` with signature `sig` and body `block`,
-    /// declared by the item spanning `span`, and exported as each of
-    /// `exports`.
+    /// declared by what spans `span`, and exported as each of `exports`. It
+    /// is function `id`, unless it is a generic function checked as
+    /// declared, and its body names each of `around`.
+    #[allow(clippy::too_many_arguments)]
     fn lower_body(
         &mut self,
         program: &Program,
+        id: Option<FuncId>,
+        around: &[Around],
         sig: FuncSig,
         block: &parse::Block,
         span: Span,
@@ -3131,6 +3182,11 @@ impl Checker {
     ) -> ir::Func {
         let mut body = Body::new(self, sig.ret);
         body.program = Some(program);
+        body.func = id;
+        body.name = sig.name.clone();
+        for outer in around {
+            body.bind_around(outer);
+        }
         // A type parameter is a type by its name, and no variable.
         for (name, ty) in sig.params.iter().filter(|(_, ty)| *ty != Ty::Type) {
             let slots = body.alloc(name, *ty);
@@ -3191,6 +3247,7 @@ impl Checker {
                 let (target, export) = (*target, export.clone());
                 self.lower_export(id, target, &export)
             }
+            Synth::Nested => unreachable!("lowered where it is declared"),
         }
     }
 
@@ -3268,7 +3325,7 @@ impl Checker {
     ) -> Ty {
         let param = match member {
             Some(_) => None,
-            None => self.type_params.iter().find(|(p, _)| p == name),
+            None => self.type_params.iter().rfind(|(p, _)| p == name),
         };
         let arity = match (param, member) {
             (Some(_), _) => Some(Arity::Plain),
@@ -3610,7 +3667,7 @@ impl Checker {
                 };
                 format!("fn({}){ret}", params.join(", "))
             }
-            Ty::Func(id) => self.funcs[id.0 as usize].name.clone(),
+            Ty::Func(id) => self.sig(id).name.clone(),
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
             Ty::Type => TYPE.to_string(),
             Ty::Unit => format!("{TUPLE}()"),
@@ -4217,6 +4274,8 @@ impl<'c> Body<'c> {
     fn new(ck: &'c mut Checker, ret: Ty) -> Self {
         Self {
             ck,
+            func: None,
+            name: String::new(),
             ret,
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
@@ -4311,7 +4370,19 @@ impl<'c> Body<'c> {
     }
 
     fn bind(&mut self, name: &str, ty: Ty, mutable: bool, slots: Vec<LocalId>) {
-        let var = Var { ty, mutable, slots };
+        let func = false;
+        self.bind_var(
+            name,
+            Var {
+                ty,
+                mutable,
+                func,
+                slots,
+            },
+        );
+    }
+
+    fn bind_var(&mut self, name: &str, var: Var) {
         self.scopes
             .last_mut()
             .unwrap()
@@ -4494,6 +4565,7 @@ impl<'c> Body<'c> {
             StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
             StmtKind::Match { value, arms } => self.match_stmt(value, arms, out),
             StmtKind::Pass => {}
+            StmtKind::Fn(decl) => self.nested_fn(decl, stmt.span),
             // Nothing runs here: the body is lowered as what it names is
             // now, and is run wherever the block is left.
             StmtKind::Defer(body) => {
@@ -4675,7 +4747,7 @@ impl<'c> Body<'c> {
     fn binding_value(&mut self, binding: &parse::Binding) -> (Ty, Value) {
         match &binding.ty {
             Some(ty) => {
-                let ty = self.ck.resolve_ty(ty);
+                let ty = self.resolve_ty(ty);
                 (ty, self.check(&binding.value, ty))
             }
             None => self.expr(&binding.value, None),
@@ -5094,7 +5166,8 @@ impl<'c> Body<'c> {
                     }
                 }
                 // A function names its type there, which no value of it has.
-                let names_fn = matches!(self.named(inner), Some(Item::Func(_)));
+                let names_fn =
+                    matches!(self.named(inner), Some(Item::Func(_))) || self.names_nested(inner);
                 if type_field && (names_fn || self.is_type_expr(inner)) {
                     let ty = self.expr_type(inner);
                     return self.type_field(ty, field, inner.span);
@@ -6005,7 +6078,7 @@ impl<'c> Body<'c> {
         unchecked: bool,
         span: Span,
     ) -> (Ty, Value) {
-        let to = self.ck.resolve_ty(ty);
+        let to = self.resolve_ty(ty);
         let expected = match to {
             // An integer literal cast to a pointer is an address, and to a
             // function pointer an index in the table.
@@ -6316,7 +6389,7 @@ impl<'c> Body<'c> {
     /// A call of function `id` with the scalars of its arguments, in
     /// parameter order.
     fn call_func(&mut self, id: FuncId, value: Value) -> (Ty, Value) {
-        let ret = self.ck.funcs[id.0 as usize].ret;
+        let ret = self.ck.sig(id).ret;
         let results = self.ck.val_types(ret);
         let mut pre = value.pre;
         // What an import takes and gives is passed as the host has it.
@@ -7098,7 +7171,7 @@ fn assigned_within(stmt: &parse::Stmt) -> Vec<String> {
         | StmtKind::While { cond: expr, .. }
         | StmtKind::For { iter: expr, .. }
         | StmtKind::Match { value: expr, .. } => push_assigned(expr, &mut names),
-        StmtKind::Pass | StmtKind::Defer(_) => {}
+        StmtKind::Pass | StmtKind::Defer(_) | StmtKind::Fn(_) => {}
     }
     names
 }
@@ -7297,7 +7370,8 @@ fn breaks(block: &[parse::Stmt]) -> bool {
         StmtKind::Match { value, arms } => {
             within(value) || arms.iter().any(|arm| breaks(&arm.body))
         }
-        StmtKind::While { .. } | StmtKind::Pass | StmtKind::Defer(_) => false,
+        // One in a function declared here is of a loop in that function.
+        StmtKind::While { .. } | StmtKind::Pass | StmtKind::Defer(_) | StmtKind::Fn(_) => false,
     })
 }
 
@@ -17844,6 +17918,201 @@ fn f(a: u8, b: uint, c: i32, x: f32, y: f64, t: bool):
                 (value("bool", "f32"), "t as! f32"),
                 (value("f64", "f32"), "1.5 as! f32"),
                 (value("i32", "u32"), "c as! u32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_function_in_a_function_is_called_as_one() {
+        let src = "\
+fn main() -> i32:
+    fn double(x: i32) -> i32:
+        return x * 2
+    return double(4)
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "main"), "(return (call main.double 4))");
+        assert_eq!(body(&module, "main.double"), "(return (I32.Mul x 2))");
+    }
+
+    #[test]
+    fn a_function_in_a_function_names_itself_and_those_declared_before_it() {
+        let src = "\
+fn main(n: i32) -> i32:
+    fn half(x: i32) -> i32:
+        return x / 2
+    fn count(x: i32) -> i32:
+        fn next(x: i32) -> i32:
+            return half(x)
+        if x == 0:
+            return 0
+        return 1 + count(next(x))
+    return count(n)
+";
+        let module = lower(src);
+        assert_eq!(body(&module, "main"), "(return (call main.count n))");
+        assert_eq!(
+            body(&module, "main.count"),
+            "(if (I32.Eq x 0) (then (return 0)) (else )) \
+             (return (I32.Add 1 (call main.count (call main.count.next x))))"
+        );
+        assert_eq!(
+            body(&module, "main.count.next"),
+            "(return (call main.half x))"
+        );
+        // Each is declared by its statement, as a `let` is, and for its
+        // block only.
+        let src = "\
+fn main() -> i32:
+    if true:
+        fn one() -> i32:
+            return later()
+    fn later() -> i32:
+        return 1
+    return one()
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                TypeErrorKind::UnknownName("later".into()),
+                TypeErrorKind::UnknownName("one".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_function_in_a_function_is_a_pointer_and_a_type_as_any_is() {
+        let src = "\
+struct(F: fn(i32) -> i32) Held:
+    f: F
+    n: u8
+fn(F: fn(i32) -> i32) twice(x: i32, f: F) -> i32:
+    return f(f(x))
+fn main() -> uint:
+    fn inc(x: i32) -> i32:
+        return x + 1
+    let p: fn(i32) -> i32 = inc
+    let f: inc = inc
+    let held = Held(inc)(f: inc, n: 1)
+    let both = [inc, inc]
+    let same = inc == p
+    let n = twice(p(1) + f(2), inc)
+    return inc.size + Held(inc).size
+";
+        let module = lower(src);
+        let table = module.table.as_ref().unwrap();
+        let names: Vec<_> = table
+            .funcs
+            .iter()
+            .map(|id| func_name(&module, *id))
+            .collect();
+        assert_eq!(names, ["main.inc"]);
+        assert!(body(&module, "main").ends_with("(return (I32.Add 0 1))"));
+        assert_eq!(
+            body(&module, "twice(main.inc)"),
+            "(return (call main.inc (call main.inc x)))"
+        );
+        // Its name is its type only where it is in scope.
+        let src = "\
+fn main():
+    if true:
+        fn inc(x: i32) -> i32:
+            return x + 1
+    let f: inc = todo
+";
+        assert_eq!(errors(src), vec![TypeErrorKind::UnknownType("inc".into())]);
+    }
+
+    #[test]
+    fn a_function_in_a_generic_function_is_of_each_instance() {
+        let src = "\
+fn(T) pick(a: T, b: T, first: bool) -> T:
+    fn choose(a: T, b: T, first: bool) -> T:
+        if first:
+            return a
+        return b
+    let p: fn(T, T, bool) -> T = choose
+    return p(choose(a, b, first), b, first)
+fn main() -> i64:
+    return pick(1 as u8, 2, true) as i64 + pick(3 as i64, 4, false)
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "pick(u8)"),
+            "(set p 1) \
+             (return (call_indirect p (call pick(u8).choose a b first) b first))"
+        );
+        let names: Vec<_> = module.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"pick(u8).choose"), "{names:?}");
+        assert!(names.contains(&"pick(i64).choose"), "{names:?}");
+        // None is of the declaration, which is only checked.
+        assert_eq!(names.len(), 5, "{names:?}");
+        let choose = module.funcs.iter().find(|f| f.name == "pick(i64).choose");
+        assert_eq!(choose.unwrap().results, [ValType::I64]);
+        // Its body is checked once, as the declaration around it is.
+        let src = "\
+fn(T) pick(a: T, b: T) -> T:
+    fn choose(a: T, b: T) -> T:
+        return a + b
+    return choose(a, b)
+";
+        let operand = TypeErrorKind::InvalidOperand {
+            op: "+",
+            ty: "T".into(),
+        };
+        assert_eq!(errors_at(src), vec![(operand, "a + b")]);
+    }
+
+    #[test]
+    fn a_function_in_a_function_is_declared_and_called_as_a_value() {
+        let src = "\
+fn(T) id(x: T) -> T:
+    return x
+fn main() -> i32:
+    fn(T) own(x: T) -> T:
+        return x
+    fn given(T: type, x: i32) -> i32:
+        return x
+    fn defaulted(x: i32 = 1) -> i32:
+        return x
+    fn hosted() = \"hosted\":
+        pass
+    fn add(a: i32, b: i32) -> i32:
+        return a + b
+    while true:
+        fn leave():
+            break
+    let a = add(1)
+    let b = add(1, b: 2)
+    return own(1) + defaulted()
+";
+        let nested = |kind: fn(String) -> TypeErrorKind, name: &str| kind(name.into());
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (nested(TypeErrorKind::NestedTypeParams, "own"), "T"),
+                (nested(TypeErrorKind::NestedTypeParams, "given"), "T: type"),
+                (nested(TypeErrorKind::NestedDefault, "defaulted"), "1"),
+                (
+                    nested(TypeErrorKind::NestedHostName, "hosted"),
+                    "\"hosted\""
+                ),
+                (TypeErrorKind::BreakOutsideLoop, "break"),
+                (
+                    TypeErrorKind::TooFewArgs {
+                        expected: 2,
+                        found: 1
+                    },
+                    "add(1)"
+                ),
+                (TypeErrorKind::LabelledPointerArg, "b"),
+                (
+                    TypeErrorKind::TooFewArgs {
+                        expected: 1,
+                        found: 0
+                    },
+                    "defaulted()"
+                ),
             ]
         );
     }

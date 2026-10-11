@@ -397,6 +397,7 @@ module.exports = grammar({
       $.match_statement,
       $.pass_statement,
       $.defer_statement,
+      $.function_declaration,
     ),
 
     expression_statement: $ => seq($._expression, $._newline),

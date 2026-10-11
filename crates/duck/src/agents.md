@@ -952,6 +952,58 @@ fn demo(f: fn(i32) -> i32) -> i32:
   `fn(i32) -> i32`.
 - `extern` functions have pointers too. Calling a zeroed pointer traps.
 
+### Functions in functions
+
+```duck
+struct(T, A: fn(uint) -> &var T) Pool:
+	make: A
+	count: uint = 0
+
+var next: uint = 8
+
+fn(T) ordered(a: &var T, b: &var T, swapped: bool):
+	fn swap(a: &var T, b: &var T):   # names the `T` of the function around it
+		let held = a.*
+		a.* = b.*
+		b.* = held
+	if swapped:
+		swap(a, b)
+
+fn demo(n: i32) -> uint:
+	fn double(x: i32) -> i32:
+		return x * 2
+	fn power(x: i32) -> i32:         # names itself, and `double` before it
+		if x <= 0:
+			return 1
+		return double(power(x - 1))
+	fn bump(size: uint) -> &var u8:
+		next += size
+		return (next - size) as! &var u8
+	let p: fn(i32) -> i32 = power    # a pointer to it, as to any function
+	let d: double = double           # its name is its type, in its block
+	let pool = Pool(u8, bump)(make: bump)
+	return (p(n) + d(n)) as uint + pool.count + double.size
+```
+
+- A `fn` in a block declares a function for the rest of that block, as a
+  `let` binds a name: nothing before its statement names it, and it
+  shadows as a `let` does.
+- It is a function in every way: of a type of its own, which takes no
+  storage, and a pointer to itself where one is expected. In its block its
+  name is its type where a type is written: `d: double`, `Pool(u8, bump)`,
+  `double.size`.
+- Its body names the type parameters of the function around it, the
+  functions declared before it in those around it, and itself. It names no
+  variable of theirs: a `n` in `double` is an error.
+- It is called as a value is, with every argument and positionally, so a
+  parameter of it has no default. It has no type parameters of its own, no
+  `pub` and no `= "name"`.
+- Its body is a function's: a `return` returns from it, a `break` or a
+  `continue` is of a loop in it, and its `defer`s run as its blocks are
+  left.
+- Each instance of a generic function has its own. An error names one for
+  the function around it: `demo.double`, `ordered(u8).swap`.
+
 ### Generic over a function
 
 ```duck

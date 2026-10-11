@@ -119,6 +119,8 @@ enum LocalKind<'p> {
     Var,
     /// Bound by a `for` or by an arm of a `match`.
     Bound,
+    /// A function declared in the body, by its signature.
+    Fn(&'p FnSig),
 }
 
 /// What a walk of the program found at a place.
@@ -308,11 +310,14 @@ impl Analysis {
         let mut src = Sources::new(&mut read);
         let described = match site.found.as_ref()? {
             Found::Local(local) => Some((local.span, self.local_text(&mut src, local)?)),
-            Found::Path { names, span } => {
-                let item = self.path(file, names)?;
-                let text = self.item_text(&mut src, &site, item, names.last()?)?;
-                Some((*span, text))
-            }
+            Found::Path { names, span } => match site.local_fn(names) {
+                Some(local) => Some((*span, self.local_text(&mut src, local)?)),
+                None => {
+                    let item = self.path(file, names)?;
+                    let text = self.item_text(&mut src, &site, item, names.last()?)?;
+                    Some((*span, text))
+                }
+            },
             Found::Declared(name) => {
                 let item = self.item(file, &name.name)?;
                 let text = self.item_text(&mut src, &site, item, &name.name)?;
@@ -943,6 +948,9 @@ impl Analysis {
             Found::Declared(name) => self.item(site.file, &name.name).map(Target::Item),
             Found::Used { item, .. } => Some(Target::Item(*item)),
             Found::Path { names, .. } => match (self.path(site.file, names), &names[..]) {
+                _ if site.local_fn(names).is_some() => {
+                    site.local_fn(names).copied().map(Target::Local)
+                }
                 (Some(item), _) => Some(Target::Item(item)),
                 (None, [name]) => site.type_param(name).map(Target::TypeParam),
                 (None, _) => None,
@@ -1244,6 +1252,7 @@ impl Analysis {
             LocalKind::Let => format!("let {name}: {}", self.type_at(local.span)?),
             LocalKind::Var => format!("var {name}: {}", self.type_at(local.span)?),
             LocalKind::Bound => format!("{name}: {}", self.type_at(local.span)?),
+            LocalKind::Fn(sig) => sig_text(src, sig),
         })
     }
 
@@ -1564,6 +1573,16 @@ impl<'p> Site<'p> {
         let mut params = self.type_params.iter();
         params.find(|param| param.name == name).copied()
     }
+
+    /// The function declared in a function that `names` name where a type
+    /// is written, if they are the name of one in scope.
+    fn local_fn(&self, names: &[&str]) -> Option<&Local<'p>> {
+        let [name] = names else {
+            return None;
+        };
+        let local = self.local(name)?;
+        matches!(local.kind, LocalKind::Fn(_)).then_some(local)
+    }
 }
 
 impl<'p> Walk<'p> {
@@ -1593,13 +1612,7 @@ impl<'p> Walk<'p> {
                 if self.sig(&decl.sig) {
                     return true;
                 }
-                // A type parameter is a type by its name, and no variable.
-                let params = decl.sig.params.iter().filter(|param| !param.ty.is_type());
-                self.site.locals.extend(params.map(|param| Local {
-                    name: &param.name.name,
-                    span: param.name.span,
-                    kind: LocalKind::Param(param),
-                }));
+                self.site.locals.extend(param_locals(&decl.sig));
                 self.block(&decl.body)
             }
             ItemKind::Extern(block) => {
@@ -1676,12 +1689,14 @@ impl<'p> Walk<'p> {
 
     fn sig(&mut self, sig: &'p FnSig) -> bool {
         let mut bounds = sig.type_params.iter().flat_map(|p| &p.bound);
-        if self.declared(&sig.name)
+        self.declared(&sig.name)
             || self.type_params(&sig.type_params)
             || bounds.any(|bound| self.ty(bound))
-        {
-            return true;
-        }
+            || self.params(sig)
+    }
+
+    /// Looks for the place in what `sig` takes and gives.
+    fn params(&mut self, sig: &'p FnSig) -> bool {
         for param in &sig.params {
             if !self.statement && self.holds(param.name.span) {
                 return self.find(Found::Local(Local {
@@ -1705,8 +1720,10 @@ impl<'p> Walk<'p> {
             if self.stmt(stmt) {
                 return true;
             }
-            if let StmtKind::Binding(binding) = &stmt.kind {
-                self.bind(&binding.pattern, binding_kind(binding));
+            match &stmt.kind {
+                StmtKind::Binding(binding) => self.bind(&binding.pattern, binding_kind(binding)),
+                StmtKind::Fn(decl) => self.site.locals.push(fn_local(&decl.sig)),
+                _ => {}
             }
         }
         self.site.locals.truncate(depth);
@@ -1774,6 +1791,24 @@ impl<'p> Walk<'p> {
                 false
             }
             StmtKind::Defer(body) => self.block(body),
+            StmtKind::Fn(decl) => {
+                let local = fn_local(&decl.sig);
+                if !self.statement && self.holds(local.span) {
+                    return self.find(Found::Local(local));
+                }
+                if self.params(&decl.sig) {
+                    return true;
+                }
+                // Its body names it, and what it takes.
+                let depth = self.site.locals.len();
+                self.site.locals.push(local);
+                self.site.locals.extend(param_locals(&decl.sig));
+                let found = self.block(&decl.body);
+                if !found {
+                    self.site.locals.truncate(depth);
+                }
+                found
+            }
             StmtKind::Pass => false,
         }
     }
@@ -2051,6 +2086,26 @@ fn signature(head: String, params: Vec<(Option<String>, String)>, tail: &str) ->
         label,
         params: placed,
     }
+}
+
+/// The function that `sig` declares in a function, as a name of its body.
+fn fn_local(sig: &FnSig) -> Local<'_> {
+    Local {
+        name: &sig.name.name,
+        span: sig.name.span,
+        kind: LocalKind::Fn(sig),
+    }
+}
+
+/// The parameters of `sig` as names of its function's body. A type
+/// parameter is a type by its name, and no variable.
+fn param_locals(sig: &FnSig) -> impl Iterator<Item = Local<'_>> {
+    let params = sig.params.iter().filter(|param| !param.ty.is_type());
+    params.map(|param| Local {
+        name: &param.name.name,
+        span: param.name.span,
+        kind: LocalKind::Param(param),
+    })
 }
 
 /// `sig` as it is written, on one line.
@@ -2951,6 +3006,70 @@ fn take(pool: &Pool(u8, bump), again: bump) -> &var u8:
         let (file, offset) = files.at("main", "again\n");
         let signature = analysis.signature(&mut files, file, offset).unwrap();
         assert_eq!(signature.label, "fn(uint) -> &var u8");
+    }
+
+    #[test]
+    fn a_function_in_a_function_is_a_variable_of_it() {
+        let src = "\
+fn outer(n: i32) -> i32:
+    fn double(x: i32) -> i32:
+        fn spare():
+            pass
+        return x * 2
+    let held: double = double
+    held
+    return held(n) + double(n)
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let line = |span: Span| src[span.start..].lines().next().unwrap();
+        // It is declared by its statement, and described as it is written
+        // there: where it is called, and where it is a type.
+        for text in ["double(n)", "double = double", "double\n    held"] {
+            let (file, offset) = files.at("main", text);
+            let declared = analysis.definition(file, offset).unwrap();
+            assert_eq!(line(declared), "double(x: i32) -> i32:");
+            let hover = analysis.hover(&mut files, file, offset).unwrap();
+            assert_eq!(hover.text, "fn double(x: i32) -> i32");
+        }
+        let (file, offset) = files.at("main", "double(x");
+        let hover = analysis.hover(&mut files, file, offset).unwrap();
+        assert_eq!(hover.text, "fn double(x: i32) -> i32");
+        let spans = analysis.references(&mut files, file, offset, true);
+        let lines: Vec<_> = spans
+            .iter()
+            .map(|span| src[..span.start].matches('\n').count() + 1)
+            .collect();
+        assert_eq!(lines, [2, 6, 6, 8]);
+        // Its parameters are variables of its body.
+        let (file, offset) = files.at("main", "x * 2");
+        assert_eq!(
+            line(analysis.definition(file, offset).unwrap()),
+            "x: i32) -> i32:"
+        );
+        let (file, offset) = files.at("main", "held\n");
+        let signature = analysis.signature(&mut files, file, offset).unwrap();
+        assert_eq!(signature.label, "fn(i32) -> i32");
+        // One that nothing names is unused, as a variable is.
+        let unused = analysis.unused(&mut files);
+        let unused: Vec<_> = unused
+            .iter()
+            .map(|unused| format!("{:?} {}", unused.kind, unused.name))
+            .collect();
+        assert_eq!(unused, ["Function outer", "Function spare"]);
+        // It is a symbol of the function that declares it.
+        let symbols = analysis.symbols(file);
+        let [outer] = &symbols[..] else {
+            panic!("{symbols:?}");
+        };
+        let [double] = &outer.children[..] else {
+            panic!("{outer:?}");
+        };
+        assert_eq!(
+            (double.kind, double.name.as_str()),
+            (SymbolKind::Function, "double")
+        );
+        assert_eq!(double.children[0].name, "spare");
     }
 
     #[test]

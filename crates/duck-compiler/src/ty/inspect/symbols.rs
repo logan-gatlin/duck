@@ -3,7 +3,7 @@
 
 use crate::file::FileId;
 use crate::lex::Span;
-use crate::parse::{Entry, Ident, ItemKind, Pattern, PatternKind};
+use crate::parse::{self, Entry, Ident, ItemKind, Pattern, PatternKind, StmtKind};
 
 use super::Analysis;
 
@@ -17,7 +17,8 @@ pub struct Symbol {
     /// Where it is named in it.
     pub name_span: Span,
     /// The fields of a struct, the variants of a union or the members of an
-    /// enum that it writes itself.
+    /// enum that it writes itself, or the functions that the body of a
+    /// function declares.
     pub children: Vec<Symbol>,
 }
 
@@ -59,7 +60,8 @@ impl Analysis {
             };
             match &item.kind {
                 ItemKind::Fn(decl) => {
-                    symbols.push(symbol(&decl.sig.name, SymbolKind::Function, Vec::new()));
+                    let nested = nested(&decl.body);
+                    symbols.push(symbol(&decl.sig.name, SymbolKind::Function, nested));
                 }
                 ItemKind::Extern(block) => {
                     let fns = block.fns.iter().map(|f| (&f.sig.name, f.span));
@@ -100,6 +102,39 @@ impl Analysis {
         }
         symbols
     }
+}
+
+/// The functions that the statements of `block` declare, each with those
+/// that its own body declares.
+fn nested(block: &[parse::Stmt]) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    for stmt in block {
+        match &stmt.kind {
+            StmtKind::Fn(decl) => symbols.push(Symbol {
+                name: decl.sig.name.name.clone(),
+                kind: SymbolKind::Function,
+                span: stmt.span,
+                name_span: decl.sig.name.span,
+                children: nested(&decl.body),
+            }),
+            StmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                symbols.extend(nested(then_body));
+                symbols.extend(nested(else_body.as_deref().unwrap_or_default()));
+            }
+            StmtKind::While { body, .. } | StmtKind::For { body, .. } | StmtKind::Defer(body) => {
+                symbols.extend(nested(body));
+            }
+            StmtKind::Match { arms, .. } => {
+                symbols.extend(arms.iter().flat_map(|arm| nested(&arm.body)));
+            }
+            StmtKind::Binding(_) | StmtKind::Expr(_) | StmtKind::Pass => {}
+        }
+    }
+    symbols
 }
 
 /// The names that `pattern` binds, and where each is.

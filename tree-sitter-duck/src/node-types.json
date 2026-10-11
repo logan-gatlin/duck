@@ -226,6 +226,10 @@
         "named": true
       },
       {
+        "type": "function_declaration",
+        "named": true
+      },
+      {
         "type": "if_statement",
         "named": true
       },
