@@ -30,7 +30,7 @@ use enums::EnumDef;
 use evaluate::Dep;
 use generic::{Arity, Instance, ParamDef, ParamDefaults, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
-use nested::Around;
+use nested::Closure;
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
 mod alias;
@@ -579,6 +579,15 @@ pub enum TypeErrorKind {
     /// A `defer` that no statement but a `defer` follows in its block, so
     /// that it would run where it is written.
     TrailingDefer,
+    /// An assignment to a `var` of a function around the one it is in, which
+    /// has only a copy of it, as it was where the function is declared.
+    CapturedAssign(String),
+    /// A closure where a pointer to a function is needed: a pointer is to
+    /// the function alone, and holds nothing of what it captures.
+    ClosurePointer {
+        name: String,
+        captures: Vec<String>,
+    },
     /// A function declared in a function that has type parameters of its
     /// own: it has those of the function around it.
     NestedTypeParams(String),
@@ -925,6 +934,9 @@ struct Checker {
     /// Each function that is declared in another, by the function whose
     /// body declares it, if that is one, and where it is declared.
     nested: HashMap<(Option<FuncId>, Span), FuncId>,
+    /// What each function that is declared in another is beyond its
+    /// signature: what it is named and what it captures.
+    closures: HashMap<FuncId, Closure>,
     /// The function `==` compares each array type through.
     eq_funcs: HashMap<Ty, FuncId>,
     /// The functions that pointers call, in the order their pointers are
@@ -1169,6 +1181,8 @@ struct Body<'c> {
     func: Option<FuncId>,
     /// The name of the function this is the body of, if it's one.
     name: String,
+    /// How many variables it has bound.
+    bound: usize,
     ret: Ty,
     locals: Vec<ir::Local>,
     scopes: Vec<HashMap<String, Var>>,
@@ -1208,9 +1222,14 @@ struct Body<'c> {
 struct Var {
     ty: Ty,
     mutable: bool,
+    /// Whether it is the copy that a function declared in a function has
+    /// of a `var` it captures, which is no variable to assign.
+    captured: bool,
     /// Whether a `fn` in a function declares it, so that its name is its
     /// type where a type is written.
     func: bool,
+    /// How many variables the body bound before it.
+    order: usize,
     /// One local per scalar leaf of `ty`.
     slots: Vec<LocalId>,
 }
@@ -1681,6 +1700,22 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "this `defer` defers nothing: no statement but a `defer` follows it in its block"
             ),
+            Self::CapturedAssign(name) => write!(
+                f,
+                "can't assign to `{name}`: this function has a copy of it, as it was where \
+                 the function is declared. What is to change is written through a `&var` \
+                 or a `varray` that it captures"
+            ),
+            Self::ClosurePointer { name, captures } => {
+                let captures: Vec<_> = captures.iter().map(|c| format!("`{c}`")).collect();
+                write!(
+                    f,
+                    "`{name}` is no pointer to a function: it captures {}, which a value \
+                     of its type holds. A type parameter that a function type bounds \
+                     takes its type",
+                    captures.join(", ")
+                )
+            }
             Self::NestedTypeParams(name) => write!(
                 f,
                 "`{name}` is declared in a function, so it has no type parameters of its own: \
@@ -3162,19 +3197,17 @@ impl Checker {
         self.record_params(&decl.sig, &sig);
         let own = self.exports(item).then_some(sig.name.as_str());
         let exports = self.export_names(Item::Func(id), own);
-        self.lower_body(program, Some(id), &[], sig, &decl.body, item.span, exports)
+        self.lower_body(program, Some(id), sig, &decl.body, item.span, exports)
     }
 
     /// Lowers a function of `program` with signature `sig` and body `block`,
     /// declared by what spans `span`, and exported as each of `exports`. It
     /// is function `id`, unless it is a generic function checked as
-    /// declared, and its body names each of `around`.
-    #[allow(clippy::too_many_arguments)]
+    /// declared.
     fn lower_body(
         &mut self,
         program: &Program,
         id: Option<FuncId>,
-        around: &[Around],
         sig: FuncSig,
         block: &parse::Block,
         span: Span,
@@ -3184,8 +3217,10 @@ impl Checker {
         body.program = Some(program);
         body.func = id;
         body.name = sig.name.clone();
-        for outer in around {
-            body.bind_around(outer);
+        // What one declared in a function captures is passed before what
+        // it takes.
+        if let Some(id) = id {
+            body.bind_captures(id);
         }
         // A type parameter is a type by its name, and no variable.
         for (name, ty) in sig.params.iter().filter(|(_, ty)| *ty != Ty::Type) {
@@ -3687,6 +3722,12 @@ impl Checker {
     fn push_leaves(&self, ty: Ty, name: String, out: &mut Vec<(String, ValType)>) {
         let ty = self.known(ty);
         match ty {
+            // A function holds what it captures, each by its name.
+            Ty::Func(id) => {
+                for capture in self.captures(id) {
+                    self.push_leaves(capture.ty, format!("{name}.{}", capture.name), out);
+                }
+            }
             Ty::Prim(prim) => out.push((name, self.fixed(prim).val_type())),
             Ty::Ptr(_) | Ty::Fn(_) => out.push((name, self.addr_type())),
             Ty::Enum(id) => self.push_leaves(self.enum_ty(id), name, out),
@@ -3713,7 +3754,7 @@ impl Checker {
                     self.push_leaves(member, format!("{name}.{field}"), out);
                 }
             }
-            Ty::Func(_) | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -4024,9 +4065,12 @@ impl Checker {
                 let (_, size, align) = self.aggregate_layout(ty);
                 (size, align)
             }
+            // A function is laid out as what it captures, which is nothing
+            // unless it is declared in a function.
+            Ty::Func(id) => self.held(id).map_or((0, 1), |held| self.layout(held)),
             // Never in memory, but a struct holding one still has a layout
             // that `field` asks for.
-            Ty::Func(_) | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
         }
     }
 
@@ -4106,7 +4150,12 @@ impl Checker {
                     self.push_cells(member, offset + member_offset, &held, &when, out);
                 }
             }
-            Ty::Func(_) | Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Func(id) => {
+                if let Some(held) = self.held(id) {
+                    self.push_cells(held, offset, leaves, &when, out);
+                }
+            }
+            Ty::Param(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
         }
     }
 
@@ -4276,6 +4325,7 @@ impl<'c> Body<'c> {
             ck,
             func: None,
             name: String::new(),
+            bound: 0,
             ret,
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
@@ -4310,6 +4360,10 @@ impl<'c> Body<'c> {
         let unchecked = matches!(found, Ty::Never | Ty::Error) || want == Ty::Error;
         if self.ck.fits(found, want) || unchecked {
             return;
+        }
+        // A closure is no pointer, whatever it is called as.
+        if let (Ty::Fn(_), Some(kind)) = (want, self.ck.no_pointer(found)) {
+            return self.error(kind, span);
         }
         // A function that is no pointer of the type expected is found as
         // the pointer that it would be.
@@ -4370,19 +4424,21 @@ impl<'c> Body<'c> {
     }
 
     fn bind(&mut self, name: &str, ty: Ty, mutable: bool, slots: Vec<LocalId>) {
-        let func = false;
-        self.bind_var(
-            name,
-            Var {
-                ty,
-                mutable,
-                func,
-                slots,
-            },
-        );
+        let var = Var {
+            ty,
+            mutable,
+            captured: false,
+            func: false,
+            order: 0,
+            slots,
+        };
+        self.bind_var(name, var);
     }
 
-    fn bind_var(&mut self, name: &str, var: Var) {
+    /// Binds `name` to `var`, the next variable of the body.
+    fn bind_var(&mut self, name: &str, mut var: Var) {
+        var.order = self.bound;
+        self.bound += 1;
         self.scopes
             .last_mut()
             .unwrap()
@@ -4565,7 +4621,7 @@ impl<'c> Body<'c> {
             StmtKind::For { var, iter, body } => self.for_loop(var, iter, body, out),
             StmtKind::Match { value, arms } => self.match_stmt(value, arms, out),
             StmtKind::Pass => {}
-            StmtKind::Fn(decl) => self.nested_fn(decl, stmt.span),
+            StmtKind::Fn(decl) => self.nested_fn(decl, stmt.span, out),
             // Nothing runs here: the body is lowered as what it names is
             // now, and is run wherever the block is left.
             StmtKind::Defer(body) => {
@@ -4610,6 +4666,9 @@ impl<'c> Body<'c> {
                 Some(ty) => {
                     let (ty, needs, element) = self.read_only(ty);
                     TypeErrorKind::ReadOnlyWrite { ty, needs, element }
+                }
+                None if self.lookup(&place.name).is_some_and(|var| var.captured) => {
+                    TypeErrorKind::CapturedAssign(place.name.clone())
                 }
                 None => TypeErrorKind::ImmutableAssign(place.name.clone()),
             };
@@ -4658,8 +4717,10 @@ impl<'c> Body<'c> {
             return self.check(value, place.ty);
         };
         let (ty, lowered) = self.expr(value, Some(place.ty));
+        // No pointer holds a closure, so none is said to hold either.
+        let closure = [ty, place.ty].map(|ty| self.ck.closure_part(ty));
         match ty {
-            Ty::Func(_) | Ty::Fn(_) if ty != place.ty => {
+            Ty::Func(_) | Ty::Fn(_) if ty != place.ty && closure == [None, None] => {
                 let pointer = self.ck.pointer_ty_of(place.ty);
                 let kind = TypeErrorKind::OneFunction {
                     name: place.name.clone(),
@@ -5534,6 +5595,8 @@ impl<'c> Body<'c> {
             if let Some(Ty::Func(first)) = elem
                 && elem != Some(ty)
                 && self.ck.pointer_ty_of(ty) == self.ck.pointer_ty(first)
+                && self.ck.closure_part(ty).is_none()
+                && !self.ck.is_closure(first)
             {
                 let pointer = self.ck.pointer_ty(first);
                 consts = consts
@@ -18115,5 +18178,261 @@ fn main() -> i32:
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_function_captures_the_variables_it_names_as_they_are() {
+        let src = "\
+fn main(n: i32, m: i32, unnamed: i32) -> i32:
+    var k = 3
+    let x = 9
+    fn add(x: i32) -> i32:
+        let unnamed = 1
+        return x + k + n + unnamed
+    k = 4
+    return add(m) + add(x)
+";
+        let module = lower(src);
+        // It holds a copy of each, in the order they are declared, which it
+        // is passed before what it takes.
+        assert_eq!(
+            body(&module, "main"),
+            "(set k 3) (set x 9) (set add.n n) (set add.k k) (set k 4) \
+             (return (I32.Add (call main.add add.n add.k m) (call main.add add.n add.k x)))"
+        );
+        assert_eq!(
+            body(&module, "main.add"),
+            "(set unnamed 1) (return (I32.Add (I32.Add (I32.Add x k) n) unnamed))"
+        );
+        let add = module.funcs.iter().find(|f| f.name == "main.add").unwrap();
+        assert_eq!(add.params, [ValType::I32; 3]);
+        let names: Vec<_> = add.locals.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["n", "k", "x", "unnamed"]);
+    }
+
+    #[test]
+    fn a_capture_is_a_copy_that_is_not_assigned() {
+        let src = "\
+struct P:
+    x: i32
+fn main(total: &var i32, cells: varray(i32)) -> i32:
+    var n = 1
+    var p = P(x: 1)
+    let k = 2
+    fn bump(by: i32):
+        n += by
+        p.x = by
+        k = by
+        total.* += by
+        cells[0] = by
+        var n = n
+        n += 1
+        fn inner():
+            n = 5
+            p.x = 6
+    bump(1)
+    return n
+";
+        let captured = |name: &str| TypeErrorKind::CapturedAssign(name.into());
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (captured("n"), "n"),
+                (captured("p"), "p.x"),
+                (TypeErrorKind::ImmutableAssign("k".into()), "k"),
+                // Of the `var` that hides the copy, it has a copy too.
+                (captured("n"), "n"),
+                (captured("p"), "p.x"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_closure_is_called_and_held_and_is_no_pointer() {
+        let src = "\
+struct(F: fn(i32) -> i32) Held:
+    f: F
+fn(F: fn(i32) -> i32) twice(x: i32, f: F) -> i32:
+    return f(f(x))
+fn each(f: fn(i32) -> i32) -> i32:
+    return f(1)
+fn main(n: i32) -> uint:
+    fn add(x: i32) -> i32:
+        return x + n
+    fn sub(x: i32) -> i32:
+        return x - n
+    let p: fn(i32) -> i32 = add
+    let a = each(add)
+    let same = add == add
+    let held = Held(add)(f: add)
+    let equal = held == held
+    let address = add as uint
+    var either = add
+    either = sub
+    let both = [add, sub]
+    match add:
+        1:
+            pass
+        other:
+            pass
+    return twice(1, add) as uint
+";
+        let pointer = || TypeErrorKind::ClosurePointer {
+            name: "main.add".into(),
+            captures: vec!["n".into()],
+        };
+        let operand = |ty: &str| TypeErrorKind::InvalidOperand {
+            op: "==",
+            ty: ty.into(),
+        };
+        let cast = TypeErrorKind::InvalidCast {
+            from: "main.add".into(),
+            to: "uint".into(),
+        };
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (pointer(), "add"),
+                (pointer(), "add"),
+                (operand("main.add"), "add == add"),
+                (operand("Held(main.add)"), "held == held"),
+                (cast, "add as uint"),
+                // Each is of a type of its own, which no pointer stands for.
+                (mismatch("main.add", "main.sub"), "sub"),
+                (TypeErrorKind::InconstantFnLiteral, "add"),
+                (mismatch("main.add", "main.sub"), "sub"),
+                (TypeErrorKind::InconstantFnLiteral, "sub"),
+                // It matches a name, and nothing that would compare it.
+                (mismatch("i32", "main.add"), "1"),
+            ]
+        );
+        // One that names only functions holds nothing, and is one.
+        let src = "\
+fn main(n: i32) -> i32:
+    fn one() -> i32:
+        return 1
+    fn two() -> i32:
+        let unit = ()
+        return one() + one()
+    fn three() -> i32:
+        return two() + one()
+    let p: fn() -> i32 = three
+    return p() + two.size as i32
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "main.three"),
+            "(return (I32.Add (call main.two ) (call main.one )))"
+        );
+    }
+
+    #[test]
+    fn a_closure_is_as_large_as_what_it_captures() {
+        let src = "\
+struct(F: fn(i32) -> i64) Held:
+    tag: u8
+    f: F
+fn(F: fn(i32) -> i64) call(x: i32, f: F) -> i64:
+    return f(x)
+fn(F) keep(f: F) -> F:
+    return f
+fn main(a: u8, b: i64, c: u16, at: &var Held(fn(i32) -> i64)) -> i64:
+    fn sum(x: i32) -> i64:
+        return a as i64 + b + c as i64 + x as i64
+    let kept = keep(sum)
+    let held = Held(sum)(tag: 1, f: kept)
+    let size = sum.size + sum.align + Held(sum).size
+    return call(1, held.f) + size as i64
+";
+        let module = lower(src);
+        // It is laid out as a struct of them is, in the order declared.
+        let main = body(&module, "main");
+        assert!(
+            main.contains("(set size (I32.Add (I32.Add 24 8) 32))"),
+            "{main}"
+        );
+        assert_eq!(
+            body(&module, "call(main.sum)"),
+            "(return (call main.sum f.a f.b f.c x))"
+        );
+        let keep = module.funcs.iter().find(|f| f.name == "keep(main.sum)");
+        assert_eq!(
+            keep.unwrap().results,
+            [ValType::I32, ValType::I64, ValType::I32]
+        );
+    }
+
+    #[test]
+    fn a_closure_captures_what_those_in_it_name_and_holds_itself() {
+        let src = "\
+fn main(n: i32, m: i32) -> i32:
+    fn outer(d: i32) -> i32:
+        fn inner(x: i32) -> i32:
+            if x > m:
+                return outer(d - 1)
+            return x + n
+        if d == 0:
+            return 0
+        return inner(d)
+    return outer(m)
+";
+        let module = lower(src);
+        // `outer` captures what `inner` names of `main`, and `inner` holds
+        // the `outer` it calls, which is what `outer` holds.
+        assert_eq!(
+            body(&module, "main"),
+            "(set outer.n n) (set outer.m m) (return (call main.outer outer.n outer.m m))"
+        );
+        assert_eq!(
+            body(&module, "main.outer"),
+            "(set inner.n n) (set inner.m m) (set inner.outer.n n) (set inner.outer.m m) \
+             (set inner.d d) \
+             (if (I32.Eq d 0) (then (return 0)) (else )) \
+             (return (call main.outer.inner inner.n inner.m inner.outer.n inner.outer.m inner.d d))"
+        );
+        assert_eq!(
+            body(&module, "main.outer.inner"),
+            "(if (I32.GtS x m) (then (return (call main.outer outer.n outer.m (I32.Sub d 1)))) \
+             (else )) (return (I32.Add x n))"
+        );
+    }
+
+    #[test]
+    fn a_closure_in_a_generic_function_captures_what_each_instance_has() {
+        let src = "\
+fn(T, F: fn(T) -> T) apply(x: T, f: F) -> T:
+    return f(x)
+fn(T) either(a: T, b: T, first: bool) -> T:
+    fn pick(other: T) -> T:
+        if first:
+            return a
+        return other
+    return apply(b, pick)
+fn main() -> i64:
+    return either(1 as i64, 2, true) + either(3 as u8, 4, false) as i64
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "either(i64)"),
+            "(set pick.a a) (set pick.first first) \
+             (return (call apply(i64, either(i64).pick) b pick.a pick.first))"
+        );
+        let pick = |name: &str| module.funcs.iter().find(|f| f.name == name).unwrap();
+        let (wide, narrow) = (pick("either(i64).pick"), pick("either(u8).pick"));
+        assert_eq!(wide.params, [ValType::I64, ValType::I32, ValType::I64]);
+        assert_eq!(narrow.params, [ValType::I32; 3]);
+        // What is wrong of one is wrong as declared, whatever `T` is given.
+        let src = "\
+fn(T) either(a: T) -> T:
+    fn pick() -> T:
+        return a
+    let p: fn() -> T = pick
+    return p()
+";
+        let pointer = TypeErrorKind::ClosurePointer {
+            name: "either.pick".into(),
+            captures: vec!["a".into()],
+        };
+        assert_eq!(errors_at(src), vec![(pointer, "pick")]);
     }
 }

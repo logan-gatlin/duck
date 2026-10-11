@@ -138,7 +138,8 @@ impl Body<'_> {
         span: Span,
     ) -> (Ty, Value) {
         let bool = Ty::Prim(Prim::Bool);
-        if ty == Ty::Error || !self.ck.storable(ty) {
+        // What a closure captures is its own to know: none is compared.
+        if ty == Ty::Error || !self.ck.storable(ty) || self.ck.closure_part(ty).is_some() {
             return self.invalid_operand(binop_symbol(op), ty, span);
         }
         (bool, self.compare(op, ty, lhs, rhs))

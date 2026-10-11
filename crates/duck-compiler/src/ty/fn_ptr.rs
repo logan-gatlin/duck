@@ -176,7 +176,9 @@ impl Body<'_> {
     /// Any other is what it was. `value` is evaluated first.
     pub(super) fn as_expected(&mut self, ty: Ty, value: Value, want: Option<Ty>) -> (Ty, Value) {
         match (ty, want) {
-            (Ty::Func(id), Some(want @ Ty::Fn(_))) if self.ck.pointer_ty(id) == want => {
+            (Ty::Func(id), Some(want @ Ty::Fn(_)))
+                if self.ck.pointer_ty(id) == want && !self.ck.is_closure(id) =>
+            {
                 (want, self.pointer_to(id, value))
             }
             _ => (ty, value),

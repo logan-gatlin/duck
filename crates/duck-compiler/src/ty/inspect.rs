@@ -32,7 +32,7 @@ mod actions;
 mod hints;
 mod lints;
 mod symbols;
-mod visit;
+pub(super) mod visit;
 
 /// A program as checked, with the type of all that is written in it.
 pub struct Analysis {
@@ -1252,7 +1252,17 @@ impl Analysis {
             LocalKind::Let => format!("let {name}: {}", self.type_at(local.span)?),
             LocalKind::Var => format!("var {name}: {}", self.type_at(local.span)?),
             LocalKind::Bound => format!("{name}: {}", self.type_at(local.span)?),
-            LocalKind::Fn(sig) => sig_text(src, sig),
+            LocalKind::Fn(sig) => {
+                let text = sig_text(src, sig);
+                let captures = match self.ty_at(local.span) {
+                    Some(Ty::Func(id)) => self.ck.captures_text(id),
+                    _ => None,
+                };
+                match captures {
+                    Some(captures) => format!("{text}\n# {captures}"),
+                    None => text,
+                }
+            }
         })
     }
 
@@ -3070,6 +3080,48 @@ fn outer(n: i32) -> i32:
             (SymbolKind::Function, "double")
         );
         assert_eq!(double.children[0].name, "spare");
+    }
+
+    #[test]
+    fn a_closure_is_described_with_what_it_captures() {
+        let src = "\
+fn(T) outer(n: i32, wide: i64, item: T) -> i32:
+    var count = n
+    fn add(x: i32) -> i32:
+        return x + count + wide as i32
+    fn held() -> T:
+        return item
+    fn unused(x: i32) -> i32:
+        return x
+    return add(count)
+fn one(flag: bool) -> bool:
+    fn get() -> bool:
+        return flag
+    return get()
+";
+        let mut files = Memory(vec![("main", src)]);
+        let analysis = analysis(&mut files);
+        let mut hover = |text: &str| {
+            let (file, offset) = files.at("main", text);
+            analysis.hover(&mut files, file, offset).unwrap().text
+        };
+        // Each variable it has a copy of, in the order it holds them, and
+        // how many bytes they take.
+        assert_eq!(
+            hover("add(count)"),
+            "fn add(x: i32) -> i32\n# captures wide: i64, count: i32 (16 bytes)"
+        );
+        assert_eq!(
+            hover("get()\n"),
+            "fn get() -> bool\n# captures flag: bool (1 byte)"
+        );
+        // One of a type parameter is as large as what that is given.
+        assert_eq!(hover("held()"), "fn held() -> T\n# captures item: T");
+        assert_eq!(hover("unused(x"), "fn unused(x: i32) -> i32");
+        // A variable that only a closure names is used.
+        let unused = analysis.unused(&mut files);
+        let unused: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
+        assert_eq!(unused, ["outer", "held", "unused", "one"]);
     }
 
     #[test]

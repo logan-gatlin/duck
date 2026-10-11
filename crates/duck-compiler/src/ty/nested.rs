@@ -2,22 +2,170 @@
 //! a type of its own, which the rest of its block names: the statement
 //! that declares it binds its name to it, as a `let` would.
 //!
+//! Its body names the variables of the functions around it that are in
+//! scope where it is declared, and captures each that it names: the
+//! function holds a copy of it, as it is when the statement runs. So a
+//! value of its type is as large as what it captures, laid out as a struct
+//! of them in the order they are declared, and a call passes those before
+//! what the function takes. One that captures nothing holds nothing, as a
+//! function of the module does.
+//!
 //! Its body is lowered where it is declared, once for each instance of the
-//! function around it, whose type parameters it names. It names the
-//! functions that are declared before it in those around it, and itself.
+//! function around it, whose type parameters it names.
 
-use crate::ir::FuncId;
+use crate::ir::{FuncId, LocalId};
 use crate::lex::Span;
 use crate::load::Program;
-use crate::parse;
+use crate::parse::{self, ExprKind, Pattern, PatternKind, StmtKind};
 
-use super::{Body, Checker, FuncSig, OPEN_FUNCS, Synth, Ty, TypeErrorKind, Var};
+use super::inspect::visit::{self, Node};
+use super::{Body, Checker, Expr, FuncSig, OPEN_FUNCS, Stmt, Synth, Ty, TypeErrorKind, Value, Var};
 
-/// What the body of a function declared in another names of those around
-/// it: a function declared before it, or itself.
-pub(super) struct Around {
+/// What a function declared in a function is beyond its signature.
+#[derive(Clone)]
+pub(super) struct Closure {
+    /// The name it is declared by, which its body names it by.
     name: String,
-    ty: Ty,
+    /// The variables of the functions around it that its body names, in
+    /// the order they are declared.
+    pub(super) captures: Vec<Capture>,
+    /// The tuple of what it captures, which a value of its type is laid
+    /// out as.
+    held: Ty,
+}
+
+/// A variable that a function declared in a function captures.
+#[derive(Clone)]
+pub(super) struct Capture {
+    pub(super) name: String,
+    pub(super) ty: Ty,
+    /// Whether it is a `var`, which the function has a copy of that it
+    /// doesn't assign.
+    var: bool,
+    /// Whether a `fn` in a function declares it.
+    func: bool,
+}
+
+/// The names that the body of a function declared in a function mentions
+/// and doesn't bind, which are those of the functions around it.
+#[derive(Default)]
+struct Free<'p> {
+    /// The names in scope that the function binds, innermost last.
+    bound: Vec<&'p str>,
+    names: Vec<&'p str>,
+}
+
+impl<'p> Free<'p> {
+    /// The names free in the function `decl`.
+    fn of(decl: &'p parse::FnDecl) -> Vec<&'p str> {
+        let mut free = Self::default();
+        free.function(decl);
+        free.names
+    }
+
+    /// Finds those of the function `decl`, whose body names it and what it
+    /// takes. One declared here is free of what this one binds.
+    fn function(&mut self, decl: &'p parse::FnDecl) {
+        let outer = self.bound.len();
+        self.bound.push(&decl.sig.name.name);
+        let params = decl.sig.params.iter();
+        self.bound
+            .extend(params.map(|param| param.name.name.as_str()));
+        self.block(&decl.body);
+        self.bound.truncate(outer);
+    }
+
+    fn block(&mut self, block: &'p [parse::Stmt]) {
+        let outer = self.bound.len();
+        for stmt in block {
+            self.stmt(stmt);
+        }
+        self.bound.truncate(outer);
+    }
+
+    /// Finds those of `block`, which names what `pattern` binds.
+    fn binding(&mut self, pattern: &'p Pattern, block: &'p [parse::Stmt]) {
+        let outer = self.bound.len();
+        self.bind(pattern);
+        self.block(block);
+        self.bound.truncate(outer);
+    }
+
+    fn stmt(&mut self, stmt: &'p parse::Stmt) {
+        match &stmt.kind {
+            // A name is bound once its value is evaluated.
+            StmtKind::Binding(binding) => {
+                self.expr(&binding.value);
+                self.bind(&binding.pattern);
+            }
+            StmtKind::Expr(expr) => self.expr(expr),
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                self.expr(cond);
+                self.block(then_body);
+                self.block(else_body.as_deref().unwrap_or_default());
+            }
+            StmtKind::While { cond, body } => {
+                self.expr(cond);
+                self.block(body);
+            }
+            StmtKind::For { var, iter, body } => {
+                self.expr(iter);
+                self.bound.push(&var.name);
+                self.block(body);
+                self.bound.pop();
+            }
+            StmtKind::Match { value, arms } => {
+                self.expr(value);
+                for arm in arms {
+                    self.binding(&arm.pattern, &arm.body);
+                }
+            }
+            StmtKind::Defer(body) => self.block(body),
+            StmtKind::Fn(decl) => {
+                self.function(decl);
+                self.bound.push(&decl.sig.name.name);
+            }
+            StmtKind::Pass => {}
+        }
+    }
+
+    /// Brings the names that `pattern` binds into scope.
+    fn bind(&mut self, pattern: &'p Pattern) {
+        match &pattern.kind {
+            PatternKind::Name(name) => self.bound.push(name),
+            PatternKind::Tuple(elems) | PatternKind::Array(elems) => {
+                for elem in elems {
+                    self.bind(elem);
+                }
+            }
+            PatternKind::Variant(_, holds) => {
+                if let Some(holds) = holds {
+                    self.bind(holds);
+                }
+            }
+            PatternKind::Discard | PatternKind::Literal(_) => {}
+        }
+    }
+
+    /// Finds those that `expr` names, wherever in it: nothing in an
+    /// expression binds a name.
+    fn expr(&mut self, expr: &'p parse::Expr) {
+        visit::expr(expr, &mut |node| {
+            if let Node::Expr(parse::Expr {
+                kind: ExprKind::Name(name),
+                ..
+            }) = node
+                && !self.bound.contains(&name.as_str())
+                && !self.names.contains(&name.as_str())
+            {
+                self.names.push(name);
+            }
+        });
+    }
 }
 
 impl Checker {
@@ -29,11 +177,109 @@ impl Checker {
         }
     }
 
+    /// What function `id` captures, if it is declared in a function, in the
+    /// order a value of its type holds them.
+    pub(super) fn captures(&self, id: FuncId) -> &[Capture] {
+        match self.closures.get(&id) {
+            Some(closure) => &closure.captures,
+            None => &[],
+        }
+    }
+
+    /// The tuple that a value of the type of function `id` is laid out as,
+    /// if the function is declared in a function: one of what it captures.
+    pub(super) fn held(&self, id: FuncId) -> Option<Ty> {
+        self.closures.get(&id).map(|closure| closure.held)
+    }
+
+    /// Whether a value of type `ty` may hold anything: a type parameter
+    /// stands for one that may, whatever it is given.
+    fn holds_value(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Func(id) => self.is_closure(id),
+            Ty::Enum(id) => self.holds_value(self.enum_ty(id)),
+            Ty::Struct(_) if self.union_id(ty).is_some() => true,
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                let mut members = self.members(ty).into_iter();
+                members.any(|member| self.holds_value(member))
+            }
+            Ty::Type | Ty::Unit | Ty::Never | Ty::Error => false,
+            Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Fn(_) | Ty::Param(_) => true,
+        }
+    }
+
+    /// Whether function `id` is a closure: one that captures what a value
+    /// of its type then holds, so that no pointer to the function alone
+    /// calls it. One that captures only what holds nothing is none.
+    pub(super) fn is_closure(&self, id: FuncId) -> bool {
+        let mut captures = self.captures(id).iter();
+        captures.any(|capture| self.holds_value(capture.ty))
+    }
+
+    /// The type of a closure that a value of type `ty` holds, if it holds
+    /// one: `ty` itself, or what a struct, a tuple or an enum of it holds.
+    pub(super) fn closure_part(&self, ty: Ty) -> Option<Ty> {
+        match ty {
+            Ty::Func(id) => self.is_closure(id).then_some(ty),
+            Ty::Enum(id) => self.closure_part(self.enum_ty(id)),
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                let mut members = self.members(ty).into_iter();
+                members.find_map(|member| self.closure_part(member))
+            }
+            _ => None,
+        }
+    }
+
+    /// The error for a `ty` that is no pointer because it is the type of a
+    /// closure, if it is one.
+    pub(super) fn no_pointer(&self, ty: Ty) -> Option<TypeErrorKind> {
+        let Ty::Func(id) = ty else {
+            return None;
+        };
+        let captures = self.captures(id).iter();
+        let held: Vec<_> = captures
+            .filter(|capture| self.holds_value(capture.ty))
+            .map(|capture| capture.name.clone())
+            .collect();
+        (!held.is_empty()).then(|| TypeErrorKind::ClosurePointer {
+            name: self.ty_name(ty),
+            captures: held,
+        })
+    }
+
+    /// What a closure `id` captures, as an editor says it: each variable
+    /// that a value of its type holds, and how many bytes they take, unless
+    /// that is for a type argument to say. `None` if it is no closure.
+    pub(super) fn captures_text(&self, id: FuncId) -> Option<String> {
+        let captures = self.captures(id).iter();
+        let held: Vec<_> = captures
+            .filter(|capture| self.holds_value(capture.ty))
+            .map(|capture| format!("{}: {}", capture.name, self.ty_name(capture.ty)))
+            .collect();
+        if held.is_empty() {
+            return None;
+        }
+        let size = match self.held(id) {
+            Some(held) if !self.has_param(held) => match self.layout(held).0 {
+                1 => " (1 byte)".to_string(),
+                size => format!(" ({size} bytes)"),
+            },
+            _ => String::new(),
+        };
+        Some(format!("captures {}{size}", held.join(", ")))
+    }
+
     /// The function with signature `sig` that the body of `parent` declares
-    /// at `span`, and whether this is the first it is asked for. One in a
-    /// generic function checked as declared is of no instance, so it is no
-    /// function of the module.
-    fn nested_id(&mut self, parent: Option<FuncId>, span: Span, sig: FuncSig) -> (FuncId, bool) {
+    /// at `span` as `closure`, and whether this is the first it is asked
+    /// for. One in a generic function checked as declared is of no
+    /// instance, so it is no function of the module.
+    fn nested_id(
+        &mut self,
+        parent: Option<FuncId>,
+        span: Span,
+        sig: FuncSig,
+        closure: impl FnOnce(&mut Self) -> Closure,
+    ) -> (FuncId, bool) {
         if let Some(id) = self.nested.get(&(parent, span)) {
             return (*id, false);
         }
@@ -49,24 +295,19 @@ impl Checker {
             }
         };
         self.nested.insert((parent, span), id);
+        let closure = closure(self);
+        self.closures.insert(id, closure);
         (id, true)
     }
 
     /// Lowers function `id`, which `decl` declares at `span` in the body of
-    /// the function being lowered, and whose body names each of `around`.
-    fn lower_nested(
-        &mut self,
-        program: &Program,
-        id: FuncId,
-        decl: &parse::FnDecl,
-        span: Span,
-        around: &[Around],
-    ) {
+    /// the function being lowered.
+    fn lower_nested(&mut self, program: &Program, id: FuncId, decl: &parse::FnDecl, span: Span) {
         let sig = self.sig(id).clone();
         self.record_params(&decl.sig, &sig);
         self.lowering.insert(id);
         self.deps.push(Vec::new());
-        let func = self.lower_body(program, Some(id), around, sig, &decl.body, span, Vec::new());
+        let func = self.lower_body(program, Some(id), sig, &decl.body, span, Vec::new());
         let deps = self.deps.pop().unwrap_or_default();
         // What it names, the function that declares it does.
         if let Some(outer) = self.deps.last_mut() {
@@ -81,20 +322,47 @@ impl Checker {
 }
 
 impl Body<'_> {
-    /// Brings `outer` into scope, which the body names.
-    pub(super) fn bind_around(&mut self, outer: &Around) {
-        let var = Var {
-            ty: outer.ty,
-            mutable: false,
-            func: true,
-            slots: Vec::new(),
+    /// Brings into scope what the body of function `id` names of those
+    /// around it, if it is declared in one: each variable it captures,
+    /// which it has a copy of, and itself, which holds them all.
+    pub(super) fn bind_captures(&mut self, id: FuncId) {
+        let Some(closure) = self.ck.closures.get(&id).cloned() else {
+            return;
         };
-        self.bind_var(&outer.name, var);
+        let mut held = Vec::new();
+        for capture in closure.captures {
+            let slots = self.alloc(&capture.name, capture.ty);
+            held.extend(&slots);
+            let var = Var {
+                ty: capture.ty,
+                mutable: false,
+                captured: capture.var,
+                func: capture.func,
+                order: 0,
+                slots,
+            };
+            self.bind_var(&capture.name, var);
+        }
+        self.bind_fn(&closure.name, Ty::Func(id), held);
+    }
+
+    /// Binds `name` to a function declared in a function, a value of type
+    /// `ty` that `slots` hold. Its name is its type where one is written.
+    fn bind_fn(&mut self, name: &str, ty: Ty, slots: Vec<LocalId>) {
+        let var = Var {
+            ty,
+            mutable: false,
+            captured: false,
+            func: ty != Ty::Error,
+            order: 0,
+            slots,
+        };
+        self.bind_var(name, var);
     }
 
     /// The functions that are declared in this one and in those around it,
-    /// and that are in scope.
-    fn fns_in_scope(&self) -> Vec<Around> {
+    /// and that are in scope, each by its name and its type.
+    fn fns_in_scope(&self) -> Vec<(String, Ty)> {
         let mut seen = Vec::new();
         let mut fns = Vec::new();
         for (name, var) in self.scopes.iter().rev().flatten() {
@@ -103,8 +371,7 @@ impl Body<'_> {
             }
             seen.push(name);
             if var.func {
-                let (name, ty) = (name.clone(), var.ty);
-                fns.push(Around { name, ty });
+                fns.push((name.clone(), var.ty));
             }
         }
         fns
@@ -115,8 +382,8 @@ impl Body<'_> {
     /// module does.
     pub(super) fn naming_fns<T>(&mut self, resolve: impl FnOnce(&mut Checker) -> T) -> T {
         let outer = self.ck.type_params.len();
-        let fns = self.fns_in_scope().into_iter();
-        self.ck.type_params.extend(fns.map(|f| (f.name, f.ty)));
+        let fns = self.fns_in_scope();
+        self.ck.type_params.extend(fns);
         let resolved = resolve(self.ck);
         self.ck.type_params.truncate(outer);
         resolved
@@ -126,7 +393,7 @@ impl Body<'_> {
     /// which is its type where a type is written.
     pub(super) fn names_nested(&self, expr: &parse::Expr) -> bool {
         match &expr.kind {
-            parse::ExprKind::Name(name) => self.lookup(name).is_some_and(|var| var.func),
+            ExprKind::Name(name) => self.lookup(name).is_some_and(|var| var.func),
             _ => false,
         }
     }
@@ -136,9 +403,27 @@ impl Body<'_> {
         self.naming_fns(|ck| ck.resolve_ty(ty))
     }
 
+    /// What the function `decl` captures, declared here: each variable in
+    /// scope that its body names, in the order they are declared.
+    fn captured(&self, decl: &parse::FnDecl) -> Vec<Capture> {
+        let named = Free::of(decl).into_iter();
+        let mut captures: Vec<_> = named
+            .filter_map(|name| self.lookup(name).map(|var| (name, var)))
+            .collect();
+        captures.sort_by_key(|(_, var)| var.order);
+        let capture = |(name, var): (&str, &Var)| Capture {
+            name: name.to_string(),
+            ty: var.ty,
+            var: var.mutable || var.captured,
+            func: var.func,
+        };
+        captures.into_iter().map(capture).collect()
+    }
+
     /// Declares the function `decl`, in the statement spanning `span`: lowers
-    /// it, unless that is done, and binds its name to it.
-    pub(super) fn nested_fn(&mut self, decl: &parse::FnDecl, span: Span) {
+    /// it, unless that is done, and binds its name to it, with a copy of
+    /// each variable it captures.
+    pub(super) fn nested_fn(&mut self, decl: &parse::FnDecl, span: Span, out: &mut Vec<Stmt>) {
         let name = &decl.sig.name;
         let own = || name.name.clone();
         if let Some(host) = &decl.export_name {
@@ -152,7 +437,7 @@ impl Body<'_> {
         let given = decl.sig.params.iter().find(|param| param.ty.is_type());
         if let Some(param) = inferred.or(given.map(|param| param.span)) {
             self.error(TypeErrorKind::NestedTypeParams(own()), param);
-            self.bind(&name.name, Ty::Error, false, Vec::new());
+            self.bind_fn(&name.name, Ty::Error, Vec::new());
             return;
         }
         let (params, ret) = self.naming_fns(|ck| ck.resolve_sig(&decl.sig));
@@ -164,25 +449,39 @@ impl Body<'_> {
             defaults: Vec::new(),
             ret,
         };
-        let (id, new) = self.ck.nested_id(self.func, span, sig);
+        let captures = self.captured(decl);
+        let (id, new) = self.ck.nested_id(self.func, span, sig, |ck| Closure {
+            name: own(),
+            held: ck.tuple_of(captures.iter().map(|capture| capture.ty).collect()),
+            captures,
+        });
         if new {
-            let mut around = self.fns_in_scope();
-            let (name, ty) = (own(), Ty::Func(id));
-            around.push(Around { name, ty });
             let program = self.program.expect("only a function has statements");
-            self.ck.lower_nested(program, id, decl, span, &around);
+            self.ck.lower_nested(program, id, decl, span);
         }
         let ty = match failed {
             true => Ty::Error,
             false => Ty::Func(id),
         };
         self.ck.record(name.span, ty);
-        let var = Var {
-            ty,
-            mutable: false,
-            func: !failed,
-            slots: Vec::new(),
+        // A copy of each variable it captures, as it is now.
+        let mut held = Vec::new();
+        for capture in self.ck.captures(id).to_vec() {
+            let var = self
+                .lookup(&capture.name)
+                .expect("in scope where it is declared");
+            let reads = var.slots.iter().map(|slot| Expr::Local(*slot));
+            held.push(self.scalars(capture.ty, reads.collect()));
+        }
+        let Value { pre, scalars } = self.seq(held);
+        out.extend(pre);
+        let slots = match failed {
+            true => Vec::new(),
+            false => self.alloc(&name.name, ty),
         };
-        self.bind_var(&name.name, var);
+        for (slot, (_, scalar)) in slots.iter().zip(scalars) {
+            out.push(Stmt::SetLocal(*slot, scalar));
+        }
+        self.bind_fn(&name.name, ty, slots);
     }
 }

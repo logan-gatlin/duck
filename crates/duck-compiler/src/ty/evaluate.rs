@@ -239,8 +239,11 @@ impl Checker {
     /// A function with the wasm type of function `id` that traps.
     fn stub(&self, id: FuncId) -> ir::Func {
         let sig = &self.funcs[id.0 as usize];
-        let params = sig.params.iter().filter(|(_, ty)| *ty != Ty::Type);
-        let params: Vec<_> = params.flat_map(|(_, ty)| self.val_types(*ty)).collect();
+        // What it captures is passed before what it takes.
+        let captures = self.captures(id).iter().map(|capture| capture.ty);
+        let params = sig.params.iter().map(|(_, ty)| *ty);
+        let params = captures.chain(params.filter(|ty| *ty != Ty::Type));
+        let params: Vec<_> = params.flat_map(|ty| self.val_types(ty)).collect();
         let local = |ty: &ValType| ir::Local {
             name: TEMP.to_string(),
             ty: *ty,
@@ -1215,5 +1218,82 @@ pub let ran = trace
 ";
         assert_eq!(consts(src), "two=2 ran=11");
         assert_eq!(Started::of(src).call("factorial", &[5]), 240);
+    }
+
+    #[test]
+    fn a_closure_runs_with_what_it_captured_where_it_was_declared() {
+        let src = "\
+struct(F: fn(i32) -> i32) Held:
+    tag: u8
+    f: F
+let cell = &var 0
+let slots: varray(i32) = [0; 3]
+fn(F: fn(i32) -> i32) call(x: i32, f: F) -> i32:
+    return f(x)
+fn(F) keep(f: F) -> F:
+    return f
+fn(F: fn(i32) -> i32) stored(at: &var Held(F), f: F, x: i32) -> i32:
+    at.* = Held(F)(tag: 7, f: f)
+    return at.f(x) + at.tag as i32
+pub fn copied(n: i32) -> i32:
+    var k = n
+    fn add(x: i32) -> i32:
+        return x + k
+    k = 100
+    return add(1) * 1000 + k
+pub fn written(n: i32) -> i32:
+    let total = cell
+    fn tally(x: i32):
+        total.* += x
+        slots[1] = x
+    tally(n)
+    tally(n + 1)
+    return cell.* * 100 + slots[1]
+pub fn passed(n: i32) -> i32:
+    fn scale(x: i32) -> i32:
+        return x * n
+    let kept = keep(scale)
+    return call(3, scale) + kept(4)
+pub fn looped(n: i32) -> i32:
+    var sum = 0
+    var i = 0
+    while i < n:
+        fn plus(x: i32) -> i32:
+            return x + i
+        i += 1
+        sum = sum * 10 + plus(0)
+    return sum
+pub fn held(n: i32) -> i32:
+    fn twice(x: i32) -> i32:
+        return x * 2 + n
+    let at = module.grow(1) as uint * module.page_size
+    return stored(at as! &var Held(twice), twice, 5)
+pub fn deep(n: i32) -> i32:
+    fn outer(d: i32) -> i32:
+        fn inner(x: i32) -> i32:
+            if x > 0:
+                return outer(x - 1) + n
+            return d
+        return inner(d)
+    return outer(3)
+fn folded() -> i32:
+    let base = 40
+    fn more(x: i32) -> i32:
+        return base + x
+    return call(2, more)
+pub let constant = folded()
+";
+        assert_eq!(consts(src), "constant=42");
+        let mut started = Started::of(src);
+        // A capture is as its variable was, whatever that is by the call.
+        assert_eq!(started.call("copied", &[5]), 6100);
+        // What it points to is the same memory.
+        assert_eq!(started.call("written", &[2]), 503);
+        assert_eq!(started.call("passed", &[5]), 35);
+        // Each time its statement runs, it has what is there then.
+        assert_eq!(started.call("looped", &[3]), 12);
+        // Its captures are stored and read as a struct of them is.
+        assert_eq!(started.call("held", &[1]), 18);
+        assert_eq!(started.call("deep", &[10]), 30);
     }
 }

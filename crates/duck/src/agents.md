@@ -7,9 +7,9 @@ the package of the nearest `Duck.toml` to a component of the world it names,
 and `duck run` runs it with WASI. `duck format` lays its files out as the
 examples here are.
 
-Absent: allocator, GC, standard library, closures, anonymous functions,
-methods, traits, overloading, varargs, ternary, ranges, exceptions, char type,
-string operations.
+Absent: allocator, GC, standard library, anonymous functions, methods,
+traits, overloading, varargs, ternary, ranges, exceptions, char type, string
+operations.
 
 ## Syntax
 
@@ -959,42 +959,67 @@ struct(T, A: fn(uint) -> &var T) Pool:
 	make: A
 	count: uint = 0
 
-var next: uint = 8
+fn(T, U, F: fn(T) -> U) apply(x: T, f: F) -> U:
+	return f(x)
 
 fn(T) ordered(a: &var T, b: &var T, swapped: bool):
-	fn swap(a: &var T, b: &var T):   # names the `T` of the function around it
+	fn swap():                       # captures `a` and `b`, each a `&var T`
 		let held = a.*
 		a.* = b.*
 		b.* = held
 	if swapped:
-		swap(a, b)
+		swap()
 
-fn demo(n: i32) -> uint:
-	fn double(x: i32) -> i32:
+fn demo(n: i32, total: &var i32, base: uint) -> uint:
+	var k = 1
+	fn add(x: i32) -> i32:           # captures `n` and `k`: 8 bytes
+		return x + n + k
+	k = 100                          # `add` still has the 1
+	fn tally(x: i32):
+		total.* += x                 # through the pointer it captured
+	fn double(x: i32) -> i32:        # captures nothing
 		return x * 2
 	fn power(x: i32) -> i32:         # names itself, and `double` before it
 		if x <= 0:
 			return 1
 		return double(power(x - 1))
 	fn bump(size: uint) -> &var u8:
-		next += size
-		return (next - size) as! &var u8
-	let p: fn(i32) -> i32 = power    # a pointer to it, as to any function
+		return (base + size) as! &var u8
+	tally(add(1))
+	let p: fn(i32) -> i32 = power    # a pointer, as it captures nothing
 	let d: double = double           # its name is its type, in its block
-	let pool = Pool(u8, bump)(make: bump)
-	return (p(n) + d(n)) as uint + pool.count + double.size
+	let pool = Pool(u8, bump)(make: bump)  # as wide as `count` and a `base`
+	return (p(n) + d(n) + apply(2, add)) as uint + pool.count + add.size
 ```
 
 - A `fn` in a block declares a function for the rest of that block, as a
   `let` binds a name: nothing before its statement names it, and it
-  shadows as a `let` does.
-- It is a function in every way: of a type of its own, which takes no
-  storage, and a pointer to itself where one is expected. In its block its
-  name is its type where a type is written: `d: double`, `Pool(u8, bump)`,
-  `double.size`.
-- Its body names the type parameters of the function around it, the
-  functions declared before it in those around it, and itself. It names no
-  variable of theirs: a `n` in `double` is an error.
+  shadows as a `let` does. Its body names itself, the type parameters of
+  the function around it, and every variable in scope at its statement.
+- It **captures** each variable its body names: it holds a copy, as the
+  variable is when the statement runs. So `add` above has the `k` that was
+  1, and one declared in a loop has what each iteration had. A `defer`
+  reads a variable as it is when it runs, and a function as it was when it
+  was declared.
+- A capture isn't assigned: `k += 1` in `add` is an error, as `add` has
+  only a copy. What is to change is behind a `&var` or a `varray` that it
+  captures, which it writes through.
+- It captures the whole of a variable, so `p.x` captures `p`, and what a
+  function declared in it names of those around both.
+- A function that captures is a closure: a value of its type holds what it
+  captures, laid out as a struct of them in the order they are declared,
+  so `add.size` is 8. A call passes them before what the function takes.
+  Nothing is captured of a function that captures nothing.
+- A closure is called, bound, passed, returned and held, and nothing else:
+  it has no `==` and no `as`, and it matches a name or `_` only.
+- **A closure is no pointer.** `let p: fn(i32) -> i32 = add` is an error
+  that names what `add` captures, as a pointer is to the function alone.
+  Its type is a type argument where a function type bounds: `apply(2,
+  add)`, `Pool(u8, bump)`.
+- One that captures nothing is a function in every way: of a type that
+  takes no storage, and a pointer to itself where one is expected.
+- In its block a function's name is its type where a type is written:
+  `d: double`, `Pool(u8, bump)`, `add.size`.
 - It is called as a value is, with every argument and positionally, so a
   parameter of it has no default. It has no type parameters of its own, no
   `pub` and no `= "name"`.
@@ -1002,7 +1027,7 @@ fn demo(n: i32) -> uint:
   `continue` is of a loop in it, and its `defer`s run as its blocks are
   left.
 - Each instance of a generic function has its own. An error names one for
-  the function around it: `demo.double`, `ordered(u8).swap`.
+  the function around it: `demo.add`, `ordered(u8).swap`.
 
 ### Generic over a function
 
@@ -1040,8 +1065,9 @@ fn demo(p: fn(i32) -> i64) -> i64:
 
 - `fn(F: fn(A) -> R)`, `struct(F: fn(A) -> R)`: `F` is bounded by a function
   type, so a type argument is called as that type is. It is the type of a
-  function whose pointers are of the bound, parameter for parameter, or it
-  is the bound itself, whose values are pointers.
+  function that takes and gives what the bound does, parameter for
+  parameter, which may be a closure, or it is the bound itself, whose
+  values are pointers.
 - An instance is of the function: `apply(i32, i64, wide)` calls `wide`, and
   takes nothing for `f`. That of a pointer type, `apply(i32, i64, fn(i32) ->
   i64)`, takes the pointer and calls through it. A parameter typed

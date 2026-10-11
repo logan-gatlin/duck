@@ -4,7 +4,7 @@
 use crate::parse::{self, Entry, ExprKind, FnSig, ItemKind, StmtKind};
 
 /// A statement or an expression that a visit of an item comes to.
-pub(super) enum Node<'p> {
+pub(in crate::ty) enum Node<'p> {
     Stmt(&'p parse::Stmt),
     Expr(&'p parse::Expr),
 }
@@ -80,7 +80,9 @@ fn block<'p>(block: &'p [parse::Stmt], visit: &mut dyn FnMut(Node<'p>)) {
     }
 }
 
-fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
+/// Calls `visit` with `expr` and every expression in it, each before those
+/// within it.
+pub(in crate::ty) fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
     visit(Node::Expr(expr));
     match &expr.kind {
         ExprKind::Int(_)
