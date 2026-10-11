@@ -549,8 +549,8 @@ impl Project {
                 members.unwrap_or_default()
             }
             Some(Completing::Expected(cursor)) => {
-                let expected = self.ask(buffers, path, &cursor, |analysis, _, file| {
-                    Some(analysis.expected(file, cursor.probe))
+                let expected = self.ask(buffers, path, &cursor, |analysis, files, file| {
+                    Some(analysis.expected(files, file, cursor.probe))
                 });
                 expected.unwrap_or_default()
             }
@@ -567,6 +567,7 @@ impl Project {
                     kind: CompletionKind::Module,
                     detail: String::new(),
                     import: None,
+                    docs: String::new(),
                 };
                 let modules = modules.unwrap_or_default().into_iter().map(module);
                 let mut completions: Vec<_> = modules.collect();
@@ -640,6 +641,7 @@ impl Project {
                     kind: CompletionKind::Variable,
                     detail: signature.label[param.range.clone()].to_string(),
                     import: None,
+                    docs: param.docs.clone(),
                 },
                 insert: Some(format!("{name}: ")),
                 import: None,
@@ -663,7 +665,7 @@ impl Project {
         let signature = self.ask(buffers, path, cursor, |analysis, files, file| match calling
             .expected
         {
-            true => analysis.expected_signature(file, cursor.probe),
+            true => analysis.expected_signature(files, file, cursor.probe),
             false => analysis.signature(files, file, cursor.probe),
         })?;
         let active = match &calling.label {
