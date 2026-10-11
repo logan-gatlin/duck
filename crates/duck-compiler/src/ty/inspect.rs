@@ -1969,6 +1969,10 @@ impl<'p> Walk<'p> {
             | ExprKind::Binary(_, a, b)
             | ExprKind::Index(a, b)
             | ExprKind::Pipe(a, b) => self.expr(a) || self.expr(b),
+            ExprKind::Slice(array, start, end) => {
+                let mut parts = [array].into_iter().chain(start).chain(end);
+                parts.any(|part| self.expr(part))
+            }
             ExprKind::Unary(_, inner)
             | ExprKind::Deref(inner)
             | ExprKind::AddrOf(_, inner)

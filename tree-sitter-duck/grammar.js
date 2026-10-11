@@ -495,6 +495,7 @@ module.exports = grammar({
       $.address_of_expression,
       $.call_expression,
       $.index_expression,
+      $.slice_expression,
       $.field_expression,
       $.dereference_expression,
     ),
@@ -632,6 +633,16 @@ module.exports = grammar({
       field('value', $._expression),
       '[',
       field('index', $._expression),
+      ']',
+    )),
+
+    // `a[start..end]`, where either bound may be left out.
+    slice_expression: $ => prec(PREC.postfix, seq(
+      field('value', $._expression),
+      '[',
+      optional(field('start', $._expression)),
+      '..',
+      optional(field('end', $._expression)),
       ']',
     )),
 

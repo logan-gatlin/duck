@@ -492,6 +492,15 @@ mod tests {
             results[0].unwrap_i32()
         }
 
+        /// Whether the exported function `name`, from `i32`s to an `i32`,
+        /// traps when it is called with `args`.
+        fn traps(&mut self, name: &str, args: &[i32]) -> bool {
+            let func = self.instance.get_func(&mut self.store, name).unwrap();
+            let args: Vec<_> = args.iter().map(|arg| wasmtime::Val::I32(*arg)).collect();
+            let mut results = [wasmtime::Val::I32(0)];
+            func.call(&mut self.store, &args, &mut results).is_err()
+        }
+
         /// The `len` bytes of memory at `addr`.
         fn bytes(&mut self, addr: usize, len: usize) -> Vec<u8> {
             let memory = self.instance.get_memory(&mut self.store, "memory").unwrap();
@@ -1224,6 +1233,55 @@ pub let crossed = wide(0xffff_fffe)
         assert_eq!(started.global("read"), 6);
         assert_eq!(started.global("narrow"), 1 + 2 + 3 + 4 + 5);
         assert_eq!(started.global("crossed"), 3);
+    }
+
+    #[test]
+    fn slices_view_the_elements_between_their_bounds() {
+        let src = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+let numbers: varray(i32) = [1, 2, 3, 4, 5]
+let vec = &var Vec(i32)(ptr: numbers.ptr, len: 4, cap: numbers.len)
+fn sum(a: array(i32)) -> i32:
+    var total = 0
+    for x in a:
+        total += x
+    return total
+fn(T, A: array(T)) tail(a: A) -> array(T):
+    return a[1..]
+pub fn between(from: i32, to: i32) -> i32:
+    return sum(numbers[from as uint..to as uint])
+pub fn after(from: i32) -> i32:
+    return sum(numbers[from as uint..])
+pub fn before(to: i32) -> i32:
+    return sum(numbers[..to as uint])
+pub fn double(from: i32) -> i32:
+    # Through the pointer, as `vec[i]` is, and only its `len` elements.
+    let rest = vec[from as uint..]
+    for i, x in rest:
+        rest[i] = x * 2
+    return sum(numbers[..]) * 10 + rest.len as i32
+pub let middle = between(1, 4)
+pub let none = between(2, 2) + after(5) + before(0)
+pub let all = sum(numbers[..]) + sum(tail(numbers)) + sum(tail(vec.*))
+pub let text = \"hello\"[1..3] == \"el\"
+";
+        let mut started = Started::of(src);
+        assert_eq!(started.global("middle"), 2 + 3 + 4);
+        assert_eq!(started.global("none"), 0);
+        assert_eq!(started.global("all"), 15 + 14 + 9);
+        assert_eq!(started.global("text"), 1);
+        assert_eq!(started.call("after", &[3]), 4 + 5);
+        assert_eq!(started.call("before", &[2]), 1 + 2);
+        // It traps unless `start <= end <= len`.
+        for (from, to) in [(3, 2), (0, 6), (6, 6), (-1, 2)] {
+            assert!(started.traps("between", &[from, to]), "{from}..{to}");
+        }
+        assert!(started.traps("after", &[6]));
+        assert!(started.traps("before", &[6]));
+        assert!(started.traps("double", &[5]));
+        assert_eq!(started.call("double", &[2]), (1 + 2 + 6 + 8 + 5) * 10 + 2);
     }
 
     #[test]

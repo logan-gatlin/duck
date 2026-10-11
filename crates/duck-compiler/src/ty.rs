@@ -5171,18 +5171,13 @@ impl<'c> Body<'c> {
         })
     }
 
-    /// The element `array[index]`, as a place whose `pre` traps unless
-    /// `index < array.len`. `array` is one, a struct that starts as one, or
-    /// a pointer to either. `None` after reporting an error.
-    fn index_place(
-        &mut self,
-        array: &parse::Expr,
-        index: &parse::Expr,
-        span: Span,
-    ) -> Option<Place> {
+    /// `array`, which brackets follow, as the type it's written as, and what
+    /// is indexed and sliced of it: the array that it is or starts as, read
+    /// through any number of pointers, as fields are. Of a struct behind
+    /// one, only the array it starts as is read. What is no array is as it
+    /// is written.
+    fn subscripted(&mut self, array: &parse::Expr) -> (Ty, Ty, Value) {
         let (written, mut array) = self.expr(array, None);
-        // Elements are reached through any number of pointers, as fields
-        // are. Of a struct behind one, only the array it starts as is read.
         let mut ty = written;
         while let Ty::Ptr(id) = ty {
             let pointee = self.ck.pointee(id);
@@ -5193,6 +5188,87 @@ impl<'c> Body<'c> {
             };
             array = self.load(array, 0, ty);
         }
+        (written, ty, array)
+    }
+
+    /// `array[start..end]`: the elements of `array` from `start` up to `end`,
+    /// as an array that writes them if `array` does. It traps unless
+    /// `start <= end <= array.len`. One without a `start` is from the first
+    /// element, and one without an `end` to the last. `array` is one, a
+    /// struct that starts as one, or a pointer to either.
+    fn slice(
+        &mut self,
+        array: &parse::Expr,
+        start: Option<&parse::Expr>,
+        end: Option<&parse::Expr>,
+        span: Span,
+    ) -> (Ty, Value) {
+        let (written, ty, array) = self.subscripted(array);
+        let uint = Ty::Prim(Prim::Uint);
+        let bounds = [start, end].map(|bound| bound.map(|bound| self.check(bound, uint)));
+        let view = self.ck.array_view(ty);
+        let array = match view {
+            Some(_) => self.array_start(array),
+            None => array,
+        };
+        let mut value = self.seq(
+            [array]
+                .into_iter()
+                .chain(bounds.into_iter().flatten())
+                .collect(),
+        );
+        let Some(id) = view else {
+            return match ty {
+                Ty::Never => never(value.pre),
+                _ => self.invalid_operand("[]", written, span),
+            };
+        };
+        // Each is read again by the check, and everything is read after
+        // the prelude.
+        self.spill(&mut value, is_simple);
+        let mut scalars = exprs(value.scalars);
+        let to = end.and_then(|_| scalars.pop());
+        let from = start.and_then(|_| scalars.pop());
+        // Only a mistyped bound has other than one scalar.
+        let Ok([ptr, len]) = <[_; 2]>::try_from(scalars) else {
+            return (Ty::Error, Value::default());
+        };
+        let vt = self.ck.addr_type();
+        let past = |a: &Expr, b: &Expr| binary(vt, IrBinOp::GtU, a.clone(), b.clone());
+        let outside = match (&from, &to) {
+            (Some(from), Some(to)) => Some(binary(vt, IrBinOp::Or, past(from, to), past(to, &len))),
+            (Some(bound), None) | (None, Some(bound)) => Some(past(bound, &len)),
+            (None, None) => None,
+        };
+        let mut pre = value.pre;
+        pre.extend(outside.map(|cond| Stmt::If {
+            cond,
+            then_body: vec![Stmt::Unreachable],
+            else_body: Vec::new(),
+        }));
+        let to = to.unwrap_or(len);
+        let (ptr, len) = match from {
+            Some(from) => {
+                let stride = self.ck.layout(self.ck.element(id)).0;
+                let first = self.ck.element_addr(ptr, from.clone(), stride);
+                (first, binary(vt, IrBinOp::Sub, to, from))
+            }
+            None => (ptr, to),
+        };
+        let scalars = vec![(vt, ptr), (vt, len)];
+        (Ty::Array(id), Value { pre, scalars })
+    }
+
+    /// The element `array[index]`, as a place whose `pre` traps unless
+    /// `index < array.len`. `array` is one, a struct that starts as one, or
+    /// a pointer to either. `None` after reporting an error.
+    fn index_place(
+        &mut self,
+        array: &parse::Expr,
+        index: &parse::Expr,
+        span: Span,
+    ) -> Option<Place> {
+        let (written, ty, array) = self.subscripted(array);
         let index = self.check(index, Ty::Prim(Prim::Uint));
         if ty == Ty::Never {
             return Some(never_place(self.seq(vec![array, index]).pre));
@@ -5407,6 +5483,9 @@ impl<'c> Body<'c> {
             ExprKind::List(items) => self.list(items, expected, expr.span),
             ExprKind::Repeat(value, len) => self.repeat(value, len, expected, expr.span),
             ExprKind::Range(..) => unreachable!("only a `for` has a range, which it takes apart"),
+            ExprKind::Slice(array, start, end) => {
+                self.slice(array, start.as_deref(), end.as_deref(), expr.span)
+            }
             ExprKind::Index(..) => match self.place(expr) {
                 Some(place) => {
                     let value = self.read_place(&place);
@@ -7518,6 +7597,11 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
             push_assigned(a, names);
             push_assigned(b, names);
         }
+        ExprKind::Slice(array, start, end) => {
+            for part in [array].into_iter().chain(start).chain(end) {
+                push_assigned(part, names);
+            }
+        }
         ExprKind::Call(callee, args) => {
             push_assigned(callee, names);
             for arg in args {
@@ -7720,6 +7804,10 @@ fn has_break(expr: &parse::Expr) -> bool {
             value: b,
             ..
         } => has_break(a) || has_break(b),
+        ExprKind::Slice(array, start, end) => {
+            let mut parts = [array].into_iter().chain(start).chain(end);
+            parts.any(|part| has_break(part))
+        }
         ExprKind::Call(callee, args) => {
             has_break(callee) || args.iter().any(|arg| has_break(&arg.value))
         }
@@ -13226,6 +13314,62 @@ fn f(n: u8, wide: i64, x: f32, p: &u8):
                 invalid_operand("..", "&u8"),
                 TypeErrorKind::RangeIndex,
                 mismatch("tuple(_, _)", "u8"),
+            ]
+        );
+    }
+
+    #[test]
+    fn slices_check_their_bounds_once() {
+        let src = "\
+fn f(a: array(u16), v: varray(u16), p: &varray(u16), i: uint, j: uint):
+    let both = a[i..j]
+    let from = v[i..]
+    let to = p[..j]
+    let all = a[..]
+";
+        // One check, of what is written, and none where nothing is.
+        assert_eq!(
+            body(&lower(src), "f"),
+            "(if (I32.Or (I32.GtU i j) (I32.GtU j a.len)) (then unreachable) (else )) \
+             (set both.ptr (I32.Add a.ptr (I32.Mul i 2))) (set both.len (I32.Sub j i)) \
+             (if (I32.GtU i v.len) (then unreachable) (else )) \
+             (set from.ptr (I32.Add v.ptr (I32.Mul i 2))) (set from.len (I32.Sub v.len i)) \
+             (set tmp11 (I32.Load offset=0 p)) (set tmp12 (I32.Load offset=4 p)) \
+             (if (I32.GtU j tmp12) (then unreachable) (else )) \
+             (set to.ptr tmp11) (set to.len j) \
+             (set all.ptr a.ptr) (set all.len a.len)"
+        );
+        let src = "\
+struct(T) Vec:
+    use varray(T)
+    cap: uint
+fn f(a: array(u8), v: Vec(u8), p: &Vec(u8), n: i32, i: i32):
+    let s: varray(u8) = a[..]
+    let t: Vec(u8) = v[..]
+    let u: varray(u8) = p[1..]
+    a[1..][0] = 1
+    v[1..][0] = 1
+    let x = n[..]
+    let y = a[i..]
+    let z = a[..2.0]
+    let w = &a[1..]
+";
+        // It is the array that is sliced, which writes if that does, and
+        // never the struct. It is a value, which has no address.
+        assert_eq!(
+            errors(src),
+            vec![
+                mismatch("varray(u8)", "array(u8)"),
+                mismatch("Vec(u8)", "varray(u8)"),
+                TypeErrorKind::ReadOnlyWrite {
+                    ty: "array(u8)".into(),
+                    needs: "varray(u8)".into(),
+                    element: true,
+                },
+                invalid_operand("[]", "i32"),
+                mismatch("uint", "i32"),
+                mismatch("uint", "f64"),
+                TypeErrorKind::NotAddressable,
             ]
         );
     }

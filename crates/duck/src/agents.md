@@ -279,6 +279,46 @@ fn demo(a: array(i32), pairs: array(tuple(i32, i32))) -> i32:
 - `break` leaves the loop. `continue` moves on to the next element, and the
   index with it.
 
+## Slices
+
+```duck
+struct(T) Vec:
+	use varray(T)
+	cap: uint
+
+fn sum(a: array(i32)) -> i32:
+	var total = 0
+	for x in a:
+		total += x
+	return total
+
+fn demo(a: array(i32), vec: &var Vec(i32)) -> i32:
+	let middle = a[1..a.len - 1]     # from `a[1]` up to the last, and not it
+	let rest = vec[2..]              # a `varray(i32)`, through the pointer
+	for i, x in rest:
+		rest[i] = x * 2              # writes `vec[2 + i]`
+	return sum(middle) + sum(a[..2]) + sum(vec[..])
+```
+
+- `a[start..end]` is a view of the elements of `a` from `start` up to `end`,
+  which is not one of them: a `ptr` and a `len` over the same memory, which
+  copies nothing. `a[start..]` goes on to the last, `a[..end]` is from the
+  first, and `a[..]` is all of them.
+- Both bounds are `uint`s, as an index is. It traps unless
+  `start <= end <= a.len`, which is checked once: `a[a.len..]` is empty, and
+  `a[3..2]` traps.
+- It is sliced as it is indexed: through any number of pointers, and a
+  struct that starts as an array as that array. It is a `varray(T)` where
+  `a[i]` is assigned, and an `array(T)` otherwise, and never the struct:
+  `vec[..]` is a `varray(i32)`.
+- A slice is a value, of the array as it was: `vec[..]` keeps the `ptr` and
+  `len` that `vec` had, whatever is pushed to `vec` after. So `for x in
+  vec[..]` runs for the elements that were there.
+- Nothing is assigned to one, and it has no address: `a[1..3] = b` and
+  `&a[1..3]` are errors. Copy with a loop, or with `module.copy`.
+- `..` is no operator. Each bound is a whole expression, so `a[i + 1..n - 1]`
+  is from `i + 1` up to `n - 1`.
+
 ## Literals and globals
 
 **A string or array literal in a function is a constant that is only read.**
@@ -509,7 +549,7 @@ fn push(head: &Node, v: i32) -> &Node:
 	return n
 
 fn view(p: &i32, len: uint) -> array(i32):
-	return array(i32)(ptr: p, len: len) # slice by building a new view
+	return array(i32)(ptr: p, len: len) # a view of what is at an address
 ```
 
 - `&` and `&var` take the address of `p.field`, `p.*` and `a[i]` only. Locals,
@@ -903,8 +943,8 @@ fn demo(b: &Both, d: &Deep) -> i32:
 - A list names structs and arrays, none of them twice, and no field of
   theirs twice: `(Head, Head)` is an error, as no struct uses both. Only a
   bound is a list, which no value has the type of.
-- A `T` bounded by a list is cast, indexed and iterated as the first type in
-  it is, and meets the bounds that it does.
+- A `T` bounded by a list is cast, indexed, sliced and iterated as the first
+  type in it is, and meets the bounds that it does.
 
 ### Structs that start as an array
 
@@ -943,9 +983,9 @@ fn demo() -> i32:
 - A struct starts as an array when its first `use` names one, or names a
   struct that starts as one. One that starts as a `varray(T)` starts as an
   `array(T)` too. Fields of its own named `ptr` and `len` don't make it one.
-- It is indexed and iterated as that array is: `v[i]` checks `i` against its
-  `len`, and `for x in v` reads its `ptr` and `len` once, before the first
-  iteration. An element is written only through a `varray(T)`.
+- It is indexed, sliced and iterated as that array is: `v[i]` checks `i`
+  against its `len`, and `for x in v` reads its `ptr` and `len` once, before
+  the first iteration. An element is written only through a `varray(T)`.
 - `as` makes it the array, `v as array(T)`, and a pointer to it one to the
   array, `p as &array(T)`: a `&var varray(T)` only of one that starts as a
   `varray(T)`, and never a `&var array(T)`. `as!` makes one that only reads
@@ -960,8 +1000,8 @@ fn demo() -> i32:
   `p: &var A`, `p.ptr = s.ptr` leaves the `ptr` of an `array(T)` where the
   type argument has that of a `varray(T)`.
 - In the body an `A` has the `ptr` and `len` of its bound, and is indexed,
-  iterated and cast as the bound is. It is otherwise as any `T` is: `a == b`
-  and the pattern `[x, y]` are errors.
+  sliced, iterated and cast as the bound is: `a[1..]` is an `array(T)`. It
+  is otherwise as any `T` is: `a == b` and the pattern `[x, y]` are errors.
 - Nothing else of an array is the struct's. `==` compares its fields, so two
   of them are equal when they have the same `ptr`, whatever is there. The
   patterns `[x, y]` and `"text"` match arrays only: `match v as array(u8)`.

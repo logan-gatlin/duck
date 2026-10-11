@@ -341,6 +341,10 @@ pub enum ExprKind {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),
     Index(Box<Expr>, Box<Expr>),
+    /// `array[start..end]`, a view of the elements of `array` from `start`
+    /// up to `end`. One without a `start` is from the first, and one without
+    /// an `end` to the last.
+    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>),
     Field(Box<Expr>, Ident),
     /// `pointer.*`
     Deref(Box<Expr>),
@@ -488,6 +492,14 @@ enum Parens<T> {
     Group(T),
     /// `(x, y)`, or `(x,)`: a comma makes a tuple of even one.
     Tuple(Vec<T>),
+}
+
+/// What the brackets after an array hold.
+enum Subscript {
+    /// `[i]`
+    Index(Expr),
+    /// `[start..end]`, either of which may be left out.
+    Slice(Option<Expr>, Option<Expr>),
 }
 
 /// Precedence of `not`, which sits between `and` and the comparisons.
@@ -1577,9 +1589,15 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::LBracket => {
                     self.bump();
-                    let index = self.bracketed(Self::expr)?;
+                    let subscript = self.bracketed(Self::subscript)?;
                     self.expect(TokenKind::RBracket)?;
-                    ExprKind::Index(Box::new(expr), Box::new(index))
+                    let array = Box::new(expr);
+                    match subscript {
+                        Subscript::Index(index) => ExprKind::Index(array, Box::new(index)),
+                        Subscript::Slice(start, end) => {
+                            ExprKind::Slice(array, start.map(Box::new), end.map(Box::new))
+                        }
+                    }
                 }
                 TokenKind::Dot => {
                     self.bump();
@@ -1701,6 +1719,25 @@ impl<'a> Parser<'a> {
             kind,
             span: token.span,
         })
+    }
+
+    /// What the brackets after an array hold: an index, or the `start..end`
+    /// of a slice.
+    fn subscript(&mut self) -> PResult<Subscript> {
+        let start = match self.at(TokenKind::DotDot) {
+            true => None,
+            false => Some(self.expr()?),
+        };
+        match (start, self.eat(TokenKind::DotDot)) {
+            (Some(index), false) => Ok(Subscript::Index(index)),
+            (start, _) => {
+                let end = match self.at(TokenKind::RBracket) {
+                    true => None,
+                    false => Some(self.expr()?),
+                };
+                Ok(Subscript::Slice(start, end))
+            }
+        }
     }
 
     /// Parses what brackets hold with `inner`: a pipe body that they are in
@@ -2063,6 +2100,13 @@ mod tests {
                 format!("(call {} {args})", sexpr(f))
             }
             ExprKind::Index(e, i) => format!("(index {} {})", sexpr(e), sexpr(i)),
+            ExprKind::Slice(e, start, end) => {
+                let bound = |bound: &Option<Box<Expr>>| match bound {
+                    Some(bound) => sexpr(bound),
+                    None => "_".to_string(),
+                };
+                format!("(slice {} {} {})", sexpr(e), bound(start), bound(end))
+            }
             ExprKind::Field(e, field) => format!("(. {} {})", sexpr(e), field.name),
             ExprKind::Deref(e) => format!("(.* {})", sexpr(e)),
             ExprKind::AddrOf(Mutability::Let, e) => format!("(& {})", sexpr(e)),
@@ -2724,6 +2768,30 @@ mod tests {
             };
             assert_eq!(*at, found, "{src}");
         }
+    }
+
+    #[test]
+    fn slices() {
+        assert_eq!(expr("a[i..j]"), "(slice a i j)");
+        assert_eq!(expr("a[i..]"), "(slice a i _)");
+        assert_eq!(expr("a[..j]"), "(slice a _ j)");
+        assert_eq!(expr("a[..]"), "(slice a _ _)");
+        assert_eq!(expr("p.a[1..][0]"), "(index (slice (. p a) 1 _) 0)");
+        // Each bound is a whole expression.
+        assert_eq!(
+            expr("a[i + 1..n - 1 or m]"),
+            "(slice a (Add i 1) (Or (Sub n 1) m))"
+        );
+        assert_eq!(expr("x |> a[_.._]"), "(|> x (slice a _ _))");
+        // It is a value, which nothing is assigned to.
+        assert_eq!(
+            errors("fn f():\n    a[1..2] = b\n"),
+            vec![ParseErrorKind::InvalidAssignTarget]
+        );
+        assert_eq!(
+            errors("let s = a[1..2..3]\n"),
+            vec![expected("`]`", TokenKind::DotDot)]
+        );
     }
 
     #[test]

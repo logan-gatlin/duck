@@ -892,6 +892,10 @@ mod tests {
             "fn f():\n\tfor i in -1..-n:\n\t\tpass\n"
         );
         assert_eq!(
+            formatted("let s = (a [ i+1 .. n ], a[ .. n], a [i ..], a[ .. ])\n"),
+            "let s = (a[i + 1..n], a[..n], a[i..], a[..])\n"
+        );
+        assert_eq!(
             formatted("let b:varray(u8)=[ 0 ;SIZE ]\n"),
             "let b: varray(u8) = [0; SIZE]\n"
         );
