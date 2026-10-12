@@ -864,7 +864,7 @@ fn f():
         let entry = DummyManager::new().entry_point();
         let tokens = tokenize(entry, src).unwrap();
         let program = Program::single(entry, parse::parse(&tokens).unwrap());
-        let mut ck = Checker::define(&program, &Settings::default(), false);
+        let mut ck = Checker::define(&program, &Settings::default(), false, false);
         // As if checking `add` as declared had found nothing wrong with it.
         assert!(ck.errors.is_empty());
         ck.lower_funcs(&program);

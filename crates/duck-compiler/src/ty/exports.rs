@@ -106,6 +106,21 @@ impl Checker {
         }
     }
 
+    /// Names what the component of the tests of `program` exports of
+    /// `funcs`, the functions the source defines in order, beside the
+    /// function that calls its tests: only what allocates for the host,
+    /// which is found as it is in the component that is built. What the
+    /// world of the package exports is called by no host of the tests, so
+    /// none of it is looked for.
+    pub(super) fn export_tests(&mut self, program: &Program, funcs: &mut [ir::Func]) {
+        let (mut top, _) = self.candidates(program);
+        top.retain(|candidate| candidate.name == REALLOC);
+        let missing = self.export_each(program, [REALLOC].into_iter(), None, &mut top, funcs);
+        if let (false, Some((span, wit))) = (missing.is_empty(), self.allocated.clone()) {
+            self.error(TypeErrorKind::NeedsRealloc(wit), span);
+        }
+    }
+
     /// The functions that may be exported: those of the world itself, and
     /// those of each `pub "interface":` block, with the interface as the
     /// block names it.

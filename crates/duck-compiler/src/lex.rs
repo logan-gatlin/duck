@@ -23,6 +23,7 @@ pub enum TokenKind {
     Int(u64),
     Float(f64),
     Str(String),
+    Char(char),
 
     // Keywords
     Pub,
@@ -117,6 +118,11 @@ pub struct LexError {
 pub enum LexErrorKind {
     UnexpectedChar(char),
     UnterminatedString,
+    MultilineStringOpen,
+    MultilineStringClose,
+    MultilineStringIndent,
+    UnterminatedChar,
+    InvalidChar,
     InvalidEscape,
     InvalidNumber,
     IntTooLarge,
@@ -145,6 +151,7 @@ impl fmt::Display for TokenKind {
             Self::Int(n) => return write!(f, "`{n}`"),
             Self::Float(x) => return write!(f, "`{x}`"),
             Self::Str(s) => return write!(f, "{s:?}"),
+            Self::Char(c) => return write!(f, "{c:?}"),
             Self::Newline => return write!(f, "newline"),
             Self::Indent => return write!(f, "indent"),
             Self::Dedent => return write!(f, "dedent"),
@@ -226,6 +233,11 @@ impl LexErrorKind {
         match self {
             Self::UnexpectedChar(..) => "unexpected-character",
             Self::UnterminatedString => "unterminated-string",
+            Self::MultilineStringOpen => "multiline-string-open",
+            Self::MultilineStringClose => "multiline-string-close",
+            Self::MultilineStringIndent => "multiline-string-indent",
+            Self::UnterminatedChar => "unterminated-character",
+            Self::InvalidChar => "invalid-character",
             Self::InvalidEscape => "invalid-escape",
             Self::InvalidNumber => "invalid-number",
             Self::IntTooLarge => "int-too-large",
@@ -242,6 +254,23 @@ impl fmt::Display for LexErrorKind {
         match self {
             Self::UnexpectedChar(c) => write!(f, "unexpected character {c:?}"),
             Self::UnterminatedString => write!(f, "unterminated string literal"),
+            Self::MultilineStringOpen => {
+                write!(
+                    f,
+                    "the text of a `\"\"\"` string must start on the line after its opening quotes"
+                )
+            }
+            Self::MultilineStringClose => {
+                write!(f, "the closing `\"\"\"` of a string must start its line")
+            }
+            Self::MultilineStringIndent => {
+                write!(
+                    f,
+                    "each line of a `\"\"\"` string must be indented as far as its closing quotes"
+                )
+            }
+            Self::UnterminatedChar => write!(f, "unterminated character literal"),
+            Self::InvalidChar => write!(f, "a character literal must hold one character"),
             Self::InvalidEscape => write!(f, "invalid escape sequence"),
             Self::InvalidNumber => write!(f, "invalid number literal"),
             Self::IntTooLarge => write!(f, "integer literal is too large"),
@@ -315,7 +344,12 @@ impl<'a> Lexer<'a> {
                     }
                     continue;
                 }
+                '"' if self.src[self.pos..].starts_with("\"\"") => {
+                    self.pos += 2;
+                    self.multiline_string(start)?
+                }
                 '"' => self.string(start)?,
+                '\'' => self.char(start)?,
                 '0'..='9' if self.after(TokenKind::Dot) => self.tuple_index(start)?,
                 '0'..='9' => self.number(start)?,
                 c if is_ident_start(c) => self.ident(start),
@@ -612,6 +646,118 @@ impl<'a> Lexer<'a> {
                 c => value.push(c),
             }
         }
+    }
+
+    /// Lexes a `"""` string, which is the lines between the line of its
+    /// opening quotes and that of its closing ones, each without the
+    /// indentation of the closing quotes. The opening quotes have already
+    /// been consumed.
+    fn multiline_string(&mut self, start: usize) -> Result<TokenKind, LexError> {
+        let src = self.src;
+        while matches!(self.peek(), Some(' ' | '\t')) {
+            self.bump();
+        }
+        if !matches!(self.peek(), None | Some('\n' | '\r')) {
+            let text_start = self.pos;
+            self.skip_comment();
+            return Err(self.error(LexErrorKind::MultilineStringOpen, text_start));
+        }
+        // Each line: where it is, its indentation and what follows that.
+        let mut lines: Vec<(Span, &str, String)> = Vec::new();
+        let indent = 'lines: loop {
+            if !self.eat('\n') && self.eat('\r') {
+                self.eat('\n');
+            }
+            let line_start = self.pos;
+            while matches!(self.peek(), Some(' ' | '\t')) {
+                self.bump();
+            }
+            let indent = &src[line_start..self.pos];
+            let mut text = String::new();
+            loop {
+                let c = match self.peek() {
+                    None => return Err(self.error(LexErrorKind::UnterminatedString, start)),
+                    Some('\n' | '\r') => break,
+                    Some(c) => c,
+                };
+                let escape_start = self.pos;
+                if src[self.pos..].starts_with("\"\"\"") {
+                    self.pos += 3;
+                    if !text.is_empty() {
+                        return Err(self.error(LexErrorKind::MultilineStringClose, escape_start));
+                    }
+                    break 'lines indent;
+                }
+                self.bump();
+                match c {
+                    '\\' => {
+                        let escaped = self
+                            .escape()
+                            .ok_or_else(|| self.error(LexErrorKind::InvalidEscape, escape_start))?;
+                        text.push(escaped);
+                    }
+                    c => text.push(c),
+                }
+            }
+            lines.push((self.span(line_start), indent, text));
+        };
+
+        let mut value = String::new();
+        for (i, &(span, line_indent, ref text)) in lines.iter().enumerate() {
+            if i > 0 {
+                value.push('\n');
+            }
+            match line_indent.strip_prefix(indent) {
+                Some(rest) => {
+                    value.push_str(rest);
+                    value.push_str(text);
+                }
+                // A blank line needs no indentation.
+                None if text.is_empty() => {}
+                None => {
+                    let kind = LexErrorKind::MultilineStringIndent;
+                    return Err(LexError { kind, span });
+                }
+            }
+        }
+        Ok(TokenKind::Str(value))
+    }
+
+    /// Lexes a character literal: one character, or one escape, between
+    /// `'`. The opening quote has already been consumed.
+    fn char(&mut self, start: usize) -> Result<TokenKind, LexError> {
+        let escape_start = self.pos;
+        let value = match self.peek() {
+            None | Some('\n' | '\r') => {
+                return Err(self.error(LexErrorKind::UnterminatedChar, start));
+            }
+            // Nothing is between the quotes.
+            Some('\'') => None,
+            Some(c) => {
+                self.bump();
+                Some(match c {
+                    '\\' => self
+                        .escape()
+                        .ok_or_else(|| self.error(LexErrorKind::InvalidEscape, escape_start))?,
+                    c => c,
+                })
+            }
+        };
+        if let Some(value) = value
+            && self.eat('\'')
+        {
+            return Ok(TokenKind::Char(value));
+        }
+        // Whatever else the quotes hold, if they are closed.
+        let line = self.src[self.pos..].split(['\n', '\r']).next().unwrap();
+        let kind = match line.find('\'') {
+            Some(close) => {
+                self.pos += close + 1;
+                LexErrorKind::InvalidChar
+            }
+            None => LexErrorKind::UnterminatedChar,
+        };
+        Err(self.error(kind, start))
     }
 
     /// Decodes the escape after a `\`: `\n \r \t \0 \\ \" \'` or `\u{XXXX}`.
@@ -977,6 +1123,92 @@ mod tests {
         assert_eq!(error("\"abc"), LexErrorKind::UnterminatedString);
         assert_eq!(error("\"abc\ndef\""), LexErrorKind::UnterminatedString);
         assert_eq!(error(r#""\q""#), LexErrorKind::InvalidEscape);
+    }
+
+    #[test]
+    fn chars() {
+        assert_eq!(
+            kinds(r#"'a' '🦆' '"' '#' ' ' '\'' '\\' '\n' '\u{1F986}'"#),
+            vec![
+                Char('a'),
+                Char('🦆'),
+                Char('"'),
+                Char('#'),
+                Char(' '),
+                Char('\''),
+                Char('\\'),
+                Char('\n'),
+                Char('🦆'),
+                Newline,
+                Eof,
+            ]
+        );
+        for src in ["'", "'a", "'a\n'", "'\n'", "'ab", "'\\n"] {
+            assert_eq!(error(src), LexErrorKind::UnterminatedChar, "{src}");
+        }
+        for src in ["''", "'''", "'ab'", "'\\nb'", "'e\u{301}'"] {
+            assert_eq!(error(src), LexErrorKind::InvalidChar, "{src}");
+        }
+        assert_eq!(error(r"'\q'"), LexErrorKind::InvalidEscape);
+        let invalid = lex("x = 'abc' + 1").unwrap_err();
+        assert_eq!((invalid.span.start, invalid.span.end), (4, 9));
+    }
+
+    #[test]
+    fn multiline_strings() {
+        let text = |src: &str| match &kinds(src)[..] {
+            [Str(text), Newline, Eof] => text.clone(),
+            kinds => panic!("{kinds:?}"),
+        };
+        assert_eq!(text("\"\"\"\none\n two\n\"\"\""), "one\n two");
+        // The indentation of the closing quotes is no part of a line.
+        assert_eq!(text("\"\"\"\n\t one\n\t \t two\n\t \"\"\""), "one\n\t two");
+        assert_eq!(text("\"\"\"\n\"\"\""), "");
+        assert_eq!(text("\"\"\"  \r\n  a\r\n  b\r  \"\"\""), "a\nb");
+        // Only a blank line before the closing quotes ends the text with one.
+        assert_eq!(text("\"\"\"\n\ta\n\n\t \n\t\"\"\""), "a\n\n ");
+        assert_eq!(text("\"\"\"\n\ta\n \n\n\t\"\"\""), "a\n\n");
+        assert_eq!(
+            text("\"\"\"\n say \"hi\" to \"\"\n \\\"\"\" \\u{1F986}\\n\\tx # y\n \"\"\""),
+            "say \"hi\" to \"\"\n\"\"\" 🦆\n\tx # y"
+        );
+        // An escape is no indentation.
+        assert_eq!(text("\"\"\"\n\t\\ta\n\t\"\"\""), "\ta");
+
+        // The lines of one are no lines of the block it is in.
+        assert_eq!(
+            kinds("f(\"\"\"\n\t\ta\n\t\t\"\"\", 1)\nif x:\n\ty = \"\"\"\n\ta\nb\n\"\"\"\n\tz\n")
+                .iter()
+                .filter(|kind| matches!(kind, Str(_) | Newline | Indent | Dedent))
+                .collect::<Vec<_>>(),
+            [
+                &Str("a".to_string()),
+                &Newline,
+                &Newline,
+                &Indent,
+                &Str("\ta\nb".to_string()),
+                &Newline,
+                &Newline,
+                &Dedent,
+            ]
+        );
+
+        assert_eq!(error("\"\"\"\na\n"), LexErrorKind::UnterminatedString);
+        assert_eq!(error("\"\"\""), LexErrorKind::UnterminatedString);
+        assert_eq!(error("\"\"\"a\n\"\"\""), LexErrorKind::MultilineStringOpen);
+        assert_eq!(error("\"\"\"a\"\"\""), LexErrorKind::MultilineStringOpen);
+        assert_eq!(error("\"\"\"\na\"\"\""), LexErrorKind::MultilineStringClose);
+        assert_eq!(
+            error("\"\"\"\n a\n  \"\"\""),
+            LexErrorKind::MultilineStringIndent
+        );
+        assert_eq!(
+            error("\"\"\"\n\ta\n \"\"\""),
+            LexErrorKind::MultilineStringIndent
+        );
+        assert_eq!(error("\"\"\"\n\\q\n\"\"\""), LexErrorKind::InvalidEscape);
+        let indent = lex("x = \"\"\"\n\t\ta\n\tbc\n\t\t\"\"\"\n").unwrap_err();
+        assert_eq!((indent.span.start, indent.span.end), (12, 15));
     }
 
     #[test]

@@ -329,6 +329,8 @@ pub enum ExprKind {
     Int(u64),
     Float(f64),
     Str(String),
+    /// `'c'`, a code point.
+    Char(char),
     Bool(bool),
     /// `()`
     Unit,
@@ -1464,6 +1466,7 @@ impl<'a> Parser<'a> {
             | TokenKind::Int(_)
             | TokenKind::Float(_)
             | TokenKind::Str(_)
+            | TokenKind::Char(_)
             | TokenKind::True
             | TokenKind::False => PatternKind::Literal(self.literal_pattern()?),
             _ => return Err(self.unexpected("pattern")),
@@ -1475,7 +1478,7 @@ impl<'a> Parser<'a> {
     }
 
     /// A literal that a pattern is: a number, which may follow a `-`, a
-    /// string, `true` or `false`.
+    /// string, a character, `true` or `false`.
     fn literal_pattern(&mut self) -> PResult<Expr> {
         let start = self.peek().span;
         let negative = self.eat(TokenKind::Minus);
@@ -1485,6 +1488,7 @@ impl<'a> Parser<'a> {
             TokenKind::Float(x) => ExprKind::Float(*x),
             _ if negative => return Err(self.unexpected("number")),
             TokenKind::Str(s) => ExprKind::Str(s.clone()),
+            TokenKind::Char(c) => ExprKind::Char(*c),
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
             _ => return Err(self.unexpected("pattern")),
@@ -1707,6 +1711,7 @@ impl<'a> Parser<'a> {
             TokenKind::Int(n) => ExprKind::Int(*n),
             TokenKind::Float(x) => ExprKind::Float(*x),
             TokenKind::Str(s) => ExprKind::Str(s.clone()),
+            TokenKind::Char(c) => ExprKind::Char(*c),
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
             TokenKind::Ident(name) if name == "_" => {
@@ -2061,6 +2066,7 @@ fn starts_expr(kind: &TokenKind) -> bool {
         TokenKind::Int(_)
             | TokenKind::Float(_)
             | TokenKind::Str(_)
+            | TokenKind::Char(_)
             | TokenKind::Ident(_)
             | TokenKind::True
             | TokenKind::False
@@ -2147,6 +2153,7 @@ mod tests {
             ExprKind::Int(n) => n.to_string(),
             ExprKind::Float(x) => x.to_string(),
             ExprKind::Str(s) => format!("{s:?}"),
+            ExprKind::Char(c) => format!("{c:?}"),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Unit => "()".to_string(),
             ExprKind::Name(name) => name.clone(),
@@ -2399,6 +2406,7 @@ mod tests {
         assert_eq!(expr("not not a"), "(Not (Not a))");
         assert_eq!(expr("a & 1 == 0"), "(Eq (BitAnd a 1) 0)");
         assert_eq!(expr("(a + b) * c"), "(Mul (Add a b) c)");
+        assert_eq!(expr("c - '0' as u8"), "(Sub c (as '0' u8))");
     }
 
     #[test]
@@ -3355,6 +3363,11 @@ fn f():
         assert_eq!(
             errors(&arm("-true")),
             vec![expected("number", TokenKind::True)]
+        );
+        assert!(parse_src(&arm("('a', ['\\n', _])")).is_ok());
+        assert_eq!(
+            errors(&arm("-'a'")),
+            vec![expected("number", TokenKind::Char('a'))]
         );
         assert_eq!(
             errors(&arm("[a; 2]")),

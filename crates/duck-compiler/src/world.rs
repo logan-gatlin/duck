@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{
     Function, InterfaceId, PackageId, Resolve, SourceMap, Type, TypeDefKind,
-    UnresolvedPackageGroup, WorldId, WorldItem,
+    UnresolvedPackageGroup, WorldId, WorldItem, WorldKey,
 };
 
 use crate::file::{Settings, WitFile};
@@ -34,6 +34,19 @@ pub const ROOT: &str = "$root";
 /// The function that allocates what the host passes in memory, which a
 /// module exports by this name and no other.
 pub const REALLOC: &str = "cabi_realloc";
+
+/// The function of the world itself that the component of a package's
+/// tests exports: it takes the index of a test, and calls it. A module
+/// exports it by this name.
+pub const TEST_EXPORT: &str = "duck-test";
+
+/// The WIT package that the world of a package's tests is written in, which
+/// is the compiler's own, and what that world is named there.
+const TESTS_PACKAGE: &str = "duck:tests";
+const TESTS_WORLD: &str = "tests";
+
+/// What an error in the WIT of [`TESTS_PACKAGE`] names as its file.
+const TESTS_PATH: &str = "tests.wit";
 
 /// The WIT of WASI 0.3 as Wasmtime implements it, each package after those
 /// it uses. The packages are copied from `src/p3/wit/deps` of the
@@ -314,6 +327,51 @@ impl World {
         })
     }
 
+    /// The world of the tests of a package whose world this is: it imports
+    /// what this one does, exports none of what it does, and exports the
+    /// function [`TEST_EXPORT`]. A library has no world, so that of its
+    /// tests imports each of `interfaces` that its WIT has, which are named
+    /// in full: those its `extern` blocks name, as the world of a component
+    /// built from it would have to. One that the WIT doesn't have is
+    /// reported where it is named, as one that isn't imported.
+    ///
+    /// The function is an `async func`, as the `run` of [`RUN_INTERFACE`]
+    /// is, so that what a test calls may block.
+    pub fn tests(mut self, interfaces: &[String]) -> Result<Self, WorldError> {
+        let imports: String = match self.world {
+            Some(world) => {
+                let named = &self.resolve.worlds[world];
+                let package = named.package.expect("a world is of a package");
+                let name = self.resolve.id_of_name(package, &named.name);
+                format!("    include {name};\n")
+            }
+            None => {
+                let known = interfaces.iter().filter(|name| self.has_interface(name));
+                known.map(|name| format!("    import {name};\n")).collect()
+            }
+        };
+        let wit = format!(
+            "package {TESTS_PACKAGE};\n\nworld {TESTS_WORLD} {{\n{imports}    \
+             export {TEST_EXPORT}: async func(index: u32);\n}}\n"
+        );
+        let package = self.resolve.push_str(TESTS_PATH, &wit);
+        let package = package.map_err(|e| WorldError::Wit(format!("{e:#}")))?;
+        let world = self.resolve.select_world(&[package], Some(TESTS_WORLD));
+        let world = world.map_err(|e| WorldError::Wit(format!("{e:#}")))?;
+        // An `include` takes what the world exports too, which no host of
+        // the tests calls.
+        let own = |key: &WorldKey| matches!(key, WorldKey::Name(name) if name == TEST_EXPORT);
+        self.resolve.worlds[world].exports.retain(|key, _| own(key));
+        self.world = Some(world);
+        Ok(self)
+    }
+
+    /// Whether the WIT has an interface named `name` in full.
+    fn has_interface(&self, name: &str) -> bool {
+        let mut interfaces = self.resolve.interfaces.iter();
+        interfaces.any(|(id, _)| self.resolve.id_of(id).as_deref() == Some(name))
+    }
+
     /// The packages of the WIT, resolved.
     pub(crate) fn resolve(&self) -> &Resolve {
         &self.resolve
@@ -376,9 +434,7 @@ impl World {
                 .ok_or(ImportError::Function);
         };
         let Some(id) = self.imported_interface(interface) else {
-            let mut interfaces = self.resolve.interfaces.iter();
-            let known =
-                interfaces.any(|(id, _)| self.resolve.id_of(id).as_deref() == Some(interface));
+            let known = self.has_interface(interface);
             return Err(match (&self.name, known) {
                 (Some(world), true) => ImportError::Unimported {
                     world: world.clone(),
@@ -440,9 +496,11 @@ impl World {
         })
     }
 
-    /// The name in full of each interface that is there to import.
+    /// The name in full of each interface that is there to import: those
+    /// the world imports, or any of the WIT for a library, and for the
+    /// tests of one, whose world imports whichever of them a file names.
     fn imported_interfaces(&self) -> Vec<String> {
-        let Some(world) = self.world else {
+        let Some(world) = self.world.filter(|_| self.name.is_some()) else {
             let interfaces = self.resolve.interfaces.iter();
             return interfaces
                 .filter_map(|(id, _)| self.resolve.id_of(id))
@@ -745,5 +803,181 @@ mod tests {
         let library = World::load(&Settings::default()).unwrap();
         assert!(library.is_library() && !library.exports_run());
         assert_eq!(library.exports(), Exports::default());
+    }
+
+    /// The WIT of a package whose world `app` imports and exports.
+    const APP: &str = "
+package my:pkg@0.1.0;
+
+interface math {
+    record pair { a: s32, b: s32 }
+    resource table;
+    add: func(p: pair) -> s32;
+}
+
+interface greeter {
+    use math.{pair};
+    greet: func(p: pair) -> string;
+}
+
+interface spare {
+    idle: func();
+}
+
+world app {
+    import math;
+    import trace: func(code: u32);
+    export greeter;
+    export double: func(n: s32) -> s32;
+}
+";
+
+    /// The settings of a package whose WIT is [`APP`], of the world `world`.
+    fn app(world: Option<&str>) -> Settings {
+        let file = WitFile {
+            path: "wit/app.wit".to_string(),
+            contents: APP.to_string(),
+        };
+        Settings {
+            world: world.map(str::to_string),
+            wit: crate::file::Wit {
+                package: world.iter().map(|_| file.clone()).collect(),
+                deps: world
+                    .is_none()
+                    .then(|| vec![file.clone()])
+                    .into_iter()
+                    .collect(),
+            },
+            ..Settings::default()
+        }
+    }
+
+    /// What the world of the tests of every package exports, and nothing
+    /// else.
+    fn test_export() -> Exports {
+        Exports {
+            functions: vec![TEST_EXPORT.to_string()],
+            interfaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_tests_of_a_program_import_what_it_does_and_export_what_calls_them() {
+        let command = Settings {
+            world: Some(COMMAND.to_string()),
+            ..Settings::default()
+        };
+        let world = World::load(&command).unwrap().tests(&[]).unwrap();
+        assert_eq!(world.exports(), test_export());
+        assert!(!world.exports_run() && !world.is_library());
+        // It is called with the index of a test, and gives nothing.
+        let called = WitFunc {
+            params: vec![("index".to_string(), WitTy::U32)],
+            result: None,
+        };
+        assert_eq!(world.export(None, TEST_EXPORT), Some(called));
+        assert_eq!(world.export(Some(RUN_INTERFACE), "run"), None);
+        // What the program imports is there as it is for the program.
+        let program = World::load(&command).unwrap();
+        for (interface, name) in [
+            ("wasi:cli/stdout@0.3.0", "write-via-stream"),
+            ("wasi:cli/environment@0.3.0", "get-arguments"),
+            ("wasi:filesystem/types@0.3.0", "[method]descriptor.open-at"),
+            ("wasi:cli/stdout@0.3.0", "missing"),
+            ("wasi:cli/run@0.3.0", "run"),
+        ] {
+            let found = world.import(Some(interface), name);
+            assert_eq!(found, program.import(Some(interface), name), "{interface}");
+        }
+        assert!(world.imports_resource("wasi:filesystem/types@0.3.0", "descriptor"));
+        assert_eq!(world.import(None, "log"), Err(ImportError::Function));
+    }
+
+    #[test]
+    fn the_tests_of_a_world_of_the_package_import_what_it_does() {
+        let world = World::load(&app(Some("app"))).unwrap();
+        let world = world.tests(&["my:pkg/spare@0.1.0".to_string()]).unwrap();
+        assert_eq!(world.exports(), test_export());
+        // An interface, with what its types are, and a function of the
+        // world itself.
+        let pair = WitTy::Record {
+            name: "pair".to_string(),
+            fields: vec![WitTy::S32, WitTy::S32],
+        };
+        let add = WitFunc {
+            params: vec![("p".to_string(), pair)],
+            result: Some(WitTy::S32),
+        };
+        assert_eq!(
+            world.import(Some("my:pkg/math@0.1.0"), "add"),
+            Ok(Some(add))
+        );
+        assert!(world.imports_resource("my:pkg/math@0.1.0", "table"));
+        let trace = WitFunc {
+            params: vec![("code".to_string(), WitTy::U32)],
+            result: None,
+        };
+        assert_eq!(world.import(None, "trace"), Ok(Some(trace)));
+        // Nothing that it exports is the tests' to define, or to import.
+        assert_eq!(world.export(None, "double"), None);
+        assert_eq!(world.export(Some("my:pkg/greeter@0.1.0"), "greet"), None);
+        // What it doesn't import is what the world of the package doesn't,
+        // whatever a file names.
+        let unimported = ImportError::Unimported {
+            world: "app".to_string(),
+        };
+        for interface in ["my:pkg/greeter@0.1.0", "my:pkg/spare@0.1.0"] {
+            let found = world.import(Some(interface), "idle");
+            assert_eq!(found, Err(unimported.clone()), "{interface}");
+        }
+    }
+
+    #[test]
+    fn the_tests_of_a_library_import_the_interfaces_it_names() {
+        let named = [
+            "my:pkg/greeter@0.1.0",
+            "wasi:cli/stdout@0.3.0",
+            "my:pkg/missing@0.1.0",
+        ];
+        let library = World::load(&app(None)).unwrap();
+        assert!(library.is_library());
+        let world = library.tests(&named.map(str::to_string)).unwrap();
+        assert!(!world.is_library());
+        assert_eq!(world.exports(), test_export());
+        assert!(world.import(Some("my:pkg/greeter@0.1.0"), "greet").is_ok());
+        assert!(
+            world
+                .import(Some("wasi:cli/stdout@0.3.0"), "write-via-stream")
+                .is_ok()
+        );
+        // An interface whose types one of them uses is imported with it.
+        assert!(world.import(Some("my:pkg/math@0.1.0"), "add").is_ok());
+        assert!(world.imports_resource("my:pkg/math@0.1.0", "table"));
+        // One that no file names is not, nor is one that the WIT lacks, and
+        // the world itself has no function to import.
+        let imported = |interface: &str| match world.import(Some(interface), "idle") {
+            Err(ImportError::Interface { imported }) => imported,
+            other => panic!("{other:?}"),
+        };
+        let found = imported("my:pkg/spare@0.1.0");
+        assert!(
+            found.contains(&"my:pkg/greeter@0.1.0".to_string()),
+            "{found:?}"
+        );
+        assert_eq!(imported("my:pkg/missing@0.1.0"), found);
+        assert_eq!(world.import(None, "trace"), Err(ImportError::Function));
+        // What is there to import is all that the WIT has, as for a library.
+        assert!(
+            found.contains(&"my:pkg/spare@0.1.0".to_string()),
+            "{found:?}"
+        );
+
+        // One that names nothing imports nothing.
+        let bare = World::load(&Settings::default())
+            .unwrap()
+            .tests(&[])
+            .unwrap();
+        assert_eq!(bare.exports(), test_export());
+        assert_eq!(bare.imports().unwrap().count(), 0);
     }
 }

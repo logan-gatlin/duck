@@ -356,7 +356,8 @@ impl Checker {
 
     /// The folded value of `expr`, which a member of an enum whose values
     /// have type `ty` is given. `None` after reporting an error, or if `ty`
-    /// is the error type.
+    /// is the error type, or if `expr` is of it, as what reads a global
+    /// that failed to check is.
     fn member_value(
         &mut self,
         program: &Program,
@@ -368,7 +369,8 @@ impl Checker {
         body.global = Some(program);
         let value = body.check(expr, ty);
         let consts = body.evaluate(value, expr.span);
-        consts.filter(|_| self.errors.len() == errors && ty != Ty::Error)
+        let checked = self.errors.len() == errors && ty != Ty::Error;
+        consts.filter(|consts| checked && self.is_value_of(ty, consts))
     }
 
     /// The type of enum `id`'s values.

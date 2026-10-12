@@ -127,7 +127,8 @@ impl Checker {
     /// The folded value of `expr`, the default of a field or parameter of
     /// type `ty` in a struct or function whose type parameters are `tys`,
     /// named `names`. `None` after reporting an error, or if `ty` is the
-    /// error type.
+    /// error type, or if `expr` is of it, as what reads a global that
+    /// failed to check is.
     ///
     /// A default needn't have the type `ty` as declared: it may have one of
     /// the types that `ty` stands for, as a `&Heap` is one of those a `&A`
@@ -182,7 +183,10 @@ impl Checker {
         }
         let consts = self.evaluate(program, locals, value, expr.span);
         let folded = self.errors.len() == errors && ty != Ty::Error;
-        (consts.filter(|_| folded), own.filter(|_| folded))
+        let valued = |consts: &Vec<Const>| self.is_value_of(own.unwrap_or(ty), consts);
+        let consts = consts.filter(|consts| folded && valued(consts));
+        let folded = consts.is_some();
+        (consts, own.filter(|_| folded))
     }
 
     /// The default of field `index` of struct `id`. An instance of a generic
@@ -233,7 +237,8 @@ impl Body<'_> {
     /// no value has its default.
     pub(super) fn construct_struct(&mut self, id: StructId, args: &[Arg], span: Span) -> Value {
         let def = &self.ck.structs[id.0 as usize];
-        let (ty, foreign) = (def.name.clone(), def.module != self.ck.module);
+        let foreign = !self.ck.sees_private(self.ck.module, def.module);
+        let ty = def.name.clone();
         let item = def.item;
         let fields = def.fields.clone();
         if foreign {
@@ -313,6 +318,7 @@ fn param_in_expr<'a>(
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
+        | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::Unit
         | ExprKind::Module(_)

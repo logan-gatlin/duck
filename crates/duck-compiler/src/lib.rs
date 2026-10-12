@@ -4,7 +4,7 @@ use crate::file::FileManager;
 use crate::lex::{LexError, Span};
 use crate::load::UseError;
 use crate::parse::ParseError;
-use crate::ty::{InstanceSite, TypeError, TypeErrorKind};
+use crate::ty::{InstanceSite, Test, TypeError, TypeErrorKind};
 use crate::world::{World, WorldError};
 
 pub mod bindgen;
@@ -31,6 +31,19 @@ pub enum Error {
     /// doesn't have, lacks what it exports, or declares either as the
     /// Canonical ABI doesn't.
     Component(String),
+}
+
+/// The tests of a package, as [`compile_tests`] compiles them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tests {
+    /// The component that runs them. It imports what the world of the
+    /// package does, and exports the function [`world::TEST_EXPORT`] alone,
+    /// which takes the index of a test in `tests` and calls it. Each test
+    /// is to run in an instance of its own, which starts as the constants
+    /// of the package left it.
+    pub component: Vec<u8>,
+    /// Each test, in the order they are run in.
+    pub tests: Vec<Test>,
 }
 
 impl Error {
@@ -90,6 +103,9 @@ impl std::error::Error for Error {}
 ///
 /// Stops at the first stage that fails, returning all of its errors. Loading
 /// every file counts as one stage.
+///
+/// The test modules of `files` are modules of the program, so a package is
+/// built from files that have none: [`compile_tests`] is for those that do.
 pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
     let settings = files.settings();
     if settings.world.is_none() {
@@ -101,6 +117,27 @@ pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
     let world = World::load(&settings).expect("the world is read");
     let component = world.encode(emit::emit(&module));
     component.map_err(|e| vec![Error::Component(e)])
+}
+
+/// Compiles the entry point of `files`, every file it uses, and each of its
+/// test modules, with what those use, to a WebAssembly component that runs
+/// the tests of the package: one of the world that [`World::tests`] makes
+/// of the world its [`file::Settings`] name. A library, which has no world
+/// to be built as a component of, is tested as one that imports what its
+/// `extern` blocks name.
+///
+/// Stops at the first stage that fails, as [`compile`] does.
+pub fn compile_tests(files: &mut impl FileManager) -> Result<Tests, Vec<Error>> {
+    let settings = files.settings();
+    let program = load::load(files)?;
+    let tested = ty::check_tests(&program, &settings);
+    let tested = tested.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
+    let component = tested.world.encode(emit::emit(&tested.module));
+    let component = component.map_err(|e| vec![Error::Component(e)])?;
+    Ok(Tests {
+        component,
+        tests: tested.tests,
+    })
 }
 
 /// Lowers the entry point of `files`, and every file it uses, to the core

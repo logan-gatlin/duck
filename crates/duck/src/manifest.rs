@@ -1,11 +1,12 @@
 //! `Duck.toml`, the metadata of a duck package: the component it builds, the
-//! library it offers other packages, and the packages it depends on.
+//! library it offers other packages, the directory of its tests, and the
+//! packages it depends on.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Component as Part, Path, PathBuf};
 
 use duck_compiler::file::{Settings, Wit};
 use duck_compiler::lex;
@@ -30,6 +31,16 @@ pub const LIBRARY: &str = "library";
 /// entered by.
 pub const ENTRY: &str = "entry";
 
+/// The table of a manifest that says where the tests of the package are.
+pub const TEST: &str = "test";
+
+/// The key of [`TEST`] that names the test directory.
+pub const DIR: &str = "dir";
+
+/// The test directory of a package that names none, relative to its
+/// manifest.
+pub const DEFAULT_TEST_DIR: &str = "tests";
+
 /// The size of a wasm page, which every memory size is a whole number of.
 const PAGE_SIZE: u64 = 64 * 1024;
 
@@ -41,6 +52,11 @@ pub const MAX_PAGES: u64 = 1 << 16;
 pub struct Manifest {
     pub component: Option<Component>,
     pub library: Option<Library>,
+    /// The directory whose source files are the test modules of the
+    /// package, relative to the manifest: [`DEFAULT_TEST_DIR`] where none is
+    /// named. `None` where none is named and that one is in the directory
+    /// of an entry, whose files are modules of the package already.
+    pub tests: Option<PathBuf>,
     /// Each package this one can use, by the name it uses it as.
     pub dependencies: BTreeMap<String, Dependency>,
 }
@@ -124,6 +140,13 @@ pub enum ManifestError {
     Empty,
     /// A `[memory]` without a `[component]` to give it to.
     MemoryWithoutComponent,
+    /// A test directory that is in the directory of an entry, or that
+    /// `holds` it: a file of both would be a module of the package twice.
+    TestDir {
+        dir: PathBuf,
+        entry: PathBuf,
+        holds: bool,
+    },
     /// A dependency named something that can't be used.
     DependencyName(String),
     /// A dependency with neither a `path` nor a `git`.
@@ -156,6 +179,8 @@ struct Raw {
     library: Option<RawLibrary>,
     #[serde(default, rename = "const")]
     constants: RawConstants,
+    #[serde(default)]
+    test: RawTest,
     #[serde(default)]
     dependencies: BTreeMap<String, RawDependency>,
 }
@@ -203,6 +228,12 @@ struct RawConstants {
     fuel: Option<u64>,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTest {
+    dir: Option<PathBuf>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDependency {
@@ -233,6 +264,11 @@ impl Manifest {
         if component.is_none() && library.is_none() {
             return Err(ManifestError::Empty);
         }
+        let entries = [
+            component.as_ref().map(|component| &component.entry),
+            library.as_ref().map(|library| &library.entry),
+        ];
+        let tests = test_dir(raw.test.dir, entries.into_iter().flatten())?;
         let mut dependencies = BTreeMap::new();
         for (name, dependency) in raw.dependencies {
             if !lex::is_identifier(&name) {
@@ -244,6 +280,7 @@ impl Manifest {
         Ok(Self {
             component,
             library,
+            tests,
             dependencies,
         })
     }
@@ -362,6 +399,57 @@ impl Library {
     }
 }
 
+/// The test directory of a package that names `dir` as it, or none, and
+/// is entered by `entries`: `dir`, or [`DEFAULT_TEST_DIR`]. Neither it nor
+/// the directory of an entry holds the other, as the paths are written:
+/// one that is named so is an error, and the default is then none.
+fn test_dir<'e>(
+    dir: Option<PathBuf>,
+    entries: impl Iterator<Item = &'e PathBuf>,
+) -> Result<Option<PathBuf>, ManifestError> {
+    let named = dir.is_some();
+    let dir = dir.unwrap_or_else(|| DEFAULT_TEST_DIR.into());
+    for entry in entries {
+        let modules = entry.parent().unwrap_or(Path::new(""));
+        let inside = within(&dir, modules);
+        let holds = !inside && within(modules, &dir);
+        if !inside && !holds {
+            continue;
+        }
+        let entry = entry.clone();
+        return match named {
+            true => Err(ManifestError::TestDir { dir, entry, holds }),
+            false => Ok(None),
+        };
+    }
+    Ok(Some(dir))
+}
+
+/// Whether the directory `inner` is `outer` or under it, as the two are
+/// written: each from the same directory, or from the root of the file
+/// system.
+fn within(inner: &Path, outer: &Path) -> bool {
+    let (inner, outer) = (parts(inner), parts(outer));
+    let rest = inner.strip_prefix(&outer[..]);
+    rest.is_some_and(|rest| !rest.contains(&Part::ParentDir))
+}
+
+/// The names that lead to `path`, without those that lead nowhere: a `.`,
+/// and a name with the `..` that leaves it.
+fn parts(path: &Path) -> Vec<Part<'_>> {
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match (part, parts.last()) {
+            (Part::CurDir, _) => {}
+            (Part::ParentDir, Some(Part::Normal(_))) => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts
+}
+
 /// Where the manifest `src` writes the key that `keys` lead to, each the
 /// name of a table of the one before, with the value it is given: of a
 /// table that heads lines of its own, the heading. The nearest table that
@@ -454,6 +542,7 @@ impl ManifestError {
             Self::Memory64 => vec!["memory", "memory64"],
             Self::StaticEnd => vec!["memory", "static", "end"],
             Self::MemoryWithoutComponent => vec!["memory"],
+            Self::TestDir { .. } => vec![TEST, DIR],
             Self::DependencyName(name)
             | Self::NoSource(name)
             | Self::GitRef(name)
@@ -483,6 +572,27 @@ impl fmt::Display for ManifestError {
             ),
             Self::Empty => write!(f, "needs a [component] or [library] table"),
             Self::MemoryWithoutComponent => write!(f, "[memory] needs a [component] table"),
+            Self::TestDir {
+                dir,
+                entry,
+                holds: false,
+            } => write!(
+                f,
+                "the test directory `{}` is in the directory of the entry `{}`, whose files \
+                 are modules of the package already",
+                dir.display(),
+                entry.display()
+            ),
+            Self::TestDir {
+                dir,
+                entry,
+                holds: true,
+            } => write!(
+                f,
+                "the test directory `{}` holds the entry `{}`, which is no test module",
+                dir.display(),
+                entry.display()
+            ),
             Self::DependencyName(name) => {
                 write!(f, "dependency name `{name}` is not an identifier")
             }
@@ -688,6 +798,7 @@ mod tests {
                     fuel: None,
                 }),
                 library: None,
+                tests: Some("tests".into()),
                 dependencies: BTreeMap::new(),
             }
         );
@@ -764,6 +875,88 @@ mod tests {
     }
 
     #[test]
+    fn tests_are_in_the_directory_that_is_named() {
+        let tests = |src: &str| Manifest::parse(src).map(|manifest| manifest.tests);
+        let component = "[component]\nentry = \"src/main.duck\"\noutput = \"a.wasm\"\n";
+        let library = "[library]\nentry = \"lib/lib.duck\"\n";
+        let named = |manifest: &str, dir: &str| {
+            let src = format!("{manifest}[test]\ndir = \"{dir}\"\n");
+            tests(&src).map_err(|e| e.to_string())
+        };
+        // In `tests` beside the manifest, where none is.
+        for table in ["", "[test]\n"] {
+            let src = format!("{component}{table}");
+            assert_eq!(tests(&src).unwrap(), Some("tests".into()), "{table:?}");
+        }
+        assert_eq!(
+            named(component, "checks/unit"),
+            Ok(Some("checks/unit".into()))
+        );
+        assert_eq!(named(component, "../checks"), Ok(Some("../checks".into())));
+        assert_eq!(
+            named(component, "src/../checks"),
+            Ok(Some("src/../checks".into()))
+        );
+        assert_eq!(
+            named(library, "/abs/checks"),
+            Ok(Some("/abs/checks".into()))
+        );
+
+        // A file of the directory of an entry is a module of the package
+        // already, wherever under it the file is and however it is named.
+        let inside = |dir: &str, entry: &str| {
+            Err(format!(
+                "the test directory `{dir}` is in the directory of the entry `{entry}`, whose \
+                 files are modules of the package already"
+            ))
+        };
+        for dir in ["src", "src/tests", "./src/deep/../tests", "tests/../src"] {
+            assert_eq!(named(component, dir), inside(dir, "src/main.duck"), "{dir}");
+        }
+        let both = format!("{component}{library}");
+        assert_eq!(
+            named(&both, "lib/tests"),
+            inside("lib/tests", "lib/lib.duck")
+        );
+        // And the entry is no test module.
+        let holds = |dir: &str, entry: &str| {
+            Err(format!(
+                "the test directory `{dir}` holds the entry `{entry}`, which is no test module"
+            ))
+        };
+        assert_eq!(named(component, "."), holds(".", "src/main.duck"));
+        assert_eq!(named(library, "lib/.."), holds("lib/..", "lib/lib.duck"));
+        let deep = "[library]\nentry = \"tests/unit/lib.duck\"\n";
+        assert_eq!(named(deep, "tests"), holds("tests", "tests/unit/lib.duck"));
+
+        // A package whose entry is beside its manifest has every directory
+        // of its own under that one, so it has no tests unless it names a
+        // directory elsewhere.
+        let beside = "[library]\nentry = \"lib.duck\"\n";
+        assert_eq!(tests(beside).unwrap(), None);
+        assert_eq!(named(beside, "tests"), inside("tests", "lib.duck"));
+        assert_eq!(named(beside, "../tests"), Ok(Some("../tests".into())));
+        assert_eq!(tests(deep).unwrap(), None);
+
+        // The error is about the key that names the directory.
+        let error = Manifest::parse(&format!("{beside}[test]\ndir = \"tests\"\n")).unwrap_err();
+        assert_eq!(error.key(), Some(vec!["test", "dir"]));
+        let error = |test: &str| Manifest::parse(&format!("{component}{test}")).unwrap_err();
+        let unknown = error("[test]\ndirectory = \"tests\"\n").to_string();
+        assert!(unknown.contains("unknown field `directory`"), "{unknown}");
+        assert!(
+            error("[test]\ndir = 1\n")
+                .to_string()
+                .contains("invalid type")
+        );
+        assert!(
+            error("[tests]\n")
+                .to_string()
+                .contains("unknown field `tests`")
+        );
+    }
+
+    #[test]
     fn memory_is_optional() {
         let module = |memory: &str| {
             let src = format!("[component]\nentry = \"a.duck\"\noutput = \"a.wasm\"\n{memory}");
@@ -794,6 +987,7 @@ mod tests {
                     entry: "src/lib.duck".into(),
                     fuel: None,
                 }),
+                tests: Some("tests".into()),
                 dependencies: BTreeMap::from([
                     ("math".to_string(), Dependency::Path("../math".into())),
                     ("util".to_string(), Dependency::Path("/abs/util".into())),

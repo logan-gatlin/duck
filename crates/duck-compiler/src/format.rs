@@ -5,8 +5,10 @@
 //! made regular. A statement is on one line if it fits, wherever the source
 //! breaks it, and is otherwise broken at its brackets and its pipes, as only
 //! they let a statement go on. Comments stay as they are, and only the commas
-//! that end what is in brackets come and go.
+//! that end what is in brackets come and go. The lines of a `"""` string are
+//! indented again, which leaves its text as it is.
 
+use std::borrow::Cow;
 use std::mem;
 
 use crate::Error;
@@ -50,7 +52,9 @@ struct Piece<'a> {
 }
 
 enum PieceKind<'a> {
-    Token(&'a str),
+    /// Its text, which has a line break only between the lines of a `"""`
+    /// string: those are without the indentation of its closing quotes.
+    Token(Cow<'a, str>),
     Group(Group<'a>),
 }
 
@@ -157,6 +161,9 @@ const SHORT_WIDTH: usize = 10;
 /// no spaces that do.
 const COMMENT_GAP: &str = "  ";
 
+/// What opens and closes a string of several lines.
+const QUOTES: &str = "\"\"\"";
+
 /// Lays `src` out as the language is written, changing only its whitespace
 /// and the commas that end what is in brackets. A source that doesn't parse
 /// has no layout: its errors are returned.
@@ -176,6 +183,9 @@ const COMMENT_GAP: &str = "  ";
 /// - The source keeps a statement broken with a line that starts with `|>`,
 ///   which breaks it at every pipe, and with a comma after the last item in
 ///   brackets or a comment in them, which break them.
+/// - The lines of a `"""` string, and its closing quotes, are indented once
+///   more than the line its opening quotes are on. A line of it is as long
+///   as its text is.
 /// - No more than one line in a row is blank, and none are at the start of
 ///   the file, at its end, at the start of a block or inside brackets. One
 ///   sets apart each item that has a block from the items before and after.
@@ -335,6 +345,10 @@ impl<'a> Formatter<'a> {
                 if let (Semi, Some(frame)) = (kind, self.frames.last_mut()) {
                     frame.group.list = false;
                 }
+                let text = match kind {
+                    Str(_) if text.starts_with(QUOTES) => Cow::Owned(unindented(text)),
+                    _ => Cow::Borrowed(text),
+                };
                 self.item().push(Piece {
                     spaced,
                     kind: PieceKind::Token(text),
@@ -497,7 +511,7 @@ impl<'a> Formatter<'a> {
             self.line().code = flat;
             return;
         }
-        let is_pipe = |piece: &Piece| matches!(piece.kind, PieceKind::Token("|>"));
+        let is_pipe = |piece: &Piece| matches!(&piece.kind, PieceKind::Token(text) if text == "|>");
         if !pieces.iter().any(is_pipe) {
             let parameters = parameters(&pieces);
             return self.sequence(&pieces, self.depth, 0, parameters);
@@ -588,7 +602,7 @@ impl<'a> Formatter<'a> {
                 && item
                     .flat
                     .as_ref()
-                    .is_some_and(|flat| width(flat) <= SHORT_WIDTH)
+                    .is_some_and(|flat| width(flat) <= SHORT_WIDTH && !flat.contains('\n'))
         };
         let filled = group.open == "["
             && group.list
@@ -687,8 +701,17 @@ fn render(lines: &[Line]) -> String {
         if blank && !opened && !out.is_empty() {
             out.push('\n');
         }
-        (0..line.indent).for_each(|_| out.push_str(INDENT));
-        out.push_str(&line.code);
+        // Only a `"""` string has lines of its own.
+        for (i, code) in line.code.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            if i == 0 || !code.is_empty() {
+                let indent = line.indent + (i > 0) as usize;
+                (0..indent).for_each(|_| out.push_str(INDENT));
+            }
+            out.push_str(code);
+        }
         if let Some(comment) = line.comment {
             let spaces = !comment.gap.is_empty() && comment.gap.bytes().all(|b| b == b' ');
             match (line.code.is_empty(), spaces) {
@@ -774,7 +797,7 @@ fn tail<'a>(pieces: &mut [Piece<'a>]) -> Vec<Comment<'a>> {
 /// they declare one that has any.
 fn parameters(pieces: &[Piece]) -> Option<usize> {
     let is = |piece: Option<&Piece>, token: &str| {
-        piece.is_some_and(|piece| matches!(piece.kind, PieceKind::Token(text) if text == token))
+        piece.is_some_and(|piece| matches!(&piece.kind, PieceKind::Token(text) if text == token))
     };
     let start = is(pieces.first(), "pub") as usize;
     if !is(pieces.get(start), "fn") {
@@ -789,9 +812,34 @@ fn parameters(pieces: &[Piece]) -> Option<usize> {
     }
 }
 
-/// How many columns `text` takes.
+/// How many columns `text` takes. With a `"""` string in it, they are those
+/// of its first line or of its last, which is indented once more: the lines
+/// between them are as long as the string has them.
 fn width(text: &str) -> usize {
-    text.chars().count()
+    let mut lines = text.split('\n').map(|line| line.chars().count());
+    let first = lines.next().unwrap_or(0);
+    lines
+        .next_back()
+        .map_or(first, |last| first.max(INDENT_WIDTH + last))
+}
+
+/// A `"""` string as the source has it, each of its lines without the
+/// indentation of its closing quotes.
+fn unindented(text: &str) -> String {
+    let lines: Vec<_> = lines(text).collect();
+    let [_, text @ .., close] = &lines[..] else {
+        unreachable!("the lexer ends a `\"\"\"` string on a line after the one it starts on");
+    };
+    let indent = close.trim_end_matches('"');
+    let mut unindented = String::from(QUOTES);
+    for line in text {
+        unindented.push('\n');
+        // A blank line needs no indentation.
+        unindented.push_str(line.strip_prefix(indent).unwrap_or(""));
+    }
+    unindented.push('\n');
+    unindented.push_str(QUOTES);
+    unindented
 }
 
 /// Whether a token of this kind ends an operand, so that an operator after
@@ -800,7 +848,7 @@ fn ends_operand(kind: &TokenKind) -> bool {
     use TokenKind::*;
     matches!(
         kind,
-        Ident(_) | Int(_) | Float(_) | Str(_) | True | False | Module | DotStar
+        Ident(_) | Int(_) | Float(_) | Str(_) | Char(_) | True | False | Module | DotStar
     ) || is_closer(kind)
 }
 
@@ -992,10 +1040,32 @@ mod tests {
 
     #[test]
     fn tokens_are_written_as_they_were() {
-        let src = "let x = (0xFF, 1_000, 1e3, \"a\\u{62}\\n\", ((y)))\n";
+        let src = "let x = (0xFF, 1_000, 1e3, \"a\\u{62}\\n\", 'a', '\\u{62}', ' ', ((y)))\n";
         assert_eq!(formatted(src), src);
         // Without its space, the first element of 1 would be a float.
         assert_eq!(formatted("let x = 1 . 0\n"), "let x = 1 .0\n");
+    }
+
+    #[test]
+    fn the_lines_of_a_string_are_indented_once_more_than_its_line() {
+        let src = "let s = \"\"\"  \none\n  two\n\n \n\\\"\"\"\n\"\"\"\nfn f():\n    g(\"\"\"\r\n      a\r\n        b \r\n      \"\"\",1)\n";
+        let expected = "let s = \"\"\"\n\tone\n\t  two\n\n\t \n\t\\\"\"\"\n\t\"\"\"\n\nfn f():\n\tg(\"\"\"\n\t\ta\n\t\t  b \n\t\t\"\"\", 1)\n";
+        assert_eq!(formatted(src), expected);
+        // A line of one is no longer for the brackets it is in.
+        let long = "x".repeat(MAX_WIDTH);
+        let src = format!("let s = f(\"\"\"\n\t{long}\n\t\"\"\")  # all of it\n");
+        assert_eq!(formatted(&src), src);
+
+        let src = "fn f():\n\tlet s = g(\"\"\"\n\t\ta\n\t\t\"\"\", [\"\"\"\n\t\tb\n\t\t\"\"\", \"\"\"\n\t\t\"\"\"])\n";
+        assert_eq!(formatted(src), src);
+        // Where its brackets are broken, it is indented as their items are.
+        assert_eq!(
+            within(16, src),
+            "fn f():\n\tlet s = g(\n\t\t\"\"\"\n\t\t\ta\n\t\t\t\"\"\",\n\t\t[\n\t\t\t\"\"\"\n\t\t\t\tb\n\t\t\t\t\"\"\",\n\t\t\t\"\"\"\n\t\t\t\t\"\"\",\n\t\t],\n\t)\n"
+        );
+        for width in 0..MAX_WIDTH {
+            within(width, src);
+        }
     }
 
     #[test]

@@ -296,6 +296,7 @@ module.exports = grammar({
       $.integer,
       $.float,
       $.string,
+      $.character,
       $.boolean,
     ),
 
@@ -484,6 +485,7 @@ module.exports = grammar({
       $.integer,
       $.float,
       $.string,
+      $.character,
       $.boolean,
       $.module_property,
       $.function_type,
@@ -689,13 +691,38 @@ module.exports = grammar({
 
     boolean: _ => choice('true', 'false'),
 
-    string: $ => seq(
-      '"',
-      repeat(choice($.string_content, $.escape_sequence)),
-      token.immediate('"'),
+    string: $ => choice(
+      seq(
+        '"',
+        repeat(choice($.string_content, $.escape_sequence)),
+        token.immediate('"'),
+      ),
+      // Lines of text, which end at the next `"""`.
+      seq(
+        '"""',
+        repeat(choice(
+          alias($._multiline_string_content, $.string_content),
+          alias($._multiline_string_quotes, $.string_content),
+          $.escape_sequence,
+        )),
+        token.immediate('"""'),
+      ),
     ),
 
     string_content: _ => token.immediate(prec(1, /[^"\\\r\n]+/)),
+
+    _multiline_string_content: _ => token.immediate(prec(1, /[^"\\]+/)),
+
+    // One or two quotes are text. They are of no higher precedence than the
+    // closing quotes, so three of them are those.
+    _multiline_string_quotes: _ => token.immediate(/""?/),
+
+    // A code point: one character, or one escape.
+    character: $ => seq(
+      "'",
+      choice(token.immediate(prec(1, /[^'\\\r\n]/)), $.escape_sequence),
+      token.immediate("'"),
+    ),
 
     escape_sequence: _ => token.immediate(seq(
       '\\',

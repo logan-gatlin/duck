@@ -56,6 +56,7 @@
 (float) @number.float
 (boolean) @boolean
 (string) @string
+(character) @character
 (escape_sequence) @string.escape
 (discard) @variable.builtin
 (placeholder) @variable.builtin

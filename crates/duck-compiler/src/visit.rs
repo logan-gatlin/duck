@@ -98,6 +98,7 @@ pub(crate) fn expr<'p>(expr: &'p parse::Expr, visit: &mut dyn FnMut(Node<'p>)) {
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
+        | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::Unit
         | ExprKind::Name(_)

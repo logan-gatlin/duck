@@ -27,12 +27,37 @@ pub trait FileManager {
     fn include(&mut self, _from: FileId, _path: &str) -> Included {
         Err(IncludeError::unread())
     }
+    /// The test modules of the package that the entry point is in, in the
+    /// order they are tested in: that of their paths. Each is loaded after
+    /// the entry point and what it uses, as a module of that package. None
+    /// without a file manager that has a test directory, as the one a
+    /// package is built with has none
+    fn tests(&mut self) -> Vec<TestModule> {
+        Vec::new()
+    }
+    /// Attempt to open the module `path` names from the test directory of
+    /// the package that the file `from` is in, if `from` is a test module:
+    /// what [`FileManager::open`] does from the root of the package. A file
+    /// that is no test module opens none
+    fn open_test(&mut self, _from: FileId, _path: &[&str]) -> Option<FileId> {
+        None
+    }
     /// How to compile the module the files make up
     fn settings(&mut self) -> Settings;
 
     fn mint_file_id(id: usize) -> FileId {
         FileId(id)
     }
+}
+
+/// A file of the test directory of a package, which is a module of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestModule {
+    pub file: FileId,
+    /// The names of its path from the test directory, the last of which is
+    /// that of the file without what it is named after: `["util", "geo"]`
+    /// for `util/geo.duck`. Its tests are named after them.
+    pub path: Vec<String>,
 }
 
 /// The bytes of a file that a `module.include` names, or why it has none.

@@ -69,9 +69,9 @@ const MAX_OPEN: usize = 64;
 const UNNAMED: &str = "zz";
 
 /// What is being written at byte `offset` of `src`, if something can be
-/// suggested there. Nothing is in a comment, a string or a number, for the
-/// name that a declaration gives, or for a `.name` that the type expected
-/// of it has.
+/// suggested there. Nothing is in a comment, a string, a character or a
+/// number, for the name that a declaration gives, or for a `.name` that the
+/// type expected of it has.
 pub fn completing(src: &str, offset: usize) -> Option<Completing> {
     let line = Line::at(src, offset, false)?;
     let mut tokens = &line.tokens[..];
@@ -79,7 +79,7 @@ pub fn completing(src: &str, offset: usize) -> Option<Completing> {
     match tokens.split_last() {
         Some((last, rest)) if last.span.end == offset => match last.kind {
             TokenKind::Ident(_) => tokens = rest,
-            TokenKind::Int(_) | TokenKind::Float(_) => return None,
+            TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::Char(_) => return None,
             _ => {}
         },
         _ => {}

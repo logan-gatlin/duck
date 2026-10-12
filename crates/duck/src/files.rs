@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
 
-use duck_compiler::file::{FileId, FileManager, IncludeError, Included, Settings, Wit, WitFile};
+use duck_compiler::file::{
+    FileId, FileManager, IncludeError, Included, Settings, TestModule, Wit, WitFile,
+};
 
 use crate::package::{self, Packages};
 
@@ -35,6 +37,12 @@ pub struct Files {
     files: Vec<File>,
     /// Indexed like [`Packages`].
     packages: Vec<Package>,
+    /// The test modules of the package being built, in order of their
+    /// paths. None unless the files were given [its tests](Self::with_tests).
+    tests: Vec<TestModule>,
+    /// The directory those are named from, as reached from the working
+    /// directory.
+    test_root: Option<PathBuf>,
     settings: Settings,
     /// What was read of the files that were included.
     cache: IncludeCache,
@@ -116,12 +124,39 @@ impl Files {
         let mut files = Self {
             files: Vec::new(),
             packages: packages.collect(),
+            tests: Vec::new(),
+            test_root: None,
             settings,
             cache: IncludeCache::default(),
             include_paths: Vec::new(),
         };
         files.read(entry_point.to_path_buf(), 0)?;
         Ok(files)
+    }
+
+    /// The files with the tests of the package being built: each source
+    /// file of its test directory `dir`, and of the directories that holds,
+    /// as [`sources`] finds them, is a test module of the package, named by
+    /// its path from `dir`. A directory that isn't there has none. Only
+    /// files that are given them read anything of it.
+    pub fn with_tests(mut self, dir: PathBuf) -> io::Result<Self> {
+        let mut paths = Vec::new();
+        if dir.is_dir() {
+            sources(&dir, &mut paths)?;
+        }
+        for path in paths {
+            let module = path.strip_prefix(&dir).unwrap_or(&path).with_extension("");
+            let names = module
+                .iter()
+                .map(|name| name.to_string_lossy().into_owned());
+            let test = TestModule {
+                path: names.collect(),
+                file: self.read(path, 0)?,
+            };
+            self.tests.push(test);
+        }
+        self.test_root = Some(dir);
+        Ok(self)
     }
 
     /// The canonical path of an opened file.
@@ -396,6 +431,26 @@ impl FileManager for Files {
         let package = *package;
         let library = self.packages[package].library.clone()?;
         self.read(library, package).ok()
+    }
+
+    fn tests(&mut self) -> Vec<TestModule> {
+        self.tests.clone()
+    }
+
+    fn open_test(&mut self, from: FileId, path: &[&str]) -> Option<FileId> {
+        if !self.tests.iter().any(|test| test.file == from) {
+            return None;
+        }
+        let (name, dirs) = path.split_last()?;
+        let mut file = self.test_root.clone()?;
+        file.extend(dirs);
+        file.push(format!("{name}.{EXTENSION}"));
+        // Every file of the directory was read as the tests were given.
+        let found = self.find(&fs::canonicalize(file).ok()?)?;
+        self.tests
+            .iter()
+            .any(|test| test.file == found)
+            .then_some(found)
     }
 
     fn include(&mut self, from: FileId, path: &str) -> Included {

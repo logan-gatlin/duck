@@ -194,7 +194,8 @@ impl Checker {
     /// bounds it and isn't.
     pub(super) fn private_opaque(&self, id: OpaqueId, within: Option<FileId>) -> Option<Ty> {
         let def = &self.opaques[id.0 as usize];
-        if !def.is_pub && within != Some(def.module) {
+        let named = within.is_some_and(|within| self.sees_private(within, def.module));
+        if !def.is_pub && !named {
             return Some(Ty::Opaque(id));
         }
         let bound = def.bound?;

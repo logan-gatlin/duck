@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use duck::files::{self, Files};
-use duck::manifest::{MANIFEST, Manifest};
+use duck::manifest::{DEFAULT_TEST_DIR, MANIFEST, Manifest};
 use duck::package::Packages;
 use duck::{git, package};
 use duck_compiler::file::{FileManager, Settings};
@@ -37,6 +37,25 @@ enum Command {
         /// The arguments the program is given
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Compile the package described by the nearest Duck.toml with the
+    /// files of its test directory, which is `tests` unless [test] names
+    /// another, and run its tests: each `pub fn` of those files that takes
+    /// nothing, which passes if it returns and fails if it traps. Each runs
+    /// in a new instance of the component, given what `duck run` gives a
+    /// program, and is reported as it runs, with how long it took: what it
+    /// writes is between a line that names it and one that says how it
+    /// ended
+    Test {
+        /// Run only the tests whose names have one of these in them
+        filters: Vec<String>,
+        /// Leave out each test whose name has this in it, whatever else
+        /// names it. May be given more than once
+        #[arg(long, value_name = "FILTER")]
+        skip: Vec<String>,
+        /// Run nothing: print the name of each test that would run
+        #[arg(long)]
+        list: bool,
     },
     /// Lay out the source files of the package described by the nearest
     /// Duck.toml as the language is written, with lines of up to 100 columns.
@@ -81,6 +100,11 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Build => build(),
         Command::Run { args } => run(args),
+        Command::Test {
+            filters,
+            skip,
+            list,
+        } => test(&filters, &skip, list),
         Command::Format { paths, check } => format(paths, check),
         Command::New { path, lib } => {
             let kind = if lib {
@@ -190,6 +214,73 @@ fn run(args: Vec<String>) -> ExitCode {
     let args: Vec<_> = [name].into_iter().chain(args).collect();
     match run::run(&compiled, &args) {
         Ok(status) => ExitCode::from(status),
+        Err(e) => fail(e),
+    }
+}
+
+/// Compiles the nearest package with its test modules and runs each test
+/// that `filters` ask for and none of `skip` names, or only prints their
+/// names if it is to `list` them. The component is tested if there is one, and else the library. A
+/// test is a program named as the component's output is, or as the test
+/// directory is for a library, which has none. Fails if a test does, or if
+/// the package doesn't compile.
+fn test(filters: &[String], skip: &[String], list: bool) -> ExitCode {
+    let (root, packages) = match resolve() {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+    let manifest = &packages.root().manifest;
+    let Some(dir) = &manifest.tests else {
+        println!(
+            "no tests: `{DEFAULT_TEST_DIR}` is in the directory of the entry, so [test] in \
+             {MANIFEST} is to name another directory"
+        );
+        return ExitCode::SUCCESS;
+    };
+    let wit = match files::wit(&packages) {
+        Ok(wit) => wit,
+        Err(e) => return fail(format_args!("cannot read the WIT of the package: {e}")),
+    };
+    let (entry, settings) = match (&manifest.component, &manifest.library) {
+        (Some(component), _) => (&component.entry, component.settings(wit)),
+        (None, Some(library)) => (&library.entry, library.settings(wit)),
+        (None, None) => unreachable!("every manifest has a component or a library"),
+    };
+    let entry = root.join(entry);
+    let dir = root.join(dir);
+    let files = Files::new(&packages, &entry, settings)
+        .map_err(|e| (&entry, e))
+        .and_then(|files| files.with_tests(dir.clone()).map_err(|e| (&dir, e)));
+    let mut files = match files {
+        Ok(files) => files,
+        Err((path, e)) => return fail(format_args!("cannot read {}: {e}", path.display())),
+    };
+    // A package without a test module has nothing to compile for one.
+    if files.tests().is_empty() {
+        println!("no tests: {} has no source file", dir.display());
+        return ExitCode::SUCCESS;
+    }
+    let tests = match duck_compiler::compile_tests(&mut files) {
+        Ok(tests) => tests,
+        Err(errors) => return report(&errors, &mut files, &root.join(MANIFEST)),
+    };
+    if list {
+        return match run::test::list(&tests.tests, filters, skip, &mut io::stdout()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(e),
+        };
+    }
+    if tests.tests.is_empty() {
+        println!("no tests: {} has no `pub fn`", dir.display());
+        return ExitCode::SUCCESS;
+    }
+    let output = manifest.component.as_ref();
+    let name = output.map_or(dir.file_name(), |component| component.output.file_name());
+    let name = name.unwrap_or_default().to_string_lossy();
+    let console = run::test::Console::stdio();
+    match run::test::run(&tests, filters, skip, &name, &console) {
+        Ok(summary) if summary.failed == 0 => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::FAILURE,
         Err(e) => fail(e),
     }
 }

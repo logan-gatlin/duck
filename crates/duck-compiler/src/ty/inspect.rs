@@ -260,7 +260,7 @@ const MAX_USES: usize = 64;
 
 /// Checks `program` as [`super::errors`] does, keeping what it found of it.
 pub fn analyze(program: Program, settings: &Settings) -> Analysis {
-    let (ck, ..) = lower_program(&program, settings, true);
+    let (ck, ..) = lower_program(&program, settings, true, false);
     let start = settings.start.clone();
     let mut items: HashMap<FileId, Vec<usize>> = HashMap::new();
     for (index, item) in program.items.iter().enumerate() {
@@ -852,7 +852,7 @@ impl Analysis {
     fn items_of(&self, src: &mut Sources, from: FileId, module: FileId) -> Vec<Completion> {
         let scope = self.ck.scopes.get(&module).into_iter().flatten();
         let mut items: Vec<_> = scope
-            .filter(|(_, entry)| entry.is_pub || module == from)
+            .filter(|(_, entry)| entry.is_pub || self.ck.sees_private(from, module))
             .collect();
         items.sort_by_key(|(name, _)| *name);
         let completion =
@@ -1248,7 +1248,7 @@ impl Analysis {
     /// The item `name` names in `module`, if the module `from` sees it.
     fn member(&self, from: FileId, module: FileId, name: &str) -> Option<Item> {
         let entry = self.ck.scopes.get(&module)?.get(name)?;
-        (entry.is_pub || module == from).then_some(entry.item)
+        (entry.is_pub || self.ck.sees_private(from, module)).then_some(entry.item)
     }
 
     /// The item `expr` names at `site`: a name that no variable shadows, or
@@ -2050,6 +2050,7 @@ impl<'p> Walk<'p> {
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Str(_)
+            | ExprKind::Char(_)
             | ExprKind::Bool(_)
             | ExprKind::Unit
             | ExprKind::Name(_)

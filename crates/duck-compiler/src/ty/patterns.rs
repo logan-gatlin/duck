@@ -509,6 +509,13 @@ impl Body<'_> {
             kind => kind,
         };
         let value = |subject: &[LocalId]| Expr::Local(subject[0]);
+        // Whether the literal is a number of the type `prim`.
+        let numbers = |prim: Prim| match number {
+            ExprKind::Int(_) => prim.is_float() || prim.is_int(),
+            ExprKind::Float(_) => prim.is_float(),
+            ExprKind::Char(_) => prim == Prim::U32,
+            _ => false,
+        };
         let ctor = match (number, ty) {
             (ExprKind::Bool(wanted), Ty::Prim(Prim::Bool)) => {
                 case.steps.push(Step::Test(match wanted {
@@ -517,9 +524,7 @@ impl Body<'_> {
                 }));
                 Ctor::Bool(*wanted)
             }
-            (ExprKind::Int(_), Ty::Prim(prim)) | (ExprKind::Float(_), Ty::Prim(prim))
-                if prim.is_float() || prim.is_int() && matches!(number, ExprKind::Int(_)) =>
-            {
+            (_, Ty::Prim(prim)) if numbers(prim) => {
                 let errors = self.ck.errors.len();
                 let (_, number) = self.expr(literal, Some(ty));
                 let [(vt, Expr::Const(number))] = number.scalars[..] else {
@@ -552,6 +557,7 @@ impl Body<'_> {
                     ExprKind::Bool(_) => Prim::Bool.name().to_string(),
                     ExprKind::Int(_) => Prim::I32.name().to_string(),
                     ExprKind::Float(_) => Prim::F64.name().to_string(),
+                    ExprKind::Char(_) => Prim::U32.name().to_string(),
                     _ => format!("{ARRAY}({})", Prim::U8.name()),
                 };
                 self.unmatched(expected, ty, literal.span);

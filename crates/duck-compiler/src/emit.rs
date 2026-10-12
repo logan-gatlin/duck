@@ -1297,6 +1297,26 @@ pub fn main() -> i32:
     }
 
     #[test]
+    fn a_table_that_holds_no_function_is_still_called_through() {
+        // Nothing is at index 0, which is all that it has, so a call
+        // through it traps: the module is valid, as one without a table
+        // that calls through it is not.
+        let src = "\
+var nothing = 0 as uint as! fn(i32) -> i32
+pub fn apply(f: fn(i32) -> i32, x: i32) -> i32:
+    return f(x) + nothing(x)
+";
+        let bytes = emit_src(src);
+        let wat = wat(&bytes);
+        for line in ["(table (;0;) 1 1 funcref)", r#"(export "table" (table 0))"#] {
+            assert!(wat.contains(line), "{line}\n{wat}");
+        }
+        assert!(!wat.contains("elem"), "{wat}");
+        let apply = func_wat(&bytes, "apply");
+        assert_eq!(apply.matches("call_indirect").count(), 2, "{apply}");
+    }
+
+    #[test]
     fn imports_are_table_elements_unless_their_results_need_wrapping() {
         let src = "\
 extern:

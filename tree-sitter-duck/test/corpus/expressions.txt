@@ -444,6 +444,75 @@ let _ = ""
     (string)))
 
 ====================
+Multiline strings
+====================
+
+let _ = """
+	say "hi" to ""
+	 # not a comment \n
+	"""
+let _ = f("""
+	\"""
+	""", 1)
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (string
+      (string_content)
+      (string_content)
+      (string_content)
+      (string_content)
+      (string_content)
+      (string_content)
+      (string_content)
+      (escape_sequence)
+      (string_content)))
+  (binding
+    (discard)
+    (call_expression
+      (identifier)
+      (arguments
+        (string
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (string_content))
+        (integer)))))
+
+====================
+Characters
+====================
+
+let _ = ['a', ' ', '#', '"', '\'', '\u{1F986}']
+let _ = c - '0' as u8
+
+---
+
+(source_file
+  (binding
+    (discard)
+    (list
+      (character)
+      (character)
+      (character)
+      (character)
+      (character
+        (escape_sequence))
+      (character
+        (escape_sequence))))
+  (binding
+    (discard)
+    (binary_expression
+      (identifier)
+      (cast_expression
+        (character)
+        (named_type
+          (identifier))))))
+
+====================
 Pipes
 ====================
 

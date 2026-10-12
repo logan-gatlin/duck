@@ -14,7 +14,7 @@ use duck::files::{self, Files, IncludeCache};
 use duck::git::Cache;
 use duck::manifest::{self, COMPONENT, ENTRY, LIBRARY, MANIFEST, ManifestError};
 use duck::package::{self, Packages, ResolveError};
-use duck_compiler::file::{FileId, FileManager, Included, Settings};
+use duck_compiler::file::{FileId, FileManager, Included, Settings, TestModule};
 use duck_compiler::lex::Span;
 use duck_compiler::load::Parsed;
 use duck_compiler::ty::{
@@ -984,7 +984,17 @@ impl Project {
                 Some(_) => brief(settings),
                 None => settings,
             };
-            let found = match Files::new(packages, self.root.join(entry), settings) {
+            // The tests of the package are checked with the build that
+            // `duck test` tests: its component, or else its library. A
+            // test directory that can't be read is checked as none.
+            let tested = table == COMPONENT || component.is_none();
+            let tests = manifest.tests.as_ref().filter(|_| tested);
+            let files = Files::new(packages, self.root.join(entry), settings);
+            let files = files.map(|files| {
+                let with_tests = tests.map(|dir| files.clone().with_tests(self.root.join(dir)));
+                with_tests.and_then(Result::ok).unwrap_or(files)
+            });
+            let found = match files {
                 Ok(mut files) => {
                     files.reuse(&self.includes);
                     let overlay = Overlay {
@@ -1146,6 +1156,14 @@ impl FileManager for Overlay<'_, '_> {
 
     fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId> {
         self.files.open_package(from, name)
+    }
+
+    fn tests(&mut self) -> Vec<TestModule> {
+        self.files.tests()
+    }
+
+    fn open_test(&mut self, from: FileId, path: &[&str]) -> Option<FileId> {
+        self.files.open_test(from, path)
     }
 
     /// As it was saved: the editor has no file open that isn't source.
@@ -1825,6 +1843,50 @@ pub(crate) mod tests {
                 "app/lib.duck:1:7-1:8: unknown type `B`",
             ]
         );
+    }
+
+    #[test]
+    fn the_tests_of_a_package_are_checked_with_it() {
+        let dir = TempDir::new("tested");
+        let manifest = "[component]\nentry = \"src/main.duck\"\noutput = \"out.wasm\"\n\
+                        start = \"main\"\n[library]\nentry = \"lib/lib.duck\"\n";
+        dir.write(&[
+            ("app/Duck.toml", manifest),
+            ("app/src/main.duck", "use geo\nfn main():\n    pass\n"),
+            (
+                "app/src/geo.duck",
+                "fn unit() -> i32:\n    return 1\nfn spare():\n    pass\n",
+            ),
+            ("app/lib/lib.duck", "pub let one = 1\n"),
+            (
+                "app/tests/shapes.duck",
+                "use geo\npub fn sides():\n    let n: Nope = geo.unit()\npub fn takes(n: i32):\n    pass\n",
+            ),
+            ("app/tests/.cases/broken.duck", "let x = @\n"),
+        ]);
+        // A test module sees what the package keeps to itself, and what is
+        // wrong with one is placed in it.
+        assert_eq!(
+            check(&dir, &[]),
+            [
+                "app/tests/shapes.duck:3:7-3:12: a `pub fn` of a test module is a test, which \
+                 takes nothing and returns nothing: `takes` is a helper without its `pub`",
+                "app/tests/shapes.duck:2:11-2:15: unknown type `Nope`",
+            ]
+        );
+        // As it is in the editor.
+        let edited = "use geo\npub fn sides():\n    geo.unit() == 1 or module.unreachable()\n";
+        let buffers = [("app/tests/shapes.duck", edited)];
+        assert_eq!(check(&dir, &buffers), Vec::<String>::new());
+        // What only a test uses is used, as `unit` is.
+        let cache = Cache::new(dir.0.join("no-cache"));
+        let mut project = Project::resolve(dir.0.join("app"), &cache);
+        let buffers: HashMap<PathBuf, &str> = HashMap::from([(dir.0.join(buffers[0].0), edited)]);
+        project.check(&|path| buffers.get(path).copied());
+        let unused: Vec<_> = (project.warnings().iter())
+            .map(|problem| problem.message.as_str())
+            .collect();
+        assert_eq!(unused, ["`geo` is never used", "`spare` is never used"]);
     }
 
     #[test]

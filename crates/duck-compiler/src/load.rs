@@ -3,12 +3,16 @@
 //! Every file is a module, named by its path from the root of its package:
 //! `util/strings.duck` is `util.strings`. Its items are kept apart from those
 //! of other modules, which it reaches through the names `use` gives them.
+//!
+//! A file of the test directory of the package is a module of it too, named
+//! by its path from that directory, and loaded where the files have any:
+//! after the entry point and every module it uses.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::Error;
-use crate::file::{self, FileId, FileManager, Includes};
+use crate::file::{self, FileId, FileManager, Includes, TestModule};
 use crate::lex::{self, Span, Token};
 use crate::parse::{self, Ident, Item, ItemKind, UsePath};
 use crate::visit::{self, Node};
@@ -44,6 +48,12 @@ pub struct Program {
     pub entry: FileId,
     /// What each `module.include` of a string literal includes.
     pub includes: Includes,
+    /// The test modules of the package that `entry` is in, in the order
+    /// they are tested in. None for a program that is built.
+    pub tests: Vec<TestModule>,
+    /// The modules of the package that `entry` is in, its test modules
+    /// among them: those a test module sees all of, `pub` or not.
+    pub package: HashSet<FileId>,
 }
 
 /// A name `module` gives a module, or something reached through one.
@@ -98,6 +108,10 @@ struct Loader<'f, F> {
     items: Vec<Item>,
     uses: Vec<Use>,
     includes: Includes,
+    /// Each module that a path from the root of its package, or from its
+    /// test directory, led to, after the module that uses it: the two are
+    /// of one package.
+    within: Vec<(FileId, FileId)>,
     errors: Vec<Error>,
 }
 
@@ -146,12 +160,15 @@ impl Program {
             uses: Vec::new(),
             entry,
             includes: HashMap::new(),
+            tests: Vec::new(),
+            package: HashSet::from([entry]),
         }
     }
 }
 
 /// Lexes and parses the entry point of `files` and every module it uses,
-/// recursively.
+/// recursively, then each test module that `files` have and every module
+/// those use.
 ///
 /// Each module is loaded once, however many modules use it, and modules may
 /// use one another. Errors in one file don't stop the others from loading,
@@ -193,10 +210,20 @@ impl<'f, F: FileManager> Loader<'f, F> {
             items: Vec::new(),
             uses: Vec::new(),
             includes: HashMap::new(),
+            within: Vec::new(),
             errors: Vec::new(),
         };
         loader.seen.insert(entry);
         loader.items_of(entry);
+        // A test module follows the modules of the package that it tests,
+        // and those before it, but for one that it uses.
+        let tests = loader.files.tests();
+        for test in &tests {
+            if loader.seen.insert(test.file) {
+                loader.items_of(test.file);
+            }
+        }
+        let package = loader.package(entry, &tests);
         // A file that the program no longer uses is no longer kept.
         if let Some(parsed) = &mut loader.parsed {
             parsed.files.retain(|id, _| loader.seen.contains(id));
@@ -206,8 +233,26 @@ impl<'f, F: FileManager> Loader<'f, F> {
             uses: loader.uses,
             entry,
             includes: loader.includes,
+            tests,
+            package,
         };
         (program, loader.errors)
+    }
+
+    /// The modules of the package that `entry` is in: it, `tests`, and each
+    /// that a path from the root of the package, or from its test
+    /// directory, leads to from one of them. A dependency's are not.
+    fn package(&self, entry: FileId, tests: &[TestModule]) -> HashSet<FileId> {
+        let mut package = HashSet::from([entry]);
+        package.extend(tests.iter().map(|test| test.file));
+        let mut found = true;
+        while found {
+            found = false;
+            for (from, target) in &self.within {
+                found |= package.contains(from) && package.insert(*target);
+            }
+        }
+        package
     }
 
     fn items_of(&mut self, id: FileId) {
@@ -328,10 +373,21 @@ impl<'f, F: FileManager> Loader<'f, F> {
         let local = (1..=names.len())
             .rev()
             .find_map(|len| Some((self.files.open(from, &names[..len])?, len)));
+        // A test module shares what is in its test directory, which only a
+        // path that no module of the package is along is looked for from:
+        // one named as a module of the package is, as the module it tests,
+        // names that module.
+        let local = local.or_else(|| {
+            let mut lens = (1..=names.len()).rev();
+            lens.find_map(|len| Some((self.files.open_test(from, &names[..len])?, len)))
+        });
         let dependency = self.files.open_package(from, names[0]);
         let (target, len) = match (local, dependency) {
             (Some(_), Some(_)) => return Err(UseErrorKind::Ambiguous(names[0].to_string())),
-            (Some(local), None) => local,
+            (Some(local), None) => {
+                self.within.push((from, local.0));
+                local
+            }
             // Only what its library makes `pub` is reached in a dependency.
             (None, Some(library)) => (library, 1),
             (None, None) => return Err(UseErrorKind::NotFound(names.join("."))),
@@ -379,15 +435,17 @@ fn path_span(path: &UsePath) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{IncludeError, Included, Settings};
+    use crate::file::{IncludeError, Included, Settings, TestModule};
     use crate::ir::{self, Const};
     use crate::lex::TokenKind;
     use crate::parse::{ParseErrorKind, PatternKind};
     use crate::ty::{self, TypeErrorKind};
 
     /// Files named by the paths that use them; the first is the entry
-    /// point. A file named `@name` is the library of dependency `name`, and
-    /// one named `#path` is what a `module.include` of `path` includes.
+    /// point. A file named `@name` is the library of dependency `name`,
+    /// one named `#path` is what a `module.include` of `path` includes,
+    /// and one named `~path` is the test module that `path` names from the
+    /// test directory.
     struct Memory(Vec<(&'static str, &'static str)>);
 
     impl Memory {
@@ -431,6 +489,22 @@ mod tests {
 
         fn open_package(&mut self, _from: FileId, name: &str) -> Option<FileId> {
             self.named(&format!("@{name}"))
+        }
+
+        fn tests(&mut self) -> Vec<TestModule> {
+            let tests = self.0.iter().enumerate();
+            let tests = tests.filter_map(|(index, file)| Some((index, file.0.strip_prefix('~')?)));
+            let test = |(index, path): (usize, &str)| TestModule {
+                file: Self::mint_file_id(index),
+                path: path.split('.').map(str::to_string).collect(),
+            };
+            tests.map(test).collect()
+        }
+
+        fn open_test(&mut self, from: FileId, path: &[&str]) -> Option<FileId> {
+            let tested = self.0[self.index(from)].0.starts_with('~');
+            self.named(&format!("~{}", path.join(".")))
+                .filter(|_| tested)
         }
 
         fn include(&mut self, _from: FileId, path: &str) -> Included {
@@ -503,6 +577,13 @@ mod tests {
             .map_err(|errors| errors.into_iter().map(Error::Type).collect())
     }
 
+    /// The name of each test of `files`, in the order they are run in.
+    fn tests(files: &mut Memory) -> Vec<String> {
+        let program = load(files).unwrap();
+        let tested = ty::check_tests(&program, &files.settings()).unwrap();
+        tested.tests.into_iter().map(|test| test.name).collect()
+    }
+
     fn lower(files: &mut Memory) -> ir::Module {
         match compile(files) {
             Ok(module) => module,
@@ -570,6 +651,433 @@ mod tests {
             load_partial(&mut files)
         );
         assert_eq!(parsed.files.len(), 2);
+    }
+
+    #[test]
+    fn test_modules_follow_the_modules_of_the_package() {
+        let mut files = Memory(vec![
+            ("main", "use b\nlet a = 1\n"),
+            ("b", "let b = 2\n"),
+            // One that only a test uses is loaded for it.
+            ("c", "let c = 3\n"),
+            ("~late", "use support\nuse c\nlet late = 4\n"),
+            ("~deep.early", "let early = 5\n"),
+            ("~support", "let support = 6\n"),
+        ]);
+        // Each test module after those before it, but for one it uses.
+        assert_eq!(
+            items(&mut files),
+            [
+                "b b",
+                "a main",
+                "support ~support",
+                "c c",
+                "late ~late",
+                "early ~deep.early"
+            ]
+        );
+        let program = load(&mut files).unwrap();
+        let tests: Vec<_> = program
+            .tests
+            .iter()
+            .map(|test| test.path.join("."))
+            .collect();
+        assert_eq!(tests, ["late", "deep.early", "support"]);
+        let files_of = |names: &[&str]| -> HashSet<FileId> {
+            names.iter().map(|name| files.id(name)).collect()
+        };
+        assert_eq!(
+            program.package,
+            files_of(&["main", "b", "c", "~late", "~deep.early", "~support"])
+        );
+
+        // Files without a test directory have none, and nothing of one is
+        // loaded.
+        let mut files = Memory(vec![("main", "use b\nlet a = 1\n"), ("b", "let b = 2\n")]);
+        let program = load(&mut files).unwrap();
+        assert_eq!(program.tests, []);
+        assert_eq!(program.package, files_of_all(&files, &["main", "b"]));
+    }
+
+    /// The ids of the files of `files` that `names` name.
+    fn files_of_all(files: &Memory, names: &[&str]) -> HashSet<FileId> {
+        names.iter().map(|name| files.id(name)).collect()
+    }
+
+    #[test]
+    fn a_dependency_is_no_module_of_the_package() {
+        let mut files = Memory(vec![
+            ("main", "use json\nuse inner\n"),
+            ("inner", ""),
+            ("@json", "use deep\nuse text\n"),
+            ("deep", ""),
+            ("@text", ""),
+            ("~checks", "use json\n"),
+        ]);
+        let program = load(&mut files).unwrap();
+        // What a dependency reaches from its own root is the dependency's.
+        assert_eq!(
+            program.package,
+            files_of_all(&files, &["main", "inner", "~checks"])
+        );
+    }
+
+    #[test]
+    fn a_test_module_uses_the_package_and_then_its_test_directory() {
+        let mut files = Memory(vec![
+            ("main", "use geo\npub let one = geo.unit\n"),
+            ("geo", "pub let unit = 1\n"),
+            ("geo.shapes", "pub let sides = 4\n"),
+            (
+                "~geometry",
+                "use geo\nuse geo.shapes.sides\nuse support\nuse support.deep.two\nuse json\nlet x = geo.unit + sides + support.one + two + json.three\n",
+            ),
+            ("~support", "pub let one = 1\n"),
+            ("~support.deep", "pub let two = 2\n"),
+            ("@json", "pub let three = 3\n"),
+        ]);
+        lower(&mut files);
+        let program = load(&mut files).unwrap();
+        let uses = program
+            .uses
+            .iter()
+            .filter(|u| u.module == files.id("~geometry"));
+        let targets: Vec<_> = uses.map(|u| files.0[files.index(u.target)].0).collect();
+        assert_eq!(
+            targets,
+            ["geo", "geo.shapes", "~support", "~support.deep", "@json"]
+        );
+
+        // Only a test module is led into the test directory.
+        let mut files = Memory(vec![
+            ("main", "use support\nuse json\n"),
+            ("@json", "use support\n"),
+            ("~support", ""),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"support\": cannot find `support` in this package or its dependencies",
+                "@json \"support\": cannot find `support` in this package or its dependencies",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_test_module_is_named_as_the_module_it_tests() {
+        // As `tests/geo.duck` is beside `src/geo.duck`: the name is that of
+        // the module of the package, to the test module too.
+        let mut files = Memory(vec![
+            ("main", "use geo\n"),
+            ("geo", "let unit = 1\n"),
+            (
+                "~geo",
+                "use geo\nuse geo.unit as one\npub fn has_a_unit():\n    geo.unit == one or module.unreachable()\n",
+            ),
+        ]);
+        lower(&mut files);
+        assert_eq!(tests(&mut files), ["geo.has_a_unit"]);
+        let program = load(&mut files).unwrap();
+        let uses = program.uses.iter().filter(|u| u.module == files.id("~geo"));
+        let targets: Vec<_> = uses.map(|u| u.target).collect();
+        assert_eq!(targets, [files.id("geo"), files.id("geo")]);
+    }
+
+    #[test]
+    fn a_module_of_the_package_hides_one_of_the_test_directory() {
+        let checks = "\
+use support
+use support.limit
+use util.text
+use util.numbers
+let x = support.limit + limit + text.len + numbers.count
+";
+        let package = |checks: &'static str| {
+            vec![
+                ("main", "use support\n"),
+                ("support", "pub let limit = 1\n"),
+                ("util.text", "pub let len = 4\n"),
+                ("geo", ""),
+                ("~checks", checks),
+                // What a test module shares, which the package has a module
+                // named as.
+                ("~support", "pub let limit = 2\nlet only = 3\n"),
+                // A directory holds modules of both without being one.
+                ("~util.numbers", "pub let count = 5\n"),
+                ("~geo.shapes", ""),
+                ("~json", ""),
+                ("@json", ""),
+            ]
+        };
+        let mut files = Memory(package(checks));
+        lower(&mut files);
+        let program = load(&mut files).unwrap();
+        let uses = program
+            .uses
+            .iter()
+            .filter(|u| u.module == files.id("~checks"));
+        let targets: Vec<_> = uses.map(|u| files.0[files.index(u.target)].0).collect();
+        assert_eq!(
+            targets,
+            ["support", "support", "util.text", "~util.numbers"]
+        );
+
+        // The test directory is looked in only for a path that no module of
+        // the package is along, however far along it one of its own is.
+        let mut files = Memory(package("use support.only\nuse geo.shapes\n"));
+        assert_eq!(
+            errors(&mut files),
+            [
+                "~checks \"only\": `support` has no item `only`",
+                "~checks \"shapes\": `geo` has no item `shapes`",
+            ]
+        );
+        // A dependency is still named as no module is, of either.
+        let mut files = Memory(package("use json\nuse missing\n"));
+        assert_eq!(
+            errors(&mut files),
+            [
+                "~checks \"json\": `json` is both a module of this package and a dependency",
+                "~checks \"missing\": cannot find `missing` in this package or its dependencies",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_test_module_sees_all_of_its_package() {
+        let geo = "\
+use inner as hidden
+let unit = 1
+var count = 0
+struct Point:
+    x: i32
+    pub y: i32 = 2
+enum(u8) Color:
+    red
+let Step: type = fn(i32) -> i32
+fn double(n: i32) -> i32:
+    return n * 2
+fn(T) id(x: T) -> T:
+    return x
+fn make() -> opaque(Point):
+    return Point(x: 1)
+extern \"wasi:cli/exit@0.3.0\":
+    fn exit_with_code(status: u8)
+";
+        let checks = "\
+use geo
+use geo.{Point, Color, double, id, unit, Step, hidden}
+use support
+fn area(p: Point, c: Color, step: Step) -> i32:
+    geo.count += 1
+    geo.exit_with_code(geo.count as u8)
+    let made = geo.make()
+    var q = Point(x: 3, y: 4)
+    q.x = 5
+    return p.x + q.x + double(unit) + id(c as u8) as i32 + hidden.kept + (made as Point).x
+struct Corner:
+    use Point
+    pub z: i32
+pub struct Shown:
+    pub at: Point
+pub let origin = Point(x: 0)
+pub fn passes():
+    support.check(area(origin, .red, double) == Corner(x: 1, z: 3).x + support.limit)
+";
+        let support = "let limit = 9\nfn check(ok: bool):\n    ok or module.unreachable()\n";
+        let package = |main: &'static str| {
+            vec![
+                ("main", main),
+                ("geo", geo),
+                ("inner", "let kept = 7\n"),
+                ("~checks", checks),
+                ("~support", support),
+            ]
+        };
+        let mut files = Memory(package("use geo\n"));
+        lower(&mut files);
+        assert_eq!(tests(&mut files), ["checks.passes"]);
+
+        // A module of the package sees of another only what any does.
+        let main = "use geo\nlet a = geo.unit\nfn f(p: geo.Point) -> i32:\n    return p.x\n";
+        let mut files = Memory(package(main));
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"Point\": `Point` is private",
+                "main \"unit\": `unit` is private",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_test_module_sees_of_a_dependency_what_any_module_does() {
+        let json = "\
+use text
+pub struct Value:
+    pub open: i32
+    kept: i32 = 1
+pub struct Sealed:
+    key: i32
+struct Hidden:
+    x: i32
+pub struct Holder:
+    pub held: &Hidden
+let secret = 1
+fn parse() -> Value:
+    return Value(open: text.zero)
+pub fn new() -> Value:
+    return parse()
+";
+        let checks = "\
+use json
+use json.secret
+struct Mine:
+    use json.Holder
+pub fn reads():
+    let v = json.new()
+    let _ = v.kept + json.parse().open
+    let _ = json.Value(open: 1, kept: 2)
+    let _ = json.Sealed(key: 1)
+    let _: json.Hidden = json.Hidden(x: 1)
+";
+        let mut files = Memory(vec![
+            ("main", "use json\n"),
+            ("@json", json),
+            // What a dependency reaches from its root is the dependency's.
+            ("text", "pub let zero = 0\n"),
+            ("~checks", checks),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "~checks \"secret\": `secret` is private",
+                "@json \"&Hidden\": private type `Hidden` in the type of `pub` item `held`",
+                "~checks \"json.Holder\": `use` of `held`, whose type holds the private `Hidden`",
+                "~checks \"kept\": field `kept` of `Value` is private",
+                "~checks \"parse\": `parse` is private",
+                "~checks \"kept\": field `kept` of `Value` is private",
+                "~checks \"json.Sealed(key: 1)\": field `key` of `Sealed` is private",
+                "~checks \"Hidden\": `Hidden` is private",
+                "~checks \"Hidden\": `Hidden` is private",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pub_fn_of_a_test_module_is_a_test() {
+        let mut files = Memory(vec![
+            (
+                "main",
+                "pub fn main():\n    pass\npub fn takes(n: i32) -> i32:\n    return n\n",
+            ),
+            (
+                "~b.checks",
+                "pub fn second():\n    pass\nfn helper(n: i32) -> i32:\n    return n\npub fn third():\n    todo\n",
+            ),
+            ("~a", "use b.checks\npub fn first():\n    pass\n"),
+        ]);
+        // Those of a module as it declares them, and the modules as the
+        // files have them, whichever is loaded first.
+        assert_eq!(
+            tests(&mut files),
+            ["b.checks.second", "b.checks.third", "a.first"]
+        );
+        let program = load(&mut files).unwrap();
+        let tested = ty::check_tests(&program, &files.settings()).unwrap();
+        assert_eq!(
+            files.text(tested.tests[2].span),
+            "pub fn first():\n    pass"
+        );
+        assert_eq!(tested.tests[2].span.file, files.id("~a"));
+
+        let checks = "\
+pub fn takes(n: i32):
+    pass
+pub fn defaults(n: i32 = 1):
+    pass
+pub fn gives() -> i32:
+    return 1
+pub fn stops() -> never:
+    todo
+pub fn pending() -> todo:
+    todo
+pub fn(T) infers(x: T):
+    pass
+pub fn typed(T: type):
+    pass
+pub fn unit() -> tuple():
+    return ()
+pub fn unknown() -> Nope:
+    pass
+extern:
+    pub fn log(n: i32)
+pub struct Fixture:
+    pub n: i32
+pub let limit = 1
+";
+        let mut files = Memory(vec![("main", ""), ("~checks", checks)]);
+        let no_test = |name: &str| {
+            format!(
+                "~checks {name:?}: a `pub fn` of a test module is a test, which takes nothing and \
+                 returns nothing: `{name}` is a helper without its `pub`"
+            )
+        };
+        assert_eq!(
+            errors(&mut files),
+            [
+                "~checks \"Nope\": unknown type `Nope`".to_string(),
+                no_test("takes"),
+                no_test("defaults"),
+                no_test("gives"),
+                // A test passes by returning, which neither ever does.
+                no_test("stops"),
+                no_test("pending"),
+                no_test("infers"),
+                no_test("typed"),
+            ]
+        );
+        let code = compile(&mut files).unwrap_err()[1].code();
+        assert_eq!(code, "invalid-test");
+    }
+
+    #[test]
+    fn a_pub_item_of_a_test_module_is_given_to_no_one() {
+        // So its type holds what the package keeps to itself.
+        let geo = "struct Point:\n    x: i32 = 0\nenum(u8) Color:\n    red\n";
+        let checks = "\
+use geo.{Point, Color}
+struct Own:
+    x: i32 = 0
+pub struct Fixture:
+    pub at: Point
+    pub own: Own
+pub union Either:
+    point: Point
+pub let origin = Point()
+pub let Tint: type = Color
+extern:
+    pub fn log(at: Point)
+";
+        let mut files = Memory(vec![
+            ("main", "use geo\n"),
+            ("geo", geo),
+            ("~checks", checks),
+        ]);
+        lower(&mut files);
+        // A module of the package gives another package what is `pub`.
+        let mut files = Memory(vec![
+            ("main", "use geo\n"),
+            (
+                "geo",
+                "struct Point:\n    x: i32 = 0\npub let origin = Point()\n",
+            ),
+            ("~checks", ""),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            ["geo \"origin\": private type `Point` in the type of `pub` item `origin`"]
+        );
     }
 
     #[test]

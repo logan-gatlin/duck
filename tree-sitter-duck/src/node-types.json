@@ -32,6 +32,10 @@
         "named": true
       },
       {
+        "type": "character",
+        "named": true
+      },
+      {
         "type": "continue_expression",
         "named": true
       },
@@ -169,6 +173,10 @@
       },
       {
         "type": "boolean",
+        "named": true
+      },
+      {
+        "type": "character",
         "named": true
       },
       {
@@ -666,6 +674,21 @@
           }
         ]
       }
+    }
+  },
+  {
+    "type": "character",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "escape_sequence",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -2275,6 +2298,10 @@
     "named": false
   },
   {
+    "type": "\"\"\"",
+    "named": false
+  },
+  {
     "type": "%",
     "named": false
   },
@@ -2284,6 +2311,10 @@
   },
   {
     "type": "&",
+    "named": false
+  },
+  {
+    "type": "'",
     "named": false
   },
   {

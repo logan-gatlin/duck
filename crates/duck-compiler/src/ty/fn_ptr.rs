@@ -307,3 +307,53 @@ impl Body<'_> {
         (ret, Value { pre, scalars })
     }
 }
+
+/// Whether `body` calls through the table, anywhere in it: a module whose
+/// function does has the table, whether or not it holds any function.
+pub(super) fn calls_through_table(body: &[Stmt]) -> bool {
+    let any = |exprs: &[&Expr]| exprs.iter().any(|expr| expr_calls_through_table(expr));
+    body.iter().any(|stmt| match stmt {
+        Stmt::CallIndirect { .. } => true,
+        Stmt::SetLocal(_, value) | Stmt::SetGlobal(_, value) | Stmt::Drop(value) => any(&[value]),
+        Stmt::BrIf(_, cond) => any(&[cond]),
+        Stmt::Store { addr, value, .. } => any(&[addr, value]),
+        Stmt::MemoryFill {
+            dst: a,
+            value: b,
+            len: c,
+        }
+        | Stmt::MemoryCopy {
+            dst: a,
+            src: b,
+            len: c,
+        } => any(&[a, b, c]),
+        Stmt::Call { args, .. } => args.iter().any(expr_calls_through_table),
+        Stmt::Return(values) => values.iter().any(expr_calls_through_table),
+        Stmt::Block(body) | Stmt::Loop(body) => calls_through_table(body),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => any(&[cond]) || calls_through_table(then_body) || calls_through_table(else_body),
+        Stmt::Br(_) | Stmt::Unreachable => false,
+    })
+}
+
+/// Whether `expr` calls through the table, anywhere in it.
+fn expr_calls_through_table(expr: &Expr) -> bool {
+    let calls = expr_calls_through_table;
+    match expr {
+        Expr::CallIndirect { .. } => true,
+        Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => false,
+        Expr::Unary(_, _, x) | Expr::Load { addr: x, .. } | Expr::MemoryGrow(x) => calls(x),
+        Expr::Binary(_, _, a, b) => calls(a) || calls(b),
+        Expr::Call(_, args) => args.iter().any(calls),
+        Expr::If {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => calls(cond) || calls(then_expr) || calls(else_expr),
+        Expr::Seq(body, value) => calls_through_table(body) || calls(value),
+    }
+}

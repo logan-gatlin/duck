@@ -58,6 +58,7 @@
 (float) @constant.numeric.float
 (boolean) @constant.builtin.boolean
 (string) @string
+(character) @constant.character
 (escape_sequence) @constant.character.escape
 (discard) @variable.builtin
 (placeholder) @variable.builtin

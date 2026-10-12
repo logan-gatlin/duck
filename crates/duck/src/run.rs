@@ -17,6 +17,7 @@ use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, Wasi
 
 #[cfg(feature = "gfx")]
 mod gfx;
+pub mod test;
 
 /// The directories a program is given, each to read and write under the
 /// path it has here: the working directory, which is the first, and the
@@ -37,6 +38,10 @@ pub enum Error {
     /// A program that has a surface, with no display to open a window on.
     #[cfg(feature = "gfx")]
     NoDisplay,
+    /// The tests of a package that imports a surface, which opens a window
+    /// as no test does.
+    #[cfg(feature = "gfx")]
+    Windowed,
 }
 
 /// What the host functions keep for one program.
@@ -66,6 +71,11 @@ impl fmt::Display for Error {
             Self::NoDisplay => write!(
                 f,
                 "the program has a surface, and there is no display to open a window on"
+            ),
+            #[cfg(feature = "gfx")]
+            Self::Windowed => write!(
+                f,
+                "cannot run the tests: the package imports a surface, and no test opens a window"
             ),
         }
     }
@@ -168,7 +178,7 @@ fn start(
     match returned {
         Ok(Ok(Ok(()))) => Ok(0),
         Ok(Ok(Err(()))) => Ok(1),
-        Ok(Err(e)) | Err(e) => stopped(e),
+        Ok(Err(e)) | Err(e) => stopped(e, RUN_EXPORT),
     }
 }
 
@@ -177,8 +187,10 @@ fn invalid(error: wasmtime::Error) -> Error {
     Error::Invalid(format!("{error:#}"))
 }
 
-/// The status of a program that `error` stopped, if it asked to exit.
-fn stopped(error: wasmtime::Error) -> Result<u8, Error> {
+/// The status of a program that `error` stopped, if it asked to exit, and
+/// else the trap that it is, without the function `caller` among those that
+/// were running: the one the host called.
+fn stopped(error: wasmtime::Error, caller: &str) -> Result<u8, Error> {
     if let Some(I32Exit(status)) = error.downcast_ref() {
         return Ok(*status as u8);
     }
@@ -189,10 +201,11 @@ fn stopped(error: wasmtime::Error) -> Result<u8, Error> {
     let message = message.strip_prefix("wasm trap: ").unwrap_or(&message);
     let backtrace = error.downcast_ref::<WasmBacktrace>();
     let frames = backtrace.map_or(&[][..], WasmBacktrace::frames);
-    // The last is the function that only calls the start function.
+    // The last is the function that only calls the start function, or the
+    // test.
     let frames = frames
         .iter()
-        .filter(|frame| frame.func_name() != Some(RUN_EXPORT));
+        .filter(|frame| frame.func_name() != Some(caller));
     Err(Error::Trap {
         message: message.to_string(),
         stack: frames
@@ -213,7 +226,7 @@ mod tests {
     /// What every program that writes has: `print`, which waits for what
     /// it writes to be written, and the allocator that the host returns
     /// lists through.
-    const PRELUDE: &str = r#"
+    pub(super) const PRELUDE: &str = r#"
 extern "$root":
     fn set_new() -> i32 = "[waitable-set-new]"
     fn join(waitable: i32, set: i32) = "[waitable-join]"
@@ -565,6 +578,26 @@ fn main():
             trap.to_string(),
             "the program trapped: integer divide by zero\n    in `divide`\n    in `main`"
         );
+    }
+
+    #[test]
+    fn what_traps_does_where_nothing_reads_it() {
+        let trap = |function: &str| Error::Trap {
+            message: "integer divide by zero".to_string(),
+            stack: vec![function.to_string(), "main".to_string()],
+        };
+        for (function, unread) in [
+            ("bound", "let _ = 1 / zero"),
+            ("stated", "1 % zero"),
+            ("kept", "let (_, kept) = (1 / zero, 2)"),
+            ("held", "let held = (1 / zero, 2).1"),
+        ] {
+            let src = format!(
+                "\nvar zero = 0\nlet reached = \"reached\"\n\nfn {function}():\n    {unread}\n    \
+                 print(reached)\n\nfn main():\n    {function}()\n"
+            );
+            assert_eq!(run_with(&src, &[]), (Err(trap(function)), String::new()));
+        }
     }
 
     #[test]

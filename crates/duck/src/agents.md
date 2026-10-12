@@ -4,8 +4,8 @@ Indentation-blocked, statically typed, compiled to one WebAssembly component.
 Values live in wasm locals and globals, memory is raw pointers into linear
 memory, and the host supplies all I/O through `extern`. `duck build` compiles
 the package of the nearest `Duck.toml` to a component of the world it names,
-and `duck run` runs it with WASI. `duck format` lays its files out as the
-examples here are.
+and `duck run` runs it with WASI. `duck test` runs its tests. `duck format`
+lays its files out as the examples here are.
 
 Absent: allocator, GC, standard library, anonymous functions, methods,
 traits, overloading, varargs, ternary, exceptions, char type, string
@@ -212,8 +212,8 @@ fn word(s: array(u8), strict: bool) -> i32:
     holds, or `.name`, a member of its enum
   - `(a, b)`: a tuple, by its elements
   - `[a, b]`: an array of exactly as many elements, by each
-  - a number, which may be negative, `true`, `false`, or a string for an
-    `array(u8)`: the value that `==` finds equal
+  - a number, which may be negative, `true`, `false`, a character for a
+    `u32`, or a string for an `array(u8)`: the value that `==` finds equal
 - A pattern never names a type or a constant: `Shape.empty:` is an error,
   and `LIMIT:` is a new name. Structs, pointers and function pointers match
   names and `_` only.
@@ -415,6 +415,11 @@ to write to, or for one that holds what isn't constant.
 
 ```duck
 let greeting = "hello"             # array(u8)
+let usage = """
+	usage: duck build
+	  or:  duck run
+	"""                                # "usage: duck build\n  or:  duck run"
+let duck = '🦆'                    # u32: the code point 0x1F986
 let primes: array(u16) = [2, 3, 5]
 let empty: array(i32) = []         # [] needs an annotation
 let SIZE: uint = 1024
@@ -433,6 +438,16 @@ fn day(i: uint) -> array(u8):
 ```
 
 - A literal is a read-only `array` unless its global is annotated `varray`.
+- A string in `"` is on one line. One in `"""` is the lines between the line
+  of its opening quotes and that of its closing ones, with a `\n` between
+  them and none after the last: a blank line before the closing quotes ends
+  it with one. Each line is without the indentation of the closing quotes,
+  which every line that isn't blank starts with.
+- `'a'` is a `u32`: the code point of the one character it holds, whatever
+  type is expected of it. `as` makes it another: `s[0] == 'a' as u8`.
+- All three have the escapes `\n \r \t \0 \\ \" \'` and `\u{1F986}`. In
+  `"""` a `"` needs none, and only `\"""` is three of them. In `'` a `"`
+  needs none, and a `'` needs one.
 - In a function a `varray` literal is an error unless it is empty, and so is
   an element, or the `len` of `[value; len]`, that isn't constant: a
   parameter, a local, a `var`, a call, or what is read from memory, as
@@ -1814,10 +1829,122 @@ world app {
   and its view after `present`, each frame.
 - A `duck` built without its `gfx` feature gives none of this.
 
+## Tests
+
+`duck test` compiles the package of the nearest `Duck.toml` with its test
+modules, the `.duck` files of its test directory, and runs each test of them.
+
+```duck
+var count = 0                        # as the constants left it, for each test
+let cells: varray(i32) = [0; 4]
+
+fn bump() -> i32:                    # a helper, as it isn't `pub`
+	count += 1
+	cells[0] = count
+	return count
+
+fn check(ok: bool):
+	ok or module.unreachable()       # a trap fails the test it is in
+
+pub fn counts_from_one():            # a test: `pub`, and takes nothing
+	check(bump() == 1)
+	check(bump() == 2)
+
+pub fn starts_again():               # in an instance of its own
+	check(cells[0] == 0 and bump() == 1)
+
+pub fn holds_what_it_stores():        # nor is memory as another left it
+	cells[3] = 7
+	check(cells[3] - cells[0] == 7)
+```
+
+- A test module is a `.duck` file of the test directory, or of a directory
+  it holds that isn't hidden. `[test]` in `Duck.toml` names the directory,
+  which is `tests` without it. The module is named by its path from there:
+  `tests/util/geo.duck` is `util.geo`.
+- It is a module of the package: its `use` paths start at the package's
+  root, as any file's do, or with a dependency. A path that no module of the
+  package is along is looked for from the test directory, so test modules
+  use one another. The package's module is the one named where both have
+  one: `tests/geo.duck` tests `src/geo.duck` with `use geo`, and no test
+  module then uses `tests/geo.duck`.
+- **A test module sees every item and every field of its package, `pub` or
+  not**, those of other test modules among them, so what they share needs no
+  `pub`. It names a private type, and constructs a struct by its private
+  fields. Of a dependency it sees what any module does.
+- **A test is a `pub fn` of a test module that takes nothing.** It has no
+  type parameters, and returns nothing. Any other function of the module is
+  a helper, and a `pub fn` that takes or returns something is an error, as
+  is one that returns `never`: a helper has no `pub`. A `pub` on anything
+  else of a test module gives it to no one, so its type may hold what is
+  private.
+- A test is named by its module and then itself: `util.geo.adds`. Tests run
+  in order of the paths of their modules, and those of a module as declared.
+- **A test passes if it returns, and fails if it traps**: `duck test` says
+  what the trap was and names the functions that were running. One that
+  exits, as by `wasi:cli/exit`, fails too, whatever its status. No test
+  passes by a trap.
+- **Each test runs in a new instance of the component**, which starts as the
+  constants left it, those of the test modules too: with that memory, each
+  `var` as it was, and the table. Nothing a test does to them is there for
+  the next, in whatever order they run. What is outside the instance is not
+  put back: a file that a test writes stays written.
+- A test is given what `duck run` gives a program: WASI 0.3, with the same
+  directories, environment and network, and the standard streams. Its only
+  argument is the program's name.
+- The `start` function isn't called, and nothing that the world exports is:
+  none of it need be defined for the tests to run. `cabi_realloc` is found
+  as it is for the build, in the entry file.
+- The tests import what the world of the package does, so an `extern` block
+  of a test module names an interface of that world. A library has no
+  world: its tests import each interface that an `extern` block names, in
+  it, in a library it depends on or in a test module, and none of the world
+  itself, so a block without a name is an error there. Tests run only with
+  what WASI 0.3 has, as a program does, and open no window.
+- `duck test geo adds` runs the tests whose names have `geo` or `adds` in
+  them. `--skip slow` leaves out each test whose name has `slow` in it,
+  whatever else names it, and is given once for each such name. `duck test
+  --list` prints the names of the tests that would run, and runs nothing.
+- It exits with 1 if a test fails, or if the package or a test module
+  doesn't compile, whichever tests are asked for.
+
+```
+test geo.adds ... ok
+test geo.scales ... ok (3 ms)
+test geo.prints ...
+2 shapes
+test geo.prints ... ok (1.2 s)
+test geo.divides ... FAILED
+    the test trapped: integer divide by zero
+        in `ratio`
+        in `divides`
+
+3 passed, 1 failed, 2 skipped (1.2 s)
+```
+
+- Each test is reported as it runs: its name as it starts, and on the same
+  line how it ended, with how long it took where that is a millisecond or
+  more. So the test that is named last, with nothing after its name, is the
+  one that is running.
+- What a test writes to its standard output and to its standard error goes
+  to those of `duck test` as it is written, whether the test passes or
+  fails. It starts on a line of its own, after the one that names the
+  test, and how the test ended is then on a line that names it again. A
+  line that it leaves without its end is given one.
+- The last line says how many passed and how many failed, then how many
+  `--skip` left out of those that were asked for, and how long the tests
+  that ran took between them. With names to run, it also says how many
+  tests none of them named, as `4 filtered out`.
+- `duck build` and `duck run` read nothing of the test directory, and
+  nothing of it is in the component. It is apart from the directory of the
+  entry, whose files are modules already: one that is in it, or holds it, is
+  an error in `Duck.toml`. So a package whose entry is beside `Duck.toml`
+  has no tests until `[test]` names a directory elsewhere.
+
 ## Duck.toml
 
 `duck new <dir>` creates a component package, and `duck new --lib <dir>` a
-library.
+library, each with a test in `tests`.
 
 ```toml
 [component]              # the wasm component this package builds
@@ -1833,6 +1960,9 @@ return = "256B"          # the return area, which is as large as is needed witho
 
 [const]                  # optional
 fuel = 10000000000       # wasm instructions the constants of one item may run
+
+[test]                   # optional
+dir = "tests"            # the test directory, which is `tests` without it
 
 [library]                # what other packages `use` by name
 entry = "src/lib.duck"
@@ -1857,6 +1987,8 @@ xml = { git = "https://example.com/xml.git", tag = "v1.0" }  # or rev; no branch
   no copy to keep. Its world still says that the component imports them:
   `import my:pkg/math@0.1.0;`. A package of WIT that two libraries have is
   there once, and is an error if the two differ.
+- The `.duck` files of the test directory are the test modules of the
+  package, which `duck test` runs: see "Tests".
 - Memory has no `min`: it starts with the pages below `static.start`, those
   its literals take and those its constants grow it by. For one that starts
   larger, have a constant take the pages with `module.grow`.

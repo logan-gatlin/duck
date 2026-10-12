@@ -582,6 +582,174 @@ pub let f = module.include(\"assets/socket\")
         );
     }
 
+    /// The files of the component of the package in `root`, with those of
+    /// its test directory if they are `tested`.
+    fn component_files(root: &Path, tested: bool) -> Files {
+        let packages = resolve(root, &no_cache(root)).unwrap();
+        let manifest = &packages.root().manifest;
+        let component = manifest.component.as_ref().unwrap();
+        let settings = component.settings(crate::files::wit(&packages).unwrap());
+        let files = Files::new(&packages, root.join(&component.entry), settings).unwrap();
+        match (tested, &manifest.tests) {
+            (true, Some(dir)) => files.with_tests(root.join(dir)).unwrap(),
+            _ => files,
+        }
+    }
+
+    /// The names of the tests of the package in `root`, in the order they
+    /// are run in, or each error of compiling them, as [`check`] gives one.
+    fn tests(root: &Path) -> Result<Vec<String>, Vec<String>> {
+        let mut files = component_files(root, true);
+        let errors = match duck_compiler::compile_tests(&mut files) {
+            Ok(tests) => return Ok(tests.tests.into_iter().map(|test| test.name).collect()),
+            Err(errors) => errors,
+        };
+        let errors = errors.iter().map(|error| {
+            let file = files.display_name(error.span().unwrap().file);
+            let file = Path::new(&file).strip_prefix(root).unwrap();
+            format!("{}: {error}", file.display())
+        });
+        Err(errors.collect())
+    }
+
+    const COMPONENT: &str =
+        "[component]\nentry = \"src/main.duck\"\noutput = \"out.wasm\"\nstart = \"main\"\n";
+
+    #[test]
+    fn the_source_files_of_the_test_directory_are_test_modules() {
+        let dir = TempDir::new("tests");
+        let root = dir.0.join("app");
+        let passes = "pub fn passes():\n    pass\n";
+        dir.write(&[
+            ("app/Duck.toml", COMPONENT),
+            ("app/src/main.duck", "use geo\nfn main():\n    pass\n"),
+            ("app/src/geo.duck", "fn unit() -> i32:\n    return 1\n"),
+            (
+                "app/tests/shapes.duck",
+                "use geo\nuse support\npub fn sides():\n    support.check(geo.unit() == 1)\n",
+            ),
+            (
+                "app/tests/support.duck",
+                "fn check(ok: bool):\n    ok or module.unreachable()\n",
+            ),
+            ("app/tests/deep/unit/b.duck", passes),
+            (
+                "app/tests/deep/a.duck",
+                "use deep.unit.b\npub fn uses():\n    b.passes()\n",
+            ),
+            ("app/tests/alpha.duck", passes),
+            // Neither a file that is no source nor one of a hidden directory.
+            ("app/tests/notes.md", "pub fn notes():\n"),
+            ("app/tests/.cases/broken.duck", "pub fn broken(:\n"),
+            ("app/tests/deep/.work/broken.duck", "let x = @\n"),
+        ]);
+        let mut files = component_files(&root, true);
+        let modules: Vec<_> = files
+            .tests()
+            .iter()
+            .map(|test| test.path.join("."))
+            .collect();
+        // In order of their paths, each directory where its name is.
+        assert_eq!(
+            modules,
+            ["alpha", "deep.a", "deep.unit.b", "shapes", "support"]
+        );
+        let entry = files.entry_point();
+        let shapes = files.tests()[3].file;
+        assert_eq!(
+            files.display_name(shapes),
+            root.join("tests/shapes.duck").display().to_string()
+        );
+        // A path leads into the directory from a test module alone.
+        assert_eq!(
+            files.open_test(shapes, &["deep", "unit", "b"]),
+            Some(files.tests()[2].file)
+        );
+        assert_eq!(files.open_test(shapes, &["deep", "unit"]), None);
+        assert_eq!(files.open_test(shapes, &["geo"]), None);
+        assert_eq!(files.open_test(entry, &["support"]), None);
+        assert!(files.open(shapes, &["geo"]).is_some());
+        assert_eq!(
+            tests(&root),
+            Ok([
+                "alpha.passes",
+                "deep.a.uses",
+                "deep.unit.b.passes",
+                "shapes.sides"
+            ]
+            .map(str::to_string)
+            .to_vec())
+        );
+
+        // A test module is named as the module it tests, which the name
+        // is then to every test module.
+        dir.write(&[(
+            "app/tests/geo.duck",
+            "use geo\npub fn has_a_unit():\n    geo.unit() == 1 or module.unreachable()\n",
+        )]);
+        assert_eq!(
+            tests(&root),
+            Ok([
+                "alpha.passes",
+                "deep.a.uses",
+                "deep.unit.b.passes",
+                "geo.has_a_unit",
+                "shapes.sides"
+            ]
+            .map(str::to_string)
+            .to_vec())
+        );
+        // So a module of the package hides what the test directory shares.
+        dir.write(&[("app/src/support.duck", "")]);
+        let hidden = "tests/shapes.duck: `support` has no item `check`".to_string();
+        assert_eq!(tests(&root), Err(vec![hidden]));
+
+        // A package without the directory has none.
+        fs::remove_dir_all(root.join("tests")).unwrap();
+        assert!(component_files(&root, true).tests().is_empty());
+        assert_eq!(tests(&root), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_package_is_built_without_its_tests() {
+        let dir = TempDir::new("untested");
+        let root = dir.0.join("app");
+        let main = "use geo\nvar count = geo.unit()\nfn main():\n    count += 1\n";
+        dir.write(&[
+            ("app/Duck.toml", COMPONENT),
+            ("app/src/main.duck", main),
+            ("app/src/geo.duck", "pub fn unit() -> i32:\n    return 1\n"),
+        ]);
+        let build = |root: &Path| duck_compiler::compile(&mut component_files(root, false));
+        let alone = build(&root).unwrap();
+        // Whatever is in the directory, which nothing of the build reads.
+        dir.write(&[
+            (
+                "app/Duck.toml",
+                &format!("{COMPONENT}[test]\ndir = \"checks\"\n"),
+            ),
+            (
+                "app/checks/geo_checks.duck",
+                "use geo\nvar seen = geo.unit()\npub fn passes():\n    seen += 1\n",
+            ),
+            ("app/checks/broken.duck", "pub fn broken(:\n"),
+        ]);
+        let mut files = component_files(&root, false);
+        assert!(files.tests().is_empty());
+        assert_eq!(duck_compiler::compile(&mut files).unwrap(), alone);
+        assert_eq!(
+            files.find(&fs::canonicalize(root.join("checks/broken.duck")).unwrap()),
+            None
+        );
+        // Its tests are compiled with all of it.
+        let errors = tests(&root).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("checks/broken.duck: "), "{errors:?}");
+        fs::remove_file(root.join("checks/broken.duck")).unwrap();
+        assert_eq!(tests(&root), Ok(vec!["geo_checks.passes".to_string()]));
+        assert_eq!(build(&root).unwrap(), alone);
+    }
+
     #[test]
     fn dependencies_are_found_by_path_and_shared() {
         let dir = TempDir::new("shared");

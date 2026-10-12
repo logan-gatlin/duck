@@ -25,6 +25,8 @@ use crate::parse::{
 };
 use crate::world::{REALLOC, ROOT, RUN_EXPORT, RUN_INTERFACE, World, WorldError, kebab};
 
+pub use test::{Test, Tested, check_tests};
+
 use alias::AliasDef;
 use defaults::DefaultValue;
 use enums::EnumDef;
@@ -52,6 +54,7 @@ mod nested;
 mod opaque;
 mod patterns;
 mod similar;
+mod test;
 mod unions;
 mod wit;
 
@@ -851,6 +854,9 @@ pub enum TypeErrorKind {
     UnknownStart(String),
     /// A start function that takes arguments or returns something.
     InvalidStart(String),
+    /// A `pub fn` of a test module that is no test: it takes arguments or
+    /// type parameters, or returns something, if only `never`.
+    InvalidTest(String),
     /// Literal data that ends past every address.
     DataTooLarge {
         end: u128,
@@ -942,6 +948,13 @@ struct Checker {
     module: FileId,
     /// The module whose `pub` items are exported.
     entry: FileId,
+    /// The test modules of the package that `entry` is in, each of which
+    /// sees all of that package, and the modules of that package.
+    test_modules: HashSet<FileId>,
+    package: HashSet<FileId>,
+    /// The tests of the program, in the order they run in, each with the
+    /// function it is.
+    tests: Vec<(Test, FuncId)>,
     /// What each `module.include` of the program includes.
     includes: Includes,
     /// The world the program is a component of, which says what is.
@@ -1732,6 +1745,7 @@ impl TypeErrorKind {
             Self::StartAndRun => "start-and-run",
             Self::UnknownStart(..) => "unknown-start",
             Self::InvalidStart(..) => "invalid-start",
+            Self::InvalidTest(..) => "invalid-test",
             Self::DataTooLarge { .. } => "data-too-large",
             Self::DataPastMax { .. } => "data-past-max",
             Self::UnknownModuleProperty(..) => "unknown-module-property",
@@ -2267,6 +2281,11 @@ impl fmt::Display for TypeErrorKind {
                 f,
                 "start function `{name}` must take no arguments and return nothing"
             ),
+            Self::InvalidTest(name) => write!(
+                f,
+                "a `pub fn` of a test module is a test, which takes nothing and returns \
+                 nothing: `{name}` is a helper without its `pub`"
+            ),
             Self::DataTooLarge { end } => {
                 write!(f, "literals end at address {end}, past every address")
             }
@@ -2411,7 +2430,7 @@ impl std::error::Error for TypeError {}
 /// Checking continues past errors, so every error in the program is reported
 /// at once.
 pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
-    let (mut ck, imports, mut funcs, start) = lower_program(program, settings, false);
+    let (ck, imports, mut funcs, start) = lower_program(program, settings, false, false);
     if !ck.errors.is_empty() {
         return Err(ck.errors);
     }
@@ -2436,50 +2455,31 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
             ],
         });
     }
-    let min_pages = ck.pages();
-    if let Some(eval) = &mut ck.eval {
-        ck.data = eval.data();
-        let globals = ck.ir_globals.iter_mut().enumerate();
-        for (index, global) in globals.filter(|(_, global)| global.mutable) {
-            global.init = eval.global(index);
-        }
-    }
-    Ok(ir::Module {
-        memory: ir::Memory {
-            min_pages,
-            max_pages: settings.max_pages,
-            export: MEMORY_EXPORT.to_string(),
-        },
-        data: ck.data,
-        table: (!ck.table.is_empty()).then(|| ir::Table {
-            export: ck.world.is_library().then(|| TABLE_EXPORT.to_string()),
-            funcs: ck.table,
-        }),
-        globals: ck.ir_globals,
-        imports,
-        funcs,
-    })
+    Ok(ck.module(imports, funcs, settings))
 }
 
 /// The errors that [`check`] finds in `program`, without the module it
 /// makes of one that has none.
 pub fn errors(program: &Program, settings: &Settings) -> Vec<TypeError> {
-    lower_program(program, settings, false).0.errors
+    lower_program(program, settings, false, false).0.errors
 }
 
 /// Checks and lowers `program`. Returns the checker, which has its errors,
 /// and its imports, its functions and its start function. If it `records`,
-/// the checker keeps the type of what is written, too.
+/// the checker keeps the type of what is written, too. If it is `tested`,
+/// the module is that of its tests: one of the world [`World::tests`]
+/// gives, which no start function is called in, and which is to define
+/// nothing that the world of the program exports.
 fn lower_program(
     program: &Program,
     settings: &Settings,
     records: bool,
+    tested: bool,
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
-    let mut ck = Checker::define(program, settings, records);
-    let start = settings
-        .start
-        .as_ref()
-        .and_then(|name| ck.resolve_start(program, name));
+    let mut ck = Checker::define(program, settings, records, tested);
+    let start = settings.start.as_ref().filter(|_| !tested);
+    let start = start.and_then(|name| ck.resolve_start(program, name));
+    ck.tests = ck.find_tests(program);
     ck.check_generic_fns(program);
     if !ck.unread {
         ck.check_imports(program);
@@ -2488,7 +2488,9 @@ fn lower_program(
     let mut funcs = ck.lower_funcs(program);
     // A start function that isn't one is reported as that, and not also
     // as a `run` that nothing defines.
-    if !ck.unread {
+    if !ck.unread && tested {
+        ck.export_tests(program, &mut funcs);
+    } else if !ck.unread {
         ck.export_funcs(program, &mut funcs, settings.start.is_some());
     }
     funcs.extend(ck.lower_synths(program));
@@ -2505,6 +2507,44 @@ fn lower_program(
 }
 
 impl Checker {
+    /// The module of `imports` and `funcs`, which are all that is lowered
+    /// of a program without errors, with the memory `settings` describe: as
+    /// the code its constants ran left it.
+    fn module(
+        mut self,
+        imports: Vec<ir::Import>,
+        funcs: Vec<ir::Func>,
+        settings: &Settings,
+    ) -> ir::Module {
+        let min_pages = self.pages();
+        let mut bodies = funcs.iter().map(|func| &func.body);
+        let called = bodies.any(|body| fn_ptr::calls_through_table(body));
+        if let Some(eval) = &mut self.eval {
+            self.data = eval.data();
+            let globals = self.ir_globals.iter_mut().enumerate();
+            for (index, global) in globals.filter(|(_, global)| global.mutable) {
+                global.init = eval.global(index);
+            }
+        }
+        ir::Module {
+            memory: ir::Memory {
+                min_pages,
+                max_pages: settings.max_pages,
+                export: MEMORY_EXPORT.to_string(),
+            },
+            data: self.data,
+            // A pointer that no function is taken as is still called
+            // through the table, where nothing is: the call traps.
+            table: (!self.table.is_empty() || called).then(|| ir::Table {
+                export: self.world.is_library().then(|| TABLE_EXPORT.to_string()),
+                funcs: self.table,
+            }),
+            globals: self.ir_globals,
+            imports,
+            funcs,
+        }
+    }
+
     /// Reports an error in no source file: one in what the settings ask.
     fn error_nowhere(&mut self, kind: TypeErrorKind) {
         self.errors.push(TypeError::nowhere(kind));
@@ -2818,11 +2858,11 @@ impl Checker {
         Some(entry.item)
     }
 
-    /// The item `name` names in `module`, as other modules see it.
+    /// The item `name` names in `module`, as the current module sees it.
     fn member_of(&self, module: FileId, name: &str) -> Result<Item, Member> {
         let entry = self.scopes.get(&module).and_then(|scope| scope.get(name));
         match entry {
-            Some(entry) if entry.is_pub || module == self.module => Ok(entry.item),
+            Some(entry) if entry.is_pub || self.sees_private(self.module, module) => Ok(entry.item),
             Some(_) => Err(Member::Private),
             None => Err(Member::Missing),
         }
@@ -2843,7 +2883,8 @@ impl Checker {
                     item: name.name.clone(),
                 };
                 let scope = self.scopes.get(&module).into_iter().flatten();
-                let seen = scope.filter(|(_, entry)| entry.is_pub || module == self.module);
+                let sees = self.sees_private(self.module, module);
+                let seen = scope.filter(|(_, entry)| entry.is_pub || sees);
                 let similar = similar::nearest(&name.name, seen.map(|(name, _)| name.as_str()));
                 self.error_near(kind, name.span, similar);
                 None
@@ -3280,8 +3321,12 @@ impl Checker {
     }
 
     /// Reports a type in `ty`, written at `span` in the type of `pub` item
-    /// `item`, that isn't `pub`.
+    /// `item`, that isn't `pub`. None is reported of an item of a test
+    /// module, which no other package is given.
     fn check_public(&mut self, ty: Ty, span: Span, item: &str) {
+        if self.test_modules.contains(&span.file) {
+            return;
+        }
         if let Some(private) = self.private_part(ty, None) {
             let kind = TypeErrorKind::PrivateInPublic {
                 ty: self.ty_name(private),
@@ -3292,12 +3337,14 @@ impl Checker {
     }
 
     /// The first struct or enum in `ty` that isn't `pub`. With `within`,
-    /// only one that the module `within` doesn't declare, so can't name.
+    /// only one that the module `within` can't name: one of another module
+    /// that it [sees](Self::sees_private) nothing private of.
     fn private_part(&self, ty: Ty, within: Option<FileId>) -> Option<Ty> {
+        let named = |module: FileId| within.is_some_and(|within| self.sees_private(within, module));
         match ty {
             Ty::Struct(id) => {
                 let def = &self.structs[id.0 as usize];
-                if !def.is_pub && within != Some(def.module) {
+                if !def.is_pub && !named(def.module) {
                     return Some(ty);
                 }
                 let args = def.instance.iter().flat_map(|instance| &instance.args);
@@ -3306,7 +3353,7 @@ impl Checker {
             }
             Ty::Enum(id) => {
                 let def = &self.enums[id.0 as usize];
-                (!def.is_pub && within != Some(def.module)).then_some(ty)
+                (!def.is_pub && !named(def.module)).then_some(ty)
             }
             Ty::Opaque(id) => self.private_opaque(id, within),
             _ => self
@@ -3510,14 +3557,22 @@ impl Checker {
 
     /// Declares and defines every item of `program`, which places its
     /// literals. If it `records`, the type of what is written is kept.
-    fn define(program: &Program, settings: &Settings, records: bool) -> Self {
-        let (world, unread) = match World::load(settings) {
+    /// If it is `tested`, they are items of the component of its tests.
+    fn define(program: &Program, settings: &Settings, records: bool, tested: bool) -> Self {
+        let world = World::load(settings);
+        let world = match tested {
+            true => world.and_then(|world| world.tests(&imported_interfaces(program))),
+            false => world,
+        };
+        let (world, unread) = match world {
             Ok(world) => (world, None),
             Err(e) => (World::default(), Some(e)),
         };
         let mut ck = Self {
             types: records.then(HashMap::new),
             entry: program.entry,
+            test_modules: program.tests.iter().map(|test| test.file).collect(),
+            package: program.package.clone(),
             includes: program.includes.clone(),
             world,
             max_pages: settings.max_pages,
@@ -4370,8 +4425,8 @@ impl Checker {
     }
 
     /// Whether `module` sees field `index` of struct `id`: it is `pub`, or
-    /// the module is the one that declares the struct. A list has each
-    /// field as the struct that it lists does.
+    /// the module is the one that declares the struct, or a test module of
+    /// its package. A list has each field as the struct that it lists does.
     fn sees_field(&self, id: StructId, index: usize, module: FileId) -> bool {
         let def = &self.structs[id.0 as usize];
         let field = &def.fields[index];
@@ -4379,7 +4434,7 @@ impl Checker {
             (Some(_), Some((used, _))) => self.structs[used.0 as usize].module,
             _ => def.module,
         };
-        field.is_pub || declared == module
+        field.is_pub || self.sees_private(module, declared)
     }
 
     /// `value as to`, where `value` has type `from`, and its type: `to`, or
@@ -4777,6 +4832,15 @@ impl Checker {
         self.data_end <= self.data_limit.into()
     }
 
+    /// Whether `consts` are the value of a constant of type `ty`: a
+    /// constant for each of its leaves. What failed to check is of the
+    /// error type, whatever was expected of it, and has none, though its
+    /// error may be reported elsewhere than where it is read, as that of a
+    /// global whose initializer failed is.
+    pub(super) fn is_value_of(&self, ty: Ty, consts: &[Const]) -> bool {
+        consts.len() == self.val_types(ty).len()
+    }
+
     /// Evaluates each scalar of a lowered constant without running it.
     /// Stops at the first that can't be.
     fn fold_value(&self, value: &Value) -> Result<Vec<Const>, Fold> {
@@ -4784,35 +4848,7 @@ impl Checker {
             return Err(Fold::NotConstant);
         }
         let scalars = value.scalars.iter();
-        scalars.map(|(_, scalar)| self.fold(scalar)).collect()
-    }
-
-    /// Evaluates a lowered global initializer without running it.
-    fn fold(&self, expr: &Expr) -> Result<Const, Fold> {
-        match expr {
-            Expr::Const(c) => Ok(*c),
-            Expr::Unary(_, op, x) => fold_unary(*op, self.fold(x)?),
-            Expr::Binary(_, op, a, b) => fold_binary(*op, self.fold(a)?, self.fold(b)?),
-            Expr::If {
-                cond,
-                then_expr,
-                else_expr,
-                ..
-            } => match self.fold(cond)? {
-                Const::I32(0) => self.fold(else_expr),
-                _ => self.fold(then_expr),
-            },
-            // Only a `var` is read from a global, and may have been
-            // assigned.
-            Expr::Local(_)
-            | Expr::Global(_)
-            | Expr::Call(..)
-            | Expr::CallIndirect { .. }
-            | Expr::Load { .. }
-            | Expr::MemorySize
-            | Expr::MemoryGrow(_)
-            | Expr::Seq(..) => Err(Fold::NotConstant),
-        }
+        scalars.map(|(_, scalar)| fold(scalar)).collect()
     }
 }
 
@@ -5968,6 +6004,11 @@ impl<'c> Body<'c> {
         match &expr.kind {
             ExprKind::Int(n) => self.int_literal(*n as i128, expected, expr.span),
             ExprKind::Float(x) => float_literal(*x, expected),
+            // A code point, whatever is expected of it.
+            ExprKind::Char(c) => (
+                Ty::Prim(Prim::U32),
+                scalar(ValType::I32, Expr::Const(Const::I32(*c as i32))),
+            ),
             ExprKind::Bool(b) => (
                 Ty::Prim(Prim::Bool),
                 scalar(ValType::I32, Expr::Const(Const::I32(*b as i32))),
@@ -7681,7 +7722,7 @@ impl<'c> Body<'c> {
             return self.spill(value, is_simple);
         }
         for (vt, scalar) in &mut value.scalars {
-            match self.ck.fold(scalar) {
+            match fold(scalar) {
                 Ok(c) => *scalar = Expr::Const(c),
                 // Reported where the constant is folded.
                 Err(Fold::Trap) => {}
@@ -8061,12 +8102,13 @@ fn convert(from: Prim, to: Prim, expr: Expr) -> Expr {
     }
 }
 
-/// Whether evaluating `expr` has no side effects.
+/// Whether evaluating `expr` has no side effects, a trap among them: what
+/// is pure is left out where nothing reads it, and evaluated in any order.
 fn is_pure(expr: &Expr) -> bool {
     match expr {
         Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => true,
         Expr::Unary(_, _, x) | Expr::Load { addr: x, .. } => is_pure(x),
-        Expr::Binary(_, _, a, b) => is_pure(a) && is_pure(b),
+        Expr::Binary(_, op, a, b) => !may_trap(*op, b) && is_pure(a) && is_pure(b),
         Expr::If {
             cond,
             then_expr,
@@ -8085,7 +8127,7 @@ fn is_stable(expr: &Expr) -> bool {
     match expr {
         Expr::Const(_) | Expr::Local(_) => true,
         Expr::Unary(_, _, x) => is_stable(x),
-        Expr::Binary(_, _, a, b) => is_stable(a) && is_stable(b),
+        Expr::Binary(_, op, a, b) => !may_trap(*op, b) && is_stable(a) && is_stable(b),
         Expr::If {
             cond,
             then_expr,
@@ -8100,6 +8142,23 @@ fn is_stable(expr: &Expr) -> bool {
         | Expr::MemoryGrow(_)
         | Expr::Seq(..) => false,
     }
+}
+
+/// Whether `op` may trap where `divisor` is its right operand: an integer
+/// division or remainder does by zero, and a signed division of the least
+/// integer by -1, whose result is no integer of its type. One by a constant
+/// that is neither never does.
+fn may_trap(op: IrBinOp, divisor: &Expr) -> bool {
+    let divides = matches!(
+        op,
+        IrBinOp::DivS | IrBinOp::DivU | IrBinOp::RemS | IrBinOp::RemU
+    );
+    let by = match fold(divisor) {
+        Ok(Const::I32(by)) => Some(i64::from(by)),
+        Ok(Const::I64(by)) => Some(by),
+        _ => None,
+    };
+    divides && by.is_none_or(|by| by == 0 || by == -1 && op == IrBinOp::DivS)
 }
 
 /// The variables that the assignments within the expressions of `stmt`
@@ -8135,6 +8194,7 @@ fn push_assigned(expr: &parse::Expr, names: &mut Vec<String>) {
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
+        | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::Unit
         | ExprKind::Name(_)
@@ -8276,6 +8336,19 @@ fn extern_fns(program: &Program) -> impl Iterator<Item = (&ExternBlock, &ExternF
     blocks.flat_map(|block| block.fns.iter().map(move |f| (block, f)))
 }
 
+/// The name in full of each interface that an `extern` block of `program`
+/// names, once, in the order they are first named.
+fn imported_interfaces(program: &Program) -> Vec<String> {
+    let mut interfaces: Vec<String> = Vec::new();
+    for (block, _) in extern_fns(program) {
+        let named = block.module.as_ref().map(|module| &module.name);
+        if let Some(name) = named.filter(|name| *name != ROOT && !interfaces.contains(name)) {
+            interfaces.push(name.clone());
+        }
+    }
+    interfaces
+}
+
 /// Every defined function that isn't generic, with the item that declares
 /// it.
 fn fn_decls(program: &Program) -> impl Iterator<Item = (&parse::Item, &parse::FnDecl)> {
@@ -8349,6 +8422,7 @@ fn has_break(expr: &parse::Expr) -> bool {
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
+        | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::Unit
         | ExprKind::Name(_)
@@ -8383,6 +8457,35 @@ fn has_break(expr: &parse::Expr) -> bool {
         ExprKind::Call(callee, args) => {
             has_break(callee) || args.iter().any(|arg| has_break(&arg.value))
         }
+    }
+}
+
+/// Evaluates `expr`, a scalar of a lowered constant or an operand of one,
+/// without running it, if it is made of constants alone.
+fn fold(expr: &Expr) -> Result<Const, Fold> {
+    match expr {
+        Expr::Const(c) => Ok(*c),
+        Expr::Unary(_, op, x) => fold_unary(*op, fold(x)?),
+        Expr::Binary(_, op, a, b) => fold_binary(*op, fold(a)?, fold(b)?),
+        Expr::If {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => match fold(cond)? {
+            Const::I32(0) => fold(else_expr),
+            _ => fold(then_expr),
+        },
+        // Only a `var` is read from a global, and may have been
+        // assigned.
+        Expr::Local(_)
+        | Expr::Global(_)
+        | Expr::Call(..)
+        | Expr::CallIndirect { .. }
+        | Expr::Load { .. }
+        | Expr::MemorySize
+        | Expr::MemoryGrow(_)
+        | Expr::Seq(..) => Err(Fold::NotConstant),
     }
 }
 
@@ -9974,6 +10077,83 @@ fn f(x: i64, y: f32):
     }
 
     #[test]
+    fn character_literals_are_code_points_of_u32() {
+        use TypeErrorKind::*;
+        let src = "\
+pub let duck = '🦆'
+pub let quote: u32 = '\\''
+fn f(c: u32, b: u8) -> bool:
+    let a = 'a'
+    let digit = c - '0' < 10
+    match c:
+        '\\n':
+            return digit
+        '\\u{1F986}':
+            return c == duck
+        else:
+            pass
+    return b == 'b' as u8
+";
+        let module = lower(src);
+        assert_eq!(
+            body(&module, "f"),
+            "(set a 97) (set digit (I32.LtU (I32.Sub c 48) 10)) (set tmp4 c) \
+             (block (if (I32.Eq tmp4 10) (then (return digit)) (else )) \
+             (if (I32.Eq tmp4 129414) (then (return (I32.Eq c 129414))) (else ))) \
+             (return (I32.Eq b (I32.And 98 255)))"
+        );
+        let globals: Vec<_> = (module.globals.iter())
+            .map(|g| (g.name.as_str(), konst(g.init)))
+            .collect();
+        assert_eq!(
+            globals,
+            [("duck", "129414".to_string()), ("quote", "39".to_string())]
+        );
+        let a = module.funcs[0]
+            .locals
+            .iter()
+            .find(|l| l.name == "a")
+            .unwrap();
+        assert_eq!(a.ty, ValType::I32);
+
+        // One is of no other type, whatever is expected of it.
+        let src = "\
+fn f(b: u8, i: i32, x: f64):
+    let a: u8 = 'a'
+    let c = b == 'b'
+    let d = i + 'd'
+    let e: i64 = -'e'
+    match b:
+        'g':
+            pass
+        else:
+            pass
+    match x:
+        'h':
+            pass
+        else:
+            pass
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (mismatch("u8", "u32"), "'a'"),
+                (mismatch("u8", "u32"), "'b'"),
+                (mismatch("i32", "u32"), "'d'"),
+                (
+                    InvalidOperand {
+                        op: "-",
+                        ty: "u32".into()
+                    },
+                    "-'e'"
+                ),
+                (mismatch("u32", "u8"), "'g'"),
+                (mismatch("u32", "f64"), "'h'"),
+            ]
+        );
+    }
+
+    #[test]
     fn global_initializers_are_folded() {
         let src = "\
 pub struct P:
@@ -10407,6 +10587,87 @@ fn f(b: bool) -> i32:
              (set d (if b (seq (call make [] -> [tmp7 tmp8]) (I32.Eq tmp8 2)) 0)) \
              (return a)"
         );
+    }
+
+    #[test]
+    fn what_may_trap_is_evaluated_where_nothing_reads_it() {
+        let src = "\
+fn id(x: i32) -> i32:
+    return x
+fn take(u: tuple(), n: i32) -> i32:
+    return n
+fn two(a: i32, b: i32) -> i32:
+    return b
+fn f(a: i32, b: i32, c: u64, d: u64) -> i32:
+    let _ = a / b
+    a % b
+    c / d
+    let (_, x) = (c % d, 1)
+    let y = (a / b, 2).1
+    let z = take((a / b, ()).1, 3)
+    return two(b: a / b, a: id(x + y + z))
+fn g(a: i32, c: u64) -> i32:
+    let _ = a / 0
+    let _ = a / -1
+    let _ = c % (1 - 1)
+    let _ = a / 2
+    let _ = a % -1
+    let _ = c / 18446744073709551615
+    let _ = a / (4 - 1)
+    let (_, x) = (c % 8, 1)
+    return two(b: a / 3, a: id(x))
+";
+        let module = lower(src);
+        // A division traps by zero, so it is run where it is written:
+        // whether or not its value is bound, kept or passed, and before
+        // what is written after it.
+        assert_eq!(
+            body(&module, "f"),
+            "(drop (I32.DivS a b)) (drop (I32.RemS a b)) (drop (I64.DivU c d)) \
+             (drop (I64.RemU c d)) (set x 1) \
+             (set tmp5 (I32.DivS a b)) (set y 2) \
+             (set tmp7 (I32.DivS a b)) (set z (call take 3)) \
+             (set tmp9 (I32.DivS a b)) (set tmp10 (call id (I32.Add (I32.Add x y) z))) \
+             (return (call two tmp10 tmp9))"
+        );
+        // One by a constant traps only by zero, or by -1 where it is
+        // signed and no remainder. Any other is left out, or run late, as
+        // what has no effect is.
+        assert_eq!(
+            body(&module, "g"),
+            "(drop (I32.DivS a 0)) (drop (I32.DivS a -1)) \
+             (drop (I64.RemU c (I64.Sub 1i64 1i64))) \
+             (set x 1) (set tmp3 (call id x)) (return (call two tmp3 (I32.DivS a 3)))"
+        );
+    }
+
+    #[test]
+    fn a_constant_traps_where_nothing_reads_what_does() {
+        let unread = [
+            "let _ = 1 / 0\n",
+            "let (_, x) = (1 / 0, 2)\n",
+            "let x = (1 / 0, 2).1\n",
+            "var zero = 0\nlet x = (1 % zero, 2).1\n",
+            "fn f() -> i32:\n    let _ = 1 / 0\n    return 1\nlet x = f()\n",
+            "var zero = 0\nfn f() -> i32:\n    1 % zero\n    return 1\nlet x = f()\n",
+            "fn f(n: i32 = (1 / 0, 2).1) -> i32:\n    return n\n",
+            "enum(i32) E:\n    a = (1 / 0, 2).1\n",
+            "struct S:\n    x: i32 = (1 % 0, 2).1\n",
+            "let n: array(u8) = [0; (1 / 0, 2 as uint).1]\n",
+        ];
+        for src in unread {
+            let errors = errors(src);
+            let traps = |kind: &TypeErrorKind| {
+                matches!(
+                    kind,
+                    TypeErrorKind::ConstTrap | TypeErrorKind::ConstTraps { .. }
+                )
+            };
+            assert!(errors.len() == 1 && traps(&errors[0]), "{src}: {errors:?}");
+        }
+        // As it does where something reads it.
+        assert_eq!(errors("let x = 1 / 0\n"), [TypeErrorKind::ConstTrap]);
+        lower("let x = (1 / 2, 2 % -1, 3).2\n");
     }
 
     #[test]
@@ -16689,6 +16950,49 @@ fn main() -> i32:
     }
 
     #[test]
+    fn a_module_that_calls_through_the_table_has_one() {
+        // Whether or not a pointer is taken to any function: one from
+        // elsewhere, or made of an address, is still called through it.
+        let empty = Some(ir::Table {
+            export: Some("table".to_string()),
+            funcs: Vec::new(),
+        });
+        let sources = [
+            "fn apply(f: fn(i32) -> i32, x: i32) -> i32:\n    return f(x)\n",
+            "fn apply(f: fn() -> tuple(i32, i32)) -> i32:\n    return f().1\n",
+            "var nothing = 0 as uint as! fn()\nfn f():\n    nothing()\n",
+            "fn f(steps: array(fn()), n: uint):\n    if n > 0:\n        steps[n - 1]()\n",
+            "fn f(g: fn(i32) -> i32, h: fn() -> i32) -> i32:\n    return 1 + g(h())\n",
+            "fn f(p: &var i32, h: fn() -> i32):\n    while p.* < 3:\n        p.* = h()\n",
+        ];
+        for src in sources {
+            assert_eq!(lower(src).table, empty, "{src}");
+        }
+        // A component exports no table, and has it all the same.
+        let settings = Settings {
+            world: Some(crate::world::COMMAND.to_string()),
+            start: Some("main".to_string()),
+            ..Settings::default()
+        };
+        let src = "var nothing = 0 as uint as! fn()\nfn main():\n    nothing()\n";
+        let unexported = check_with(src, &settings).unwrap().table;
+        assert_eq!(
+            unexported.map(|table| (table.export, table.funcs)),
+            Some((None, Vec::new()))
+        );
+        // One that only a generic function that is never called would
+        // call through it calls nothing.
+        let unused = "fn(T) apply(f: fn(T) -> T, x: T) -> T:\n    return f(x)\n";
+        assert_eq!(lower(unused).table, None);
+        // A constant calls through the table of what runs it, which has
+        // nothing at index 0 either.
+        let folded = "var nothing = 0 as uint as! fn() -> i32\nlet x = nothing()\n";
+        let traps = errors(folded);
+        let shown: Vec<_> = traps.iter().map(ToString::to_string).collect();
+        assert_eq!(shown, ["constant evaluation traps: uninitialized element"]);
+    }
+
+    #[test]
     fn a_function_is_a_value_of_its_own_type_called_directly() {
         let src = "\
 extern:
@@ -16854,8 +17158,9 @@ fn main(p: fn(i32) -> i32) -> i32:
     return twice(inc, 1) + twice(p, 2)
 ";
         let module = lower(src);
-        // The instance of a function calls it, and takes nothing for it.
-        assert_eq!(module.table, None);
+        // The instance of a function calls it, and takes nothing for it:
+        // the table that the instance of a pointer calls through holds none.
+        assert!(table(&module).is_empty());
         assert_eq!(
             body(&module, "twice(inc)"),
             "(return (call inc (call inc x)))"
@@ -16890,7 +17195,7 @@ fn f(any: &var Pool(u8, fn(uint) -> &var u8)) -> &var u8:
     return take(any)
 ";
         let module = lower(src);
-        assert_eq!(module.table, None);
+        assert!(table(&module).is_empty());
         // The function is no part of what holds it.
         assert_eq!(
             body(&module, "take(u8, bump)"),
@@ -18001,6 +18306,60 @@ fn f() -> i32:
                 MissingArg("g".into()),
             ]
         );
+    }
+
+    #[test]
+    fn a_constant_that_failed_to_check_is_no_value_of_what_reads_it() {
+        use TypeErrorKind::*;
+        // The error is that of the initializer, wherever its global is
+        // read: it has no scalars for what counts them.
+        let read = "\
+enum(u8) Cast:
+    a = early as u8
+    b
+enum(i32) Counted:
+    a = 1
+    b = early
+    c
+enum(i32) More:
+    use Counted
+    d
+enum(tuple(i32, i32)) Pairs:
+    a = early
+    b = (1, early)
+struct S:
+    x: i32 = early
+    pair: tuple(i32, i32) = early
+struct(T) Box:
+    held: T
+    pair: tuple(i32, i32) = early
+fn f(n: i32 = early, pair: tuple(i32, i64) = early) -> i32:
+    return n + pair.0 + S().pair.1 + Box(u8)(held: 1).pair.0
+let after = Counted.b as i32 + More.d as i32 + f() + S().x
+let sized: array(u8) = [0; early]
+";
+        let failed = [
+            ("let early = missing\n", UnknownName("missing".into())),
+            (
+                "let (early, other) = missing\n",
+                UnknownName("missing".into()),
+            ),
+            (
+                "fn bad() -> Nope:\n    pass\nlet early = bad()\n",
+                UnknownType("Nope".into()),
+            ),
+            (
+                "struct Bad:\n    x: Nope\nlet early = Bad(x: 1).x\n",
+                UnknownType("Nope".into()),
+            ),
+            (
+                "enum(Nope) Bad:\n    x = 1\nlet early = Bad.x as u8\n",
+                UnknownType("Nope".into()),
+            ),
+        ];
+        for (early, error) in failed {
+            assert_eq!(errors(&format!("{early}{read}")), [error], "{early}");
+        }
     }
 
     #[test]
