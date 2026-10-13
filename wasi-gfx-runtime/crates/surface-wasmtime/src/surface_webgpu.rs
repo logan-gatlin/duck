@@ -149,10 +149,18 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
             // is its own
             width: 0,
             height: 0,
-            present_mode: wgpu_types::PresentMode::default(),
+            // A frame is shown at the display's next refresh and never
+            // waited for: a compositor that stops refreshing, as that of a
+            // remote desktop does while nothing moves, would otherwise stop
+            // the program with it. The frames of the surface pace it.
+            present_mode: wgpu_types::PresentMode::Mailbox,
             desired_maximum_frame_latency: 2,
         };
-        context.apply(self.instance, device_id, &mut core)?;
+        if context.apply(self.instance, device_id, &mut core).is_err() {
+            // Where the surface has no such mode, it has this one.
+            core.present_mode = wgpu_types::PresentMode::Fifo;
+            context.apply(self.instance, device_id, &mut core)?;
+        }
 
         context.configuration = Some(ContextConfiguration {
             device: configuration.device,
@@ -181,7 +189,10 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
         // is as large as the canvas: a window that has changed size since it
         // was configured is configured again for it.
         let sized = (configuration.core.width, configuration.core.height);
-        let size = (context.surface.width().max(1), context.surface.height().max(1));
+        let size = (
+            context.surface.width().max(1),
+            context.surface.height().max(1),
+        );
         let mut outcome = Ok(());
         if size != sized {
             outcome = context.apply(self.instance, device_id, &mut configuration.core);

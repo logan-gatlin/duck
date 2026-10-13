@@ -28,13 +28,6 @@ pub(crate) const ENTRY: &str = "run";
 /// The bytes in a wasm page.
 const PAGE_SIZE: u64 = 64 * 1024;
 
-/// The most zero bytes that two runs of others are kept in one segment
-/// across, as a segment of its own costs about as many.
-const MAX_GAP: usize = 8;
-
-/// How much of memory is searched at once for a byte that isn't zero.
-const BLOCK: usize = 4096;
-
 /// The state of a module being compiled, which the code it runs shares.
 pub(crate) struct Evaluator {
     store: Store<()>,
@@ -195,30 +188,18 @@ impl Evaluator {
         Ok(results.iter().map(konst).collect())
     }
 
-    /// What memory holds, as the fewest segments in address order that
-    /// leave out most of its zeros: a module's memory starts zeroed.
+    /// What memory holds, as one segment from the first of its bytes that
+    /// isn't zero to the last: a module's memory starts zeroed.
     pub(crate) fn data(&self) -> Vec<ir::Data> {
         let memory = self.memory.data(&self.store);
-        // Each run of bytes that aren't zero, and those within `MAX_GAP` of
-        // one another.
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for (index, block) in memory.chunks(BLOCK).enumerate() {
-            if *block == [0; BLOCK][..block.len()] {
-                continue;
-            }
-            for (i, _) in block.iter().enumerate().filter(|(_, byte)| **byte != 0) {
-                let at = index * BLOCK + i;
-                match runs.last_mut() {
-                    Some((_, end)) if at - *end <= MAX_GAP => *end = at + 1,
-                    _ => runs.push((at, at + 1)),
-                }
-            }
-        }
-        let segment = |(start, end): (usize, usize)| ir::Data {
+        let Some(start) = memory.iter().position(|byte| *byte != 0) else {
+            return Vec::new();
+        };
+        let end = memory.iter().rposition(|byte| *byte != 0).unwrap() + 1;
+        vec![ir::Data {
             offset: start as u64,
             bytes: memory[start..end].to_vec(),
-        };
-        runs.into_iter().map(segment).collect()
+        }]
     }
 }
 
@@ -439,20 +420,26 @@ mod tests {
     }
 
     #[test]
-    fn memory_is_read_back_without_its_zeros() {
+    fn memory_is_read_back_as_one_segment_without_the_zeros_around_it() {
         let mut eval = evaluator();
+        assert_eq!(eval.data(), []);
         eval.write(4, &[1, 2]);
-        // Within `MAX_GAP` of the bytes before it, and far from those after.
-        eval.write(10, &[3]);
         assert!(eval.cover(70_000));
         eval.write(69_999, &[9]);
         let data = eval.data();
-        let expected = [(4, vec![1, 2, 0, 0, 0, 0, 3]), (69_999, vec![9])];
-        let expected = expected.map(|(offset, bytes)| ir::Data { offset, bytes });
-        assert_eq!(data, expected);
+        assert_eq!(data.len(), 1);
+        assert_eq!((data[0].offset, data[0].bytes.len()), (4, 69_996));
+        assert_eq!(
+            (&data[0].bytes[..3], &data[0].bytes[69_995..]),
+            (&[1, 2, 0][..], &[9][..])
+        );
         assert_eq!(eval.pages(), 2);
-        eval.zero(4, 7);
-        assert_eq!(eval.data().len(), 1);
+        eval.zero(69_999, 1);
+        let expected = ir::Data {
+            offset: 4,
+            bytes: vec![1, 2],
+        };
+        assert_eq!(eval.data(), [expected]);
     }
 
     #[test]

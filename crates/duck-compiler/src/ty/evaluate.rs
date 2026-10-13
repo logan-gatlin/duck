@@ -617,8 +617,12 @@ pub fn read() -> i32:
         let module = lower(src);
         assert_eq!(exported(&module), "size=3");
         assert_eq!(module.memory.min_pages, 3);
-        let offsets: Vec<_> = module.data.iter().map(|data| data.offset).collect();
-        assert_eq!(offsets, [0, 70000]);
+        // One segment, from `text` to what `far` wrote.
+        let segments = module.data.iter();
+        let segments: Vec<_> = segments
+            .map(|data| (data.offset, data.bytes.len()))
+            .collect();
+        assert_eq!(segments, [(0, 70004)]);
         let mut started = Started::of(src);
         assert_eq!(started.pages(), 3);
         assert_eq!(started.bytes(0, 2), *b"hi");
@@ -1123,7 +1127,7 @@ pub fn grow() -> i32:
         let segments: Vec<_> = segments
             .map(|data| (data.offset, data.bytes.len()))
             .collect();
-        assert_eq!(segments, [(0, 3), (65536, 1), (131072, 70001)]);
+        assert_eq!(segments, [(0, 131072 + 70001)]);
         assert_eq!(module.memory.min_pages, 4);
         let mut started = Started::of(src);
         assert_eq!(started.bytes(0, 4), *b"abc\0");
