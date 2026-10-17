@@ -34,7 +34,7 @@ start = "main"
 # How long the code that a constant runs may take, counted in wasm
 # instructions: the constants of one item share it. If not given, it is about
 # a second's worth.
-# fuel = 10000000000
+# fuel = 300000000
 
 # The directory whose source files are the tests of the package, which
 # `duck test` runs: each `pub fn` of one that takes nothing. If not given, it

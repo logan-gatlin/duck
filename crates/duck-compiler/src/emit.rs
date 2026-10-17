@@ -8,9 +8,10 @@
 //! module that takes pointers to
 //! functions also exports the table that holds them. Source names go in a `name` custom section so tools can show them.
 //!
-//! [`emit_hosted`] encodes a module for the compiler itself to run, which
-//! imports its memory, table and globals rather than defining them: every
-//! module [`crate::eval`] runs shares the one state.
+//! [`emit_hosted`] encodes a module of the kind the compiler itself runs,
+//! which imports its memory, table and globals rather than defining them:
+//! every module [`crate::eval`] runs shares the one state. A wasm engine runs
+//! it as the evaluator does.
 
 use std::collections::HashMap;
 

@@ -25,17 +25,19 @@ use crate::lex::Span;
 use crate::load::Program;
 
 use super::{
-    Checker, Fold, MEMORY_EXPORT, PAGE_SIZE, TABLE_EXPORT, TEMP, Ty, TypeErrorKind, Value, exprs,
-    fn_decls,
+    Checker, Fold, MEMORY_EXPORT, TABLE_EXPORT, TEMP, Ty, TypeErrorKind, Value, exprs, fn_decls,
 };
 
 /// The fuel the constants of one item run on, unless the settings say: about
-/// a second's worth.
-pub const DEFAULT_FUEL: u64 = 10_000_000_000;
+/// a second's worth, as the evaluator runs them.
+pub const DEFAULT_FUEL: u64 = 300_000_000;
 
-/// The most pages memory grows to while constants are evaluated, where the
-/// settings leave it unlimited: 1 GiB.
-const MAX_CONSTANT_PAGES: u64 = 16 * 1024;
+/// The most pages that the code constants run may grow memory to, whatever
+/// the settings let it grow to: 32 MiB. The literals take what they take,
+/// and only the pages they leave are the code's. So the memory that
+/// compiling takes is bounded by what the program is, wherever it is
+/// compiled.
+const MAX_CONSTANT_PAGES: u64 = 512;
 
 /// The most functions an error names of those that were running.
 const MAX_STACK: usize = 8;
@@ -262,14 +264,10 @@ impl Checker {
     /// yet, with the literals placed and the globals defined since it was
     /// last asked for. An error if memory can't hold them.
     pub(super) fn sync(&mut self) -> Result<&mut Evaluator, Failure> {
-        let eval = match &mut self.eval {
-            Some(eval) => eval,
-            none => {
-                let most = MAX_CONSTANT_PAGES.min(u64::from(u32::MAX) / PAGE_SIZE + 1);
-                let max = self.max_pages.unwrap_or(most);
-                none.insert(Evaluator::new(max)?)
-            }
-        };
+        let max = self.max_pages.unwrap_or(u64::MAX);
+        let eval = self
+            .eval
+            .get_or_insert_with(|| Evaluator::new(max, MAX_CONSTANT_PAGES));
         let end = u64::try_from(self.data_end).unwrap_or(u64::MAX);
         if !eval.cover(end) {
             let why = "memory can't grow to hold the literals".to_string();
@@ -1012,6 +1010,48 @@ pub let quick = spin(1000)
         assert_eq!(error.kind.to_string(), fuel);
         let span = error.span.unwrap();
         assert_eq!(&src[span.start..span.end], "spin(1001)");
+    }
+
+    #[test]
+    fn a_folded_constant_is_what_running_it_makes() {
+        // To the bits of a NaN, which a machine's own arithmetic may give
+        // any of.
+        let src = "\
+fn zero() -> f64:
+    return 0.0
+pub let folded = 0.0 / 0.0
+pub let run = zero() / zero()
+pub let narrowed = (0.0 / 0.0) as f32
+";
+        let bits: Vec<_> = lower(src)
+            .globals
+            .iter()
+            .map(|global| match global.init {
+                Const::F32(x) => u64::from(x.to_bits()),
+                Const::F64(x) => x.to_bits(),
+                c => panic!("{c:?} is no float"),
+            })
+            .collect();
+        assert_eq!(bits, [0x7ff8_0000_0000_0000, 0x7ff8_0000_0000_0000, 0x7fc0_0000]);
+    }
+
+    #[test]
+    fn constants_grow_memory_to_32_mib_at_most() {
+        // Whatever the settings let the host grow it to.
+        let src = "\
+fn take(pages: uint) -> int:
+    return module.grow(pages)
+pub let past = take(513) as i32
+pub let all = take(512) as i32
+pub let more = take(1) as i32
+pub let none = take(0) as i32
+";
+        assert_eq!(consts(src), "past=-1 all=0 more=-1 none=512");
+        let module = lower(src);
+        assert_eq!(
+            (module.memory.min_pages, module.memory.max_pages),
+            (512, None)
+        );
     }
 
     #[test]

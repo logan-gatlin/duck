@@ -11,7 +11,7 @@ use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::eval::Evaluator;
+use crate::eval::{self, Evaluator};
 use crate::file::{FileId, IncludeError, Includes, Settings};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
@@ -63,67 +63,6 @@ pub use inspect::{
     Action, ActionKind, Analysis, Apart, Completion, CompletionKind, Hint, HintKind, Hover,
     Parameter, Signature, Symbol, SymbolKind, Unused, UnusedKind, analyze, module_members,
 };
-
-/// Folds the wasm integer instruction `$op` over `$a` and `$b`, which have
-/// signed type `$s` and unsigned counterpart `$u`. Returns from the enclosing
-/// function on a trap or a non-integer instruction.
-macro_rules! fold_int_binary {
-    ($op:expr, $a:expr, $b:expr, $s:ty, $u:ty, $variant:ident) => {{
-        let (a, b): ($s, $s) = ($a, $b);
-        let (ua, ub) = (a as $u, b as $u);
-        let bool = |x: bool| Const::I32(x as i32);
-        match $op {
-            IrBinOp::Add => Const::$variant(a.wrapping_add(b)),
-            IrBinOp::Sub => Const::$variant(a.wrapping_sub(b)),
-            IrBinOp::Mul => Const::$variant(a.wrapping_mul(b)),
-            IrBinOp::DivS => Const::$variant(a.checked_div(b).ok_or(Fold::Trap)?),
-            IrBinOp::DivU => Const::$variant(ua.checked_div(ub).ok_or(Fold::Trap)? as $s),
-            IrBinOp::RemS if b == 0 => return Err(Fold::Trap),
-            IrBinOp::RemS => Const::$variant(a.wrapping_rem(b)),
-            IrBinOp::RemU => Const::$variant(ua.checked_rem(ub).ok_or(Fold::Trap)? as $s),
-            IrBinOp::And => Const::$variant(a & b),
-            IrBinOp::Or => Const::$variant(a | b),
-            IrBinOp::Xor => Const::$variant(a ^ b),
-            IrBinOp::Shl => Const::$variant(a.wrapping_shl(b as u32)),
-            IrBinOp::ShrS => Const::$variant(a.wrapping_shr(b as u32)),
-            IrBinOp::ShrU => Const::$variant(ua.wrapping_shr(b as u32) as $s),
-            IrBinOp::Eq => bool(a == b),
-            IrBinOp::Ne => bool(a != b),
-            IrBinOp::LtS => bool(a < b),
-            IrBinOp::LtU => bool(ua < ub),
-            IrBinOp::LeS => bool(a <= b),
-            IrBinOp::LeU => bool(ua <= ub),
-            IrBinOp::GtS => bool(a > b),
-            IrBinOp::GtU => bool(ua > ub),
-            IrBinOp::GeS => bool(a >= b),
-            IrBinOp::GeU => bool(ua >= ub),
-            _ => return Err(Fold::NotConstant),
-        }
-    }};
-}
-
-/// Folds the wasm float instruction `$op` over `$a` and `$b` of type `$f`.
-macro_rules! fold_float_binary {
-    ($op:expr, $a:expr, $b:expr, $f:ty, $variant:ident) => {{
-        let (a, b): ($f, $f) = ($a, $b);
-        let bool = |x: bool| Const::I32(x as i32);
-        match $op {
-            IrBinOp::Add => Const::$variant(a + b),
-            IrBinOp::Sub => Const::$variant(a - b),
-            IrBinOp::Mul => Const::$variant(a * b),
-            IrBinOp::Div => Const::$variant(a / b),
-            IrBinOp::Min => Const::$variant(wasm_min(a as f64, b as f64) as $f),
-            IrBinOp::Max => Const::$variant(wasm_max(a as f64, b as f64) as $f),
-            IrBinOp::Eq => bool(a == b),
-            IrBinOp::Ne => bool(a != b),
-            IrBinOp::Lt => bool(a < b),
-            IrBinOp::Le => bool(a <= b),
-            IrBinOp::Gt => bool(a > b),
-            IrBinOp::Ge => bool(a >= b),
-            _ => return Err(Fold::NotConstant),
-        }
-    }};
-}
 
 /// The export name of the module's memory, which no item may take.
 const MEMORY_EXPORT: &str = "memory";
@@ -8466,7 +8405,11 @@ fn fold(expr: &Expr) -> Result<Const, Fold> {
     match expr {
         Expr::Const(c) => Ok(*c),
         Expr::Unary(_, op, x) => fold_unary(*op, fold(x)?),
-        Expr::Binary(_, op, a, b) => fold_binary(*op, fold(a)?, fold(b)?),
+        Expr::Binary(ty, op, a, b) => match eval::fold_binary(*ty, *op, fold(a)?, fold(b)?) {
+            Some(Ok(c)) => Ok(c),
+            Some(Err(())) => Err(Fold::Trap),
+            None => Err(Fold::NotConstant),
+        },
         Expr::If {
             cond,
             then_expr,
@@ -8489,112 +8432,15 @@ fn fold(expr: &Expr) -> Result<Const, Fold> {
     }
 }
 
+/// `op` of the constant `c`, its operand, as a run gives it.
 fn fold_unary(op: IrUnOp, c: Const) -> Result<Const, Fold> {
-    use Const::*;
-    Ok(match (op, c) {
-        (IrUnOp::Eqz, I32(x)) => I32((x == 0) as i32),
-        (IrUnOp::Eqz, I64(x)) => I32((x == 0) as i32),
-        (IrUnOp::Clz, I32(x)) => I32(x.leading_zeros() as i32),
-        (IrUnOp::Clz, I64(x)) => I64(x.leading_zeros() as i64),
-        (IrUnOp::Ctz, I32(x)) => I32(x.trailing_zeros() as i32),
-        (IrUnOp::Ctz, I64(x)) => I64(x.trailing_zeros() as i64),
-        (IrUnOp::Neg, F32(x)) => F32(-x),
-        (IrUnOp::Neg, F64(x)) => F64(-x),
-        (IrUnOp::Extend8S, I32(x)) => I32(x as i8 as i32),
-        (IrUnOp::Extend16S, I32(x)) => I32(x as i16 as i32),
-        (IrUnOp::Extend8S, I64(x)) => I64(x as i8 as i64),
-        (IrUnOp::Extend16S, I64(x)) => I64(x as i16 as i64),
-        (IrUnOp::Wrap, I64(x)) => I32(x as i32),
-        (IrUnOp::ExtendS, I32(x)) => I64(x as i64),
-        (IrUnOp::ExtendU, I32(x)) => I64(x as u32 as i64),
-        (IrUnOp::Demote, F64(x)) => F32(x as f32),
-        (IrUnOp::Promote, F32(x)) => F64(x as f64),
-        (IrUnOp::Reinterpret, F32(x)) => I32(x.to_bits() as i32),
-        (IrUnOp::Reinterpret, F64(x)) => I64(x.to_bits() as i64),
-        (IrUnOp::Reinterpret, I32(x)) => F32(f32::from_bits(x as u32)),
-        (IrUnOp::Reinterpret, I64(x)) => F64(f64::from_bits(x as u64)),
-        // Rust's float to int `as` saturates and maps NaN to 0, like wasm's
-        // `trunc_sat`.
-        (IrUnOp::TruncSatS(to), F32(_) | F64(_)) => {
-            let x = float(c);
-            match to {
-                ValType::I64 => I64(x as i64),
-                _ => I32(x as i32),
-            }
-        }
-        (IrUnOp::TruncSatU(to), F32(_) | F64(_)) => {
-            let x = float(c);
-            match to {
-                ValType::I64 => I64(x as u64 as i64),
-                _ => I32(x as u32 as i32),
-            }
-        }
-        (IrUnOp::ConvertS(to), I32(_) | I64(_)) => {
-            let x = match c {
-                I32(x) => x as i64,
-                I64(x) => x,
-                _ => unreachable!(),
-            };
-            match to {
-                ValType::F32 => F32(x as f32),
-                _ => F64(x as f64),
-            }
-        }
-        (IrUnOp::ConvertU(to), I32(_) | I64(_)) => {
-            let x = match c {
-                I32(x) => x as u32 as u64,
-                I64(x) => x as u64,
-                _ => unreachable!(),
-            };
-            match to {
-                ValType::F32 => F32(x as f32),
-                _ => F64(x as f64),
-            }
-        }
-        _ => return Err(Fold::NotConstant),
-    })
-}
-
-fn fold_binary(op: IrBinOp, a: Const, b: Const) -> Result<Const, Fold> {
-    Ok(match (a, b) {
-        (Const::I32(a), Const::I32(b)) => fold_int_binary!(op, a, b, i32, u32, I32),
-        (Const::I64(a), Const::I64(b)) => fold_int_binary!(op, a, b, i64, u64, I64),
-        (Const::F32(a), Const::F32(b)) => fold_float_binary!(op, a, b, f32, F32),
-        (Const::F64(a), Const::F64(b)) => fold_float_binary!(op, a, b, f64, F64),
-        _ => return Err(Fold::NotConstant),
-    })
-}
-
-/// A float constant widened to `f64`, which is exact.
-fn float(c: Const) -> f64 {
-    match c {
-        Const::F32(x) => x as f64,
-        Const::F64(x) => x,
-        Const::I32(x) => x as f64,
-        Const::I64(x) => x as f64,
-    }
-}
-
-/// `fN.min`: NaN if either operand is, and `-0 < +0`.
-fn wasm_min(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        f64::NAN
-    } else if a == b {
-        if a.is_sign_negative() { a } else { b }
-    } else {
-        a.min(b)
-    }
-}
-
-/// `fN.max`: NaN if either operand is, and `-0 < +0`.
-fn wasm_max(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        f64::NAN
-    } else if a == b {
-        if a.is_sign_negative() { b } else { a }
-    } else {
-        a.max(b)
-    }
+    let ty = match c {
+        Const::I32(_) => ValType::I32,
+        Const::I64(_) => ValType::I64,
+        Const::F32(_) => ValType::F32,
+        Const::F64(_) => ValType::F64,
+    };
+    eval::fold_unary(ty, op, c).ok_or(Fold::NotConstant)
 }
 
 #[cfg(test)]

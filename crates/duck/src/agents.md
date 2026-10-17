@@ -513,8 +513,8 @@ fn area(w: i32, h: i32 = id()) -> i32:  # 3, for every call without an `h`
 - The module starts as its constants left it: with every byte they wrote,
   anywhere in memory, with the pages they grew it to, and with each `var` as
   they last assigned it. Nothing separates the two: a function runs the same
-  for a constant as for the host. Zero what was only scratch, as every other
-  byte is in the wasm.
+  for a constant as for the host, but for how much memory it may take. Zero
+  what was only scratch, as every other byte is in the wasm.
 - Constants run in order: those of a module that is used before those of the
   module that uses it, and each file top to bottom. One that another reads
   runs first, wherever it is declared, as does one that a function the other
@@ -533,10 +533,19 @@ fn area(w: i32, h: i32 = id()) -> i32:  # 3, for every call without an `h`
   once for each call that leaves `h` out.
 - A constant has no `return`: it is evaluated for no function.
 - The constants of one item share its fuel, which `[const]` in `Duck.toml`
-  sets, and is about a second's worth without it.
+  sets, and is about a second's worth without it: 300000000. Each wasm
+  instruction a constant runs uses one, but for `block`, `loop`, `else`,
+  `end`, `return`, `unreachable` and `drop`, which use none. A call uses one
+  more, for the function it goes into, `module.fill` and `module.copy` one
+  more for each byte, and `module.grow` one more for each page it is asked
+  for, whether or not it gives them. Fuel is counted so on every machine.
 - A constant takes memory as the host's code does, with `module.grow`, and
   the module starts with what it took. A literal is never placed in a page
   that `grow` gave.
+- Constants take 32 MiB of memory at most, whatever `max` lets the host
+  take: past that, `module.grow` gives no page while the program is compiled.
+  Literals take what pages they need, and only those they leave are the
+  constants'. Calls go 10000 deep at most, the constant itself the first.
 
 ## Operators
 
@@ -1959,7 +1968,7 @@ static = { start = "1KiB" }  # where literals go from, which is 0 without it
 return = "256B"          # the return area, which is as large as is needed without it
 
 [const]                  # optional
-fuel = 10000000000       # wasm instructions the constants of one item may run
+fuel = 300000000         # wasm instructions the constants of one item may run
 
 [test]                   # optional
 dir = "tests"            # the test directory, which is `tests` without it

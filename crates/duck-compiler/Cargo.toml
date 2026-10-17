@@ -10,10 +10,12 @@ gfx = []
 
 [dependencies]
 wasm-encoder = "0.259.0"
-wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "gc", "gc-null", "backtrace", "std"] }
 wit-component = "0.258.3"
 wit-parser = "0.258.3"
 
 [dev-dependencies]
+# What runs the modules the tests compile, and what the evaluator is
+# checked against: a wasm engine that compiles them for the machine.
+wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "gc", "gc-null", "backtrace", "std"] }
 wasmparser = "0.259.0"
 wasmprinter = "0.259.0"

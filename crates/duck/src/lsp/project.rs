@@ -199,7 +199,7 @@ const UNLOADED: &str =
     "cannot rename in a package that doesn't parse: not every use of a name in it is known";
 
 /// The fuel the constants of one item run on where their errors aren't
-/// reported: about a thousandth of a second's worth.
+/// reported: about a thirtieth of a second's worth.
 const ASKING_FUEL: u64 = 10_000_000;
 
 /// The most [`Probe`]s that are kept: what can be written in a call is
