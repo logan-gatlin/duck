@@ -22,6 +22,7 @@ use crate::file::Settings;
 use crate::ir::{self, Const, DataId, Expr, FuncId, Stmt, Symbol, UnOp, ValType, ValueId};
 use crate::lex::Span;
 
+use super::artifact::{Ref, renumber};
 use super::enums::{const_bits, const_int, int_const};
 use super::{
     Cell, Checker, Fold, InstanceSite, MEMORY_EXPORT, PAGE_SIZE, Prim, Scalar, TABLE_EXPORT, TEMP,
@@ -206,6 +207,30 @@ pub(super) enum Event {
     Place(DataId),
     Find(ValueId),
     Check(usize),
+}
+
+/// What linking is given of a lowered program, beside what lowering asked
+/// of it: its imports, its functions, its globals and its table.
+pub(super) struct Lowered<'p> {
+    pub(super) imports: &'p [ir::Import],
+    /// Every function it defines, in order, after the imports.
+    pub(super) funcs: &'p [ir::Func],
+    pub(super) globals: &'p [ir::Global],
+    /// What each of `globals` starts as.
+    pub(super) inits: &'p [Scalar],
+    /// The functions that pointers are taken to, at the places from 1.
+    pub(super) table: &'p [FuncId],
+}
+
+/// The module that runs a constant. It has the functions that the constant
+/// may call and those that the table holds, not every function there is, so
+/// each is where this module has it and not where the program does.
+struct Hosted {
+    module: ir::Module,
+    /// How many of its functions the constant may call, which have their
+    /// bodies and come first. Those after them trap, but for the last, which
+    /// is the constant itself.
+    reached: usize,
 }
 
 impl Linking {
@@ -461,19 +486,6 @@ impl Linking {
     }
 }
 
-/// What linking is given of a lowered program, beside what lowering asked
-/// of it: its imports, its functions, its globals and its table.
-pub(super) struct Lowered<'p> {
-    pub(super) imports: &'p [ir::Import],
-    /// Every function it defines, in order, after the imports.
-    pub(super) funcs: &'p [ir::Func],
-    pub(super) globals: &'p [ir::Global],
-    /// What each of `globals` starts as.
-    pub(super) inits: &'p [Scalar],
-    /// The functions that pointers are taken to, at the places from 1.
-    pub(super) table: &'p [FuncId],
-}
-
 impl Linking {
     /// Places the literals of `program` and finds the constants that are
     /// only known by running them, in the order lowering asked for them.
@@ -520,8 +532,8 @@ impl Linking {
         let def = &self.values[id.0 as usize];
         let (span, errors, instances) = (def.span, def.errors, def.instances.clone());
         let (item, globals) = (def.item, def.globals);
-        let module = match self.hosted(program, def) {
-            Ok(module) => module,
+        let hosted = match self.hosted(program, def) {
+            Ok(hosted) => hosted,
             Err(why) => {
                 self.failed = true;
                 self.error(errors, TypeErrorKind::ConstNotRun(why), span, &instances);
@@ -535,7 +547,7 @@ impl Linking {
         let fuel = *self.fuel.entry(item).or_insert(full);
         let results = match self.sync(program, globals) {
             Ok(eval) => {
-                let (results, left) = eval.run(&module, fuel);
+                let (results, left) = eval.run(&hosted.module, fuel);
                 self.fuel.insert(item, left);
                 results
             }
@@ -545,11 +557,7 @@ impl Linking {
             Ok(consts) => Some(consts),
             Err(failure) => {
                 self.failed = true;
-                let Finding::Run { reached, .. } = &self.values[id.0 as usize].how else {
-                    unreachable!("what is run is found by running it");
-                };
-                let imported = program.imports.len() as u32;
-                let kind = failure_kind(self.fuel_limit, imported, &module, reached, failure);
+                let kind = failure_kind(self.fuel_limit, &hosted, failure);
                 self.error(errors, kind, span, &instances);
                 None
             }
@@ -557,38 +565,69 @@ impl Linking {
     }
 
     /// The module that runs the code of `def` with the state of `program`
-    /// so far. It has every function there was then, each where the program
-    /// has it, so that what is lowered calls what it names, but only those
-    /// it may reach have their bodies: the others are never reached. Each
-    /// symbol is what it stands for, or else it can't be run.
-    fn hosted(&self, program: &Lowered, def: &ValueDef) -> Result<ir::Module, String> {
+    /// so far. Of the functions there were then, it has those that `def`
+    /// may reach, with their bodies, and those that only the table leads
+    /// to, which trap: no other is ever reached, and one that is left out
+    /// is not made again for each constant that is run. So a function is
+    /// not where the program has it, and what is lowered is given the index
+    /// of each function it calls by name. Each symbol is what it stands
+    /// for, or else it can't be run.
+    fn hosted(&self, program: &Lowered, def: &ValueDef) -> Result<Hosted, String> {
         let unknown = || "it uses what isn't known yet".to_string();
         let Finding::Run { thunk, reached } = &def.how else {
             unreachable!("what is run is found by running it");
         };
         let imported = program.imports.len() as u32;
-        let ids = (imported..def.funcs as u32).map(FuncId);
-        let mut hosted = Vec::new();
-        for id in ids {
+        let table = &program.table[..def.table];
+        let mut ids: Vec<_> = reached.iter().copied().collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        // A pointer to an imported function leads to the import.
+        let pointed = table
+            .iter()
+            .filter(|id| id.0 >= imported && !reached.contains(id));
+        let mut pointed: Vec<_> = pointed.copied().collect();
+        pointed.sort_unstable_by_key(|id| id.0);
+        pointed.dedup();
+        let bodies = ids.len();
+        ids.extend(pointed);
+        let index = |i: usize| FuncId(imported + i as u32);
+        let places: HashMap<_, _> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, index(i)))
+            .collect();
+        // What is imported is where the program has it. Every other function
+        // that is called by name is reached.
+        let place = |id: FuncId| match id.0 < imported {
+            true => id,
+            false => places[&id],
+        };
+        let mut calls = |name| match name {
+            Ref::Func(id) => Ref::Func(place(id)),
+            name => name,
+        };
+        let mut hosted = Vec::with_capacity(ids.len() + 1);
+        for (i, id) in ids.iter().enumerate() {
             let func = &program.funcs[(id.0 - imported) as usize];
-            hosted.push(match reached.contains(&id) {
-                true => {
-                    let mut func = ir::Func {
-                        exports: Vec::new(),
-                        ..func.clone()
-                    };
-                    if !self.resolve_stmts(&mut func.body) {
-                        return Err(unknown());
-                    }
-                    func
-                }
-                false => stub(func),
-            });
+            if i >= bodies {
+                hosted.push(stub(func));
+                continue;
+            }
+            let mut func = ir::Func {
+                exports: Vec::new(),
+                ..func.clone()
+            };
+            if !self.resolve_stmts(&mut func.body) {
+                return Err(unknown());
+            }
+            renumber(&mut func.body, &mut calls);
+            hosted.push(func);
         }
         let mut thunk = thunk.clone();
         if !self.resolve_stmts(&mut thunk.body) {
             return Err(unknown());
         }
+        renumber(&mut thunk.body, &mut calls);
         hosted.push(thunk);
         let globals = program.globals[..def.globals].iter().zip(program.inits);
         let globals: Option<Vec<_>> = globals
@@ -600,7 +639,7 @@ impl Linking {
                 })
             })
             .collect();
-        Ok(ir::Module {
+        let module = ir::Module {
             // The memory is the evaluator's, whatever size it is.
             memory: ir::Memory {
                 min_pages: 0,
@@ -610,11 +649,15 @@ impl Linking {
             data: Vec::new(),
             table: Some(ir::Table {
                 export: Some(TABLE_EXPORT.to_string()),
-                funcs: program.table[..def.table].to_vec(),
+                funcs: table.iter().map(|id| place(*id)).collect(),
             }),
             globals: globals.ok_or_else(unknown)?,
             imports: program.imports.to_vec(),
             funcs: hosted,
+        };
+        Ok(Hosted {
+            module,
+            reached: bodies,
         })
     }
 
@@ -815,16 +858,9 @@ impl Checker {
     }
 }
 
-/// What an error says of `failure`, which stopped `module`, a module of a
-/// program with `imported` imports. It has the bodies of the functions of
-/// `reached`.
-fn failure_kind(
-    fuel_limit: u64,
-    imported: u32,
-    module: &ir::Module,
-    reached: &HashSet<FuncId>,
-    failure: Failure,
-) -> TypeErrorKind {
+/// What an error says of `failure`, which stopped the module of `hosted`.
+fn failure_kind(fuel_limit: u64, hosted: &Hosted, failure: Failure) -> TypeErrorKind {
+    let module = &hosted.module;
     let imports = module.imports.len();
     let name = |index: &u32| match (*index as usize).checked_sub(imports) {
         Some(defined) => module.funcs[defined].name.clone(),
@@ -838,9 +874,8 @@ fn failure_kind(
     stack.dedup();
     stack.truncate(MAX_STACK);
     let innermost = failure.stack.first().copied();
-    let unnamed = innermost.filter(|index| {
-        *index != thunk && *index >= imported && !reached.contains(&FuncId(*index))
-    });
+    let trapping = (imports + hosted.reached) as u32..thunk;
+    let unnamed = innermost.filter(|index| trapping.contains(index));
     match failure.kind {
         // One of those given no body.
         FailureKind::Unreachable if unnamed.is_some() => TypeErrorKind::ConstCallsUnnamed {

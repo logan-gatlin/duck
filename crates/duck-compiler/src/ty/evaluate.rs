@@ -810,6 +810,65 @@ pub let kept = through()
     }
 
     #[test]
+    fn a_constant_runs_among_functions_it_never_calls() {
+        // What a constant calls is not where the program has it in the
+        // module that runs it, which leaves `idle`, `spare` and `last` out:
+        // by name or through a pointer, each call still reaches its own.
+        let src = "\
+fn idle() -> i32:
+    return 1
+fn double(x: i32) -> i32:
+    return x * 2
+fn spare(x: i32) -> i32:
+    return idle() + x
+fn triple(x: i32) -> i32:
+    return x * 3
+fn apply(f: fn(i32) -> i32, x: i32) -> i32:
+    return f(x)
+fn last() -> i32:
+    return apply(spare, 1)
+var held: fn(i32) -> i32 = spare
+pub let named = triple(double(1))
+pub let pointed = apply(triple, 4)
+pub let both = apply(double, 5) + triple(1)
+";
+        assert_eq!(consts(src), "named=6 pointed=12 both=13");
+
+        // A failure names them as the program does.
+        let src = "\
+fn idle() -> i32:
+    return 1
+fn divide(a: i32, b: i32) -> i32:
+    return a / b
+fn spare() -> i32:
+    return idle()
+fn ratio(of: i32) -> i32:
+    return divide(of, of - of)
+var held: fn() -> i32 = spare
+let r = ratio(4)
+";
+        let trap = "constant evaluation traps: integer divide by zero, \
+                    in `divide`, called from `ratio`";
+        assert_eq!(errors_at(src), [(trap.to_string(), "ratio(4)")]);
+
+        // One that only the table leads to is still the one that is named.
+        let src = "\
+fn idle() -> i32:
+    return 1
+fn hidden() -> i32:
+    return 2
+let table: array(fn() -> i32) = [idle, hidden]
+fn sneak() -> i32:
+    let f = (4 as uint) as! &fn() -> i32
+    return f.*()
+let b = sneak()
+";
+        let unnamed = "constant evaluation calls `hidden` through a pointer that nothing \
+                       the constant names leads to, in `sneak`";
+        assert_eq!(errors_at(src), [(unnamed.to_string(), "sneak()")]);
+    }
+
+    #[test]
     fn a_pointer_does_not_put_a_constant_in_its_own_definition() {
         // `on_event` reads `limit`, but nothing `limit` runs names it.
         let src = "\

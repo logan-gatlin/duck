@@ -295,8 +295,9 @@ struct Extract<'c> {
     foreign_index: HashMap<Foreign, u32>,
 }
 
-/// What lowering numbers that an artifact numbers as its own.
-enum Ref {
+/// What lowering numbers that an artifact numbers as its own, and that
+/// the module that runs a constant numbers as it holds them.
+pub(super) enum Ref {
     Func(FuncId),
     Global(GlobalId),
     Symbol(Symbol),
@@ -761,7 +762,7 @@ impl Extract<'_> {
 
 /// Gives each function, global and symbol that `body` names what `f`
 /// makes of it.
-fn renumber(body: &mut [Stmt], f: &mut impl FnMut(Ref) -> Ref) {
+pub(super) fn renumber(body: &mut [Stmt], f: &mut impl FnMut(Ref) -> Ref) {
     for stmt in body {
         match stmt {
             Stmt::SetLocal(_, value) | Stmt::Drop(value) => renumber_expr(value, f),
