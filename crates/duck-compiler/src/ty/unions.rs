@@ -9,6 +9,7 @@
 
 use std::iter;
 
+use crate::eval;
 use crate::ir::{BinOp as IrBinOp, Const, Expr, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
 use crate::load::Program;
@@ -511,11 +512,17 @@ pub(super) fn narrow(from: ValType, to: ValType, expr: Expr) -> Expr {
 /// constant is one in whatever leaf holds it.
 fn unary(ty: ValType, op: IrUnOp, expr: Expr) -> Expr {
     let folded = match expr {
-        Expr::Const(c) => fold_unary(op, c).ok(),
+        Expr::Const(c) => fold_unary(op, c).ok().map(Expr::Const),
+        // What only linking knows is held in a wider leaf, or as the bits
+        // of a float, as the same, which linking widens or reinterprets.
+        // Nothing is lost so, as it would be of a narrower leaf.
+        Expr::Symbol(_, symbol) if matches!(op, IrUnOp::ExtendU | IrUnOp::Reinterpret) => {
+            eval::unary_type(ty, op).map(|to| Expr::Symbol(to, symbol))
+        }
         _ => None,
     };
     match folded {
-        Some(c) => Expr::Const(c),
+        Some(folded) => folded,
         None => Expr::Unary(ty, op, Box::new(expr)),
     }
 }

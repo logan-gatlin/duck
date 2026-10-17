@@ -12,8 +12,8 @@ use crate::load::Program;
 use crate::parse::{self, EnumDecl, ExprKind, Ident, ItemKind, Pattern};
 
 use super::{
-    Body, Checker, EnumId, Item, Label, Prim, TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit,
-    similar, zero,
+    Body, Check, CheckDef, Checker, EnumId, Finding, Item, Label, Prim, Scalar, TYPE_FIELDS, Ty,
+    TypeErrorKind, Value, Visit, similar, zero,
 };
 
 pub(super) struct EnumDef {
@@ -39,7 +39,7 @@ pub(super) struct EnumDef {
 pub(super) struct MemberDef {
     pub(super) name: String,
     /// One constant per scalar leaf of the enum's type.
-    pub(super) value: Vec<Const>,
+    pub(super) value: Vec<Scalar>,
     /// Whether `value` is its value, rather than zeros in place of one that
     /// failed to check or isn't folded yet.
     pub(super) known: bool,
@@ -49,6 +49,14 @@ pub(super) struct MemberDef {
     used: Option<(EnumId, usize)>,
     /// Where it is written: the `use`, for one that a `use` makes a member.
     span: Span,
+}
+
+/// What an integer member that is given no value counts up to.
+#[derive(Clone, Copy)]
+enum Counted {
+    Known(i128),
+    /// One more than this, which only linking knows.
+    After(Scalar),
 }
 
 impl Checker {
@@ -248,9 +256,12 @@ impl Checker {
             _ => None,
         };
         // The value the next member counts up to, and each value so far by
-        // its bits, `None` where it failed to check.
-        let mut next = Some(0);
+        // its bits, `None` where it failed to check, and each as it is,
+        // which are compared once linking knows them, if it is to.
+        let mut next = Some(Counted::Known(0));
         let mut bits: Vec<Option<Vec<u64>>> = Vec::new();
+        let mut values = Vec::new();
+        let mut linked = None;
         let mut written = decl.entries.iter().filter_map(parse::Entry::own);
         for i in 0..self.enums[id.0 as usize].members.len() {
             let members = &self.enums[id.0 as usize].members;
@@ -278,14 +289,23 @@ impl Checker {
                 }
             };
             next = match (int, &value) {
-                (Some(prim), Some(value)) => Some(const_int(prim, value[0]) + 1),
+                (Some(prim), Some(value)) => Some(match value[0] {
+                    Scalar::Known(c) => Counted::Known(const_int(prim, c) + 1),
+                    from @ Scalar::Linked(..) => Counted::After(from),
+                }),
                 _ => None,
             };
-            let value_bits = value
-                .as_ref()
-                .map(|v| v.iter().map(|c| const_bits(*c)).collect());
+            // From the first whose value only linking knows, they are
+            // compared once it does.
+            let known: Option<Vec<_>> = value.iter().flatten().map(|s| s.known()).collect();
+            if value.is_some() && known.is_none() && linked.is_none() {
+                linked = Some(i);
+            }
+            let value_bits = known.filter(|_| value.is_some());
+            let value_bits = value_bits.map(|v| v.into_iter().map(const_bits).collect());
             if let Some(same) = value_bits
                 .as_ref()
+                .filter(|_| linked.is_none())
                 .and_then(|b| bits.iter().position(|prev| prev.as_ref() == Some(b)))
             {
                 let kind = TypeErrorKind::DuplicateValue {
@@ -295,11 +315,25 @@ impl Checker {
                 self.error(kind, span);
             }
             bits.push(value_bits);
+            values.push((name.name.clone(), span, value.clone().unwrap_or_default()));
             let known = value.is_some();
-            let zeros = || self.val_types(ty).into_iter().map(zero).collect();
+            let zeros = || {
+                self.val_types(ty)
+                    .into_iter()
+                    .map(|vt| Scalar::Known(zero(vt)))
+                    .collect()
+            };
             let value = value.unwrap_or_else(zeros);
             let member = &mut self.enums[id.0 as usize].members[i];
             (member.known, member.value) = (known, value);
+        }
+        if let Some(from) = linked {
+            let errors = self.errors.len();
+            let check = Check::Distinct {
+                members: values,
+                from,
+            };
+            self.link.check(CheckDef { check, errors });
         }
     }
 
@@ -311,9 +345,9 @@ impl Checker {
         &mut self,
         ty: Ty,
         int: Option<Prim>,
-        next: Option<i128>,
+        next: Option<Counted>,
         name: &Ident,
-    ) -> Option<Vec<Const>> {
+    ) -> Option<Vec<Scalar>> {
         let prim = match int {
             Some(prim) => prim,
             None if ty == Ty::Error => return None,
@@ -323,7 +357,14 @@ impl Checker {
             }
         };
         // Counting from a member whose value is unknown.
-        let n = next?;
+        let n = match next? {
+            Counted::Known(n) => n,
+            Counted::After(from) => {
+                let (prim, member) = (self.fixed(prim), name.name.clone());
+                let found = Finding::Count { from, prim, member };
+                return Some(self.find(found, name.span));
+            }
+        };
         if n > self.fixed(prim).range().1 {
             let kind = TypeErrorKind::MemberOutOfRange {
                 member: name.name.clone(),
@@ -332,7 +373,7 @@ impl Checker {
             self.error(kind, name.span);
             return None;
         }
-        Some(vec![int_const(self.fixed(prim), n)])
+        Some(vec![Scalar::Known(int_const(self.fixed(prim), n))])
     }
 
     /// The value of member `index` of enum `from`, which the `use` at `span`
@@ -344,7 +385,7 @@ impl Checker {
         from: EnumId,
         index: usize,
         span: Span,
-    ) -> Option<Vec<Const>> {
+    ) -> Option<Vec<Scalar>> {
         let def = &self.enums[from.0 as usize];
         let (item, name) = (def.item, def.name.clone());
         if !self.folded(Some(program), item, &name, span) {
@@ -363,7 +404,7 @@ impl Checker {
         program: &Program,
         ty: Ty,
         expr: &parse::Expr,
-    ) -> Option<Vec<Const>> {
+    ) -> Option<Vec<Scalar>> {
         let errors = self.errors.len();
         let mut body = Body::new(self, Ty::Unit);
         body.global = Some(program);
@@ -421,7 +462,7 @@ impl Body<'_> {
             return Some((Ty::Error, Value::default()));
         }
         let member = &self.ck.enums[id.0 as usize].members[index];
-        let consts = member.value.iter().map(|c| Expr::Const(*c)).collect();
+        let consts = member.value.iter().map(|c| c.expr()).collect();
         Some((Ty::Enum(id), self.scalars(Ty::Enum(id), consts)))
     }
 
@@ -452,7 +493,7 @@ impl Body<'_> {
             .map(|(i, member)| {
                 let sets = dests.iter().zip(&member.value);
                 let mut copy: Vec<_> = sets
-                    .filter_map(|(slot, c)| Some(Stmt::SetLocal((*slot)?, Expr::Const(*c))))
+                    .filter_map(|(slot, c)| Some(Stmt::SetLocal((*slot)?, c.expr())))
                     .collect();
                 let position = Expr::Const(self.ck.addr_const(i as u64));
                 copy.extend(place.map(|place| Stmt::SetLocal(place, position)));
@@ -473,7 +514,7 @@ fn enum_decls(program: &Program) -> impl Iterator<Item = &EnumDecl> {
 }
 
 /// An integer constant of type `prim` as a number.
-fn const_int(prim: Prim, c: Const) -> i128 {
+pub(super) fn const_int(prim: Prim, c: Const) -> i128 {
     match c {
         Const::I32(x) if prim.is_signed() => x.into(),
         Const::I32(x) => (x as u32).into(),
@@ -484,7 +525,7 @@ fn const_int(prim: Prim, c: Const) -> i128 {
 }
 
 /// `n` as a constant of the integer type `prim`, which it fits in.
-fn int_const(prim: Prim, n: i128) -> Const {
+pub(super) fn int_const(prim: Prim, n: i128) -> Const {
     match prim.val_type() {
         ValType::I64 => Const::I64(n as i64),
         _ => Const::I32(n as i32),
@@ -493,7 +534,7 @@ fn int_const(prim: Prim, n: i128) -> Const {
 
 /// The bits of a constant, which tell apart floats that compare equal, like
 /// `0.0` and `-0.0`.
-fn const_bits(c: Const) -> u64 {
+pub(super) fn const_bits(c: Const) -> u64 {
     match c {
         Const::I32(x) => x as u32 as u64,
         Const::I64(x) => x as u64,

@@ -11,8 +11,8 @@ use crate::load::Program;
 use crate::parse::{self, Arm, BinOp, ExprKind, Ident, ItemKind, Pattern, PatternKind, StmtKind};
 
 use super::{
-    ARRAY, Body, Checker, Flow, Label, Prim, StructId, TUPLE, Ty, TypeErrorKind, Value, binary,
-    scalar, similar, single, unions::narrow,
+    ARRAY, Body, Checker, Flow, Label, Prim, Scalar, StructId, TUPLE, Ty, TypeErrorKind, Value,
+    binary, scalar, similar, single, unions::narrow,
 };
 
 /// A pattern as the values it matches: any, or those built one way from
@@ -210,8 +210,9 @@ impl Checker {
 
     /// The address of `string`, which a pattern is, placing it in memory
     /// unless it is there.
-    fn pattern_string(&mut self, string: &str) -> u64 {
-        self.share_data(string.as_bytes().to_vec(), 1, 1)
+    fn pattern_string(&mut self, string: &str) -> Scalar {
+        let once = Scalar::Known(self.addr_const(1));
+        self.share_data(string.as_bytes().to_vec(), Vec::new(), 1, once)
     }
 }
 
@@ -543,7 +544,8 @@ impl Body<'_> {
                 // Every function's are placed before any is lowered, but
                 // one lowered for a constant to call.
                 let placed = self.ck.pattern_string(string);
-                let string_value = self.ck.array_value(placed, string.len() as u64);
+                let len = Scalar::Known(self.ck.addr_const(string.len() as u64));
+                let string_value = self.ck.array_value(placed, len);
                 let equal = self.compare(BinOp::Eq, ty, value, string_value);
                 case.steps.push(Step::Test(single(equal)));
                 // What it matches is the array of its bytes, which an array

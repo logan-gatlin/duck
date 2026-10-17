@@ -1,9 +1,10 @@
 //! What a constant is evaluated to, as it would be written: the checker
-//! folds each where it is first used, and keeps the scalars of its value.
+//! folds each where it is first used, and keeps the scalars of its value,
+//! some of which only linking knows.
 
 use crate::ir::Const;
 
-use super::super::{Prim, Slots, Ty};
+use super::super::{Prim, Scalar, Slots, Ty};
 use super::Analysis;
 
 /// The longest value shown of a constant: one longer says less of it than
@@ -16,7 +17,9 @@ impl Analysis {
     pub(super) fn global_value(&self, index: usize) -> Option<String> {
         let global = self.ck.globals.get(index)?.as_ref()?;
         match &global.slots {
-            Slots::Const(consts) if global.known => self.value_text(global.ty, consts),
+            Slots::Const(scalars) if global.known => {
+                self.value_text(global.ty, &self.consts(scalars)?)
+            }
             _ => None,
         }
     }
@@ -27,9 +30,15 @@ impl Analysis {
         let def = self.ck.enums.iter().find(|def| def.item == index)?;
         let member = def.members.iter().find(|member| member.name == name)?;
         match member.known {
-            true => self.value_text(def.ty, &member.value),
+            true => self.value_text(def.ty, &self.consts(&member.value)?),
             false => None,
         }
+    }
+
+    /// The constants that `scalars` are, if linking knows them all: one
+    /// that failed or didn't run has none.
+    fn consts(&self, scalars: &[Scalar]) -> Option<Vec<Const>> {
+        scalars.iter().map(|s| self.ck.link.known(*s)).collect()
     }
 
     /// `consts`, the scalars of a constant of type `ty`, as the value would
@@ -49,7 +58,9 @@ impl Analysis {
             (Ty::Prim(prim), [scalar]) => number(self.ck.fixed(prim), *scalar),
             (Ty::Enum(id), _) => {
                 let mut members = self.ck.enums[id.0 as usize].members.iter();
-                let member = members.find(|member| member.known && member.value == consts)?;
+                let member = members.find(|member| {
+                    member.known && self.consts(&member.value).as_deref() == Some(consts)
+                })?;
                 Some(format!(".{}", member.name))
             }
             (Ty::Struct(_) | Ty::Tuple(_), _) if self.ck.union_id(ty).is_none() => {

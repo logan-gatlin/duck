@@ -344,7 +344,9 @@ fn expr_calls_through_table(expr: &Expr) -> bool {
     let calls = expr_calls_through_table;
     match expr {
         Expr::CallIndirect { .. } => true,
-        Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => false,
+        Expr::Const(_) | Expr::Symbol(..) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => {
+            false
+        }
         Expr::Unary(_, _, x) | Expr::Load { addr: x, .. } | Expr::MemoryGrow(x) => calls(x),
         Expr::Binary(_, _, a, b) => calls(a) || calls(b),
         Expr::Call(_, args) => args.iter().any(calls),

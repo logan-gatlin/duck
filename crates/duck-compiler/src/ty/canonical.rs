@@ -20,11 +20,12 @@
 //!
 //! [`Settings`]: crate::file::Settings
 
-use crate::ir::{self, Expr, FuncId, Stmt, ValType};
+use crate::ir::{self, BinOp as IrBinOp, Expr, FuncId, Stmt, ValType};
 use crate::load::Program;
 
 use super::{
-    Body, Checker, FuncSig, Item, Place, Slots, Ty, Value, exprs, fn_decls, is_simple, scalar,
+    Body, Checker, FuncSig, Item, Place, Slots, Ty, Value, binary, exprs, fn_decls, fold,
+    is_simple, scalar,
 };
 
 /// The most wasm values that the parameters of a function are, before they
@@ -152,10 +153,17 @@ impl Checker {
         }
     }
 
-    /// The address of the return area.
-    fn return_area(&self) -> u64 {
-        self.return_area
-            .expect("it is placed where anything passes through it")
+    /// The address `offset` bytes into the return area.
+    fn return_area(&self, offset: u32) -> Expr {
+        let area = self.return_area;
+        let area = area.expect("it is placed where anything passes through it");
+        let by = ir::Expr::Const(self.addr_const(offset.into()));
+        let at = binary(self.addr_type(), IrBinOp::Add, area.expr(), by);
+        // Folded, as the address of a place in memory plus a constant is.
+        match fold(&at) {
+            Ok(at) => at.expr(),
+            _ => at,
+        }
     }
 
     /// Lowers function `id`, which the world exports as `export`: one that
@@ -195,8 +203,7 @@ impl Checker {
         let mut stmts = value.pre;
         let results = match passing.result {
             Some(offset) => {
-                let area = body.ck.return_area();
-                let area = Expr::Const(body.ck.addr_const(area));
+                let area = body.ck.return_area(0);
                 body.store_at(area.clone(), offset, sig.ret, value.scalars, &mut stmts);
                 stmts.push(Stmt::Return(vec![area]));
                 vec![addr_type]
@@ -235,8 +242,7 @@ impl Body<'_> {
         if passing.params.is_none() && passing.result.is_none() {
             return (exprs(scalars), None, false);
         }
-        let area = self.ck.return_area();
-        let at = |ck: &Checker, offset: u32| Expr::Const(ck.addr_const(area + u64::from(offset)));
+        let at = |ck: &Checker, offset: u32| ck.return_area(offset);
         let mut args = match &passing.params {
             Some(offsets) => {
                 let params = sig.params.iter().filter(|(_, ty)| *ty != Ty::Type);

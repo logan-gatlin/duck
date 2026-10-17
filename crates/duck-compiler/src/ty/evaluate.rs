@@ -3,12 +3,12 @@
 //! one may have written.
 //!
 //! Such a constant is run as a function of its own, in a module with the
-//! functions it may call, on the [`Evaluator`] that holds the state of the
-//! program so far. Each function is lowered the first time a constant may
-//! call it, and has what it reads folded first, so a constant is run with
-//! everything it names, and is in its own definition if that leads back to
-//! it. What the runs leave in memory and in the globals is what the module
-//! starts with.
+//! functions it may call, once the program is [linked](super::link): on the
+//! state of the program as lowering left it where the constant is. Each
+//! function is lowered here the first time a constant may call it, and has
+//! what it reads folded first, so a constant is run with everything it
+//! names, and is in its own definition if that leads back to it. What the
+//! runs leave in memory and in the globals is what the module starts with.
 //!
 //! A constant may call the functions it calls by name, those it takes a
 //! pointer to, and those that the constants it reads do, and so on through
@@ -19,28 +19,18 @@
 use std::collections::HashSet;
 use std::mem;
 
-use crate::eval::{self, Evaluator, Failure, FailureKind};
-use crate::ir::{self, Const, Expr, FuncId, Stmt, ValType};
+use crate::eval;
+use crate::ir::{self, Expr, FuncId, Stmt, Symbol};
 use crate::lex::Span;
 use crate::load::Program;
 
 use super::{
-    Checker, Fold, MEMORY_EXPORT, TABLE_EXPORT, TEMP, Ty, TypeErrorKind, Value, exprs, fn_decls,
+    Checker, Finding, Fold, InstanceSite, Scalar, TypeErrorKind, Value, ValueDef, exprs, fn_decls,
 };
 
 /// The fuel the constants of one item run on, unless the settings say: about
 /// a second's worth, as the evaluator runs them.
 pub const DEFAULT_FUEL: u64 = 300_000_000;
-
-/// The most pages that the code constants run may grow memory to, whatever
-/// the settings let it grow to: 32 MiB. The literals take what they take,
-/// and only the pages they leave are the code's. So the memory that
-/// compiling takes is bounded by what the program is, wherever it is
-/// compiled.
-const MAX_CONSTANT_PAGES: u64 = 512;
-
-/// The most functions an error names of those that were running.
-const MAX_STACK: usize = 8;
 
 /// What a constant or a function names that code run for a constant may go
 /// on to call.
@@ -131,37 +121,55 @@ impl Checker {
 
     /// The scalars of the lowered constant `value`, whose temporaries are
     /// `locals`: folded, or else found by running it, with every function
-    /// it calls. `None` after reporting, at `span`, why it has none, or if
-    /// it isn't run.
+    /// it calls, once the program is linked. `None` after reporting, at
+    /// `span`, why it has none, or if it isn't run.
     pub(super) fn evaluate(
         &mut self,
         program: &Program,
         locals: Vec<ir::Local>,
         value: Value,
         span: Span,
-    ) -> Option<Vec<Const>> {
+    ) -> Option<Vec<Scalar>> {
         match self.fold_value(&value) {
-            Ok(consts) => Some(consts),
+            Ok(scalars) => Some(scalars),
             Err(Fold::Trap) => {
                 self.error(TypeErrorKind::ConstTrap, span);
                 None
             }
+            Err(Fold::Linked) => Some(self.fold_linked(value, span)),
             Err(Fold::NotConstant) => self.run(program, locals, value, span),
         }
     }
 
+    /// The scalars of the lowered constant `value`, which is made of
+    /// constants alone, some of which only linking knows: it is folded
+    /// once they are known, and a trap is reported then, at `span`.
+    pub(super) fn fold_linked(&mut self, value: Value, span: Span) -> Vec<Scalar> {
+        let results = value.scalars.iter().map(|(ty, _)| *ty).collect();
+        let thunk = ir::Func {
+            name: String::new(),
+            exports: Vec::new(),
+            params: Vec::new(),
+            results,
+            locals: Vec::new(),
+            body: vec![Stmt::Return(exprs(value.scalars))],
+        };
+        self.find(Finding::Fold(thunk), span)
+    }
+
     /// Runs the lowered constant `value`, whose temporaries are `locals`,
-    /// and returns each of its scalars. `None` after reporting, at `span`,
-    /// why it has none, or if it isn't run: after any error, nothing is,
-    /// as what an error leaves lowered may not be valid.
+    /// once the program is linked, and returns each of its scalars, which
+    /// only linking knows. `None` after reporting, at `span`, why it has
+    /// none, or if it isn't run: after any error, nothing is, as what an
+    /// error leaves lowered may not be valid.
     fn run(
         &mut self,
         program: &Program,
         locals: Vec<ir::Local>,
         value: Value,
         span: Span,
-    ) -> Option<Vec<Const>> {
-        if self.failed || !self.errors.is_empty() {
+    ) -> Option<Vec<Scalar>> {
+        if !self.errors.is_empty() {
             return None;
         }
         let folding = self.folding.last().copied();
@@ -182,173 +190,44 @@ impl Checker {
         let reached = self.lower_callable(program, &thunk, span);
         self.constant_depth -= 1;
         let reached = reached?;
-        // Literals that don't fit are at no address, and are reported.
-        if self.failed || !self.errors.is_empty() || !self.data_fits() {
+        if !self.errors.is_empty() {
             return None;
         }
-        let module = self.hosted(program, thunk, &reached);
-        let fuel = self.fuel;
-        let results = match self.sync().map(|eval| eval.run(&module, fuel)) {
-            Ok((results, left)) => {
-                self.fuel = left;
-                results
-            }
-            Err(failure) => Err(failure),
+        Some(self.find(Finding::Run { thunk, reached }, span))
+    }
+
+    /// The scalars of the constant that linking finds as `how` says, of
+    /// types `results`, where the program has been lowered to here. What
+    /// fails of it is reported at `span`.
+    pub(super) fn find(&mut self, how: Finding, span: Span) -> Vec<Scalar> {
+        let results = match &how {
+            Finding::Fold(thunk) | Finding::Run { thunk, .. } => thunk.results.clone(),
+            Finding::Count { prim, .. } => vec![prim.val_type()],
         };
-        match results {
-            Ok(consts) => Some(consts),
-            Err(failure) => {
-                self.failed = true;
-                let kind = self.failure_kind(&module, &reached, failure);
-                self.error(kind, span);
-                None
-            }
-        }
-    }
-
-    /// The module that runs `thunk`, the code of a constant, with the state
-    /// of the program so far. It has every function there is, each where
-    /// the program has it, so that what is lowered calls what it names, but
-    /// only those of `reached` have their bodies. The others are never
-    /// reached.
-    fn hosted(&self, program: &Program, thunk: ir::Func, reached: &HashSet<FuncId>) -> ir::Module {
-        let ids = (self.import_count..self.funcs.len() as u32).map(FuncId);
-        let funcs = ids.map(|id| match self.lowered.get(&id) {
-            Some(func) if reached.contains(&id) => ir::Func {
-                exports: Vec::new(),
-                ..func.clone()
-            },
-            _ => self.stub(id),
-        });
-        ir::Module {
-            // The memory is the evaluator's, whatever size it is.
-            memory: ir::Memory {
-                min_pages: 0,
-                max_pages: None,
-                export: MEMORY_EXPORT.to_string(),
-            },
-            data: Vec::new(),
-            table: Some(ir::Table {
-                export: Some(TABLE_EXPORT.to_string()),
-                funcs: self.table.clone(),
-            }),
-            globals: self.ir_globals.clone(),
-            imports: self.lower_imports(program),
-            funcs: funcs.chain([thunk]).collect(),
-        }
-    }
-
-    /// A function with the wasm type of function `id` that traps.
-    fn stub(&self, id: FuncId) -> ir::Func {
-        let sig = &self.funcs[id.0 as usize];
-        // What it captures is passed before what it takes.
-        let captures = self.captures(id).iter().map(|capture| capture.ty);
-        let params = sig.params.iter().map(|(_, ty)| *ty);
-        let params = captures.chain(params.filter(|ty| *ty != Ty::Type));
-        let params: Vec<_> = params.flat_map(|ty| self.val_types(ty)).collect();
-        let local = |ty: &ValType| ir::Local {
-            name: TEMP.to_string(),
-            ty: *ty,
-        };
-        ir::Func {
-            name: sig.name.clone(),
-            exports: Vec::new(),
-            locals: params.iter().map(local).collect(),
-            params,
-            results: self.val_types(sig.ret),
-            body: vec![Stmt::Unreachable],
-        }
-    }
-
-    /// The state that the code constants run leaves, made if none has run
-    /// yet, with the literals placed and the globals defined since it was
-    /// last asked for. An error if memory can't hold them.
-    pub(super) fn sync(&mut self) -> Result<&mut Evaluator, Failure> {
-        let max = self.max_pages.unwrap_or(u64::MAX);
-        let eval = self
-            .eval
-            .get_or_insert_with(|| Evaluator::new(max, MAX_CONSTANT_PAGES));
-        let end = u64::try_from(self.data_end).unwrap_or(u64::MAX);
-        if !eval.cover(end) {
-            let why = "memory can't grow to hold the literals".to_string();
-            return Err(Failure {
-                kind: FailureKind::Invalid(why),
-                stack: Vec::new(),
+        let mut instances = Vec::new();
+        let mut at = span;
+        for instance in &self.instance_chain {
+            instances.push(InstanceSite {
+                name: instance.name.clone(),
+                span: at,
             });
+            at = instance.call;
         }
-        for (offset, len) in self.zeroed.drain(..) {
-            eval.zero(offset, len);
-        }
-        for data in &self.data[self.synced..] {
-            eval.write(data.offset, &data.bytes);
-        }
-        self.synced = self.data.len();
-        for global in &self.ir_globals[eval.global_count()..] {
-            eval.add_global(global);
-        }
-        Ok(eval)
-    }
-
-    /// Gives the state that the code constants ran left, if any ran, the
-    /// literals placed since the last of it did. Reports memory that can't
-    /// hold them.
-    pub(super) fn place_late_literals(&mut self) {
-        if self.eval.is_none() || !self.errors.is_empty() {
-            return;
-        }
-        if let Err(failure) = self.sync() {
-            let FailureKind::Invalid(why) = failure.kind else {
-                unreachable!("nothing is run");
-            };
-            self.error_nowhere(TypeErrorKind::ConstNotRun(why));
-        }
-    }
-
-    /// What an error says of `failure`, which stopped `module`. It has the
-    /// bodies of the functions of `reached`.
-    fn failure_kind(
-        &self,
-        module: &ir::Module,
-        reached: &HashSet<FuncId>,
-        failure: Failure,
-    ) -> TypeErrorKind {
-        let imports = module.imports.len();
-        let name = |index: &u32| match (*index as usize).checked_sub(imports) {
-            Some(defined) => module.funcs[defined].name.clone(),
-            None => module.imports[*index as usize].name.clone(),
-        };
-        // The constant itself is the last of them.
-        let thunk = (imports + module.funcs.len() - 1) as u32;
-        let frames = failure.stack.iter().filter(|index| **index != thunk);
-        // A function that calls itself is named once.
-        let mut stack: Vec<_> = frames.map(name).collect();
-        stack.dedup();
-        stack.truncate(MAX_STACK);
-        let innermost = failure.stack.first().copied();
-        let unnamed = innermost.filter(|index| {
-            *index != thunk && *index >= self.import_count && !reached.contains(&FuncId(*index))
+        instances.reverse();
+        let id = self.link.find(ValueDef {
+            how,
+            item: self.folding.last().copied(),
+            span: at,
+            instances,
+            funcs: self.funcs.len(),
+            globals: self.ir_globals.len(),
+            table: self.table.len(),
+            errors: self.errors.len(),
         });
-        match failure.kind {
-            // One of those given no body.
-            FailureKind::Unreachable if unnamed.is_some() => TypeErrorKind::ConstCallsUnnamed {
-                name: stack[0].clone(),
-                stack: stack[1..].to_vec(),
-            },
-            FailureKind::Unreachable => TypeErrorKind::ConstTraps {
-                trap: "unreachable code is reached".to_string(),
-                stack,
-            },
-            FailureKind::Trap(trap) => TypeErrorKind::ConstTraps { trap, stack },
-            FailureKind::OutOfFuel => TypeErrorKind::ConstOutOfFuel {
-                fuel: self.fuel_limit,
-                stack,
-            },
-            FailureKind::Imported(index) => TypeErrorKind::ConstCallsExtern {
-                name: name(&index),
-                stack,
-            },
-            FailureKind::Invalid(why) => TypeErrorKind::ConstNotRun(why),
-        }
+        let scalars = results.into_iter().enumerate();
+        let scalars =
+            scalars.map(|(index, ty)| Scalar::Linked(ty, Symbol::Value(id, index as u32)));
+        scalars.collect()
     }
 }
 
@@ -401,7 +280,8 @@ fn push_calls(body: &[Stmt], out: &mut Vec<Dep>) {
 /// Adds each function that `expr` calls by name to `out`.
 fn push_expr_calls(expr: &Expr, out: &mut Vec<Dep>) {
     match expr {
-        Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => {}
+        Expr::Const(_) | Expr::Symbol(..) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => {
+        }
         Expr::Unary(_, _, x) | Expr::Load { addr: x, .. } | Expr::MemoryGrow(x) => {
             push_expr_calls(x, out);
         }
@@ -437,6 +317,7 @@ mod tests {
     use super::super::{TypeError, check};
     use super::*;
     use crate::file::{DummyManager, FileManager, Settings};
+    use crate::ir::Const;
     use crate::lex::tokenize;
     use crate::parse;
 
@@ -1013,6 +894,126 @@ pub let quick = spin(1000)
     }
 
     #[test]
+    fn members_count_up_from_one_that_is_run() {
+        let src = "\
+fn three() -> u8:
+    return 3
+fn top() -> u8:
+    return 255
+enum(u8) E:
+    a = three()
+    b
+    c
+pub let b = E.b as u8
+pub let c = E.c as u8
+";
+        assert_eq!(consts(src), "b=4 c=5");
+        // Linking counts as checking would, past the type as well.
+        let src = "\
+fn top() -> u8:
+    return 255
+enum(u8) F:
+    x = top()
+    y
+";
+        let error = "member `y` counts past the largest `u8`".to_string();
+        assert_eq!(errors_at(src), [(error, "y")]);
+    }
+
+    #[test]
+    fn members_that_are_run_are_told_apart_once_they_are() {
+        let same = |member: &str, other: &str| {
+            format!("member `{member}` has the same value as `{other}`")
+        };
+        let src = "\
+fn three() -> i32:
+    return 3
+enum(i32) E:
+    a = three()
+    b = 3
+";
+        assert_eq!(errors_at(src), [(same("b", "a"), "b = 3")]);
+        // From the first that is run, each is compared with every one
+        // before it, in order.
+        let src = "\
+fn three() -> i32:
+    return 3
+enum(i32) G:
+    a = three()
+    b = 1
+    c = 1
+    d = 3
+";
+        assert_eq!(
+            errors_at(src),
+            [(same("c", "b"), "c = 1"), (same("d", "a"), "d = 3")]
+        );
+        // Those before it are told apart by checking, and once: nothing is
+        // run after its error, so the rest aren't known.
+        let src = "\
+fn three() -> i32:
+    return 3
+enum(i32) H:
+    a = 1
+    b = 1
+    c = three()
+    d = 3
+";
+        assert_eq!(errors_at(src), [(same("b", "a"), "b = 1")]);
+    }
+
+    #[test]
+    fn what_is_folded_of_a_constant_that_is_run_traps_where_it_is() {
+        let src = "\
+fn zero() -> i32:
+    return 0
+let a = zero()
+let b = 10 / a
+";
+        let error = "constant evaluation traps".to_string();
+        assert_eq!(errors_at(src), [(error, "10 / a")]);
+    }
+
+    #[test]
+    fn copies_that_a_run_counts_hold_their_value_if_there_are_any() {
+        // What is copied is made once, whether or not it is stored.
+        let src = "\
+var made = 0
+fn make() -> i32:
+    made += 1
+    return 7
+fn three() -> uint:
+    return 3
+fn none() -> uint:
+    return 0
+let filled: varray(i32) = [make(); three()]
+let empty: varray(i32) = [make(); none()]
+pub let firsts = filled[0] + filled[2]
+pub let calls = made
+pub let lens = (filled.len + empty.len) as i32
+";
+        assert_eq!(consts(src), "firsts=14 calls=2 lens=3");
+    }
+
+    #[test]
+    fn a_writable_literal_that_a_run_counts_is_shared_if_it_holds_any() {
+        let src = "\
+fn none() -> uint:
+    return 0
+fn three() -> uint:
+    return 3
+let N = none()
+let M = three()
+fn f() -> uint:
+    let a: varray(u8) = [0; N]
+    let b: varray(u8) = [0; M]
+    return a.len + b.len
+";
+        let error = "a writable literal in a function is shared by every call, so it must be empty";
+        assert_eq!(errors_at(src), [(error.to_string(), "[0; M]")]);
+    }
+
+    #[test]
     fn a_folded_constant_is_what_running_it_makes() {
         // To the bits of a NaN, which a machine's own arithmetic may give
         // any of.
@@ -1032,7 +1033,10 @@ pub let narrowed = (0.0 / 0.0) as f32
                 c => panic!("{c:?} is no float"),
             })
             .collect();
-        assert_eq!(bits, [0x7ff8_0000_0000_0000, 0x7ff8_0000_0000_0000, 0x7fc0_0000]);
+        assert_eq!(
+            bits,
+            [0x7ff8_0000_0000_0000, 0x7ff8_0000_0000_0000, 0x7fc0_0000]
+        );
     }
 
     #[test]

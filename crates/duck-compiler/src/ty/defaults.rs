@@ -5,12 +5,11 @@
 //! members, which may use them as they may use those: a field's with its
 //! struct, and a parameter's with its function.
 
-use crate::ir::Const;
 use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::{self, Arg, ExprKind, FnSig, Ident, StructDecl, TypeKind};
 
-use super::{Body, Checker, Dep, StructId, Ty, TypeErrorKind, Value, param_names};
+use super::{Body, Checker, Dep, Scalar, StructId, Ty, TypeErrorKind, Value, param_names};
 
 /// The default of a struct field or function parameter that has one.
 #[derive(Clone)]
@@ -19,7 +18,7 @@ pub(super) enum DefaultValue {
     /// or other default first uses one of its struct's.
     Pending,
     /// One constant per scalar leaf of the field's or parameter's type.
-    Folded(Vec<Const>),
+    Folded(Vec<Scalar>),
     /// Reported as an error.
     Failed,
 }
@@ -143,7 +142,7 @@ impl Checker {
         expr: &parse::Expr,
         names: &[Ident],
         tys: &[Ty],
-    ) -> (Option<Vec<Const>>, Option<Ty>) {
+    ) -> (Option<Vec<Scalar>>, Option<Ty>) {
         if let Some((name, span)) = param_in_expr(expr, names, true) {
             self.error(TypeErrorKind::DefaultUsesParam(name.to_string()), span);
             return (None, None);
@@ -183,7 +182,7 @@ impl Checker {
         }
         let consts = self.evaluate(program, locals, value, expr.span);
         let folded = self.errors.len() == errors && ty != Ty::Error;
-        let valued = |consts: &Vec<Const>| self.is_value_of(own.unwrap_or(ty), consts);
+        let valued = |consts: &Vec<Scalar>| self.is_value_of(own.unwrap_or(ty), consts);
         let consts = consts.filter(|consts| folded && valued(consts));
         let folded = consts.is_some();
         (consts, own.filter(|_| folded))

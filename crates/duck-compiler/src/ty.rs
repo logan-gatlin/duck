@@ -1,8 +1,15 @@
-//! Name resolution, type checking, and lowering to [`crate::ir`].
+//! Name resolution, type checking, and lowering to [`crate::ir`], and then
+//! linking what was lowered.
 //!
-//! All three happen in one walk over each function body. Signatures are
-//! collected first so items can be used before they are declared. Functions
-//! imported from `extern` blocks come first in the function index space.
+//! The first three happen in one walk over each function body. Signatures
+//! are collected first so items can be used before they are declared.
+//! Functions imported from `extern` blocks come first in the function index
+//! space.
+//!
+//! Lowering places nothing in memory and runs no constant: where it would,
+//! it leaves a [`Symbol`](crate::ir::Symbol) that linking makes the
+//! address or the value, placing and running each in the order lowering
+//! asked for them once every function is lowered.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -11,11 +18,11 @@ use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::eval::{self, Evaluator};
+use crate::eval;
 use crate::file::{FileId, IncludeError, Includes, Settings};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
-    UnOp as IrUnOp, ValType,
+    Symbol as IrSymbol, UnOp as IrUnOp, ValType,
 };
 use crate::lex::Span;
 use crate::load::Program;
@@ -34,6 +41,7 @@ use evaluate::Dep;
 use generic::{Arity, Instance, ParamDef, ParamDefaults, param_names};
 use generic_fn::{FnInstance, GenericFn, InstanceCall};
 use init::{Flow, Operands, Round};
+use link::{Check, CheckDef, DataDef, Fill, Finding, Linking, Placing, ValueDef};
 use nested::NestedFn;
 use opaque::{OpaqueDef, OpaqueSite, Owner};
 use unions::{Holds, narrow, tags_are, where_held, widen};
@@ -50,6 +58,7 @@ mod generic;
 mod generic_fn;
 mod init;
 mod inspect;
+mod link;
 mod nested;
 mod opaque;
 mod patterns;
@@ -906,7 +915,7 @@ struct Checker {
     /// unless the settings say.
     return_area_size: u32,
     /// Where the return area is, if anything is passed through it.
-    return_area: Option<u64>,
+    return_area: Option<Scalar>,
     /// Where the host is first passed what it allocates in the component,
     /// and what that is, as the WIT writes it.
     allocated: Option<(Span, String)>,
@@ -1039,23 +1048,15 @@ struct Checker {
     /// How many constants are being folded, each within the one before.
     constant_depth: usize,
     ir_globals: Vec<ir::Global>,
+    /// What each of `ir_globals` starts as, which may only be known once the
+    /// program is linked.
+    ir_inits: Vec<Scalar>,
     /// The most pages memory may grow to, which `module.max` is, unless it
     /// may grow without limit.
     max_pages: Option<u64>,
-    /// The address literals must end by.
-    data_limit: u64,
-    /// The contents of literals, placed in memory in the order they are
-    /// lowered.
-    data: Vec<ir::Data>,
-    /// The first address after the last literal, or the address the settings
-    /// place them from if there is none. The pages up to it are the
-    /// literals', and those that code run for a constant grows memory by are
-    /// not. Data that doesn't fit may end past every address.
-    data_end: u128,
-    /// The address of each constant that functions only read: a literal in
-    /// one, or a string that a pattern is. It's placed once, by the bytes of
-    /// one of its elements, what they are aligned to and how many there are.
-    shared: HashMap<(Vec<u8>, u32, u64), u64>,
+    /// What is placed in memory and what is only known by running it, which
+    /// linking places and runs, and what it makes of them.
+    link: Linking,
     /// The item of the program that declares each function that isn't
     /// generic, indexed by [`FuncId`], and each that is, by [`GenericFnId`].
     func_items: Vec<usize>,
@@ -1073,25 +1074,9 @@ struct Checker {
     func_deps: HashMap<FuncId, Vec<Dep>>,
     /// The functions being lowered for a constant to call.
     lowering: HashSet<FuncId>,
-    /// The state that the code constants run leaves, which the module
-    /// starts with. `None` until one runs any.
-    eval: Option<Evaluator>,
-    /// How many of `data` are in the memory of `eval`.
-    synced: usize,
-    /// The addresses of literals that are all zeros, which aren't in `data`,
-    /// and how many bytes each is: those placed since `eval` was last given
-    /// them.
-    zeroed: Vec<(u64, u64)>,
-    /// Whether code run for a constant failed. None is run after that, as
-    /// it left the state half made.
-    failed: bool,
     /// Whether the initializer being checked read a global whose own has no
     /// value, so that what is made of it is no value either.
     unknown: bool,
-    /// The fuel the constants of one item run on, and what is left of it
-    /// for the item being folded.
-    fuel_limit: u64,
-    fuel: u64,
     errors: Vec<TypeError>,
     /// The type of each expression and of each name a pattern binds, by
     /// where it is written, if they are kept for an [`Analysis`].
@@ -1365,7 +1350,7 @@ enum Slots {
     Global(Vec<GlobalId>),
     /// The value of each scalar leaf of a `let` global, which every use of
     /// it is replaced with.
-    Const(Vec<Const>),
+    Const(Vec<Scalar>),
     /// `offset` bytes past `addr`, which is a local or constant so that it
     /// can be reused.
     Memory {
@@ -1409,6 +1394,7 @@ struct Ranged {
 }
 
 /// Where one scalar of a type lives in memory.
+#[derive(Clone)]
 struct Cell {
     /// Bytes from the start of the value.
     offset: u32,
@@ -1426,10 +1412,41 @@ struct Cell {
 }
 
 /// Why a global initializer could not be folded.
+#[derive(Debug, PartialEq)]
 enum Fold {
     /// It is only known by running it.
     NotConstant,
     Trap,
+    /// It is made of constants, but some of them only linking knows: it is
+    /// folded once they are known.
+    Linked,
+}
+
+/// A scalar of a constant: one that checking knows, or one that only
+/// linking knows, as an address of what is placed in memory is, and a
+/// scalar of a constant that is only known by running it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Scalar {
+    Known(Const),
+    Linked(ValType, IrSymbol),
+}
+
+impl Scalar {
+    /// The expression that is the scalar.
+    fn expr(self) -> Expr {
+        match self {
+            Self::Known(c) => Expr::Const(c),
+            Self::Linked(ty, symbol) => Expr::Symbol(ty, symbol),
+        }
+    }
+
+    /// The constant it is, if checking knows it.
+    fn known(self) -> Option<Const> {
+        match self {
+            Self::Known(c) => Some(c),
+            Self::Linked(..) => None,
+        }
+    }
 }
 
 impl Prim {
@@ -2433,6 +2450,9 @@ fn lower_program(
         ck.export_funcs(program, &mut funcs, settings.start.is_some());
     }
     funcs.extend(ck.lower_synths(program));
+    // What only running finds is found now that every function it may call
+    // is lowered.
+    ck.link_constants(program, &funcs);
     // An instance may only have an error that checking its declaration
     // missed because of one that is reported.
     let unchecked = |e: &TypeError| matches!(e.kind, TypeErrorKind::Unchecked { .. });
@@ -2446,44 +2466,6 @@ fn lower_program(
 }
 
 impl Checker {
-    /// The module of `imports` and `funcs`, which are all that is lowered
-    /// of a program without errors, with the memory `settings` describe: as
-    /// the code its constants ran left it.
-    fn module(
-        mut self,
-        imports: Vec<ir::Import>,
-        funcs: Vec<ir::Func>,
-        settings: &Settings,
-    ) -> ir::Module {
-        let min_pages = self.pages();
-        let mut bodies = funcs.iter().map(|func| &func.body);
-        let called = bodies.any(|body| fn_ptr::calls_through_table(body));
-        if let Some(eval) = &mut self.eval {
-            self.data = eval.data();
-            let globals = self.ir_globals.iter_mut().enumerate();
-            for (index, global) in globals.filter(|(_, global)| global.mutable) {
-                global.init = eval.global(index);
-            }
-        }
-        ir::Module {
-            memory: ir::Memory {
-                min_pages,
-                max_pages: settings.max_pages,
-                export: MEMORY_EXPORT.to_string(),
-            },
-            data: self.data,
-            // A pointer that no function is taken as is still called
-            // through the table, where nothing is: the call traps.
-            table: (!self.table.is_empty() || called).then(|| ir::Table {
-                export: self.world.is_library().then(|| TABLE_EXPORT.to_string()),
-                funcs: self.table,
-            }),
-            globals: self.ir_globals,
-            imports,
-            funcs,
-        }
-    }
-
     /// Reports an error in no source file: one in what the settings ask.
     fn error_nowhere(&mut self, kind: TypeErrorKind) {
         self.errors.push(TypeError::nowhere(kind));
@@ -3350,7 +3332,6 @@ impl Checker {
         let module = mem::replace(&mut self.module, item.span.file);
         let type_params = mem::take(&mut self.type_params);
         let chain = mem::take(&mut self.instance_chain);
-        let fuel = mem::replace(&mut self.fuel, self.fuel_limit);
         match &item.kind {
             ItemKind::Binding(decl) => self.define_binding(program, item, decl, id),
             ItemKind::Enum(decl) => self.define_members(program, EnumId(id as u32), decl),
@@ -3366,7 +3347,6 @@ impl Checker {
             }
             _ => {}
         }
-        self.fuel = fuel;
         self.module = module;
         self.type_params = type_params;
         self.instance_chain = chain;
@@ -3458,7 +3438,7 @@ impl Checker {
             let exports = self.export_names(Item::Global(index), own);
             let leaves = self.leaves(bound.ty, bound.name);
             for ((name, vt), i) in leaves.into_iter().zip(bound.leaves) {
-                let init = inits.get(i).copied().unwrap_or(zero(vt));
+                let init = inits.get(i).copied().unwrap_or(Scalar::Known(zero(vt)));
                 consts.push(init);
                 // Only a wasm global can be assigned or exported.
                 if mutable || !exports.is_empty() {
@@ -3470,8 +3450,9 @@ impl Checker {
                         name,
                         ty: vt,
                         mutable,
-                        init,
+                        init: zero(vt),
                     });
+                    self.ir_inits.push(init);
                 }
             }
             // A `let` is its value wherever it is used, so an exported
@@ -3515,14 +3496,14 @@ impl Checker {
             includes: program.includes.clone(),
             world,
             max_pages: settings.max_pages,
-            data_end: settings.static_start.into(),
-            fuel_limit: settings.fuel.unwrap_or(DEFAULT_FUEL),
             ..Self::default()
         };
         let max_bytes = settings
             .max_pages
             .map(|pages| pages.saturating_mul(PAGE_SIZE));
-        ck.data_limit = max_bytes.map_or(ck.max_addr(), |bytes| bytes.min(ck.max_addr()));
+        let data_limit = max_bytes.map_or(ck.max_addr(), |bytes| bytes.min(ck.max_addr()));
+        let fuel_limit = settings.fuel.unwrap_or(DEFAULT_FUEL);
+        ck.link = Linking::new(settings, data_limit, fuel_limit);
         if let Some(error) = unread {
             ck.unread = true;
             ck.error_nowhere(TypeErrorKind::World(error));
@@ -3535,33 +3516,6 @@ impl Checker {
         ck.check_lists();
         ck.place_pattern_strings(program);
         ck
-    }
-
-    /// The pages memory has: the fewest that hold the literals, or as many
-    /// as the code constants ran grew it to, if those are more.
-    fn pages(&self) -> u64 {
-        let literals = self.data_end.div_ceil(PAGE_SIZE.into());
-        let grown = self.eval.as_ref().map_or(0, Evaluator::pages);
-        u64::try_from(literals).unwrap_or(u64::MAX).max(grown)
-    }
-
-    /// Checks that the literals end within the pages memory may grow to.
-    fn check_data_fits(&mut self) {
-        if self.data_fits() {
-            return;
-        }
-        let end = self.data_end;
-        let within = |max_pages: &u64| end <= u128::from(*max_pages) * u128::from(PAGE_SIZE);
-        let kind = match self.max_pages.filter(|max_pages| !within(max_pages)) {
-            Some(max_pages) => TypeErrorKind::DataPastMax { end, max_pages },
-            None => TypeErrorKind::DataTooLarge { end },
-        };
-        self.errors.push(TypeError {
-            kind,
-            span: None,
-            instances: Vec::new(),
-            similar: None,
-        });
     }
 
     /// The function `name`, which must take and return nothing. `None` after
@@ -3994,12 +3948,26 @@ impl Checker {
     }
 
     /// The constant array of `len` elements at `ptr`.
-    fn array_value(&self, ptr: u64, len: u64) -> Value {
+    fn array_value(&self, ptr: Scalar, len: Scalar) -> Value {
         let vt = self.addr_type();
-        let consts = [ptr, len].map(|x| (vt, Expr::Const(self.addr_const(x))));
+        let consts = [ptr, len].map(|x| (vt, x.expr()));
         Value {
             pre: Vec::new(),
             scalars: consts.to_vec(),
+        }
+    }
+
+    /// The address `by` bytes past `addr`, folded where `addr` is constant.
+    fn offset_addr(&self, addr: &Expr, by: u64) -> Expr {
+        let at = binary(
+            self.addr_type(),
+            IrBinOp::Add,
+            addr.clone(),
+            Expr::Const(self.addr_const(by)),
+        );
+        match fold(&at) {
+            Ok(at) => at.expr(),
+            Err(_) => at,
         }
     }
 
@@ -4668,126 +4636,146 @@ impl Checker {
         }
     }
 
+    /// Writes a value whose scalars are `scalars` to `out` at `offset`, as
+    /// storing it to `cells` would, if checking knows them all. Otherwise
+    /// writes nothing, and gives what writes it once linking knows them.
+    fn fill_bytes(
+        &self,
+        out: &mut [u8],
+        offset: usize,
+        cells: &[Cell],
+        scalars: &[Scalar],
+    ) -> Vec<Fill> {
+        let known: Option<Vec<_>> = scalars.iter().map(|scalar| scalar.known()).collect();
+        match known {
+            Some(consts) => {
+                self.write_consts(&mut out[offset..], cells, &consts);
+                Vec::new()
+            }
+            None => vec![Fill {
+                offset,
+                cells: cells.to_vec(),
+                scalars: scalars.to_vec(),
+            }],
+        }
+    }
+
     /// Places `bytes`, which hold `len` elements, in memory at the next
-    /// multiple of `align`, or right at the end if there are none. Returns the
-    /// array of them.
-    fn push_data(&mut self, bytes: Vec<u8>, align: u32, len: u64) -> Value {
-        let ptr = self.place_data(bytes, align);
-        self.array_value(ptr, len)
+    /// multiple of `align`, or right at the end if there are none, with
+    /// `fills` written to them. Returns the array of them.
+    fn push_data(&mut self, bytes: Vec<u8>, fills: Vec<Fill>, align: u32, len: u64) -> Value {
+        let ptr = self.place_data(bytes, fills, align);
+        self.array_value(ptr, Scalar::Known(self.addr_const(len)))
     }
 
     /// Places `bytes` in memory at the next multiple of `align`, or right
-    /// at the end if there are none. Returns their address.
-    fn place_data(&mut self, bytes: Vec<u8>, align: u32) -> u64 {
-        let offset = self.reserve_data(bytes.len() as u128, align);
-        if !bytes.is_empty() {
-            self.data.push(ir::Data { offset, bytes });
-        }
-        offset
+    /// at the end if there are none, with `fills` written to them. Returns
+    /// their address.
+    fn place_data(&mut self, bytes: Vec<u8>, fills: Vec<Fill>, align: u32) -> Scalar {
+        let count = Scalar::Known(self.addr_const(1));
+        self.data(DataDef {
+            bytes,
+            fills,
+            align,
+            count,
+            how: Placing::Own,
+        })
     }
 
     /// Makes room in memory for `size` bytes at the next multiple of `align`,
-    /// or right at the end if there are none. Returns their address, which
-    /// is only meaningful while the data fits.
-    ///
-    /// Bytes that the literals' last page has no room for go in the pages
-    /// after it, unless code run for a constant grew memory since: those
-    /// pages are its own, as any are that `module.grow` gives, so the bytes
-    /// go in pages past them.
-    fn reserve_data(&mut self, size: u128, align: u32) -> u64 {
-        let mut offset = self.data_end;
-        if size > 0 {
-            offset = offset.next_multiple_of(align.into());
-            let page = u128::from(PAGE_SIZE);
-            let owned = self.data_end.next_multiple_of(page);
-            let grown = self.eval.as_ref().map_or(0, Evaluator::pages);
-            let top = u128::from(grown) * page;
-            if offset + size > owned && top > owned {
-                offset = top;
-            }
-            self.data_end = offset + size;
-        }
-        offset as u64
+    /// or right at the end if there are none. Returns their address.
+    fn reserve_data(&mut self, size: u128, align: u32) -> Scalar {
+        let count = Scalar::Known(self.addr_const(1));
+        self.data(DataDef {
+            bytes: Vec::new(),
+            fills: Vec::new(),
+            align,
+            count,
+            how: Placing::Room(size),
+        })
     }
 
-    /// Places `count` copies of a `ty` whose scalars are `consts` in memory.
-    /// Returns the address of the first.
-    fn repeat_data(&mut self, ty: Ty, consts: Vec<Const>, count: u64) -> u64 {
-        let (bytes, align) = self.const_bytes(ty, &consts);
-        self.repeat_bytes(&bytes, align, count)
+    /// Places `count` copies of a `ty` whose scalars are `scalars` in
+    /// memory. Returns the address of the first.
+    fn repeat_data(&mut self, ty: Ty, scalars: Vec<Scalar>, count: Scalar) -> Scalar {
+        let (bytes, fills, align) = self.const_bytes(ty, &scalars);
+        self.data(DataDef {
+            bytes,
+            fills,
+            align,
+            count,
+            how: Placing::Copied,
+        })
     }
 
-    /// The bytes of a `ty` whose scalars are `consts`, and what they are
+    /// The bytes of a `ty` whose scalars are `scalars`, as far as checking
+    /// knows them, what writes the rest once linking does, and what they are
     /// aligned to.
-    fn const_bytes(&self, ty: Ty, consts: &[Const]) -> (Vec<u8>, u32) {
+    fn const_bytes(&self, ty: Ty, scalars: &[Scalar]) -> (Vec<u8>, Vec<Fill>, u32) {
         let (size, align) = self.layout(ty);
         let mut bytes = vec![0; size as usize];
-        self.write_consts(&mut bytes, &self.cells(ty), consts);
-        (bytes, align)
+        let fills = self.fill_bytes(&mut bytes, 0, &self.cells(ty), scalars);
+        (bytes, fills, align)
     }
 
-    /// Places `count` copies of `bytes` in memory at the next multiple of
-    /// `align`. Returns the address of the first.
-    fn repeat_bytes(&mut self, bytes: &[u8], align: u32, count: u64) -> u64 {
-        let size = bytes.len() as u64;
-        let offset = self.reserve_data(u128::from(size) * u128::from(count), align);
-        // Memory starts out zeroed, and data that doesn't fit is an error, so
-        // neither is written out.
-        let zeroed = count == 0 || bytes.iter().all(|&byte| byte == 0);
-        if !zeroed && self.data_fits() {
-            let bytes = bytes.repeat(count as usize);
-            self.data.push(ir::Data { offset, bytes });
-        } else if self.eval.is_some() && self.data_fits() {
-            // Code that has run may have written there.
-            self.zeroed.push((offset, size * count));
-        }
-        offset
-    }
-
-    /// Places `count` copies of `bytes` in memory at the next multiple of
-    /// `align`, as a constant that functions only read, unless one that is
-    /// the same is there. Returns the address of the first.
-    fn share_data(&mut self, bytes: Vec<u8>, align: u32, count: u64) -> u64 {
+    /// Places `count` copies of `bytes`, with `fills` written to each, in
+    /// memory at the next multiple of `align`, as a constant that functions
+    /// only read, unless one that is the same is there. Returns the address
+    /// of the first.
+    fn share_data(
+        &mut self,
+        bytes: Vec<u8>,
+        fills: Vec<Fill>,
+        align: u32,
+        count: Scalar,
+    ) -> Scalar {
         // What a generic function lowers as declared is dropped.
         if self.open {
-            return 0;
+            return Scalar::Known(self.addr_const(0));
         }
-        // One that is empty takes no memory to share.
-        if bytes.is_empty() || count == 0 {
-            return self.reserve_data(0, align);
-        }
-        let key = (bytes, align, count);
-        if let Some(placed) = self.shared.get(&key) {
-            return *placed;
-        }
-        let offset = self.repeat_bytes(&key.0, align, count);
-        self.shared.insert(key, offset);
-        offset
+        self.data(DataDef {
+            bytes,
+            fills,
+            align,
+            count,
+            how: Placing::Shared,
+        })
     }
 
-    /// Whether every literal placed so far is within the pages memory may
-    /// grow to.
-    fn data_fits(&self) -> bool {
-        self.data_end <= self.data_limit.into()
+    /// The address of `def`, which linking places where lowering is.
+    fn data(&mut self, def: DataDef) -> Scalar {
+        Scalar::Linked(self.addr_type(), self.link.place(def))
     }
 
-    /// Whether `consts` are the value of a constant of type `ty`: a
-    /// constant for each of its leaves. What failed to check is of the
-    /// error type, whatever was expected of it, and has none, though its
-    /// error may be reported elsewhere than where it is read, as that of a
-    /// global whose initializer failed is.
-    pub(super) fn is_value_of(&self, ty: Ty, consts: &[Const]) -> bool {
-        consts.len() == self.val_types(ty).len()
+    /// Whether `scalars` are the value of a constant of type `ty`: a
+    /// scalar for each of its leaves. What failed to check is of the error
+    /// type, whatever was expected of it, and has none, though its error
+    /// may be reported elsewhere than where it is read, as that of a global
+    /// whose initializer failed is.
+    pub(super) fn is_value_of(&self, ty: Ty, scalars: &[Scalar]) -> bool {
+        scalars.len() == self.val_types(ty).len()
     }
 
     /// Evaluates each scalar of a lowered constant without running it.
-    /// Stops at the first that can't be.
-    fn fold_value(&self, value: &Value) -> Result<Vec<Const>, Fold> {
+    /// Stops at the first that can't be, but for one that only linking
+    /// knows enough to fold, which leaves the whole to be folded then.
+    fn fold_value(&self, value: &Value) -> Result<Vec<Scalar>, Fold> {
         if !value.pre.is_empty() {
             return Err(Fold::NotConstant);
         }
-        let scalars = value.scalars.iter();
-        scalars.map(|(_, scalar)| fold(scalar)).collect()
+        let mut linked = false;
+        let mut scalars = Vec::new();
+        for (_, scalar) in &value.scalars {
+            match fold(scalar) {
+                Ok(scalar) => scalars.push(scalar),
+                Err(Fold::Linked) => linked = true,
+                Err(fold) => return Err(fold),
+            }
+        }
+        match linked {
+            true => Err(Fold::Linked),
+            false => Ok(scalars),
+        }
     }
 }
 
@@ -5751,7 +5739,7 @@ impl<'c> Body<'c> {
         let mut value = self.seq(vec![array, index]);
         // The bounds check reads the index again, and everything is read
         // after the prelude.
-        self.spill(&mut value, |e| matches!(e, Expr::Local(_) | Expr::Const(_)));
+        self.spill(&mut value, is_simple);
         // Only a mistyped index has other than one scalar.
         let [ptr, len, index] = <[_; 3]>::try_from(exprs(value.scalars)).ok()?;
         let mut pre = value.pre;
@@ -5805,7 +5793,7 @@ impl<'c> Body<'c> {
     /// evaluated more than once, moving it into a temporary if needed.
     fn reusable_addr(&mut self, ptr: Value) -> (Vec<Stmt>, Expr) {
         let (mut pre, addr) = split1(ptr);
-        if matches!(addr, Expr::Local(_) | Expr::Const(_)) {
+        if is_simple(&addr) {
             return (pre, addr);
         }
         let tmp = self.temp(self.ck.addr_type());
@@ -5822,7 +5810,7 @@ impl<'c> Body<'c> {
                 return self.read_variable(&place.name, value);
             }
             Slots::Global(slots) => slots.iter().map(|g| Expr::Global(*g)).collect(),
-            Slots::Const(consts) => consts.iter().map(|c| Expr::Const(*c)).collect(),
+            Slots::Const(consts) => consts.iter().map(|c| c.expr()).collect(),
             Slots::Memory { addr, offset } => {
                 let ptr = scalar(self.ck.addr_type(), addr.clone());
                 return self.load(ptr, *offset, place.ty);
@@ -5860,7 +5848,7 @@ impl<'c> Body<'c> {
         } else if value.scalars.len() > 1 {
             match place.slots {
                 Slots::Memory { .. } => self.spill(&mut value, is_stable),
-                _ => self.spill(&mut value, |e| matches!(e, Expr::Const(_))),
+                _ => self.spill(&mut value, is_constant),
             }
         }
         out.extend(value.pre);
@@ -6115,7 +6103,7 @@ impl<'c> Body<'c> {
         let deferred = self.deferred(0);
         if !deferred.is_empty() {
             // Held, as they may change what it is read from.
-            self.spill(&mut value, |scalar| matches!(scalar, Expr::Const(_)));
+            self.spill(&mut value, is_constant);
         }
         let mut pre = value.pre;
         pre.extend(deferred);
@@ -6177,13 +6165,19 @@ impl<'c> Body<'c> {
     /// default or a function, unless it's empty: its elements would be
     /// shared wherever the default is used, or by every call.
     fn check_shared(&mut self, mutable: bool, len: usize, span: Span) {
-        if !mutable || len == 0 {
-            return;
+        if let Some(kind) = self.shared_error(mutable).filter(|_| len > 0) {
+            self.error(kind, span);
         }
-        if self.default {
-            self.error(TypeErrorKind::SharedLiteral, span);
-        } else if self.global.is_none() {
-            self.error(TypeErrorKind::WritableFnLiteral, span);
+    }
+
+    /// The error a literal that holds any elements is, where they would be
+    /// shared: of a `varray` that is `mutable`, in a default or a function.
+    fn shared_error(&self, mutable: bool) -> Option<TypeErrorKind> {
+        match () {
+            _ if !mutable => None,
+            _ if self.default => Some(TypeErrorKind::SharedLiteral),
+            _ if self.global.is_none() => Some(TypeErrorKind::WritableFnLiteral),
+            _ => None,
         }
     }
 
@@ -6191,12 +6185,14 @@ impl<'c> Body<'c> {
     /// next multiple of `align`. Returns the array of them. In a function
     /// they are constant and only read, so every literal that has them
     /// shares them.
-    fn literal_data(&mut self, bytes: Vec<u8>, align: u32, len: u64) -> Value {
+    fn literal_data(&mut self, bytes: Vec<u8>, fills: Vec<Fill>, align: u32, len: u64) -> Value {
         if self.global.is_some() {
-            return self.ck.push_data(bytes, align, len);
+            return self.ck.push_data(bytes, fills, align, len);
         }
-        let ptr = self.ck.share_data(bytes, align, 1);
-        self.ck.array_value(ptr, len)
+        let once = Scalar::Known(self.ck.addr_const(1));
+        let ptr = self.ck.share_data(bytes, fills, align, once);
+        self.ck
+            .array_value(ptr, Scalar::Known(self.ck.addr_const(len)))
     }
 
     /// A string literal: an array of its UTF-8 bytes.
@@ -6211,7 +6207,7 @@ impl<'c> Body<'c> {
         self.check_shared(mutable, bytes.len(), span);
         let ty = self.ck.array_of(Ty::Prim(Prim::U8), mutable);
         let len = bytes.len() as u64;
-        (ty, self.literal_data(bytes, 1, len))
+        (ty, self.literal_data(bytes, Vec::new(), 1, len))
     }
 
     /// `module.include(path)`: a literal of the bytes of the file that
@@ -6432,7 +6428,7 @@ impl<'c> Body<'c> {
                 let pointer = self.ck.pointer_ty(first);
                 consts = consts
                     .into_iter()
-                    .map(|held: Result<Vec<Const>, Value>| {
+                    .map(|held: Result<Vec<Scalar>, Value>| {
                         // One that folded had nothing to evaluate.
                         let held = held.err().unwrap_or_default();
                         let value = self.pointer_to(first, held);
@@ -6461,20 +6457,20 @@ impl<'c> Body<'c> {
         let (size, align) = self.ck.layout(elem);
         let cells = self.ck.cells(elem);
         let mut bytes = vec![0; size as usize * items.len()];
+        let mut fills = Vec::new();
         for (i, consts) in consts.iter().enumerate() {
             let consts = consts.as_deref().unwrap_or_default();
-            self.ck
-                .write_consts(&mut bytes[i * size as usize..], &cells, consts);
+            let at = i * size as usize;
+            fills.extend(self.ck.fill_bytes(&mut bytes, at, &cells, consts));
         }
-        let mut value = self.literal_data(bytes, align, items.len() as u64);
-        let first = match value.scalars.first() {
-            Some((_, Expr::Const(Const::I32(addr)))) => u64::from(*addr as u32),
-            Some((_, Expr::Const(Const::I64(addr)))) => *addr as u64,
-            _ => unreachable!("a literal is placed at a constant address"),
+        let mut value = self.literal_data(bytes, fills, align, items.len() as u64);
+        let Some((_, first)) = value.scalars.first().cloned() else {
+            unreachable!("a literal is placed at an address");
         };
         for (i, item) in consts.into_iter().enumerate() {
             if let Err(item) = item {
-                let place = self.placed(elem, first + i as u64 * u64::from(size));
+                let at = self.ck.offset_addr(&first, i as u64 * u64::from(size));
+                let place = self.placed(elem, at);
                 self.assign(&place, item, &mut value.pre);
             }
         }
@@ -6531,12 +6527,26 @@ impl<'c> Body<'c> {
             return (Ty::Error, Value::default());
         }
         let count = match count[..] {
-            [Const::I32(count)] => (count as u32).into(),
-            [Const::I64(count)] => count as u64,
+            [count @ (Scalar::Known(Const::I32(_) | Const::I64(_)) | Scalar::Linked(..))] => count,
             _ => return (Ty::Error, Value::default()),
         };
-        let len = usize::try_from(count).unwrap_or(usize::MAX);
-        self.check_shared(mutable, len, span);
+        match count {
+            Scalar::Known(Const::I32(count)) => {
+                self.check_shared(mutable, count as u32 as usize, span)
+            }
+            Scalar::Known(Const::I64(count)) => {
+                let len = usize::try_from(count as u64).unwrap_or(usize::MAX);
+                self.check_shared(mutable, len, span);
+            }
+            // One that only linking knows is checked once it does.
+            _ => {
+                if let Some(kind) = self.shared_error(mutable) {
+                    let errors = self.ck.errors.len();
+                    let check = Check::Empty { count, kind, span };
+                    self.ck.link.check(CheckDef { check, errors });
+                }
+            }
+        }
         let (consts, stored) = match consts {
             Ok(consts) => (consts, None),
             Err(stored) => (Vec::new(), Some(stored)),
@@ -6544,8 +6554,8 @@ impl<'c> Body<'c> {
         let offset = match self.global {
             Some(_) => self.ck.repeat_data(elem, consts, count),
             None => {
-                let (bytes, align) = self.ck.const_bytes(elem, &consts);
-                self.ck.share_data(bytes, align, count)
+                let (bytes, fills, align) = self.ck.const_bytes(elem, &consts);
+                self.ck.share_data(bytes, fills, align, count)
             }
         };
         let mut value = self.ck.array_value(offset, count);
@@ -7176,11 +7186,11 @@ impl<'c> Body<'c> {
             Ok(consts) => (consts, None),
             Err(stored) => (Vec::new(), Some(stored)),
         };
-        let offset = self.ck.repeat_data(ty, consts, 1);
-        let addr = Expr::Const(self.ck.addr_const(offset));
-        let mut value = scalar(self.ck.addr_type(), addr);
+        let once = Scalar::Known(self.ck.addr_const(1));
+        let offset = self.ck.repeat_data(ty, consts, once);
+        let mut value = scalar(self.ck.addr_type(), offset.expr());
         if let Some(stored) = stored {
-            value.pre = self.fill(ty, stored, offset, 1);
+            value.pre = self.fill(ty, stored, offset, once);
         }
         (self.ck.ptr_to(ty, mutable), value)
     }
@@ -7438,10 +7448,10 @@ impl<'c> Body<'c> {
                 DefaultValue::Folded(consts) => consts.clone(),
                 // Reported, here or where it failed to fold.
                 DefaultValue::Pending | DefaultValue::Failed => {
-                    types.iter().map(|ty| zero(*ty)).collect()
+                    types.iter().map(|ty| Scalar::Known(zero(*ty))).collect()
                 }
             };
-            let consts = consts.into_iter().map(Expr::Const);
+            let consts = consts.into_iter().map(Scalar::expr);
             by_param[i] = types.into_iter().zip(consts).collect();
         }
         let mut values = Vec::new();
@@ -7662,9 +7672,10 @@ impl<'c> Body<'c> {
         }
         for (vt, scalar) in &mut value.scalars {
             match fold(scalar) {
-                Ok(c) => *scalar = Expr::Const(c),
-                // Reported where the constant is folded.
-                Err(Fold::Trap) => {}
+                Ok(folded) => *scalar = folded.expr(),
+                // Reported where the constant is folded, which is once
+                // linking knows enough of one to fold it.
+                Err(Fold::Trap | Fold::Linked) => {}
                 Err(Fold::NotConstant) if is_simple(scalar) => {}
                 Err(Fold::NotConstant) => {
                     let tmp = self.push_local(TEMP.to_string(), *vt);
@@ -7680,9 +7691,10 @@ impl<'c> Body<'c> {
     /// it, as a global initializer is. One that traps is reported at `span`,
     /// and has no scalars, as is one in a function that doesn't fold: a
     /// literal there is never stored to.
-    fn constant(&mut self, value: Value, span: Span) -> Result<Vec<Const>, Value> {
+    fn constant(&mut self, value: Value, span: Span) -> Result<Vec<Scalar>, Value> {
         match self.ck.fold_value(&value) {
             Ok(consts) => Ok(consts),
+            Err(Fold::Linked) => Ok(self.ck.fold_linked(value, span)),
             Err(Fold::NotConstant) if self.global.is_none() => {
                 self.error(TypeErrorKind::InconstantFnLiteral, span);
                 Ok(Vec::new())
@@ -7697,60 +7709,78 @@ impl<'c> Body<'c> {
 
     /// The scalars of `value`, the whole of a constant in a global
     /// initializer, as [`Checker::evaluate`] finds them.
-    fn evaluate(&mut self, value: Value, span: Span) -> Option<Vec<Const>> {
+    fn evaluate(&mut self, value: Value, span: Span) -> Option<Vec<Scalar>> {
         let program = self.global?;
         self.ck.evaluate(program, self.locals.clone(), value, span)
     }
 
     /// The memory at `addr`, where a literal of type `ty` is placed, as a
     /// place to assign what isn't constant of it.
-    fn placed(&self, ty: Ty, addr: u64) -> Place {
+    fn placed(&self, ty: Ty, addr: Expr) -> Place {
         Place {
             name: String::new(),
             ty,
             mutable: true,
             behind: None,
             pre: Vec::new(),
-            slots: Slots::Memory {
-                addr: Expr::Const(self.ck.addr_const(addr)),
-                offset: 0,
-            },
+            slots: Slots::Memory { addr, offset: 0 },
         }
     }
 
     /// Stores `value`, a `ty`, to each of the `count` elements placed at
-    /// `addr`. It is evaluated once, whatever `count` is.
-    fn fill(&mut self, ty: Ty, mut value: Value, addr: u64, count: u64) -> Vec<Stmt> {
-        if count == 0 {
+    /// `addr`. It is evaluated once, whatever `count` is, which may be one
+    /// that only linking knows: then it is only stored if there are any.
+    fn fill(&mut self, ty: Ty, mut value: Value, addr: Scalar, count: Scalar) -> Vec<Stmt> {
+        let known = match count {
+            Scalar::Known(Const::I32(count)) => Some(u64::from(count as u32)),
+            Scalar::Known(Const::I64(count)) => Some(count as u64),
+            _ => None,
+        };
+        if known == Some(0) {
             self.spill(&mut value, is_pure);
             return value.pre;
         }
         let mut out = Vec::new();
-        let place = self.placed(ty, addr);
-        self.assign(&place, value, &mut out);
-        let (size, _) = self.ck.layout(ty);
-        if count == 1 || size == 0 {
-            return out;
+        if known.is_none() {
+            self.spill(&mut value, is_simple);
+            out.append(&mut value.pre);
         }
-        // The rest are copies of the first.
-        let vt = self.ck.addr_type();
-        let konst = |n: u64| Expr::Const(self.ck.addr_const(n));
-        let (first, size, count) = (konst(addr), konst(size.into()), konst(count));
-        let one = konst(1);
-        let i = self.temp(vt);
-        let at = binary(vt, IrBinOp::Mul, Expr::Local(i), size.clone());
-        let next = binary(vt, IrBinOp::Add, Expr::Local(i), one.clone());
-        out.push(Stmt::SetLocal(i, one));
-        out.push(Stmt::Block(vec![Stmt::Loop(vec![
-            Stmt::BrIf(1, binary(vt, IrBinOp::GeU, Expr::Local(i), count)),
-            Stmt::MemoryCopy {
-                dst: binary(vt, IrBinOp::Add, first.clone(), at),
-                src: first,
-                len: size,
-            },
-            Stmt::SetLocal(i, next),
-            Stmt::Br(0),
-        ])]));
+        let mut stored = Vec::new();
+        let place = self.placed(ty, addr.expr());
+        self.assign(&place, value, &mut stored);
+        let (size, _) = self.ck.layout(ty);
+        if known != Some(1) && size != 0 {
+            // The rest are copies of the first.
+            let vt = self.ck.addr_type();
+            let konst = |n: u64| Expr::Const(self.ck.addr_const(n));
+            let (first, size, one) = (addr.expr(), konst(size.into()), konst(1));
+            let i = self.temp(vt);
+            let at = binary(vt, IrBinOp::Mul, Expr::Local(i), size.clone());
+            let next = binary(vt, IrBinOp::Add, Expr::Local(i), one.clone());
+            stored.push(Stmt::SetLocal(i, one));
+            stored.push(Stmt::Block(vec![Stmt::Loop(vec![
+                Stmt::BrIf(1, binary(vt, IrBinOp::GeU, Expr::Local(i), count.expr())),
+                Stmt::MemoryCopy {
+                    dst: binary(vt, IrBinOp::Add, first.clone(), at),
+                    src: first,
+                    len: size,
+                },
+                Stmt::SetLocal(i, next),
+                Stmt::Br(0),
+            ])]));
+        }
+        match known {
+            Some(_) => out.append(&mut stored),
+            None => {
+                let vt = self.ck.addr_type();
+                let none = Expr::Const(self.ck.addr_const(0));
+                out.push(Stmt::If {
+                    cond: binary(vt, IrBinOp::Ne, count.expr(), none),
+                    then_body: stored,
+                    else_body: Vec::new(),
+                });
+            }
+        }
         out
     }
 
@@ -7801,7 +7831,13 @@ fn exprs(scalars: Vec<(ValType, Expr)>) -> Vec<Expr> {
 /// Whether `expr` is a local or a constant, which is as cheap to read again
 /// as to keep.
 fn is_simple(expr: &Expr) -> bool {
-    matches!(expr, Expr::Local(_) | Expr::Const(_))
+    matches!(expr, Expr::Local(_)) || is_constant(expr)
+}
+
+/// Whether `expr` is a constant: one that checking knows, or that only
+/// linking does.
+fn is_constant(expr: &Expr) -> bool {
+    matches!(expr, Expr::Const(_) | Expr::Symbol(..))
 }
 
 /// Splits a single-scalar value into its prelude and scalar.
@@ -8045,7 +8081,9 @@ fn convert(from: Prim, to: Prim, expr: Expr) -> Expr {
 /// is pure is left out where nothing reads it, and evaluated in any order.
 fn is_pure(expr: &Expr) -> bool {
     match expr {
-        Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => true,
+        Expr::Const(_) | Expr::Symbol(..) | Expr::Local(_) | Expr::Global(_) | Expr::MemorySize => {
+            true
+        }
         Expr::Unary(_, _, x) | Expr::Load { addr: x, .. } => is_pure(x),
         Expr::Binary(_, op, a, b) => !may_trap(*op, b) && is_pure(a) && is_pure(b),
         Expr::If {
@@ -8064,7 +8102,7 @@ fn is_pure(expr: &Expr) -> bool {
 /// read from temporaries, as [`Body::read_variable`] has it.
 fn is_stable(expr: &Expr) -> bool {
     match expr {
-        Expr::Const(_) | Expr::Local(_) => true,
+        Expr::Const(_) | Expr::Symbol(..) | Expr::Local(_) => true,
         Expr::Unary(_, _, x) => is_stable(x),
         Expr::Binary(_, op, a, b) => !may_trap(*op, b) && is_stable(a) && is_stable(b),
         Expr::If {
@@ -8093,8 +8131,8 @@ fn may_trap(op: IrBinOp, divisor: &Expr) -> bool {
         IrBinOp::DivS | IrBinOp::DivU | IrBinOp::RemS | IrBinOp::RemU
     );
     let by = match fold(divisor) {
-        Ok(Const::I32(by)) => Some(i64::from(by)),
-        Ok(Const::I64(by)) => Some(by),
+        Ok(Scalar::Known(Const::I32(by))) => Some(i64::from(by)),
+        Ok(Scalar::Known(Const::I64(by))) => Some(by),
         _ => None,
     };
     divides && by.is_none_or(|by| by == 0 || by == -1 && op == IrBinOp::DivS)
@@ -8400,24 +8438,74 @@ fn has_break(expr: &parse::Expr) -> bool {
 }
 
 /// Evaluates `expr`, a scalar of a lowered constant or an operand of one,
-/// without running it, if it is made of constants alone.
-fn fold(expr: &Expr) -> Result<Const, Fold> {
+/// without running it, if it is made of constants alone. A constant that
+/// only linking knows is a scalar too, as is the address of what is placed
+/// in memory that a constant is added to or taken from. Anything else made
+/// of one is folded once linking knows it.
+fn fold(expr: &Expr) -> Result<Scalar, Fold> {
     match expr {
-        Expr::Const(c) => Ok(*c),
-        Expr::Unary(_, op, x) => fold_unary(*op, fold(x)?),
-        Expr::Binary(ty, op, a, b) => match eval::fold_binary(*ty, *op, fold(a)?, fold(b)?) {
-            Some(Ok(c)) => Ok(c),
-            Some(Err(())) => Err(Fold::Trap),
-            None => Err(Fold::NotConstant),
+        Expr::Const(c) => Ok(Scalar::Known(*c)),
+        Expr::Symbol(ty, symbol) => Ok(Scalar::Linked(*ty, *symbol)),
+        Expr::Unary(_, op, x) => match fold(x)? {
+            Scalar::Known(c) => fold_unary(*op, c).map(Scalar::Known),
+            Scalar::Linked(..) => Err(Fold::Linked),
         },
+        Expr::Binary(ty, op, a, b) => {
+            // Each operand as it would run, the first before the other.
+            let (a, b) = (operand(fold(a))?, operand(fold(b))?);
+            let offset = |by: Const| match by {
+                Const::I32(by) => Some(i64::from(by)),
+                Const::I64(by) => Some(by),
+                _ => None,
+            };
+            match (a, b, op) {
+                (Some(Scalar::Known(a)), Some(Scalar::Known(b)), _) => {
+                    match eval::fold_binary(*ty, *op, a, b) {
+                        Some(Ok(c)) => Ok(Scalar::Known(c)),
+                        Some(Err(())) => Err(Fold::Trap),
+                        None => Err(Fold::NotConstant),
+                    }
+                }
+                (
+                    Some(Scalar::Linked(vt, IrSymbol::Data(id, at))),
+                    Some(Scalar::Known(by)),
+                    IrBinOp::Add | IrBinOp::Sub,
+                ) if vt == *ty && offset(by).is_some() => {
+                    let by = offset(by).unwrap_or_default();
+                    let at = match op {
+                        IrBinOp::Add => at.wrapping_add(by),
+                        _ => at.wrapping_sub(by),
+                    };
+                    Ok(Scalar::Linked(vt, IrSymbol::Data(id, at)))
+                }
+                (
+                    Some(Scalar::Known(by)),
+                    Some(Scalar::Linked(vt, IrSymbol::Data(id, at))),
+                    IrBinOp::Add,
+                ) if vt == *ty && offset(by).is_some() => {
+                    let by = offset(by).unwrap_or_default();
+                    Ok(Scalar::Linked(vt, IrSymbol::Data(id, at.wrapping_add(by))))
+                }
+                _ => Err(Fold::Linked),
+            }
+        }
         Expr::If {
             cond,
             then_expr,
             else_expr,
             ..
-        } => match fold(cond)? {
-            Const::I32(0) => fold(else_expr),
-            _ => fold(then_expr),
+        } => match operand(fold(cond))? {
+            Some(Scalar::Known(Const::I32(0))) => fold(else_expr),
+            Some(Scalar::Known(_)) => fold(then_expr),
+            // Which of them is the value is only known once linking knows
+            // the condition, so both are to fold then.
+            Some(Scalar::Linked(..)) | None => {
+                let folds = |branch: &Expr| fold(branch) != Err(Fold::NotConstant);
+                match folds(then_expr) && folds(else_expr) {
+                    true => Err(Fold::Linked),
+                    false => Err(Fold::NotConstant),
+                }
+            }
         },
         // Only a `var` is read from a global, and may have been
         // assigned.
@@ -8429,6 +8517,17 @@ fn fold(expr: &Expr) -> Result<Const, Fold> {
         | Expr::MemorySize
         | Expr::MemoryGrow(_)
         | Expr::Seq(..) => Err(Fold::NotConstant),
+    }
+}
+
+/// What an operand folds to, given what [`fold`] made of it: `None` where
+/// only linking knows enough to fold it. That it isn't constant, or traps,
+/// is the error of the whole.
+fn operand(folded: Result<Scalar, Fold>) -> Result<Option<Scalar>, Fold> {
+    match folded {
+        Ok(scalar) => Ok(Some(scalar)),
+        Err(Fold::Linked) => Ok(None),
+        Err(fold) => Err(fold),
     }
 }
 
@@ -8586,6 +8685,7 @@ mod tests {
                 ..
             } => format!("(if {} {} {})", ex(cond), ex(then_expr), ex(else_expr)),
             Expr::Seq(body, value) => format!("(seq {} {})", stmts(m, f, body), ex(value)),
+            Expr::Symbol(_, symbol) => format!("{symbol:?}"),
         }
     }
 

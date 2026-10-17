@@ -395,6 +395,7 @@ fn expr(f: &mut Function, types: &mut Types, expr: &Expr) {
             stmts(f, types, body);
             self::expr(f, types, value);
         }
+        Expr::Symbol(..) => panic!("a module is linked before it is encoded"),
     }
 }
 

@@ -676,6 +676,7 @@ impl<'m> Compiler<'m> {
                 self.stmts(body)?;
                 self.expr(value)?
             }
+            Expr::Symbol(..) => return Err("a module that isn't linked".to_string()),
         };
         Ok(ty)
     }
@@ -877,7 +878,7 @@ impl Run<'_> {
                 },
                 Ok(Flow::Return) => match self.frames.pop() {
                     Some(caller) => frame = caller,
-                    None => return Ok(self.values.drain(..).collect()),
+                    None => return Ok(mem::take(&mut self.values)),
                 },
                 Err(stop) => {
                     self.frames.push(frame);
@@ -1107,7 +1108,8 @@ fn extend(x: i64, wide: bool) -> u64 {
     }
 }
 
-fn type_of(c: Const) -> ValType {
+/// The type of the constant `c`.
+pub(crate) fn type_of(c: Const) -> ValType {
     match c {
         Const::I32(_) => ValType::I32,
         Const::I64(_) => ValType::I64,
@@ -1154,7 +1156,7 @@ pub(crate) fn fold_binary(ty: ValType, op: BinOp, a: Const, b: Const) -> Option<
 }
 
 /// The type of `<ty>.<op>`, if there is that instruction.
-fn unary_type(ty: ValType, op: UnOp) -> Option<ValType> {
+pub(crate) fn unary_type(ty: ValType, op: UnOp) -> Option<ValType> {
     use UnOp::*;
     use ValType::*;
     Some(match (ty, op) {
@@ -2201,35 +2203,25 @@ mod against_wasmtime {
         }
 
         /// A function that may be called by name: the import, or one made
-        /// before this.
+        /// before this, each by its index.
         fn callee(&mut self) -> (FuncId, FuncType) {
-            let index = self
-                .rng
-                .below(self.sigs.len() - 1 + usize::from(self.sigs.len() == 1));
-            let index = index.min(self.sigs.len() - 1);
-            let callable = index < self.sigs.len() - 1 || index == 0;
-            let index = if callable { index } else { 0 };
+            let index = self.rng.below(self.sigs.len());
             (FuncId(index as u32), self.sigs[index].clone())
         }
 
         /// A place in the table to call, and the type it is called as: mostly
-        /// that of a function made before this, and otherwise one that is
-        /// empty, out of the table or of another type.
+        /// that of what is there, a function that may be called by name, and
+        /// otherwise a place that is empty or out of the table, or of a
+        /// function of another type.
         fn place(&mut self) -> (i32, FuncType) {
-            let made = self.sigs.len() - 1;
+            // Each is at the place after its index.
+            let index = self.rng.below(self.sigs.len());
+            let at = index as i32 + 1;
             match self.rng.below(6) {
-                0 => (0, self.sigs[0].clone()),
-                1 => (99, self.sigs[0].clone()),
-                2 => (made as i32, self.sigs[0].clone()),
-                _ => {
-                    // Functions are at the place after their index.
-                    let index = self
-                        .rng
-                        .below(made.max(1))
-                        .min(made.saturating_sub(1).max(0));
-                    let index = if made == 0 { 0 } else { index };
-                    (index as i32 + 1, self.sigs[index].clone())
-                }
+                0 => (0, self.sigs[index].clone()),
+                1 => (99, self.sigs[index].clone()),
+                2 => (at, self.sigs[self.rng.below(self.sigs.len())].clone()),
+                _ => (at, self.sigs[index].clone()),
             }
         }
 
@@ -2735,6 +2727,7 @@ mod against_wasmtime {
                     e(else_expr)
                 ),
                 Expr::Seq(b, v) => format!("seq{{{}; {}}}", ss(b, 0).trim(), e(v)),
+                Expr::Symbol(_, symbol) => format!("{symbol:?}"),
             }
         }
         fn ss(b: &[Stmt], d: usize) -> String {

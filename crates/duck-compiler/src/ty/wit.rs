@@ -21,6 +21,7 @@ use crate::load::Program;
 use crate::parse::FnSig;
 use crate::world::{ImportError, ROOT, WitFunc, WitTy, kebab};
 
+use super::Scalar;
 use super::{Checker, FuncSig, OPTION, Prim, RESULT, Ty, TypeError, TypeErrorKind, extern_fns};
 
 /// The start of the name a handle of a resource is dropped by, before the
@@ -404,7 +405,8 @@ impl Checker {
         let mut counted = def.members.iter().enumerate();
         def.ty == Ty::Prim(enum_prim(cases))
             && def.members.len() == cases
-            && counted.all(|(index, member)| member.value == [Const::I32(index as i32)])
+            && counted
+                .all(|(index, member)| member.value == [Scalar::Known(Const::I32(index as i32))])
     }
 }
 

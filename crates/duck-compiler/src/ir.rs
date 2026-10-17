@@ -6,6 +6,11 @@
 //! pointers are indices into the module's table, and control flow is wasm's
 //! structured `block`/`loop`/`if` with branch targets given as label depths.
 //! An address, a function pointer and a count of pages are each an `i32`.
+//!
+//! A lowered program is linked before it is encoded or run: until then, the
+//! address of what it places in memory and a scalar of what a constant is
+//! found to be by running it are each a [`Symbol`], which linking makes the
+//! constant it stands for.
 
 /// A wasm function index: [`Module::imports`] come first, then
 /// [`Module::funcs`].
@@ -19,6 +24,15 @@ pub struct GlobalId(pub u32);
 /// Index into [`Func::locals`]. Parameters come first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalId(pub u32);
+
+/// What a lowered program places in memory, by the order it is lowered in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DataId(pub u32);
+
+/// A constant of a lowered program that is found by running it, by the
+/// order it is lowered in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValueId(pub u32);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
@@ -234,6 +248,18 @@ pub enum Expr {
     /// Runs the statements and then evaluates the expression. Not a label:
     /// codegen emits the statements inline.
     Seq(Vec<Stmt>, Box<Expr>),
+    /// The constant of type `ValType` that the symbol stands for, which only
+    /// a program that isn't linked has.
+    Symbol(ValType, Symbol),
+}
+
+/// A constant that only linking knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Symbol {
+    /// The address `offset` bytes past where data is placed.
+    Data(DataId, i64),
+    /// The scalar of this index of a constant that is run.
+    Value(ValueId, u32),
 }
 
 /// Unary instructions, named as in wasm. Conversions name their result type;
