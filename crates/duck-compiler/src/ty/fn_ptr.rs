@@ -13,8 +13,8 @@ use crate::lex::Span;
 use crate::parse::{self, Arg};
 
 use super::{
-    Body, Checker, Dep, FnId, FuncSig, Synth, Ty, TypeErrorKind, Value, exprs, is_pure, is_stable,
-    path_text, split1,
+    Body, Checker, Dep, FnId, FuncSig, IrSymbol, Synth, Ty, TypeErrorKind, Value, exprs, is_pure,
+    is_stable, path_text, split1,
 };
 
 impl Checker {
@@ -82,12 +82,13 @@ impl Checker {
         }
     }
 
-    /// The table index of function `id`, which is the next one free the
-    /// first time it's asked for.
-    fn table_index(&mut self, id: FuncId) -> u32 {
+    /// The function that a pointer to function `id` is the place in the
+    /// table of, which is put at the next one free the first time it's
+    /// asked for. `None` where no pointer is taken.
+    fn table_target(&mut self, id: FuncId) -> Option<FuncId> {
         // A generic function checked as declared takes no pointers.
         if self.open {
-            return 0;
+            return None;
         }
         let target = self.pointer_target(id);
         self.note(Dep::Func(target));
@@ -97,7 +98,7 @@ impl Checker {
         if index == next {
             self.table.push(target);
         }
-        index
+        Some(target)
     }
 
     /// The function that pointers to function `id` call: `id` itself,
@@ -195,8 +196,12 @@ impl Body<'_> {
     /// A pointer to function `id`, once `value` is evaluated, which is the
     /// function itself.
     pub(super) fn pointer_to(&mut self, id: FuncId, value: Value) -> Value {
-        let index = self.ck.table_index(id);
-        let index = Expr::Const(self.ck.addr_const(index.into()));
+        let vt = self.ck.addr_type();
+        let index = match self.ck.table_target(id) {
+            Some(target) => Expr::Symbol(vt, IrSymbol::Func(target)),
+            // A generic function checked as declared takes no pointers.
+            None => Expr::Const(self.ck.addr_const(0)),
+        };
         Value {
             pre: value.pre,
             scalars: vec![(self.ck.addr_type(), index)],

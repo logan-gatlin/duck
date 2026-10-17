@@ -4,6 +4,19 @@ use std::rc::Rc;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FileId(usize);
 
+impl FileId {
+    /// What the file is minted from: see [`FileManager::mint_file_id`].
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+
+    /// The file minted from `index`, as [`FileManager::mint_file_id`]
+    /// mints one.
+    pub(crate) fn minted(index: usize) -> Self {
+        Self(index)
+    }
+}
+
 pub trait FileManager {
     /// Returns the entry point file (main.duck)
     fn entry_point(&mut self) -> FileId;

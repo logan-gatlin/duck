@@ -20,6 +20,7 @@ use crate::lex::Span;
 use crate::load::Program;
 use crate::parse::FnSig;
 use crate::world::{ImportError, ROOT, WitFunc, WitTy, kebab};
+use std::ops::Range;
 
 use super::Scalar;
 use super::{Checker, FuncSig, OPTION, Prim, RESULT, Ty, TypeError, TypeErrorKind, extern_fns};
@@ -49,9 +50,13 @@ impl Checker {
     /// the WIT declares it: one of an interface that isn't imported, one
     /// the interface doesn't have, one with no name there, and one that
     /// takes or gives what the WIT doesn't say.
-    pub(super) fn check_imports(&mut self, program: &Program) {
+    pub(super) fn check_imports(&mut self, program: &Program, items: &Range<usize>) {
         let mut unknown: Vec<Span> = Vec::new();
-        for (index, (block, decl)) in extern_fns(program).enumerate() {
+        let imports = extern_fns(program).enumerate();
+        let own: Vec<_> = imports
+            .filter(|(index, _)| items.contains(&self.func_items[*index]))
+            .collect();
+        for (index, (block, decl)) in own {
             let own = &decl.sig.name;
             let sig = self.funcs[index].clone();
             let needs = self.import_passing(FuncId(index as u32)).size;

@@ -47,27 +47,53 @@ impl Checker {
     /// constants are still being folded, or for what its result hides.
     /// The constants that its body is first to read are folded for it.
     pub(super) fn lower_early(&mut self, program: &Program, id: FuncId) {
+        let first = self.funcs.len() - self.synths.len();
+        let normal = mem::replace(&mut self.normal, false);
+        match (id.0 as usize) < first {
+            true => {
+                let defined = (id.0 - self.import_count) as usize;
+                let (item, decl) = fn_decls(program).nth(defined).unwrap();
+                self.lower_kept(program, id, |ck, program| {
+                    ck.lower_decl(program, id, item, decl)
+                });
+            }
+            false => self.lower_kept(program, id, |ck, program| ck.lower_synth(program, id)),
+        }
+        self.normal = normal;
+    }
+
+    /// Lowers function `id` with `lower`, keeping what it names for a
+    /// constant that is run later to call it. One lowered in the turn of its
+    /// package, rather than for a constant, is kept as one that no run has
+    /// reached.
+    pub(super) fn lower_kept(
+        &mut self,
+        program: &Program,
+        id: FuncId,
+        lower: impl FnOnce(&mut Self, &Program) -> ir::Func,
+    ) {
         self.lowering.insert(id);
         self.deps.push(Vec::new());
         // What is folding may be in another module, or a generic function's.
         let module = self.module;
         let type_params = mem::take(&mut self.type_params);
         let chain = mem::take(&mut self.instance_chain);
-        let first = self.funcs.len() - self.synths.len();
-        let func = match (id.0 as usize) < first {
-            true => {
-                let defined = (id.0 - self.import_count) as usize;
-                let (item, decl) = fn_decls(program).nth(defined).unwrap();
-                self.lower_decl(program, id, item, decl)
-            }
-            false => self.lower_synth(program, id),
-        };
+        let func = lower(self, program);
         self.module = module;
         self.type_params = type_params;
         self.instance_chain = chain;
         let deps = self.deps.pop().unwrap_or_default();
         self.func_deps.insert(id, deps);
         self.lowering.remove(&id);
+        self.keep_lowered(id, func);
+    }
+
+    /// Keeps `func`, function `id` lowered, as one lowered for a constant
+    /// to call unless it is lowered in the turn of its package.
+    pub(super) fn keep_lowered(&mut self, id: FuncId, func: ir::Func) {
+        if self.normal {
+            self.normally.insert(id);
+        }
         self.lowered.insert(id, func);
     }
 
@@ -86,9 +112,13 @@ impl Checker {
     ) -> Option<HashSet<FuncId>> {
         let mut work = self.deps.last().cloned().unwrap_or_default();
         push_calls(&thunk.body, &mut work);
-        // Only a function that is lowered has run, or been run by one that
-        // has.
-        let pointed = self.table.iter().filter(|id| self.lowered.contains_key(id));
+        // Only a function that is lowered for a constant has run, or been
+        // run by one that has, or one that a run has reached.
+        let ran = |id: &&FuncId| {
+            let early = self.lowered.contains_key(id) && !self.normally.contains(id);
+            early || self.ran.contains(id)
+        };
+        let pointed = self.table.iter().filter(ran);
         work.extend(pointed.map(|id| Dep::Func(*id)));
         let (mut funcs, mut items) = (HashSet::new(), HashSet::new());
         while let Some(dep) = work.pop() {
@@ -193,6 +223,7 @@ impl Checker {
         if !self.errors.is_empty() {
             return None;
         }
+        self.ran.extend(&reached);
         Some(self.find(Finding::Run { thunk, reached }, span))
     }
 

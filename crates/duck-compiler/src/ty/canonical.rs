@@ -20,6 +20,8 @@
 //!
 //! [`Settings`]: crate::file::Settings
 
+use std::ops::Range;
+
 use crate::ir::{self, BinOp as IrBinOp, Expr, FuncId, Stmt, ValType};
 use crate::load::Program;
 
@@ -37,7 +39,7 @@ const MAX_FLAT_PARAMS: usize = 16;
 const MAX_FLAT_RESULTS: usize = 1;
 
 /// What the return area is aligned to: the most that any type is.
-const RETURN_AREA_ALIGN: u32 = 8;
+pub(super) const RETURN_AREA_ALIGN: u32 = 8;
 
 /// How what a function takes and gives is passed.
 pub(super) struct Passing {
@@ -131,26 +133,33 @@ impl Checker {
     /// passes where that is `None`. Every signature is resolved by now, and
     /// nothing is lowered yet.
     pub(super) fn place_return_area(&mut self, program: &Program, size: Option<u32>) {
-        let imports = (0..self.import_count).map(|id| self.import_passing(FuncId(id)).size);
-        // What a component may export: a `pub` function of the entry
-        // module, one that a `pub use` there names, and one of a block of
-        // an interface. A library exports nothing through it.
-        let entry = fn_decls(program).enumerate().filter(|(_, (item, decl))| {
-            item.span.file == self.entry && (item.is_pub || decl.interface.is_some())
-        });
-        let entry = entry.map(|(index, _)| self.import_count as usize + index);
-        let used = self.reexports.iter().filter_map(|(item, _)| match item {
-            Item::Func(id) => Some(id.0 as usize),
-            _ => None,
-        });
-        let exports = entry.chain(used).filter(|_| !self.world.is_library());
-        let exports = exports.map(|id| self.passing(&self.funcs[id], false).size);
-        let passed = imports.chain(exports).max().unwrap_or(0);
+        let passed = self.passed(program, 0..self.import_count, true);
         self.return_area_size = size.unwrap_or(passed);
         if passed > 0 {
             let area = self.reserve_data(self.return_area_size.into(), RETURN_AREA_ALIGN);
             self.return_area = Some(area);
         }
+    }
+
+    /// The most bytes that the imports `imports` pass in the return area,
+    /// and what the component exports, if it is the `entry`'s to say.
+    pub(super) fn passed(&self, program: &Program, imports: Range<u32>, entry: bool) -> u32 {
+        let imports = imports.map(|id| self.import_passing(FuncId(id)).size);
+        // What a component may export: a `pub` function of the entry
+        // module, one that a `pub use` there names, and one of a block of
+        // an interface. A library exports nothing through it.
+        let own = fn_decls(program).enumerate().filter(|(_, (item, decl))| {
+            item.span.file == self.entry && (item.is_pub || decl.interface.is_some())
+        });
+        let own = own.map(|(index, _)| self.import_count as usize + index);
+        let used = self.reexports.iter().filter_map(|(item, _)| match item {
+            Item::Func(id) => Some(id.0 as usize),
+            _ => None,
+        });
+        let exported = entry && !self.world.is_library();
+        let exports = own.chain(used).filter(|_| exported);
+        let exports = exports.map(|id| self.passing(&self.funcs[id], false).size);
+        imports.chain(exports).max().unwrap_or(0)
     }
 
     /// The address `offset` bytes into the return area.

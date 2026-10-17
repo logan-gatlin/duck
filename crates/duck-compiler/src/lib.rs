@@ -4,7 +4,7 @@ use crate::file::FileManager;
 use crate::lex::{LexError, Span};
 use crate::load::UseError;
 use crate::parse::ParseError;
-use crate::ty::{InstanceSite, Test, TypeError, TypeErrorKind};
+use crate::ty::{Artifact, InstanceSite, Test, TypeError, TypeErrorKind};
 use crate::world::{World, WorldError};
 
 pub mod bindgen;
@@ -115,6 +115,43 @@ pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
     let module = lower(files)?;
     // The module has no errors, so the settings name a world.
     let world = World::load(&settings).expect("the world is read");
+    let component = world.encode(emit::emit(&module));
+    component.map_err(|e| vec![Error::Component(e)])
+}
+
+/// Compiles the entry point of `files`, and every file it uses, to the
+/// [`Artifact`] of each of its packages, those it depends on first: what
+/// [`link`] makes the component of that [`compile`] makes.
+///
+/// Stops at the first stage that fails, as [`compile`] does. The errors of
+/// linking are found by [`link`].
+pub fn compile_artifacts(files: &mut impl FileManager) -> Result<Vec<Artifact>, Vec<Error>> {
+    let settings = files.settings();
+    if settings.world.is_none() {
+        let error = TypeError::nowhere(TypeErrorKind::World(WorldError::Library));
+        return Err(vec![Error::Type(error)]);
+    }
+    let program = load::load(files)?;
+    let artifacts = ty::artifacts(&program, &settings, files);
+    artifacts.map_err(|e| e.into_iter().map(Error::Type).collect())
+}
+
+/// Links `artifacts`, which [`compile_artifacts`] makes of files with
+/// `settings`, to the component that [`compile`] makes of those files.
+///
+/// Each error is in the file of [`Artifact::linked_files`] that its span's
+/// [`file::FileId`] is minted from the index of.
+pub fn link(artifacts: &[Artifact], settings: &file::Settings) -> Result<Vec<u8>, Vec<Error>> {
+    let world = World::load(settings).map_err(|e| {
+        let error = TypeError::nowhere(TypeErrorKind::World(e));
+        vec![Error::Type(error)]
+    })?;
+    if world.is_library() {
+        let error = TypeError::nowhere(TypeErrorKind::World(WorldError::Library));
+        return Err(vec![Error::Type(error)]);
+    }
+    let module = ty::link(artifacts, settings);
+    let module = module.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
     let component = world.encode(emit::emit(&module));
     component.map_err(|e| vec![Error::Component(e)])
 }

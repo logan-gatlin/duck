@@ -260,6 +260,9 @@ pub enum Symbol {
     Data(DataId, i64),
     /// The scalar of this index of a constant that is run.
     Value(ValueId, u32),
+    /// The place in the table of the function of this index, which a
+    /// pointer to it is.
+    Func(FuncId),
 }
 
 /// Unary instructions, named as in wasm. Conversions name their result type;

@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::eval;
-use crate::file::{FileId, IncludeError, Includes, Settings};
+use crate::file::{FileId, FileManager, IncludeError, Includes, Settings};
 use crate::ir::{
     self, BinOp as IrBinOp, Const, Expr, FuncId, GlobalId, LoadOp, LocalId, Stmt, StoreOp,
     Symbol as IrSymbol, UnOp as IrUnOp, ValType,
@@ -30,7 +30,7 @@ use crate::parse::{
     self, Arg, BinOp, ExprKind, ExternBlock, ExternFn, FnSig, INCLUDE, Ident, ItemKind, Mutability,
     Pattern, PatternKind, StmtKind, StructDecl, TypeKind, UnaryOp, UnionDecl,
 };
-use crate::world::{REALLOC, ROOT, RUN_EXPORT, RUN_INTERFACE, World, WorldError, kebab};
+use crate::world::{REALLOC, ROOT, RUN_INTERFACE, World, WorldError, kebab};
 
 pub use test::{Test, Tested, check_tests};
 
@@ -47,6 +47,7 @@ use opaque::{OpaqueDef, OpaqueSite, Owner};
 use unions::{Holds, narrow, tags_are, where_held, widen};
 
 mod alias;
+mod artifact;
 mod canonical;
 mod defaults;
 mod enums;
@@ -67,6 +68,7 @@ mod test;
 mod unions;
 mod wit;
 
+pub use artifact::{Artifact, DecodeError, link};
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
     Action, ActionKind, Analysis, Apart, Completion, CompletionKind, Hint, HintKind, Hover,
@@ -659,6 +661,12 @@ pub enum TypeErrorKind {
     },
     /// Code that couldn't be run to evaluate a constant, and why.
     ConstNotRun(String),
+    /// An artifact, linked, that uses a package whose artifact isn't
+    /// linked before it.
+    Unlinked {
+        artifact: String,
+        package: String,
+    },
     /// A global, enum or struct that the global's initializer, the enum's
     /// members' values or the struct's fields' defaults use.
     RecursiveConstant(String),
@@ -1061,6 +1069,9 @@ struct Checker {
     /// generic, indexed by [`FuncId`], and each that is, by [`GenericFnId`].
     func_items: Vec<usize>,
     generic_fn_items: Vec<usize>,
+    /// Where each list of what is lowered was where each package was about
+    /// to be lowered, in the order they are.
+    package_marks: Vec<artifact::Marks>,
     /// The items whose constants are being folded, innermost last.
     folding: Vec<usize>,
     /// What each item being folded and each function being lowered for one
@@ -1074,6 +1085,12 @@ struct Checker {
     func_deps: HashMap<FuncId, Vec<Dep>>,
     /// The functions being lowered for a constant to call.
     lowering: HashSet<FuncId>,
+    /// Whether the functions being lowered are lowered in the turn of their
+    /// package, and those that were, which no constant was run to call.
+    normal: bool,
+    normally: HashSet<FuncId>,
+    /// Every function that a constant that is run may call.
+    ran: HashSet<FuncId>,
     /// Whether the initializer being checked read a global whose own has no
     /// value, so that what is made of it is no value either.
     unknown: bool,
@@ -1376,7 +1393,7 @@ enum Visit {
 }
 
 /// A scalar leaf of a value: which of them it is, and its type.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Leaf {
     index: usize,
     ty: ValType,
@@ -1394,7 +1411,7 @@ struct Ranged {
 }
 
 /// Where one scalar of a type lives in memory.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Cell {
     /// Bytes from the start of the value.
     offset: u32,
@@ -1668,6 +1685,7 @@ impl TypeErrorKind {
             Self::ConstCallsExtern { .. } => "const-calls-extern",
             Self::ConstCallsUnnamed { .. } => "const-calls-unnamed",
             Self::ConstNotRun(..) => "const-not-run",
+            Self::Unlinked { .. } => "unlinked",
             Self::RecursiveConstant(..) => "recursive-constant",
             Self::ConstantTooDeep(..) => "constant-too-deep",
             Self::ReservedExport(..) => "reserved-export",
@@ -2077,6 +2095,10 @@ impl fmt::Display for TypeErrorKind {
                 Stack(stack)
             ),
             Self::ConstNotRun(why) => write!(f, "constant evaluation couldn't run: {why}"),
+            Self::Unlinked { artifact, package } => write!(
+                f,
+                "`{artifact}` uses `{package}`, whose artifact isn't linked before it"
+            ),
             Self::RecursiveConstant(name) => {
                 write!(f, "`{name}` is used in its own definition")
             }
@@ -2392,26 +2414,29 @@ pub fn check(program: &Program, settings: &Settings) -> Result<ir::Module, Vec<T
     }
     // The start function is called by the `run` that the world exports, as
     // no import that reads or writes memory can be called while the module
-    // is instantiated. It returns the `result` of `run`, which is `ok` once
-    // the start function returns: a program that fails exits with a status.
+    // is instantiated.
     if let Some(start) = start {
-        funcs.push(ir::Func {
-            name: RUN_EXPORT.to_string(),
-            exports: vec![RUN_EXPORT.to_string()],
-            params: Vec::new(),
-            results: vec![ValType::I32],
-            locals: Vec::new(),
-            body: vec![
-                Stmt::Call {
-                    func: start,
-                    args: Vec::new(),
-                    dests: Vec::new(),
-                },
-                Stmt::Return(vec![Expr::Const(Const::I32(0))]),
-            ],
-        });
+        funcs.push(artifact::run_export(start));
     }
     Ok(ck.module(imports, funcs, settings))
+}
+
+/// The artifact of each package of `program`, which [`check`] would make a
+/// module of without errors, those it depends on first: or its errors.
+/// Each artifact is named by the name `files` give the root module of its
+/// package, and names each file it has spans in as they give it.
+///
+/// [`link`] makes the module of the artifacts that [`check`] makes.
+pub fn artifacts(
+    program: &Program,
+    settings: &Settings,
+    files: &mut impl FileManager,
+) -> Result<Vec<Artifact>, Vec<TypeError>> {
+    let (ck, imports, funcs, start) = lower_unlinked(program, settings, false, false);
+    match ck.errors.is_empty() {
+        true => Ok(ck.artifacts(program, files, &imports, &funcs, start)),
+        false => Err(ck.errors),
+    }
 }
 
 /// The errors that [`check`] finds in `program`, without the module it
@@ -2432,27 +2457,10 @@ fn lower_program(
     records: bool,
     tested: bool,
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
-    let mut ck = Checker::define(program, settings, records, tested);
-    let start = settings.start.as_ref().filter(|_| !tested);
-    let start = start.and_then(|name| ck.resolve_start(program, name));
-    ck.tests = ck.find_tests(program);
-    ck.check_generic_fns(program);
-    if !ck.unread {
-        ck.check_imports(program);
-    }
-    let imports = ck.lower_imports(program);
-    let mut funcs = ck.lower_funcs(program);
-    // A start function that isn't one is reported as that, and not also
-    // as a `run` that nothing defines.
-    if !ck.unread && tested {
-        ck.export_tests(program, &mut funcs);
-    } else if !ck.unread {
-        ck.export_funcs(program, &mut funcs, settings.start.is_some());
-    }
-    funcs.extend(ck.lower_synths(program));
+    let (mut ck, imports, funcs, start) = lower_unlinked(program, settings, records, tested);
     // What only running finds is found now that every function it may call
     // is lowered.
-    ck.link_constants(program, &funcs);
+    ck.link_constants(&imports, &funcs);
     // An instance may only have an error that checking its declaration
     // missed because of one that is reported.
     let unchecked = |e: &TypeError| matches!(e.kind, TypeErrorKind::Unchecked { .. });
@@ -2461,7 +2469,54 @@ fn lower_program(
     }
     // Functions have literals too, so only now has every one been placed.
     ck.check_data_fits();
-    ck.place_late_literals();
+    ck.place_late_literals(&imports, &funcs);
+    (ck, imports, funcs, start)
+}
+
+/// Checks and lowers `program`, as [`lower_program`] does, but for linking
+/// what is lowered.
+fn lower_unlinked(
+    program: &Program,
+    settings: &Settings,
+    records: bool,
+    tested: bool,
+) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
+    let mut ck = Checker::define(program, settings, records, tested);
+    let mut start = None;
+    // Each package is folded and lowered after every package it depends
+    // on, as a whole: what is made of one is made of nothing that depends
+    // on it, nor of another beside it. What the entry's package makes of
+    // what it lowers is lowered with what it exports.
+    for package in &program.packages {
+        let items = package.items.clone();
+        ck.package_marks.push(ck.marks());
+        ck.define_globals(program, items.clone());
+        ck.check_lists(&items);
+        ck.place_pattern_strings(program, &items);
+        if package.root == program.entry {
+            let name = settings.start.as_ref().filter(|_| !tested);
+            start = name.and_then(|name| ck.resolve_start(program, name));
+            ck.tests = ck.find_tests(program);
+        }
+        ck.check_generic_fns(program, &items);
+        if !ck.unread {
+            ck.check_imports(program, &items);
+        }
+        ck.lower_funcs(program, &items);
+        if package.root != program.entry {
+            ck.lower_new_synths(program);
+        }
+    }
+    let imports = ck.lower_imports(program);
+    let mut funcs = ck.defined_funcs();
+    // A start function that isn't one is reported as that, and not also
+    // as a `run` that nothing defines.
+    if !ck.unread && tested {
+        ck.export_tests(program, &mut funcs);
+    } else if !ck.unread {
+        ck.export_funcs(program, &mut funcs, settings.start.is_some());
+    }
+    funcs.extend(ck.lower_synths(program));
     (ck, imports, funcs, start)
 }
 
@@ -3307,11 +3362,12 @@ impl Checker {
         (params, ret)
     }
 
-    /// Checks and folds global initializers, the values of enum members and
-    /// the defaults of struct fields and of parameters: in declaration
-    /// order, but for those that an earlier one uses, which are folded then.
-    fn define_globals(&mut self, program: &Program) {
-        for index in 0..program.items.len() {
+    /// Checks and folds the global initializers, the values of enum members
+    /// and the defaults of struct fields and of parameters that `items` of
+    /// `program` declare: in declaration order, but for those that an
+    /// earlier one uses, which are folded then.
+    fn define_globals(&mut self, program: &Program, items: Range<usize>) {
+        for index in items {
             self.fold_item(program, index);
         }
     }
@@ -3512,9 +3568,6 @@ impl Checker {
         ck.define_structs(program);
         ck.define_funcs(program);
         ck.place_return_area(program, settings.return_area);
-        ck.define_globals(program);
-        ck.check_lists();
-        ck.place_pattern_strings(program);
         ck
     }
 
@@ -3564,17 +3617,32 @@ impl Checker {
 
     /// Lowers every function the source defines that isn't generic, but for
     /// those lowered for a constant to call, which are lowered already.
-    fn lower_funcs(&mut self, program: &Program) -> Vec<ir::Func> {
-        let mut funcs = Vec::new();
-        for (i, (item, decl)) in fn_decls(program).enumerate() {
-            let id = FuncId(self.import_count + i as u32);
-            let func = match self.lowered.remove(&id) {
-                Some(func) => func,
-                None => self.lower_decl(program, id, item, decl),
-            };
-            funcs.push(func);
+    fn lower_funcs(&mut self, program: &Program, items: &Range<usize>) {
+        let first = self.import_count as usize;
+        let own: Vec<_> = fn_decls(program)
+            .enumerate()
+            .filter(|(i, _)| items.contains(&self.func_items[first + i]))
+            .collect();
+        for (i, (item, decl)) in own {
+            let id = FuncId((first + i) as u32);
+            if !self.lowered.contains_key(&id) {
+                self.normal = true;
+                self.lower_kept(program, id, |ck, program| {
+                    ck.lower_decl(program, id, item, decl)
+                });
+                self.normal = false;
+            }
         }
-        funcs
+    }
+
+    /// Every function the program defines, lowered, in order, but for those
+    /// the checker makes, which [`Self::lower_synths`] gives.
+    fn defined_funcs(&mut self) -> Vec<ir::Func> {
+        let first = self.import_count as usize;
+        let defined = first..self.funcs.len() - self.synths.len();
+        let funcs = defined.map(|id| self.lowered.remove(&FuncId(id as u32)));
+        let funcs: Option<Vec<_>> = funcs.collect();
+        funcs.expect("every function is lowered")
     }
 
     /// Lowers function `id`, which `decl` of `item` defines.
@@ -3651,21 +3719,30 @@ impl Checker {
         }
     }
 
-    /// Lowers every function in `synths`, including those that lowering the
-    /// others creates, but for those lowered for a constant to call, which
-    /// are lowered already.
-    fn lower_synths(&mut self, program: &Program) -> Vec<ir::Func> {
+    /// Lowers each function in `synths` that isn't lowered yet, including
+    /// those that lowering the others creates.
+    fn lower_new_synths(&mut self, program: &Program) {
         let first = self.funcs.len() - self.synths.len();
-        let mut funcs = Vec::new();
-        while funcs.len() < self.synths.len() {
-            let id = FuncId((first + funcs.len()) as u32);
-            let func = match self.lowered.remove(&id) {
-                Some(func) => func,
-                None => self.lower_synth(program, id),
-            };
-            funcs.push(func);
+        let mut index = 0;
+        while index < self.synths.len() {
+            let id = FuncId((first + index) as u32);
+            if !self.lowered.contains_key(&id) {
+                self.normal = true;
+                self.lower_kept(program, id, |ck, program| ck.lower_synth(program, id));
+                self.normal = false;
+            }
+            index += 1;
         }
-        funcs
+    }
+
+    /// Every function in `synths`, including those that lowering the others
+    /// creates, lowered, in order.
+    fn lower_synths(&mut self, program: &Program) -> Vec<ir::Func> {
+        self.lower_new_synths(program);
+        let first = self.funcs.len() - self.synths.len();
+        let ids = (first..self.funcs.len()).map(|id| FuncId(id as u32));
+        let funcs: Option<Vec<_>> = ids.map(|id| self.lowered.remove(&id)).collect();
+        funcs.expect("every function the checker makes is lowered")
     }
 
     /// Lowers function `id`, which is one of `synths`.
@@ -4618,24 +4695,6 @@ impl Checker {
         }
     }
 
-    /// Writes a value whose scalars are `consts` to the start of `out`, as
-    /// storing it to `cells` would.
-    fn write_consts(&self, out: &mut [u8], cells: &[Cell], consts: &[Const]) {
-        for cell in cells {
-            // A value that failed to fold, or is stored when it is run,
-            // lacks some.
-            let Some(c) = consts.get(cell.leaf.index) else {
-                continue;
-            };
-            let held = cell.when.iter().all(|holds| holds.in_consts(consts));
-            if let Expr::Const(c) = narrow(cell.leaf.ty, cell.ty, Expr::Const(*c))
-                && held
-            {
-                write_const(&mut out[cell.offset as usize..], cell.store, c);
-            }
-        }
-    }
-
     /// Writes a value whose scalars are `scalars` to `out` at `offset`, as
     /// storing it to `cells` would, if checking knows them all. Otherwise
     /// writes nothing, and gives what writes it once linking knows them.
@@ -4649,7 +4708,7 @@ impl Checker {
         let known: Option<Vec<_>> = scalars.iter().map(|scalar| scalar.known()).collect();
         match known {
             Some(consts) => {
-                self.write_consts(&mut out[offset..], cells, &consts);
+                write_consts(&mut out[offset..], cells, &consts);
                 Vec::new()
             }
             None => vec![Fill {
@@ -6542,7 +6601,12 @@ impl<'c> Body<'c> {
             _ => {
                 if let Some(kind) = self.shared_error(mutable) {
                     let errors = self.ck.errors.len();
-                    let check = Check::Empty { count, kind, span };
+                    let default = kind == TypeErrorKind::SharedLiteral;
+                    let check = Check::Empty {
+                        count,
+                        default,
+                        span,
+                    };
                     self.ck.link.check(CheckDef { check, errors });
                 }
             }
@@ -7937,6 +8001,24 @@ fn binary(ty: ValType, op: IrBinOp, a: Expr, b: Expr) -> Expr {
     Expr::Binary(ty, op, Box::new(a), Box::new(b))
 }
 
+/// Writes a value whose scalars are `consts` to the start of `out`, as
+/// storing it to `cells` would.
+fn write_consts(out: &mut [u8], cells: &[Cell], consts: &[Const]) {
+    for cell in cells {
+        // A value that failed to fold, or is stored when it is run,
+        // lacks some.
+        let Some(c) = consts.get(cell.leaf.index) else {
+            continue;
+        };
+        let held = cell.when.iter().all(|holds| holds.in_consts(consts));
+        if let Expr::Const(c) = narrow(cell.leaf.ty, cell.ty, Expr::Const(*c))
+            && held
+        {
+            write_const(&mut out[cell.offset as usize..], cell.store, c);
+        }
+    }
+}
+
 /// Writes `c` to the start of `out` as `store` would.
 fn write_const(out: &mut [u8], store: StoreOp, c: Const) {
     let bytes = match c {
@@ -8548,6 +8630,7 @@ mod tests {
     use crate::file::{DummyManager, FileManager};
     use crate::ir::{Const, Expr, Func, Module, Stmt, ValType};
     use crate::lex::tokenize;
+    use crate::world::RUN_EXPORT;
 
     pub(super) fn check_src(src: &str) -> Result<Module, Vec<TypeError>> {
         check_with(src, &Settings::default())

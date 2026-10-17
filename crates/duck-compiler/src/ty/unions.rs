@@ -51,12 +51,12 @@ struct Builtin {
 }
 
 /// That a union within a value holds one of its variants.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Holds {
     /// The leaf of the value that holds the union's tag.
-    tag: Leaf,
+    pub(super) tag: Leaf,
     /// The tag of the variant.
-    variant: i32,
+    pub(super) variant: i32,
 }
 
 impl Holds {

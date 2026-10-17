@@ -354,7 +354,7 @@ impl Checker {
         self.lowering.remove(&id);
         if id.0 < OPEN_FUNCS {
             self.func_deps.insert(id, deps);
-            self.lowered.insert(id, func);
+            self.keep_lowered(id, func);
         }
     }
 }

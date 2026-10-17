@@ -10,6 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::mem;
+use std::ops::Range;
 
 use crate::Error;
 use crate::file::{self, FileId, FileManager, Includes, TestModule};
@@ -38,8 +40,13 @@ pub enum UseErrorKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     /// Every module's items, each module's after those of every module it
-    /// uses that doesn't use it in turn.
+    /// uses that doesn't use it in turn, and each package's after those of
+    /// every package it depends on, as [`Program::packages`] has them.
     pub items: Vec<Item>,
+    /// The packages of the program, each after those it depends on, which
+    /// leaves the package of the entry last: each with the items that are
+    /// its own, which follow one another.
+    pub packages: Vec<PackageItems>,
     /// Each after every `use` of the module it leads into, unless that
     /// module uses this one in turn.
     pub uses: Vec<Use>,
@@ -54,6 +61,16 @@ pub struct Program {
     /// The modules of the package that `entry` is in, its test modules
     /// among them: those a test module sees all of, `pub` or not.
     pub package: HashSet<FileId>,
+}
+
+/// The items of one package of a program.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackageItems {
+    /// The module the package is reached by: the entry point, or the
+    /// library of a dependency.
+    pub root: FileId,
+    /// Its items, in [`Program::items`].
+    pub items: Range<usize>,
 }
 
 /// A name `module` gives a module, or something reached through one.
@@ -112,6 +129,11 @@ struct Loader<'f, F> {
     /// test directory, led to, after the module that uses it: the two are
     /// of one package.
     within: Vec<(FileId, FileId)>,
+    /// The module that each module's package is reached by.
+    roots: HashMap<FileId, FileId>,
+    /// Each package that a package depends on, by those modules, in the
+    /// order its modules first use them.
+    depends: Vec<(FileId, FileId)>,
     errors: Vec<Error>,
 }
 
@@ -155,7 +177,9 @@ impl std::error::Error for UseError {}
 impl Program {
     /// A program of one module, which uses nothing.
     pub fn single(entry: FileId, module: parse::Module) -> Self {
+        let items = 0..module.items.len();
         Self {
+            packages: vec![PackageItems { root: entry, items }],
             items: module.items,
             uses: Vec::new(),
             entry,
@@ -211,6 +235,8 @@ impl<'f, F: FileManager> Loader<'f, F> {
             uses: Vec::new(),
             includes: HashMap::new(),
             within: Vec::new(),
+            roots: HashMap::from([(entry, entry)]),
+            depends: Vec::new(),
             errors: Vec::new(),
         };
         loader.seen.insert(entry);
@@ -219,17 +245,20 @@ impl<'f, F: FileManager> Loader<'f, F> {
         // and those before it, but for one that it uses.
         let tests = loader.files.tests();
         for test in &tests {
+            loader.roots.entry(test.file).or_insert(entry);
             if loader.seen.insert(test.file) {
                 loader.items_of(test.file);
             }
         }
         let package = loader.package(entry, &tests);
+        let packages = loader.group(entry);
         // A file that the program no longer uses is no longer kept.
         if let Some(parsed) = &mut loader.parsed {
             parsed.files.retain(|id, _| loader.seen.contains(id));
         }
         let program = Program {
             items: loader.items,
+            packages,
             uses: loader.uses,
             entry,
             includes: loader.includes,
@@ -253,6 +282,62 @@ impl<'f, F: FileManager> Loader<'f, F> {
             }
         }
         package
+    }
+
+    /// Puts the items of each package after those of every package it
+    /// depends on, each package's in the order they were loaded, which
+    /// keeps those of a module after those of each module it uses. Returns
+    /// the packages in that order: the dependencies of each first, in the
+    /// order its modules first use them, and then it, and so on from the
+    /// package of `entry`.
+    fn group(&mut self, entry: FileId) -> Vec<PackageItems> {
+        let mut order = Vec::new();
+        let mut visited = HashSet::new();
+        self.visit_package(entry, &mut visited, &mut order);
+        let position: HashMap<_, _> = order
+            .iter()
+            .enumerate()
+            .map(|(i, root)| (*root, i))
+            .collect();
+        let package = |item: &Item| {
+            let root = self.roots.get(&item.span.file).unwrap_or(&entry);
+            position.get(root).copied().unwrap_or(order.len() - 1)
+        };
+        let mut items: Vec<_> = mem::take(&mut self.items)
+            .into_iter()
+            .map(|item| (package(&item), item))
+            .collect();
+        items.sort_by_key(|(package, _)| *package);
+        // Sorted, each package's are those up to where the next one's start.
+        let mut packages = Vec::new();
+        let mut start = 0;
+        for (index, root) in order.iter().enumerate() {
+            let end = start
+                + items[start..]
+                    .iter()
+                    .take_while(|(p, _)| *p == index)
+                    .count();
+            packages.push(PackageItems {
+                root: *root,
+                items: start..end,
+            });
+            start = end;
+        }
+        self.items = items.into_iter().map(|(_, item)| item).collect();
+        packages
+    }
+
+    /// Adds the package that `root` reaches to `order`, after each it
+    /// depends on that isn't there yet.
+    fn visit_package(&self, root: FileId, visited: &mut HashSet<FileId>, order: &mut Vec<FileId>) {
+        if !visited.insert(root) {
+            return;
+        }
+        let depends = self.depends.iter().filter(|(from, _)| *from == root);
+        for (_, dependency) in depends {
+            self.visit_package(*dependency, visited, order);
+        }
+        order.push(root);
     }
 
     fn items_of(&mut self, id: FileId) {
@@ -382,14 +467,22 @@ impl<'f, F: FileManager> Loader<'f, F> {
             lens.find_map(|len| Some((self.files.open_test(from, &names[..len])?, len)))
         });
         let dependency = self.files.open_package(from, names[0]);
+        let root = self.roots.get(&from).copied().unwrap_or(from);
         let (target, len) = match (local, dependency) {
             (Some(_), Some(_)) => return Err(UseErrorKind::Ambiguous(names[0].to_string())),
             (Some(local), None) => {
                 self.within.push((from, local.0));
+                self.roots.entry(local.0).or_insert(root);
                 local
             }
             // Only what its library makes `pub` is reached in a dependency.
-            (None, Some(library)) => (library, 1),
+            (None, Some(library)) => {
+                self.roots.entry(library).or_insert(library);
+                if !self.depends.contains(&(root, library)) {
+                    self.depends.push((root, library));
+                }
+                (library, 1)
+            }
             (None, None) => return Err(UseErrorKind::NotFound(names.join("."))),
         };
         if self.seen.insert(target) {

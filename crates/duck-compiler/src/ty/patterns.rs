@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::ops::Range;
 
 use crate::ir::{BinOp as IrBinOp, Const, Expr, LocalId, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
@@ -196,9 +197,9 @@ impl Checker {
     /// Places each string that a pattern of `program` is in memory, after
     /// the literals of its globals: a `match` compares with it there. One
     /// in a function lowered for a constant to call is placed already.
-    pub(super) fn place_pattern_strings(&mut self, program: &Program) {
+    pub(super) fn place_pattern_strings(&mut self, program: &Program, items: &Range<usize>) {
         let mut strings = Vec::new();
-        for item in &program.items {
+        for item in &program.items[items.clone()] {
             if let ItemKind::Fn(decl) = &item.kind {
                 push_pattern_strings(&decl.body, &mut strings);
             }

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::ops::Range;
 
 use crate::ir::{self, FuncId};
 use crate::lex::Span;
@@ -193,8 +194,12 @@ impl Checker {
     /// Checks the body of every generic function as declared, with its type
     /// parameters standing for themselves. What is lowered is of no
     /// instance, and is dropped.
-    pub(super) fn check_generic_fns(&mut self, program: &Program) {
-        for (i, (item, decl)) in generic_fn_decls(program).enumerate() {
+    pub(super) fn check_generic_fns(&mut self, program: &Program, items: &Range<usize>) {
+        let decls = generic_fn_decls(program).enumerate();
+        let own: Vec<_> = decls
+            .filter(|(i, _)| items.contains(&self.generic_fn_items[*i]))
+            .collect();
+        for (i, (item, decl)) in own {
             self.module = item.span.file;
             let def = &self.generic_fns[i];
             let (params, sig) = (def.params.clone(), def.sig.clone());
@@ -867,7 +872,7 @@ fn f():
         let mut ck = Checker::define(&program, &Settings::default(), false, false);
         // As if checking `add` as declared had found nothing wrong with it.
         assert!(ck.errors.is_empty());
-        ck.lower_funcs(&program);
+        ck.lower_funcs(&program, &(0..program.items.len()));
         ck.lower_synths(&program);
         let [error] = &ck.errors[..] else {
             panic!("expected one error: {:#?}", ck.errors);

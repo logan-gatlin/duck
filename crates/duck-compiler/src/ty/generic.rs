@@ -4,6 +4,7 @@
 //! expressions, like the `i32` in `Box(i32)(value: 1)`.
 
 use std::mem;
+use std::ops::Range;
 
 use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeArg, TypeKind, TypeParam};
@@ -299,8 +300,12 @@ impl Checker {
 
     /// Reports each list that bounds a type parameter and names a type or
     /// a field twice, as no struct does, so that nothing meets it.
-    pub(super) fn check_lists(&mut self) {
-        for (id, span) in mem::take(&mut self.list_bounds) {
+    pub(super) fn check_lists(&mut self, items: &Range<usize>) {
+        let (own, rest) = mem::take(&mut self.list_bounds)
+            .into_iter()
+            .partition(|(id, _)| items.contains(&self.structs[id.0 as usize].item));
+        self.list_bounds = rest;
+        for (id, span) in own {
             let def = &self.structs[id.0 as usize];
             let twice = (0..def.uses.len()).find(|i| def.uses[..*i].contains(&def.uses[*i]));
             if let Some(twice) = twice {
