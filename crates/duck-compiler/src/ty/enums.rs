@@ -324,7 +324,7 @@ impl Checker {
                     .collect()
             };
             let value = value.unwrap_or_else(zeros);
-            let member = &mut self.enums[id.0 as usize].members[i];
+            let member = &mut self.enums.untracked()[id.0 as usize].members[i];
             (member.known, member.value) = (known, value);
         }
         if let Some(from) = linked {

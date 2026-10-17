@@ -42,7 +42,7 @@ impl Checker {
                 ),
                 false => (Some(DefaultValue::Failed), None),
             };
-            let field = &mut self.structs[id.0 as usize].fields[index];
+            let field = &mut self.structs.untracked()[id.0 as usize].fields[index];
             (field.default, field.default_ty) = (default, default_ty);
         }
         for field in decl.entries.iter().filter_map(parse::Entry::own) {
@@ -58,7 +58,7 @@ impl Checker {
             let names = param_names(&decl.params);
             let tys = self.structs[id.0 as usize].params.clone();
             let (consts, own) = self.fold_default(program, ty, expr, &names, &tys);
-            let field = &mut self.structs[id.0 as usize].fields[index];
+            let field = &mut self.structs.untracked()[id.0 as usize].fields[index];
             field.default_ty = own;
             field.default = Some(match consts {
                 Some(consts) => DefaultValue::Folded(consts),

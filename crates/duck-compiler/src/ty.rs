@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::iter;
 use std::mem;
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::rc::Rc;
 
 use crate::eval;
@@ -891,6 +891,16 @@ pub enum TypeErrorKind {
     },
 }
 
+/// A table that counts how many times it was given to be changed. What is
+/// worked out from the tables of a [`Checker`] and kept is right for as long
+/// as the count of each table it was worked out from is what it was, so
+/// nothing that changes one has to say that it did.
+#[derive(Default)]
+struct Tracked<T> {
+    table: T,
+    changes: u64,
+}
+
 #[derive(Default)]
 struct Checker {
     /// The names declared in each module: its items and what it uses.
@@ -933,7 +943,7 @@ struct Checker {
     /// Struct declarations in declaration order, then the built-in unions
     /// and the struct that lists are instances of, then instances of
     /// generic ones as they are used.
-    structs: Vec<StructDef>,
+    structs: Tracked<Vec<StructDef>>,
     /// The built-in unions, `option` and then `result`, once declared.
     builtin_unions: Vec<StructId>,
     /// The struct that every [list](Checker::list_of) is an instance of,
@@ -946,7 +956,7 @@ struct Checker {
     /// arguments.
     instances: HashMap<(StructId, Vec<Ty>), StructId>,
     /// Every generic struct's type parameters, indexed by [`ParamId`].
-    params: Vec<ParamDef>,
+    params: Tracked<Vec<ParamDef>>,
     /// The type parameters in scope, and the types they stand for: themselves
     /// in a generic declaration, and type arguments in an instance. While a
     /// type written in a body is resolved, the functions declared in
@@ -955,7 +965,7 @@ struct Checker {
     /// of a name is the one it names.
     type_params: Vec<(String, Ty)>,
     /// Enum declarations in declaration order.
-    enums: Vec<EnumDef>,
+    enums: Tracked<Vec<EnumDef>>,
     /// The names of types, in declaration order.
     aliases: Vec<AliasDef>,
     /// Instances whose fields wait on every generic struct's being defined.
@@ -1006,10 +1016,15 @@ struct Checker {
     nested: HashMap<(Option<FuncId>, Span), FuncId>,
     /// What each function that is declared in another is beyond its
     /// signature: what it is named and what it captures.
-    nested_fns: HashMap<FuncId, NestedFn>,
+    nested_fns: Tracked<HashMap<FuncId, NestedFn>>,
     /// Every type that the result of a function hides, indexed by
     /// [`OpaqueId`].
-    opaques: Vec<OpaqueDef>,
+    opaques: Tracked<Vec<OpaqueDef>>,
+    /// Each member of a struct, a tuple or an array as [`Self::places`]
+    /// found it, which every read of a field asks for, and the
+    /// [`Self::shape`] they were found at.
+    places: HashMap<Ty, Vec<(Ty, Range<usize>, u32)>>,
+    placed: u64,
     /// The result being resolved, if it's that of a function with a body:
     /// nothing else hides a type.
     opaque_site: Option<OpaqueSite>,
@@ -1463,6 +1478,41 @@ impl Scalar {
             Self::Known(c) => Some(c),
             Self::Linked(..) => None,
         }
+    }
+}
+
+impl<T> Deref for Tracked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.table
+    }
+}
+
+/// Whatever is given the table to change counts as a change of it, whether
+/// or not it changes anything.
+impl<T> DerefMut for Tracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.changes += 1;
+        &mut self.table
+    }
+}
+
+impl<T> Tracked<T> {
+    /// Gives the table to change what nothing that is kept is worked out
+    /// from: a default or a value, and neither the type nor the signature it
+    /// is of. That counts as no change.
+    fn untracked(&mut self) -> &mut T {
+        &mut self.table
+    }
+}
+
+impl<T> Tracked<Vec<T>> {
+    /// Adds `value` after the others. That changes none of them, and
+    /// nothing was worked out from one that wasn't there, so it counts as
+    /// no change.
+    fn push(&mut self, value: T) {
+        self.table.push(value);
     }
 }
 
@@ -4346,6 +4396,43 @@ impl Checker {
         }
     }
 
+    /// How many times what lays a type out was given to be changed: the
+    /// structs, the enums, the type parameters, the types that results hide
+    /// and what functions capture.
+    fn shape(&self) -> u64 {
+        let types = self.structs.changes + self.enums.changes + self.params.changes;
+        types + self.opaques.changes + self.nested_fns.changes
+    }
+
+    /// The type of each member of `ty`, a struct, a tuple or an array, the
+    /// range of `ty`'s leaves it covers, and its offset in memory. They are
+    /// kept, as every read of a field asks for them, until what lays a type
+    /// out is changed.
+    fn places(&mut self, ty: Ty) -> &[(Ty, Range<usize>, u32)] {
+        let shape = self.shape();
+        if mem::replace(&mut self.placed, shape) != shape {
+            self.places.clear();
+        }
+        if !self.places.contains_key(&ty) {
+            let places = self.find_places(ty);
+            self.places.insert(ty, places);
+        }
+        debug_assert_eq!(self.places[&ty], self.find_places(ty));
+        &self.places[&ty]
+    }
+
+    fn find_places(&self, ty: Ty) -> Vec<(Ty, Range<usize>, u32)> {
+        let offsets = self.aggregate_layout(ty).0;
+        let mut end = 0;
+        let members = self.members(ty).into_iter().zip(offsets);
+        let places = members.map(|(member, offset)| {
+            let start = end;
+            end += self.val_types(member).len();
+            (member, start..end, offset)
+        });
+        places.collect()
+    }
+
     /// The type of `field` in `ty`, the range of `ty`'s leaves it covers, and
     /// its offset in memory. A tuple's fields are its indices. `None` after
     /// reporting an error.
@@ -4378,14 +4465,7 @@ impl Checker {
             }
         }
         if let Some(index) = index {
-            let members = self.members(ty);
-            let start = members[..index]
-                .iter()
-                .map(|member| self.val_types(*member).len())
-                .sum::<usize>();
-            let len = self.val_types(members[index]).len();
-            let offset = self.aggregate_layout(ty).0[index];
-            return Some((members[index], start..start + len, offset));
+            return Some(self.places(ty)[index].clone());
         }
         if ty != Ty::Error {
             let kind = TypeErrorKind::NoField {
@@ -8802,6 +8882,25 @@ mod tests {
             "tmp" => format!("tmp{}", l.0),
             name => name.to_string(),
         }
+    }
+
+    #[test]
+    fn a_tracked_table_counts_what_is_given_it_to_change() {
+        let mut table: Tracked<Vec<u32>> = Tracked::default();
+        // One more is a change of none of the others.
+        table.push(1);
+        table.push(2);
+        assert_eq!((table.len(), table[1], table.changes), (2, 2, 0));
+        assert_eq!((table.iter().sum::<u32>(), table.changes), (3, 0));
+        table[0] = 5;
+        assert_eq!((table[0], table.changes), (5, 1));
+        // It counts whether or not anything is changed.
+        table.iter_mut().for_each(|_| {});
+        assert_eq!(table.changes, 2);
+        *table = vec![7];
+        assert_eq!((table.len(), table.changes), (1, 3));
+        table.untracked()[0] = 8;
+        assert_eq!((table[0], table.changes), (8, 3));
     }
 
     #[test]
