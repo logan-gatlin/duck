@@ -38,10 +38,6 @@ pub enum Error {
     /// A program that has a surface, with no display to open a window on.
     #[cfg(feature = "gfx")]
     NoDisplay,
-    /// The tests of a package that imports a surface, which opens a window
-    /// as no test does.
-    #[cfg(feature = "gfx")]
-    Windowed,
 }
 
 /// What the host functions keep for one program.
@@ -71,11 +67,6 @@ impl fmt::Display for Error {
             Self::NoDisplay => write!(
                 f,
                 "the program has a surface, and there is no display to open a window on"
-            ),
-            #[cfg(feature = "gfx")]
-            Self::Windowed => write!(
-                f,
-                "cannot run the tests: the package imports a surface, and no test opens a window"
             ),
         }
     }
@@ -455,7 +446,7 @@ pub fn cabi_realloc(old: &var u8, old_size: uint, align: uint, new_size: uint) -
     /// How a program that draws is compiled: as one of a world that
     /// imports what `includes` name beside what a program does.
     #[cfg(feature = "gfx")]
-    fn drawing(includes: &[&str]) -> Settings {
+    pub(super) fn drawing(includes: &[&str]) -> Settings {
         let includes: String = includes
             .iter()
             .map(|i| format!("  include {i};\n"))

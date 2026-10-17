@@ -1,9 +1,16 @@
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use shared::channel_to_stream;
-use std::{fmt::Debug, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{
+    fmt::Debug,
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use wasi_gfx::surface::surface;
 pub use wasi_gfx::surface::surface::{
-    FrameEvent, Key, KeyEvent, PointerEvent, {CreateDesc as SurfaceDesc, ResizeEvent},
+    FrameEvent, Key, KeyEvent, PointerButton, PointerEvent, WheelEvent, WheelUnit,
+    {CreateDesc as SurfaceDesc, ResizeEvent},
 };
 use wasmtime::component::{Access, HasData, Resource, StreamReader};
 
@@ -13,6 +20,7 @@ wasmtime::component::bindgen!({
     imports: {
         "wasi-gfx:surface/surface.[method]surface.on-pointer-down": store | trappable,
         "wasi-gfx:surface/surface.[method]surface.on-pointer-move": store | trappable,
+        "wasi-gfx:surface/surface.[method]surface.on-wheel": store | trappable,
         "wasi-gfx:surface/surface.[method]surface.on-key-up": store | trappable,
         "wasi-gfx:surface/surface.[method]surface.on-pointer-up": store | trappable,
         "wasi-gfx:surface/surface.[method]surface.on-key-down": store | trappable,
@@ -25,6 +33,11 @@ wasmtime::component::bindgen!({
     },
 });
 
+/// How wide and high a window is that is asked for without either, as winit
+/// makes one.
+pub(crate) const DEFAULT_WIDTH: u32 = 800;
+pub(crate) const DEFAULT_HEIGHT: u32 = 600;
+
 // types
 
 /// Any type implementing GfxWindow can be used to back a wasi-gfx:surface
@@ -32,6 +45,51 @@ pub trait GfxWindow: HasDisplayHandle + HasWindowHandle {
     fn height(&self) -> u32;
     fn width(&self) -> u32;
     fn request_set_size(&self, width: Option<u32>, height: Option<u32>);
+
+    /// Whether this is no window of a display, and so has no handle for
+    /// what draws to draw to.
+    fn is_headless(&self) -> bool {
+        false
+    }
+}
+
+/// A window that is only a size, which it takes at once when asked: no
+/// display shows it.
+struct Headless(Mutex<(u32, u32)>);
+
+impl HasDisplayHandle for Headless {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+impl HasWindowHandle for Headless {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+impl GfxWindow for Headless {
+    fn height(&self) -> u32 {
+        self.0.lock().unwrap().1
+    }
+
+    fn width(&self) -> u32 {
+        self.0.lock().unwrap().0
+    }
+
+    fn request_set_size(&self, width: Option<u32>, height: Option<u32>) {
+        let mut size = self.0.lock().unwrap();
+        *size = (width.unwrap_or(size.0), height.unwrap_or(size.1));
+    }
+
+    fn is_headless(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +106,10 @@ impl Surface {
         let (mut pointer_move_sender, pointer_move_receiver) = async_broadcast::broadcast(1);
         let pointer_move_receiver = pointer_move_receiver.deactivate();
         pointer_move_sender.set_overflow(true);
+        // A touchpad scrolls by many small events, each of which counts.
+        let (mut wheel_sender, wheel_receiver) = async_broadcast::broadcast(32);
+        let wheel_receiver = wheel_receiver.deactivate();
+        wheel_sender.set_overflow(true);
         let (mut key_up_sender, key_up_receiver) = async_broadcast::broadcast(5);
         let key_up_receiver = key_up_receiver.deactivate();
         key_up_sender.set_overflow(true);
@@ -68,6 +130,8 @@ impl Surface {
             _pointer_down_receiver: pointer_down_receiver,
             pointer_move_sender,
             _pointer_move_receiver: pointer_move_receiver,
+            wheel_sender,
+            _wheel_receiver: wheel_receiver,
             key_up_sender,
             _key_up_receiver: key_up_receiver,
             key_down_sender,
@@ -77,6 +141,27 @@ impl Surface {
             frame_sender,
             _frame_receiver: frame_receiver,
         }))
+    }
+
+    /// A surface with no window, for where there is none to open: it has
+    /// the size `desc` asks for, and takes another when asked. Nothing
+    /// happens to it, so each of its streams is done from the start, as
+    /// those of a window that was closed are, and what is drawn to it is
+    /// shown nowhere.
+    pub fn headless(desc: SurfaceDesc) -> Self {
+        let size = (
+            desc.width.unwrap_or(DEFAULT_WIDTH),
+            desc.height.unwrap_or(DEFAULT_HEIGHT),
+        );
+        let surface = Self::new(Box::new(Headless(Mutex::new(size))));
+        surface.close();
+        surface
+    }
+
+    /// Whether the surface has no window, as that of [`Surface::headless`]
+    /// has none.
+    pub fn is_headless(&self) -> bool {
+        self.0.window.is_headless()
     }
 
     pub fn height(&self) -> u32 {
@@ -109,6 +194,7 @@ impl Surface {
             inner.pointer_up_sender.close(),
             inner.pointer_down_sender.close(),
             inner.pointer_move_sender.close(),
+            inner.wheel_sender.close(),
             inner.key_up_sender.close(),
             inner.key_down_sender.close(),
             inner.resize_sender.close(),
@@ -130,6 +216,9 @@ impl Surface {
     }
     pub fn pointer_move(&self, event: PointerEvent) {
         shared::unwrap_unless_inactive_or_full(self.0.pointer_move_sender.try_broadcast(event));
+    }
+    pub fn wheel(&self, event: WheelEvent) {
+        shared::unwrap_unless_inactive(self.0.wheel_sender.try_broadcast(event));
     }
     pub fn key_up(&self, event: KeyEvent) {
         shared::unwrap_unless_inactive(self.0.key_up_sender.try_broadcast(event));
@@ -175,6 +264,8 @@ struct SurfaceInner {
     _pointer_down_receiver: async_broadcast::InactiveReceiver<PointerEvent>,
     pointer_move_sender: async_broadcast::Sender<PointerEvent>,
     _pointer_move_receiver: async_broadcast::InactiveReceiver<PointerEvent>,
+    wheel_sender: async_broadcast::Sender<WheelEvent>,
+    _wheel_receiver: async_broadcast::InactiveReceiver<WheelEvent>,
     key_up_sender: async_broadcast::Sender<KeyEvent>,
     _key_up_receiver: async_broadcast::InactiveReceiver<KeyEvent>,
     key_down_sender: async_broadcast::Sender<KeyEvent>,
@@ -195,6 +286,8 @@ impl Debug for SurfaceInner {
             .field("_pointer_down_receiver", &self._pointer_down_receiver)
             .field("pointer_move_sender", &self.pointer_move_sender)
             .field("_pointer_move_receiver", &self._pointer_move_receiver)
+            .field("wheel_sender", &self.wheel_sender)
+            .field("_wheel_receiver", &self._wheel_receiver)
             .field("key_up_sender", &self.key_up_sender)
             .field("_key_up_receiver", &self._key_up_receiver)
             .field("key_down_sender", &self.key_down_sender)
@@ -316,6 +409,16 @@ impl<T, S: MainThreadSpawner> surface::HostSurfaceWithStore<T> for HasSurfaceCtx
         Ok(channel_to_stream(access, receiver))
     }
 
+    fn on_wheel(
+        mut access: Access<T, Self>,
+        surface: Resource<surface::Surface>,
+    ) -> wasmtime::Result<StreamReader<WheelEvent>> {
+        let ctx = access.get();
+        let surface = ctx.table.get(&surface)?;
+        let receiver = surface.0.wheel_sender.new_receiver();
+        Ok(channel_to_stream(access, receiver))
+    }
+
     fn on_key_up(
         mut access: Access<T, Self>,
         surface: Resource<surface::Surface>,
@@ -361,41 +464,10 @@ impl<T, S: MainThreadSpawner> surface::HostSurfaceWithStore<T> for HasSurfaceCtx
 mod tests {
     use super::*;
     use futures::{executor::block_on, StreamExt};
-    use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
-    use std::sync::Mutex;
 
-    /// A window that is only a size, which it takes at once when asked.
-    struct Sized(Mutex<(u32, u32)>);
-
-    impl HasDisplayHandle for Sized {
-        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-            Err(HandleError::Unavailable)
-        }
-    }
-
-    impl HasWindowHandle for Sized {
-        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-            Err(HandleError::Unavailable)
-        }
-    }
-
-    impl GfxWindow for Sized {
-        fn height(&self) -> u32 {
-            self.0.lock().unwrap().1
-        }
-
-        fn width(&self) -> u32 {
-            self.0.lock().unwrap().0
-        }
-
-        fn request_set_size(&self, width: Option<u32>, height: Option<u32>) {
-            let mut size = self.0.lock().unwrap();
-            *size = (width.unwrap_or(size.0), height.unwrap_or(size.1));
-        }
-    }
-
+    /// A surface whose window is only a size, with its streams open.
     fn surface(width: u32, height: u32) -> Surface {
-        Surface::new(Box::new(Sized(Mutex::new((width, height)))))
+        Surface::new(Box::new(Headless(Mutex::new((width, height)))))
     }
 
     #[test]
@@ -417,6 +489,7 @@ mod tests {
         let surface = surface(10, 20);
         let mut frames = surface.0.frame_sender.new_receiver();
         let mut moves = surface.0.pointer_move_sender.new_receiver();
+        let mut wheels = surface.0.wheel_sender.new_receiver();
         surface.animation_frame();
 
         assert!(surface.close());
@@ -424,7 +497,18 @@ mod tests {
 
         // Nothing more is sent, and sending is no fault.
         surface.animation_frame();
-        surface.pointer_up(PointerEvent { x: 0.0, y: 0.0 });
+        surface.pointer_up(PointerEvent {
+            x: 0.0,
+            y: 0.0,
+            button: Some(PointerButton::Left),
+        });
+        surface.wheel(WheelEvent {
+            x: 0.0,
+            y: 0.0,
+            delta_x: 0.0,
+            delta_y: 1.0,
+            unit: WheelUnit::Line,
+        });
         surface.canvas_resize(ResizeEvent {
             height: 1,
             width: 1,
@@ -434,9 +518,31 @@ mod tests {
         assert!(block_on(frames.next()).is_some());
         assert!(block_on(frames.next()).is_none());
         assert!(block_on(moves.next()).is_none());
+        assert!(block_on(wheels.next()).is_none());
 
         // A stream that is asked for afterwards is done from the start.
         let mut late = surface.0.key_down_sender.new_receiver();
         assert!(block_on(late.next()).is_none());
+    }
+
+    #[test]
+    fn a_headless_surface_is_a_size_and_nothing_that_happens() {
+        let surface = Surface::headless(SurfaceDesc {
+            height: None,
+            width: Some(30),
+        });
+        assert!(surface.is_headless());
+        assert_eq!((surface.width(), surface.height()), (30, DEFAULT_HEIGHT));
+
+        // It takes the size it is asked to, and says nothing of it.
+        let mut resizes = surface.0.resize_sender.new_receiver();
+        surface.request_set_size(Some(40), Some(50));
+        assert_eq!((surface.width(), surface.height()), (40, 50));
+        assert!(block_on(resizes.next()).is_none());
+
+        // Every stream is done, as there is nothing to wait for.
+        let mut frames = surface.0.frame_sender.new_receiver();
+        assert!(block_on(frames.next()).is_none());
+        assert!(!surface.close());
     }
 }

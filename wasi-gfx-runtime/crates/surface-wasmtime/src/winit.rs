@@ -10,7 +10,8 @@ use std::{
 };
 
 use crate::surface::{
-    wasi_gfx, KeyEvent, MainThreadSpawner, PointerEvent, ResizeEvent, SurfaceDesc,
+    wasi_gfx, KeyEvent, MainThreadSpawner, PointerButton, PointerEvent, ResizeEvent, SurfaceDesc,
+    WheelEvent, WheelUnit, DEFAULT_HEIGHT, DEFAULT_WIDTH,
 };
 use crate::surface::{GfxWindow, Surface};
 use raw_window_handle::{
@@ -19,16 +20,11 @@ use raw_window_handle::{
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalSize, Size},
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     keyboard::ModifiersState,
     window::{Window, WindowAttributes, WindowId},
 };
-
-/// How wide and high a window is that is asked for without either, as winit
-/// makes one.
-const DEFAULT_WIDTH: u32 = 800;
-const DEFAULT_HEIGHT: u32 = 600;
 
 pub fn create_wasi_winit_event_loop() -> (WasiWinitEventLoop, WasiWinitEventLoopProxy) {
     let event_loop = WasiWinitEventLoop {
@@ -155,6 +151,7 @@ impl WasiWinitEventLoop {
                             proxy.pointer_move(PointerEvent {
                                 x: position.x,
                                 y: position.y,
+                                button: None,
                             });
                         }
                     }
@@ -190,11 +187,19 @@ impl WasiWinitEventLoop {
                             }
                         }
                     }
-                    WindowEvent::MouseInput { state, .. } => {
+                    WindowEvent::MouseInput { state, button, .. } => {
                         let (pointer_x, pointer_y) = self.pointer_pos.get(&window_id).unwrap();
                         let event = PointerEvent {
                             x: *pointer_x,
                             y: *pointer_y,
+                            button: match button {
+                                MouseButton::Left => Some(PointerButton::Left),
+                                MouseButton::Middle => Some(PointerButton::Middle),
+                                MouseButton::Right => Some(PointerButton::Right),
+                                MouseButton::Back => Some(PointerButton::Back),
+                                MouseButton::Forward => Some(PointerButton::Forward),
+                                MouseButton::Other(_) => None,
+                            },
                         };
                         if let Some(proxy) = self.surfaces.get(&window_id) {
                             match state {
@@ -205,6 +210,27 @@ impl WasiWinitEventLoop {
                                     proxy.pointer_up(event);
                                 }
                             }
+                        }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let (pointer_x, pointer_y) = self.pointer_pos.get(&window_id).unwrap();
+                        // winit counts what is scrolled into view from the
+                        // left and from above, and the WIT what is scrolled
+                        // to: to the right, and down.
+                        let (delta_x, delta_y, unit) = match delta {
+                            MouseScrollDelta::LineDelta(x, y) => {
+                                (-f64::from(x), -f64::from(y), WheelUnit::Line)
+                            }
+                            MouseScrollDelta::PixelDelta(by) => (-by.x, -by.y, WheelUnit::Pixel),
+                        };
+                        if let Some(proxy) = self.surfaces.get(&window_id) {
+                            proxy.wheel(WheelEvent {
+                                x: *pointer_x,
+                                y: *pointer_y,
+                                delta_x,
+                                delta_y,
+                                unit,
+                            });
                         }
                     }
                     WindowEvent::Resized(new_size) => {

@@ -16,6 +16,7 @@ interface surface {
     on-pointer-up: func() -> stream<pointer-event>;
     on-pointer-down: func() -> stream<pointer-event>;
     on-pointer-move: func() -> stream<pointer-event>;
+    on-wheel: func() -> stream<wheel-event>;
     on-key-up: func() -> stream<key-event>;
     on-key-down: func() -> stream<key-event>;
   }
@@ -31,9 +32,42 @@ interface surface {
     nothing: bool,
   }
 
+  /// corresponds with https://w3c.github.io/pointerevents/#the-button-property
+  /// A button that has no name here is not included, use
+  /// `option<pointer-button>` instead.
+  enum pointer-button {
+    left,
+    middle,
+    right,
+    back,
+    forward,
+  }
+
   record pointer-event {
     x: f64,
     y: f64,
+    /// The button that was pressed or let go. None where the pointer only
+    /// moved, and for a button that `pointer-button` has no name for.
+    button: option<pointer-button>,
+  }
+
+  /// What the deltas of a `wheel-event` count.
+  enum wheel-unit {
+    /// Lines of text, as the notches of a wheel are.
+    line,
+    /// Pixels of the surface, as a touchpad scrolls by.
+    pixel,
+  }
+
+  /// corresponds with https://w3c.github.io/uievents/#interface-wheelevent
+  record wheel-event {
+    /// Where the pointer was.
+    x: f64,
+    y: f64,
+    /// How far was scrolled, in `unit`: to the right, and down.
+    delta-x: f64,
+    delta-y: f64,
+    unit: wheel-unit,
   }
 
   /// corresponds with https://w3c.github.io/uievents-code/#code-value-tables

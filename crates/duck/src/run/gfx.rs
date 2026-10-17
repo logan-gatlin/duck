@@ -10,15 +10,22 @@
 //! one `duck run` starts on: what happens to a window reaches the program
 //! through the streams of its surface. One without a surface runs where it
 //! starts, as any does, whether or not it computes on a GPU.
+//!
+//! A test runs where it starts too, one after another, so there is no event
+//! loop for it and it opens no window: a surface it makes is one without,
+//! as [`Surface::headless`] has it. It has a size, each of its streams is
+//! done from the start, and what is drawn to it is shown nowhere.
 
+use std::future::{self, Future};
 use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use frame_buffer_wasmtime::{FrameBufferCtx, FrameBufferCtxView};
 use surface_wasmtime::winit::{WasiWinitEventLoopProxy, create_wasi_winit_event_loop};
 use surface_wasmtime::{
-    MainThreadSpawner, SurfaceCtx, SurfaceCtxView, SurfaceFrameBufferCtx,
+    MainThreadSpawner, Surface, SurfaceCtx, SurfaceCtxView, SurfaceDesc, SurfaceFrameBufferCtx,
     SurfaceFrameBufferCtxView, SurfaceWebgpuCtx, SurfaceWebgpuCtxView,
 };
 use wasi_webgpu_wasmtime::{WasiWebGpuCtx, WasiWebGpuCtxView, WasiWebGpuOptions};
@@ -37,9 +44,6 @@ const SURFACE: &str = "wasi-gfx:surface/";
 /// as Rust gives one that panics.
 const FAULT: u8 = 101;
 
-/// Why a function of a surface has the event loop to ask.
-const WINDOWED: &str = "a program that imports a surface is run with an event loop";
-
 /// What the host functions that draw keep for one program.
 #[derive(Default)]
 pub(super) struct Gfx {
@@ -48,10 +52,15 @@ pub(super) struct Gfx {
     /// that draws nothing.
     gpu: OnceLock<Arc<Global>>,
     options: WasiWebGpuOptions,
-    /// The event loop of the windows, which the thread that `duck run`
-    /// starts on runs. `None` for a program without a surface.
-    main_thread: Option<Arc<WasiWinitEventLoopProxy>>,
+    main_thread: MainThread,
 }
+
+/// What a surface asks of the thread a process starts on: the event loop of
+/// the windows, which that thread runs for a program that `duck run` runs.
+/// `None` where there is no loop, as for a test: a surface is then one
+/// without a window, of which nothing is asked of any thread.
+#[derive(Default)]
+pub(super) struct MainThread(Option<Arc<WasiWinitEventLoopProxy>>);
 
 impl Gfx {
     /// Every adapter and device of the program.
@@ -67,10 +76,25 @@ impl Gfx {
             Arc::new(Global::new("webgpu", descriptor, None))
         })
     }
+}
 
-    /// The event loop of the windows.
-    fn main_thread(&self) -> &WasiWinitEventLoopProxy {
-        self.main_thread.as_deref().expect(WINDOWED)
+impl MainThreadSpawner for MainThread {
+    async fn spawn<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        match &self.0 {
+            Some(event_loop) => event_loop.spawn(f).await,
+            None => f(),
+        }
+    }
+
+    fn create_surface(&self, desc: SurfaceDesc) -> Pin<Box<dyn Future<Output = Surface> + Send>> {
+        match &self.0 {
+            Some(event_loop) => event_loop.create_surface(desc),
+            None => Box::pin(future::ready(Surface::headless(desc))),
+        }
     }
 }
 
@@ -93,36 +117,36 @@ impl FrameBufferCtxView for Host {
 }
 
 impl SurfaceCtxView for Host {
-    type Spawner = WasiWinitEventLoopProxy;
+    type Spawner = MainThread;
 
-    fn surface_ctx(&mut self) -> SurfaceCtx<'_, WasiWinitEventLoopProxy> {
+    fn surface_ctx(&mut self) -> SurfaceCtx<'_, MainThread> {
         SurfaceCtx {
             table: &mut self.table,
-            main_thread_spawner: self.gfx.main_thread(),
+            main_thread_spawner: &self.gfx.main_thread,
         }
     }
 }
 
 impl SurfaceWebgpuCtxView for Host {
-    type Spawner = WasiWinitEventLoopProxy;
+    type Spawner = MainThread;
 
-    fn surface_webgpu_ctx(&mut self) -> SurfaceWebgpuCtx<'_, WasiWinitEventLoopProxy> {
+    fn surface_webgpu_ctx(&mut self) -> SurfaceWebgpuCtx<'_, MainThread> {
         SurfaceWebgpuCtx {
             table: &mut self.table,
             instance: self.gfx.gpu(),
-            main_thread_spawner: self.gfx.main_thread(),
+            main_thread_spawner: &self.gfx.main_thread,
         }
     }
 }
 
 impl SurfaceFrameBufferCtxView for Host {
-    type Spawner = WasiWinitEventLoopProxy;
+    type Spawner = MainThread;
 
-    fn surface_frame_buffer_ctx(&mut self) -> SurfaceFrameBufferCtx<'_, WasiWinitEventLoopProxy> {
+    fn surface_frame_buffer_ctx(&mut self) -> SurfaceFrameBufferCtx<'_, MainThread> {
         SurfaceFrameBufferCtx {
             table: &mut self.table,
             instance: self.gfx.gpu(),
-            main_thread_spawner: self.gfx.main_thread(),
+            main_thread_spawner: &self.gfx.main_thread,
         }
     }
 }
@@ -164,7 +188,7 @@ pub(super) fn run_windowed(
     let (event_loop, main_thread) = create_wasi_winit_event_loop();
     let main_thread = Arc::new(main_thread);
     let gfx = Gfx {
-        main_thread: Some(Arc::clone(&main_thread)),
+        main_thread: MainThread(Some(Arc::clone(&main_thread))),
         ..Gfx::default()
     };
     let host = Host::new(ctx, gfx);

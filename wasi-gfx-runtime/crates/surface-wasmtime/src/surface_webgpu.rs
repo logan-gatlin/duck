@@ -25,7 +25,10 @@ wasmtime::component::bindgen!({
 // types
 pub struct Context {
     pub(crate) surface: surface_webgpu::Surface,
-    pub(crate) surface_id: wgpu_core::id::SurfaceId,
+    /// `None` for a surface that has no window, which wgpu has no surface
+    /// of: each of its textures is one of the device's own, which is drawn
+    /// to as any is, and shown nowhere.
+    pub(crate) surface_id: Option<wgpu_core::id::SurfaceId>,
     pub(crate) configuration: Option<ContextConfiguration>,
 }
 
@@ -37,7 +40,8 @@ pub(crate) struct ContextConfiguration {
 
 impl Context {
     /// Configures the wgpu surface as `configuration` has it, for the size
-    /// the window is now, which wgpu takes no surface without.
+    /// the window is now, which wgpu takes no surface without. Where there
+    /// is no wgpu surface, the size is all there is to take.
     fn apply(
         &self,
         instance: &wgpu_core::global::Global,
@@ -46,7 +50,10 @@ impl Context {
     ) -> wasmtime::Result<()> {
         configuration.width = self.surface.width().max(1);
         configuration.height = self.surface.height().max(1);
-        match instance.surface_configure(self.surface_id, device_id, configuration) {
+        let Some(surface_id) = self.surface_id else {
+            return Ok(());
+        };
+        match instance.surface_configure(surface_id, device_id, configuration) {
             Some(err) => bail!("{err:#?}"),
             None => Ok(()),
         }
@@ -93,6 +100,13 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
     ) -> wasmtime::Result<Resource<surface_webgpu::Context>> {
         let surface = self.table.get(&surface)?;
         let instance = Arc::clone(self.instance);
+        if surface.is_headless() {
+            return Ok(self.table.push(Context {
+                surface: surface.arc_clone(),
+                surface_id: None,
+                configuration: None,
+            })?);
+        }
 
         let surface_id = futures::executor::block_on({
             let surface = surface.arc_clone();
@@ -111,7 +125,7 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
 
         Ok(self.table.push(Context {
             surface: surface.arc_clone(),
-            surface_id,
+            surface_id: Some(surface_id),
             configuration: None,
         })?)
     }
@@ -200,10 +214,9 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
         // What wgpu says is out of date or lost is configured again too, once.
         let mut texture_id = None;
         let mut tries = 0;
-        while outcome.is_ok() && texture_id.is_none() {
-            let output = self
-                .instance
-                .surface_get_current_texture(context.surface_id, None);
+        while let (Some(surface_id), None, true) = (context.surface_id, texture_id, outcome.is_ok())
+        {
+            let output = self.instance.surface_get_current_texture(surface_id, None);
             match output {
                 Ok(output) if output.texture.is_some() => texture_id = output.texture,
                 Ok(_) if tries == 0 => {
@@ -223,7 +236,7 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
         // What the texture is, for its getters to say: wgpu says nothing of
         // one that it gave.
         let descriptor = wgpu_types::TextureDescriptor {
-            label: (),
+            label: None,
             size: wgpu_types::Extent3d {
                 width: configuration.core.width,
                 height: configuration.core.height,
@@ -238,7 +251,19 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
         };
         context.configuration = Some(configuration);
         outcome?;
-        let texture_id = texture_id.expect("there is one where nothing failed");
+        let texture_id = match texture_id {
+            Some(texture_id) => texture_id,
+            // Without a wgpu surface to give one, the device makes it.
+            None => {
+                let (texture_id, err) =
+                    self.instance
+                        .device_create_texture(device_id, &descriptor, None);
+                if let Some(err) = err {
+                    bail!("{err:#?}");
+                }
+                texture_id
+            }
+        };
 
         let device: Resource<wasi_webgpu_wasmtime::Device> = device;
         let device = self.table.get(&device)?;
@@ -250,9 +275,9 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
     }
 
     fn present(&mut self, context: Resource<surface_webgpu::Context>) -> wasmtime::Result<()> {
-        let surface_id = self.table.get(&context)?.surface_id;
-
-        self.instance.surface_present(surface_id)?;
+        if let Some(surface_id) = self.table.get(&context)?.surface_id {
+            self.instance.surface_present(surface_id)?;
+        }
         Ok(())
     }
 

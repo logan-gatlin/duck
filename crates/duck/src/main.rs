@@ -43,9 +43,10 @@ enum Command {
     /// another, and run its tests: each `pub fn` of those files that takes
     /// nothing, which passes if it returns and fails if it traps. Each runs
     /// in a new instance of the component, given what `duck run` gives a
-    /// program, and is reported as it runs, with how long it took: what it
-    /// writes is between a line that names it and one that says how it
-    /// ended
+    /// program but a window, as a surface it makes is shown nowhere and has
+    /// nothing happen to it, and is reported as it runs, with how long it
+    /// took: what it writes is between a line that names it and one that
+    /// says how it ended
     Test {
         /// Run only the tests whose names have one of these in them
         filters: Vec<String>,

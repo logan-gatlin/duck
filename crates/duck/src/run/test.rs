@@ -9,7 +9,11 @@
 //! back: a file that a test writes stays written.
 //!
 //! A test is given what `duck run` gives a program: WASI 0.3, with the same
-//! directories, environment and network, and its standard streams.
+//! directories, environment and network, and its standard streams. With the
+//! `gfx` feature it is given what draws too, but that it opens no window: a
+//! surface it makes has a size and nothing that happens to it, so each of
+//! its streams is done from the start, and what is drawn to it is shown
+//! nowhere.
 //!
 //! Each test is reported as it runs, on a [`Console`]: its name as it
 //! starts, and on the same line how it ended and how long it took, as in
@@ -315,12 +319,6 @@ impl Runner {
     pub fn new(component: &[u8], name: &str) -> Result<Self, Error> {
         let engine = Engine::default();
         let component = Component::new(&engine, component).map_err(invalid)?;
-        // A window is opened by the thread that a process starts on, which
-        // runs the tests.
-        #[cfg(feature = "gfx")]
-        if super::gfx::opens_windows(&component, &engine) {
-            return Err(Error::Windowed);
-        }
         let component = linker(&engine)?.instantiate_pre(&component);
         Ok(Self {
             component: component.map_err(invalid)?,
@@ -483,6 +481,8 @@ mod tests {
     use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 
     use super::super::tests::PRELUDE;
+    #[cfg(feature = "gfx")]
+    use super::super::tests::drawing;
     use super::*;
 
     /// The entry file of a program after [`PRELUDE`], which its tests are
@@ -1191,5 +1191,89 @@ pub fn writes_and_exits():
         let error = error.to_string();
         assert!(error.starts_with("cannot run the component"), "{error}");
         assert!(error.contains("my:pkg/host"), "{error}");
+    }
+
+    #[cfg(feature = "gfx")]
+    #[test]
+    fn a_surface_of_a_test_opens_no_window() {
+        // A package that draws: what is generated for the three packages,
+        // every function of which its tests import as it does.
+        let packages = [
+            "wasi:webgpu@0.3.0-rc.2",
+            "wasi-gfx:frame-buffer@0.2.0",
+            "wasi-gfx:surface@0.2.0",
+        ];
+        let settings = drawing(&[
+            "wasi:webgpu/imports@0.3.0-rc.2",
+            "wasi-gfx:surface/webgpu-imports@0.2.0",
+            "wasi-gfx:surface/frame-buffer-imports@0.2.0",
+        ]);
+        let bindings = duck_compiler::bindgen::bindgen(&settings, &packages.map(str::to_string));
+        let checks = r#"
+use main
+use main.check
+
+let pixels: array(u8) = [1, 2, 3, 4, 5, 6, 7, 8]
+let frames: varray(main.FrameEvent) = [main.FrameEvent(nothing: false); 1]
+
+fn surface() -> main.Surface:
+    return main.surface_new(main.CreateDesc(height: .some(20), width: .none))
+
+pub fn is_as_large_as_it_is_asked_to_be():
+    let surface = surface()
+    check(main.surface_width(surface) == 800 and main.surface_height(surface) == 20)
+    main.surface_request_set_size(surface, .none, .some(30))
+    check(main.surface_width(surface) == 30 and main.surface_height(surface) == 20)
+
+pub fn has_nothing_happen_to_it():
+    let stream = main.surface_on_frame(surface())
+    # Nothing is read, as the stream is done: its other end was dropped.
+    check(main.settle(stream, main.surface_on_frame_stream0_read(stream, frames)) == 1)
+
+pub fn keeps_the_pixels_it_is_given():
+    let context = main.surface_frame_buffer_context_new(surface())
+    let buffer = main.surface_frame_buffer_context_get_current_buffer(context)
+    main.buffer_set_with_copy(buffer, pixels)
+    main.surface_frame_buffer_context_present(context)
+    let kept = main.buffer_get_with_copy(buffer)
+    check(kept.len == 8 and kept[7] == 8)
+
+# Whether there is an adapter is the machine's to say.
+pub fn is_drawn_to_by_a_device():
+    match main.gpu_request_adapter(main.get_gpu(), .none):
+        .some(adapter):
+            match main.gpu_adapter_request_device(adapter, .none):
+                .ok(device):
+                    let context = main.surface_webgpu_context_new(surface())
+                    main.surface_webgpu_context_configure(context, main.ContextConfiguration(
+                        device: device,
+                        format: .rgba8unorm,
+                        usage: .none,
+                        view_formats: .none,
+                        color_space: .none,
+                        tone_mapping: .none,
+                        alpha_mode: .none,
+                    ))
+                    let texture = main.surface_webgpu_context_get_current_texture(context)
+                    check(main.gpu_texture_width(texture) == 800)
+                    check(main.gpu_texture_height(texture) == 20)
+                    main.gpu_texture_view_drop(main.gpu_texture_create_view(texture, .none))
+                    main.surface_webgpu_context_present(context)
+                .err(_):
+                    pass
+        .none:
+            pass
+"#;
+        let mut files = Package {
+            entry: format!("{}{PRELUDE}{ENTRY}", bindings.unwrap()),
+            checks: checks.to_string(),
+            settings,
+        };
+        let tests = match duck_compiler::compile_tests(&mut files) {
+            Ok(tests) => tests,
+            Err(errors) => panic!("{errors:#?}"),
+        };
+        let (summary, out, _) = ran(&tests, &[], &[], &[]);
+        assert_eq!((summary.passed, summary.failed), (4, 0), "{out}");
     }
 }

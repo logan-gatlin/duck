@@ -27,22 +27,25 @@ pub struct GfxContext {
 }
 
 struct FBSurfaceArc {
-    surface: Arc<Mutex<softbuffer::Surface<Surface, Surface>>>,
+    /// `None` for a surface that has no window, which softbuffer has nothing
+    /// to show pixels on: what is written to its buffer is kept, and read
+    /// back, and shown nowhere.
+    surface: Option<Arc<Mutex<softbuffer::Surface<Surface, Surface>>>>,
     /// softbuffer only presents pixels written into the current `buffer_mut()`, so
     /// `set_buffer` stashes the frame here and `present` copies + presents it.
     staged: Arc<Mutex<Vec<u32>>>,
 }
 
 impl FBSurfaceArc {
-    pub fn new(surface: softbuffer::Surface<Surface, Surface>) -> Self {
+    pub fn new(surface: Option<softbuffer::Surface<Surface, Surface>>) -> Self {
         Self {
-            surface: Arc::new(Mutex::new(surface)),
+            surface: surface.map(|surface| Arc::new(Mutex::new(surface))),
             staged: Arc::new(Mutex::new(Vec::new())),
         }
     }
     pub fn arc_clone(&self) -> Self {
         Self {
-            surface: Arc::clone(&self.surface),
+            surface: self.surface.clone(),
             staged: Arc::clone(&self.staged),
         }
     }
@@ -116,6 +119,9 @@ impl<'a, S: MainThreadSpawner> surface_frame_buffer::HostContext for SurfaceFram
         let gfx_surface = self.table.get(&gfx_surface)?.arc_clone();
 
         let fb_surface = futures::executor::block_on(self.main_thread_spawner.spawn(move || {
+            if gfx_surface.is_headless() {
+                return FBSurfaceArc::new(None);
+            }
             let fb_context = softbuffer::Context::new(gfx_surface.arc_clone()).unwrap();
             let mut fb_surface =
                 softbuffer::Surface::new(&fb_context, gfx_surface.arc_clone()).unwrap();
@@ -133,7 +139,7 @@ impl<'a, S: MainThreadSpawner> surface_frame_buffer::HostContext for SurfaceFram
                 )
                 .unwrap();
 
-            FBSurfaceArc::new(fb_surface)
+            FBSurfaceArc::new(Some(fb_surface))
         }));
 
         let gfx_context = GfxContext { fb_surface };
@@ -156,8 +162,11 @@ impl<'a, S: MainThreadSpawner> surface_frame_buffer::HostContext for SurfaceFram
         gfx_context: Resource<surface_frame_buffer::Context>,
     ) -> wasmtime::Result<()> {
         let gfx_context = self.table.get_mut(&gfx_context)?;
+        let Some(surface) = &gfx_context.fb_surface.surface else {
+            return Ok(());
+        };
         let staged = gfx_context.fb_surface.staged.lock().unwrap();
-        let mut surface = gfx_context.fb_surface.surface.lock().unwrap();
+        let mut surface = surface.lock().unwrap();
         // The buffer is as large as the window is now, whatever it was when
         // the context was made.
         let one = NonZeroU32::MIN;
