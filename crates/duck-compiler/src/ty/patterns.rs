@@ -2,9 +2,10 @@
 //! and whether the arms cover every value, each matching some that those
 //! before it don't.
 
-use std::collections::HashMap;
 use std::mem;
 use std::ops::Range;
+
+use rustc_hash::FxHashMap;
 
 use crate::ir::{BinOp as IrBinOp, Const, Expr, LocalId, Stmt, UnOp as IrUnOp, ValType};
 use crate::lex::Span;
@@ -310,7 +311,7 @@ impl Body<'_> {
         let mut after = Flow::never();
         for (arm, case) in arms.iter().zip(cases) {
             self.flow = before.clone();
-            self.scopes.push(HashMap::new());
+            self.scopes.push(FxHashMap::default());
             for (name, ty, slots) in case.names {
                 self.bind(name, ty, false, slots);
             }

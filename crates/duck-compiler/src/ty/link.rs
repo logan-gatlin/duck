@@ -14,8 +14,9 @@
 //! it was asked for: a run that traps is reported as if it had trapped
 //! where its constant is checked.
 
-use std::collections::{HashMap, HashSet};
 use std::mem;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::eval::{self, Evaluator, Failure, FailureKind};
 use crate::file::Settings;
@@ -60,7 +61,7 @@ pub(super) struct Linking {
     /// Where each data is placed, once it is.
     addrs: Vec<Option<u64>>,
     /// The place in the table of each function that pointers are taken to.
-    pub(super) table: HashMap<FuncId, u32>,
+    pub(super) table: FxHashMap<FuncId, u32>,
     /// The scalars of each value, once it is found.
     found: Vec<Option<Vec<Const>>>,
     /// The contents of literals, in the order they are placed.
@@ -72,7 +73,7 @@ pub(super) struct Linking {
     data_end: u128,
     /// The address of each constant that functions only read, by its bytes,
     /// what they are aligned to and how many copies there are.
-    shared: HashMap<(Vec<u8>, u32, u64), u64>,
+    shared: FxHashMap<(Vec<u8>, u32, u64), u64>,
     /// The state that the code constants run leaves, which the module
     /// starts with. `None` until one runs any.
     eval: Option<Evaluator>,
@@ -87,7 +88,7 @@ pub(super) struct Linking {
     failed: bool,
     /// What is left of the fuel of each item whose constants ran, by the
     /// item: none runs outside an item, which has none.
-    fuel: HashMap<Option<usize>, u64>,
+    fuel: FxHashMap<Option<usize>, u64>,
     /// The errors of linking, each with how many errors checking had
     /// reported where it was asked for.
     errors: Vec<(usize, TypeError)>,
@@ -162,7 +163,7 @@ pub(super) enum Finding {
     /// By running `thunk`, which may call the functions of `reached`.
     Run {
         thunk: ir::Func,
-        reached: HashSet<FuncId>,
+        reached: FxHashSet<FuncId>,
     },
     /// As the integer of type `prim` after `from`, as an enum's member
     /// `member` counts up from the one before. One past the type is an
@@ -591,7 +592,7 @@ impl Linking {
         let bodies = ids.len();
         ids.extend(pointed);
         let index = |i: usize| FuncId(imported + i as u32);
-        let places: HashMap<_, _> = ids
+        let places: FxHashMap<_, _> = ids
             .iter()
             .enumerate()
             .map(|(i, id)| (*id, index(i)))

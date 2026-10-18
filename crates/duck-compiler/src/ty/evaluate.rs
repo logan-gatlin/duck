@@ -16,8 +16,9 @@
 //! memory holds leads to its function if an earlier run could have called
 //! it, and otherwise to one that traps.
 
-use std::collections::HashSet;
 use std::mem;
+
+use rustc_hash::FxHashSet;
 
 use crate::eval;
 use crate::ir::{self, Expr, FuncId, Stmt, Symbol};
@@ -109,7 +110,7 @@ impl Checker {
         program: &Program,
         thunk: &ir::Func,
         span: Span,
-    ) -> Option<HashSet<FuncId>> {
+    ) -> Option<FxHashSet<FuncId>> {
         let mut work = self.deps.last().cloned().unwrap_or_default();
         push_calls(&thunk.body, &mut work);
         // Only a function that is lowered for a constant has run, or been
@@ -120,7 +121,7 @@ impl Checker {
         };
         let pointed = self.table.iter().filter(ran);
         work.extend(pointed.map(|id| Dep::Func(*id)));
-        let (mut funcs, mut items) = (HashSet::new(), HashSet::new());
+        let (mut funcs, mut items) = (FxHashSet::default(), FxHashSet::default());
         while let Some(dep) = work.pop() {
             let id = match dep {
                 Dep::Item(index) => {

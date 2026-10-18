@@ -3,8 +3,9 @@
 //! of a `match`. Nothing reads one before it is assigned, however control
 //! got there, and a `let` is assigned only where it may not have been.
 
-use std::collections::HashMap;
 use std::mem;
+
+use rustc_hash::FxHashMap;
 
 use crate::lex::Span;
 use crate::parse::{self, BinOp, Binding, ExprKind, Mutability, Pattern, PatternKind};
@@ -20,7 +21,7 @@ pub(super) struct Flow {
     /// so nothing is reported of it.
     dead: bool,
     /// What is known of each of the variables, by its `order`.
-    vars: HashMap<usize, Init>,
+    vars: FxHashMap<usize, Init>,
 }
 
 /// What is known of a variable declared without a value.
@@ -65,7 +66,7 @@ impl Flow {
     pub(super) fn never() -> Self {
         Self {
             dead: true,
-            vars: HashMap::new(),
+            vars: FxHashMap::default(),
         }
     }
 

@@ -3,8 +3,9 @@
 //! the value that it is given at once, which says in two lines what one
 //! does.
 
-use std::collections::HashSet;
 use std::slice;
+
+use rustc_hash::FxHashSet;
 
 use crate::file::{FileId, FileManager};
 use crate::lex::Span;
@@ -85,11 +86,11 @@ impl Analysis {
         let uses = self.program.uses.iter();
         let written =
             uses.flat_map(|used| used.path.iter().chain(&used.members).chain([&used.name]));
-        let written: HashSet<Span> = written.map(|name| name.span).collect();
+        let written: FxHashSet<Span> = written.map(|name| name.span).collect();
         // What is named somewhere other than where it is declared, and in
         // which files by which names.
-        let mut named: HashSet<Span> = HashSet::new();
-        let mut named_as: HashSet<(FileId, &str, Span)> = HashSet::new();
+        let mut named: FxHashSet<Span> = FxHashSet::default();
+        let mut named_as: FxHashSet<(FileId, &str, Span)> = FxHashSet::default();
         let texts: Vec<_> = (self.files().into_iter())
             .map(|file| (file, src.file(file).to_string()))
             .collect();

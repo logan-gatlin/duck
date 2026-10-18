@@ -9,6 +9,9 @@ edition = "2024"
 gfx = []
 
 [dependencies]
+# The hash of every map of the compiler: fast on the short names and ids it
+# keys them by, and the same from one build to the next.
+rustc-hash = "2.1.3"
 wasm-encoder = "0.259.0"
 wit-component = "0.258.3"
 wit-parser = "0.258.3"

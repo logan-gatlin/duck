@@ -11,12 +11,13 @@
 //! address or the value, placing and running each in the order lowering
 //! asked for them once every function is lowered.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::iter;
 use std::mem;
 use std::ops::{Deref, DerefMut, Range};
 use std::rc::Rc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::eval;
 use crate::file::{FileId, FileManager, IncludeError, Includes, Settings};
@@ -904,10 +905,10 @@ struct Tracked<T> {
 #[derive(Default)]
 struct Checker {
     /// The names declared in each module: its items and what it uses.
-    scopes: HashMap<FileId, HashMap<String, Entry>>,
+    scopes: FxHashMap<FileId, FxHashMap<String, Entry>>,
     /// The names each module uses that weren't found, which are reported
     /// where they are used and not again where they are named.
-    unresolved: HashSet<(FileId, String)>,
+    unresolved: FxHashSet<(FileId, String)>,
     /// How far each `use` of the program is declared.
     uses: Vec<Visit>,
     /// The module whose names are in scope.
@@ -916,8 +917,8 @@ struct Checker {
     entry: FileId,
     /// The test modules of the package that `entry` is in, each of which
     /// sees all of that package, and the modules of that package.
-    test_modules: HashSet<FileId>,
-    package: HashSet<FileId>,
+    test_modules: FxHashSet<FileId>,
+    package: FxHashSet<FileId>,
     /// The tests of the program, in the order they run in, each with the
     /// function it is.
     tests: Vec<(Test, FuncId)>,
@@ -954,7 +955,7 @@ struct Checker {
     list_bounds: Vec<(StructId, Span)>,
     /// Each instance of a generic struct by its declaration and type
     /// arguments.
-    instances: HashMap<(StructId, Vec<Ty>), StructId>,
+    instances: FxHashMap<(StructId, Vec<Ty>), StructId>,
     /// Every generic struct's type parameters, indexed by [`ParamId`].
     params: Tracked<Vec<ParamDef>>,
     /// The type parameters in scope, and the types they stand for: themselves
@@ -978,17 +979,17 @@ struct Checker {
     generics_defined: bool,
     /// The pointee of each pointer type, and whether it's a `&var`.
     pointees: Vec<(Ty, bool)>,
-    ptr_ids: HashMap<(Ty, bool), PtrId>,
+    ptr_ids: FxHashMap<(Ty, bool), PtrId>,
     /// The element types of each tuple type.
     tuples: Vec<Vec<Ty>>,
-    tuple_ids: HashMap<Vec<Ty>, TupleId>,
+    tuple_ids: FxHashMap<Vec<Ty>, TupleId>,
     /// The type of each array type's `ptr` field, which points to its
     /// elements. A `varray`'s is a `&var`.
     arrays: Vec<Ty>,
-    array_ids: HashMap<Ty, ArrayId>,
+    array_ids: FxHashMap<Ty, ArrayId>,
     /// The parameter types and result type of each function type.
     fn_tys: Vec<(Vec<Ty>, Ty)>,
-    fn_ty_ids: HashMap<(Vec<Ty>, Ty), FnId>,
+    fn_ty_ids: FxHashMap<(Vec<Ty>, Ty), FnId>,
     /// Whether every struct's fields are known, so pointer types can be
     /// checked for storability as they are resolved.
     structs_defined: bool,
@@ -1013,48 +1014,48 @@ struct Checker {
     open_funcs: Vec<FuncSig>,
     /// Each function that is declared in another, by the function whose
     /// body declares it, if that is one, and where it is declared.
-    nested: HashMap<(Option<FuncId>, Span), FuncId>,
+    nested: FxHashMap<(Option<FuncId>, Span), FuncId>,
     /// What each function that is declared in another is beyond its
     /// signature: what it is named and what it captures.
-    nested_fns: Tracked<HashMap<FuncId, NestedFn>>,
+    nested_fns: Tracked<FxHashMap<FuncId, NestedFn>>,
     /// Every type that the result of a function hides, indexed by
     /// [`OpaqueId`].
     opaques: Tracked<Vec<OpaqueDef>>,
     /// Each member of a struct, a tuple or an array as [`Self::places`]
     /// found it, which every read of a field asks for, and the
     /// [`Self::shape`] they were found at.
-    places: HashMap<Ty, Vec<(Ty, Range<usize>, u32)>>,
+    places: FxHashMap<Ty, Vec<(Ty, Range<usize>, u32)>>,
     placed: u64,
     /// The result being resolved, if it's that of a function with a body:
     /// nothing else hides a type.
     opaque_site: Option<OpaqueSite>,
     /// Each opaque type of an instance of a generic function, by the one
     /// that the declaration has in its place and the type arguments.
-    opaque_instances: HashMap<(OpaqueId, Vec<Ty>), OpaqueId>,
+    opaque_instances: FxHashMap<(OpaqueId, Vec<Ty>), OpaqueId>,
     /// The function `==` compares each array type through.
-    eq_funcs: HashMap<Ty, FuncId>,
+    eq_funcs: FxHashMap<Ty, FuncId>,
     /// The functions that pointers call, in the order their pointers are
     /// first taken. Each is at the table index one past its place here.
     table: Vec<FuncId>,
-    table_indices: HashMap<FuncId, u32>,
+    table_indices: FxHashMap<FuncId, u32>,
     /// The function that pointers to each imported function call it
     /// through, for those that a call doesn't pass wasm values as they
     /// are: the host may give a result out of range, or takes or gives
     /// one in memory.
-    wrappers: HashMap<FuncId, FuncId>,
+    wrappers: FxHashMap<FuncId, FuncId>,
     /// The imported functions that are built-ins of the component model,
     /// which no WIT declares: each is passed what it is declared with.
-    builtins: HashSet<FuncId>,
+    builtins: FxHashSet<FuncId>,
     /// Generic function declarations, indexed by [`GenericFnId`].
     generic_fns: Vec<GenericFn>,
     /// Each instance of a generic function by its declaration and type
     /// arguments.
-    fn_instances: HashMap<(GenericFnId, Vec<Ty>), FuncId>,
+    fn_instances: FxHashMap<(GenericFnId, Vec<Ty>), FuncId>,
     /// Where the body of a generic function uses a value of a bounded type
     /// parameter as its bound, by the file and start of what does: the name
     /// of a field it reads, or the value a `match` takes apart. Each
     /// instance uses it as that bound too.
-    bound_uses: HashMap<(FileId, usize), Ty>,
+    bound_uses: FxHashMap<(FileId, usize), Ty>,
     /// While checking or lowering an instance of a generic function, it and
     /// the instances whose calls led to it, innermost first. Given to errors.
     instance_chain: Vec<InstanceCall>,
@@ -1093,26 +1094,26 @@ struct Checker {
     /// names, innermost last.
     deps: Vec<Vec<Dep>>,
     /// What the constants of each item that is folded name.
-    item_deps: HashMap<usize, Vec<Dep>>,
+    item_deps: FxHashMap<usize, Vec<Dep>>,
     /// The functions lowered for a constant to call, which are lowered once,
     /// and what each names.
-    lowered: HashMap<FuncId, ir::Func>,
-    func_deps: HashMap<FuncId, Vec<Dep>>,
+    lowered: FxHashMap<FuncId, ir::Func>,
+    func_deps: FxHashMap<FuncId, Vec<Dep>>,
     /// The functions being lowered for a constant to call.
-    lowering: HashSet<FuncId>,
+    lowering: FxHashSet<FuncId>,
     /// Whether the functions being lowered are lowered in the turn of their
     /// package, and those that were, which no constant was run to call.
     normal: bool,
-    normally: HashSet<FuncId>,
+    normally: FxHashSet<FuncId>,
     /// Every function that a constant that is run may call.
-    ran: HashSet<FuncId>,
+    ran: FxHashSet<FuncId>,
     /// Whether the initializer being checked read a global whose own has no
     /// value, so that what is made of it is no value either.
     unknown: bool,
     errors: Vec<TypeError>,
     /// The type of each expression and of each name a pattern binds, by
     /// where it is written, if they are kept for an [`Analysis`].
-    types: Option<HashMap<Span, Ty>>,
+    types: Option<FxHashMap<Span, Ty>>,
 }
 
 /// The functions that were running where code run for a constant stopped,
@@ -1279,7 +1280,7 @@ struct Body<'c> {
     fns: Vec<(String, Ty)>,
     ret: Ty,
     locals: Vec<ir::Local>,
-    scopes: Vec<HashMap<String, Var>>,
+    scopes: Vec<FxHashMap<String, Var>>,
     /// Enclosing wasm labels, innermost last.
     labels: Vec<Label>,
     /// The `defer`s of each enclosing block, innermost last.
@@ -1315,7 +1316,7 @@ struct Body<'c> {
     flow: Flow,
     /// Each variable declared without a value, by its `order`, and whether
     /// an assignment to it that may not be its first is reported.
-    late: HashMap<usize, bool>,
+    late: FxHashMap<usize, bool>,
     /// The loops being lowered, innermost last.
     rounds: Vec<Round>,
     /// How many variables were bound before the innermost `defer` whose
@@ -3595,7 +3596,7 @@ impl Checker {
             Err(e) => (World::default(), Some(e)),
         };
         let mut ck = Self {
-            types: records.then(HashMap::new),
+            types: records.then(FxHashMap::default),
             entry: program.entry,
             test_modules: program.tests.iter().map(|test| test.file).collect(),
             package: program.package.clone(),
@@ -3626,7 +3627,7 @@ impl Checker {
     fn resolve_start(&mut self, program: &Program, name: &str) -> Option<FuncId> {
         self.module = self.entry;
         if let Some(Item::GenericFn(generic)) = self.item(name) {
-            let (_, decl) = generic_fn_decls(program).nth(generic.0 as usize).unwrap();
+            let (_, decl) = self.generic_fn_decl(program, generic);
             let span = decl.sig.name.span;
             self.error(TypeErrorKind::InvalidStart(name.to_string()), span);
             return None;
@@ -4929,7 +4930,7 @@ impl<'c> Body<'c> {
             fns: Vec::new(),
             ret,
             locals: Vec::new(),
-            scopes: vec![HashMap::new()],
+            scopes: vec![FxHashMap::default()],
             labels: Vec::new(),
             defers: Vec::new(),
             deferring: None,
@@ -4941,7 +4942,7 @@ impl<'c> Body<'c> {
             branches: 0,
             assigned: Vec::new(),
             flow: Flow::default(),
-            late: HashMap::new(),
+            late: FxHashMap::default(),
             rounds: Vec::new(),
             deferred_from: None,
         }
@@ -5078,7 +5079,7 @@ impl<'c> Body<'c> {
     }
 
     fn block(&mut self, block: &parse::Block) -> Vec<Stmt> {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FxHashMap::default());
         self.defers.push(Deferred {
             nesting: self.labels.len(),
             bodies: Vec::new(),
@@ -5447,7 +5448,7 @@ impl<'c> Body<'c> {
             }
             _ => (elem, self.load(at, 0, elem)),
         };
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FxHashMap::default());
         let (place, dests) = self.for_bindings(index, pattern, bound);
         self.set_leaves(dests, each, &mut inner);
         inner.extend(place.map(|place| Stmt::SetLocal(place, i.clone())));
@@ -5512,7 +5513,7 @@ impl<'c> Body<'c> {
             1,
             binary(vt, reached, n.clone(), Expr::Local(limit)),
         )];
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FxHashMap::default());
         let (_, dests) = self.for_bindings(index, pattern, elem);
         self.set_leaves(dests, scalar(vt, n.clone()), &mut inner);
         // Advanced before the body, so `continue` moves on too. It is less

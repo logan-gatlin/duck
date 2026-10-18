@@ -1,5 +1,6 @@
-use std::collections::HashMap;
 use std::rc::Rc;
+
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FileId(usize);
@@ -78,7 +79,7 @@ pub type Included = Result<Rc<[u8]>, IncludeError>;
 
 /// What each `module.include` of a program includes, by the module it is in
 /// and the path it names.
-pub type Includes = HashMap<(FileId, String), Included>;
+pub type Includes = FxHashMap<(FileId, String), Included>;
 
 /// Why a `module.include` includes nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -8,10 +8,11 @@
 //! by its path from that directory, and loaded where the files have any:
 //! after the entry point and every module it uses.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::mem;
 use std::ops::Range;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Error;
 use crate::file::{self, FileId, FileManager, Includes, TestModule};
@@ -60,7 +61,7 @@ pub struct Program {
     pub tests: Vec<TestModule>,
     /// The modules of the package that `entry` is in, its test modules
     /// among them: those a test module sees all of, `pub` or not.
-    pub package: HashSet<FileId>,
+    pub package: FxHashSet<FileId>,
 }
 
 /// The items of one package of a program.
@@ -100,7 +101,7 @@ pub struct Use {
 /// again.
 #[derive(Default)]
 pub struct Parsed {
-    files: HashMap<FileId, Read>,
+    files: FxHashMap<FileId, Read>,
 }
 
 /// A file as it was read, and what was made of it.
@@ -121,7 +122,7 @@ struct Loader<'f, F> {
     /// kept.
     parsed: Option<&'f mut Parsed>,
     /// The modules loaded or being loaded, which are not loaded again.
-    seen: HashSet<FileId>,
+    seen: FxHashSet<FileId>,
     items: Vec<Item>,
     uses: Vec<Use>,
     includes: Includes,
@@ -130,7 +131,7 @@ struct Loader<'f, F> {
     /// of one package.
     within: Vec<(FileId, FileId)>,
     /// The module that each module's package is reached by.
-    roots: HashMap<FileId, FileId>,
+    roots: FxHashMap<FileId, FileId>,
     /// Each package that a package depends on, by those modules, in the
     /// order its modules first use them.
     depends: Vec<(FileId, FileId)>,
@@ -183,9 +184,9 @@ impl Program {
             items: module.items,
             uses: Vec::new(),
             entry,
-            includes: HashMap::new(),
+            includes: FxHashMap::default(),
             tests: Vec::new(),
-            package: HashSet::from([entry]),
+            package: FxHashSet::from_iter([entry]),
         }
     }
 }
@@ -230,12 +231,12 @@ impl<'f, F: FileManager> Loader<'f, F> {
             files,
             partial,
             parsed,
-            seen: HashSet::new(),
+            seen: FxHashSet::default(),
             items: Vec::new(),
             uses: Vec::new(),
-            includes: HashMap::new(),
+            includes: FxHashMap::default(),
             within: Vec::new(),
-            roots: HashMap::from([(entry, entry)]),
+            roots: FxHashMap::from_iter([(entry, entry)]),
             depends: Vec::new(),
             errors: Vec::new(),
         };
@@ -271,8 +272,8 @@ impl<'f, F: FileManager> Loader<'f, F> {
     /// The modules of the package that `entry` is in: it, `tests`, and each
     /// that a path from the root of the package, or from its test
     /// directory, leads to from one of them. A dependency's are not.
-    fn package(&self, entry: FileId, tests: &[TestModule]) -> HashSet<FileId> {
-        let mut package = HashSet::from([entry]);
+    fn package(&self, entry: FileId, tests: &[TestModule]) -> FxHashSet<FileId> {
+        let mut package = FxHashSet::from_iter([entry]);
         package.extend(tests.iter().map(|test| test.file));
         let mut found = true;
         while found {
@@ -292,9 +293,9 @@ impl<'f, F: FileManager> Loader<'f, F> {
     /// package of `entry`.
     fn group(&mut self, entry: FileId) -> Vec<PackageItems> {
         let mut order = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = FxHashSet::default();
         self.visit_package(entry, &mut visited, &mut order);
-        let position: HashMap<_, _> = order
+        let position: FxHashMap<_, _> = order
             .iter()
             .enumerate()
             .map(|(i, root)| (*root, i))
@@ -329,7 +330,12 @@ impl<'f, F: FileManager> Loader<'f, F> {
 
     /// Adds the package that `root` reaches to `order`, after each it
     /// depends on that isn't there yet.
-    fn visit_package(&self, root: FileId, visited: &mut HashSet<FileId>, order: &mut Vec<FileId>) {
+    fn visit_package(
+        &self,
+        root: FileId,
+        visited: &mut FxHashSet<FileId>,
+        order: &mut Vec<FileId>,
+    ) {
         if !visited.insert(root) {
             return;
         }
@@ -776,7 +782,7 @@ mod tests {
             .map(|test| test.path.join("."))
             .collect();
         assert_eq!(tests, ["late", "deep.early", "support"]);
-        let files_of = |names: &[&str]| -> HashSet<FileId> {
+        let files_of = |names: &[&str]| -> FxHashSet<FileId> {
             names.iter().map(|name| files.id(name)).collect()
         };
         assert_eq!(
@@ -793,7 +799,7 @@ mod tests {
     }
 
     /// The ids of the files of `files` that `names` name.
-    fn files_of_all(files: &Memory, names: &[&str]) -> HashSet<FileId> {
+    fn files_of_all(files: &Memory, names: &[&str]) -> FxHashSet<FileId> {
         names.iter().map(|name| files.id(name)).collect()
     }
 

@@ -6,9 +6,10 @@
 //! pattern binds. What a name stands for is found here, as the checker finds
 //! it: a variable of the function it's in, or else an item of its module.
 
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::ptr;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::file::{FileId, FileManager, Settings};
 use crate::lex::Span;
@@ -44,7 +45,7 @@ pub struct Analysis {
     /// The items of each file, each by its place in the program, in the
     /// order they are written: what is at a place is looked for in the one
     /// that holds it, and in no other.
-    items: HashMap<FileId, Vec<usize>>,
+    items: FxHashMap<FileId, Vec<usize>>,
 }
 
 /// What is written at a place.
@@ -216,7 +217,7 @@ struct Walk<'p> {
 /// The source of the program's files, each read once.
 struct Sources<'f> {
     read: &'f mut dyn FnMut(FileId) -> String,
-    files: HashMap<FileId, String>,
+    files: FxHashMap<FileId, String>,
 }
 
 /// The longest initializer shown with a global: one longer says less of the
@@ -262,7 +263,7 @@ const MAX_USES: usize = 64;
 pub fn analyze(program: Program, settings: &Settings) -> Analysis {
     let (ck, ..) = lower_program(&program, settings, true, false);
     let start = settings.start.clone();
-    let mut items: HashMap<FileId, Vec<usize>> = HashMap::new();
+    let mut items: FxHashMap<FileId, Vec<usize>> = FxHashMap::default();
     for (index, item) in program.items.iter().enumerate() {
         items.entry(item.span.file).or_default().push(index);
     }
@@ -472,7 +473,7 @@ impl Analysis {
         let name = src.text(wanted);
         let uses = self.program.uses.iter();
         let used = uses.flat_map(|used| used.path.last().into_iter().chain([&used.name]));
-        let used: HashSet<&str> = used.map(|name| name.name.as_str()).collect();
+        let used: FxHashSet<&str> = used.map(|name| name.name.as_str()).collect();
         let mut references = Vec::new();
         for file in self.files() {
             for (start, word) in names(src.file(file)) {
@@ -652,7 +653,7 @@ impl Analysis {
             });
         }
         // A name stands for the nearest thing it is the name of.
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         names.retain(|completion| seen.insert(completion.name.clone()));
         names
     }
@@ -2134,7 +2135,7 @@ impl<'f> Sources<'f> {
     fn new(read: &'f mut dyn FnMut(FileId) -> String) -> Self {
         Self {
             read,
-            files: HashMap::new(),
+            files: FxHashMap::default(),
         }
     }
 

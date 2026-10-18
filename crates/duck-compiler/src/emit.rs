@@ -13,8 +13,7 @@
 //! every module [`crate::eval`] runs shares the one state. A wasm engine runs
 //! it as the evaluator does.
 
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
@@ -33,7 +32,7 @@ pub const HOST: &str = "host";
 #[derive(Default)]
 struct Types {
     section: TypeSection,
-    ids: HashMap<FuncType, u32>,
+    ids: FxHashMap<FuncType, u32>,
 }
 
 impl Types {

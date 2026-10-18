@@ -2,8 +2,9 @@
 //! type. A value is stored as its member's constant, so each use of a member,
 //! like `ReturnCode.ok`, builds a fresh copy of it.
 
-use std::collections::HashMap;
 use std::mem;
+
+use rustc_hash::FxHashMap;
 
 use crate::file::FileId;
 use crate::ir::{Const, Expr, Stmt, ValType};
@@ -477,7 +478,7 @@ impl Body<'_> {
         pattern: &Pattern,
         body: &parse::Block,
     ) -> Stmt {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FxHashMap::default());
         let (place, dests) = self.for_bindings(index, pattern, Ty::Enum(id));
         self.enter_round();
         // An enum may have no members to run it for.

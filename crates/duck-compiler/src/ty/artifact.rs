@@ -26,8 +26,9 @@
 //! [`Artifact::encode`] writes one as bytes, and [`Artifact::decode`] reads
 //! them back, so that one is kept, sent and linked elsewhere.
 
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::file::{FileId, FileManager, Settings};
 use crate::ir::{
@@ -290,9 +291,9 @@ struct Extract<'c> {
     uses: Vec<String>,
     /// The files of its spans, in the order they are numbered.
     files: Vec<FileId>,
-    file_index: HashMap<FileId, usize>,
+    file_index: FxHashMap<FileId, usize>,
     foreign: Foreigns,
-    foreign_index: HashMap<Foreign, u32>,
+    foreign_index: FxHashMap<Foreign, u32>,
 }
 
 /// What lowering numbers that an artifact numbers as its own, and that
@@ -385,9 +386,9 @@ impl Checker {
                 package: index,
                 uses: Vec::new(),
                 files: Vec::new(),
-                file_index: HashMap::new(),
+                file_index: FxHashMap::default(),
                 foreign: Foreigns::default(),
-                foreign_index: HashMap::new(),
+                foreign_index: FxHashMap::default(),
             };
             // Only the package of the entry exports anything, and runs
             // what it names, which may be of another.
@@ -864,7 +865,7 @@ fn renumber_expr(expr: &mut Expr, f: &mut impl FnMut(Ref) -> Ref) {
 /// linking them, each in the file of [`Artifact::linked_files`] that its
 /// [`FileId`] is minted from the index of.
 pub fn link(artifacts: &[Artifact], settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
-    let mut names = HashMap::new();
+    let mut names = FxHashMap::default();
     for (index, artifact) in artifacts.iter().enumerate() {
         names.entry(artifact.name.clone()).or_insert(index);
     }
@@ -1567,7 +1568,7 @@ impl<T: Decode> Decode for Box<T> {
     }
 }
 
-impl Encode for HashSet<FuncId> {
+impl Encode for FxHashSet<FuncId> {
     fn encode(&self, w: &mut Writer) {
         // In order, so that one set is always the same bytes.
         let mut ids: Vec<_> = self.iter().copied().collect();
@@ -1576,7 +1577,7 @@ impl Encode for HashSet<FuncId> {
     }
 }
 
-impl Decode for HashSet<FuncId> {
+impl Decode for FxHashSet<FuncId> {
     fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
         Ok(Vec::<FuncId>::decode(r)?.into_iter().collect())
     }

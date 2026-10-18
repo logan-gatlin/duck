@@ -35,6 +35,12 @@ const MAX_DEPTH: usize = 8;
 pub struct Files {
     /// Every opened file; the first is the entry point.
     files: Vec<File>,
+    /// Each of those by its canonical path.
+    by_canonical: HashMap<PathBuf, FileId>,
+    /// The file that a module or a library at each path was opened as, or
+    /// none if none could be: a path is read once in a build, however many
+    /// `use`s lead along it.
+    opened: HashMap<PathBuf, Option<FileId>>,
     /// Indexed like [`Packages`].
     packages: Vec<Package>,
     /// The test modules of the package being built, in order of their
@@ -123,6 +129,8 @@ impl Files {
         });
         let mut files = Self {
             files: Vec::new(),
+            by_canonical: HashMap::new(),
+            opened: HashMap::new(),
             packages: packages.collect(),
             tests: Vec::new(),
             test_root: None,
@@ -166,8 +174,7 @@ impl Files {
 
     /// The opened file at the canonical path `path`, if one is.
     pub fn find(&self, path: &Path) -> Option<FileId> {
-        let file = self.files.iter().find(|f| f.canonical == path)?;
-        Some(file.id)
+        self.by_canonical.get(path).copied()
     }
 
     /// Includes each file as `cache` last read it, where it is as it was
@@ -213,20 +220,12 @@ impl Files {
     /// read already.
     fn read(&mut self, path: PathBuf, package: usize) -> io::Result<FileId> {
         let canonical = fs::canonicalize(&path)?;
-        self.read_canonical(path, canonical, package)
-    }
-
-    fn read_canonical(
-        &mut self,
-        path: PathBuf,
-        canonical: PathBuf,
-        package: usize,
-    ) -> io::Result<FileId> {
-        if let Some(file) = self.files.iter().find(|f| f.canonical == canonical) {
-            return Ok(file.id);
+        if let Some(id) = self.find(&canonical) {
+            return Ok(id);
         }
         let id = Self::mint_file_id(self.files.len());
         let contents = fs::read_to_string(&canonical)?;
+        self.by_canonical.insert(canonical.clone(), id);
         self.files.push(File {
             id,
             path,
@@ -235,6 +234,17 @@ impl Files {
             package,
         });
         Ok(id)
+    }
+
+    /// Opens the file at `path`, of package `package`, as [`Self::read`]
+    /// does, but only the first time it is asked for.
+    fn open_path(&mut self, path: PathBuf, package: usize) -> Option<FileId> {
+        if let Some(opened) = self.opened.get(&path) {
+            return *opened;
+        }
+        let opened = self.read(path.clone(), package).ok();
+        self.opened.insert(path, opened);
+        opened
     }
 
     fn get(&self, id: FileId) -> &File {
@@ -422,7 +432,7 @@ impl FileManager for Files {
         let mut file = self.packages[package].root.clone();
         file.extend(dirs);
         file.push(format!("{name}.{EXTENSION}"));
-        self.read(file, package).ok()
+        self.open_path(file, package)
     }
 
     fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId> {
@@ -430,7 +440,7 @@ impl FileManager for Files {
         let (_, package) = dependencies.iter().find(|(dep, _)| dep == name)?;
         let package = *package;
         let library = self.packages[package].library.clone()?;
-        self.read(library, package).ok()
+        self.open_path(library, package)
     }
 
     fn tests(&mut self) -> Vec<TestModule> {

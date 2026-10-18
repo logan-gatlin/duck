@@ -12,14 +12,15 @@
 //! alignment are known. So what is right there is right for every list of
 //! type arguments, and an instance is lowered without being checked again.
 
-use std::collections::HashMap;
 use std::mem;
 use std::ops::Range;
+
+use rustc_hash::FxHashMap;
 
 use crate::ir::{self, FuncId};
 use crate::lex::Span;
 use crate::load::Program;
-use crate::parse::{self, Arg, FnSig};
+use crate::parse::{self, Arg, FnSig, ItemKind};
 
 use super::opaque::{OpaqueSite, Owner};
 use super::{
@@ -259,7 +260,7 @@ impl Checker {
     /// that memory can't hold.
     fn instance_sig(&mut self, generic: GenericFnId, args: &[Ty], call: Span) -> Option<FuncSig> {
         let sig = self.generic_fns[generic.0 as usize].sig.clone();
-        let mut sizes = HashMap::new();
+        let mut sizes = FxHashMap::default();
         let size = args.iter().map(|arg| self.written_size(*arg, &mut sizes));
         if size.fold(0, u64::saturating_add) > MAX_INSTANCE_SIZE {
             self.error(TypeErrorKind::InstanceTooLarge(sig.name), call);
@@ -303,6 +304,20 @@ impl Checker {
         self.instance_sig(generic, args, call)
     }
 
+    /// The item of `program` that declares the generic function `generic`,
+    /// and its declaration.
+    pub(super) fn generic_fn_decl<'p>(
+        &self,
+        program: &'p Program,
+        generic: GenericFnId,
+    ) -> (&'p parse::Item, &'p parse::FnDecl) {
+        let item = &program.items[self.generic_fn_items[generic.0 as usize]];
+        match &item.kind {
+            ItemKind::Fn(decl) => (item, decl),
+            _ => unreachable!("a generic function is declared by a function"),
+        }
+    }
+
     /// Lowers function `id`, an instance of a generic function. Its
     /// declaration is right for every list of type arguments, so an error in
     /// lowering it is one that checking the declaration missed.
@@ -312,9 +327,7 @@ impl Checker {
         id: FuncId,
         instance: FnInstance,
     ) -> ir::Func {
-        let (item, decl) = generic_fn_decls(program)
-            .nth(instance.generic.0 as usize)
-            .unwrap();
+        let (item, decl) = self.generic_fn_decl(program, instance.generic);
         self.module = item.span.file;
         let names = decl.sig.type_param_names().into_iter().map(|p| p.name);
         self.type_params = names.zip(instance.args).collect();
@@ -426,7 +439,7 @@ impl Checker {
     /// How many types `ty` is written with, counting itself and each type
     /// within it wherever it's written. Memoized in `sizes`, since types that
     /// hold the same type many times over are written exponentially long.
-    fn written_size(&self, ty: Ty, sizes: &mut HashMap<Ty, u64>) -> u64 {
+    fn written_size(&self, ty: Ty, sizes: &mut FxHashMap<Ty, u64>) -> u64 {
         if let Some(size) = sizes.get(&ty) {
             return *size;
         }

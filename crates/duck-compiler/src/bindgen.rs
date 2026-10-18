@@ -18,9 +18,9 @@
 //! is declared once. Two of a name are each named for their interface too,
 //! and for their package where that still doesn't tell them apart.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use wit_parser::{
     Docs, Function, FunctionKind, Handle, InterfaceId, Resolve, Type, TypeDefKind, TypeId,
     TypeOwner, WorldItem,
@@ -73,10 +73,10 @@ struct Generator<'a> {
     /// The types that are declared, in the order they are met.
     types: Vec<TypeId>,
     /// What each of those is named.
-    names: HashMap<TypeId, String>,
+    names: FxHashMap<TypeId, String>,
     /// What each of those is named with the words of WIT, each `-` kept,
     /// which the constants of `flags` are named after.
-    words: HashMap<TypeId, String>,
+    words: FxHashMap<TypeId, String>,
 }
 
 impl fmt::Display for BindgenError {
@@ -145,15 +145,15 @@ pub fn bindgen(settings: &Settings, names: &[String]) -> Result<String, BindgenE
             _ => None,
         }));
     }
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     interfaces.retain(|id| seen.insert(*id));
     let mut generator = Generator {
         world: &world,
         resolve,
         interfaces,
         types: Vec::new(),
-        names: HashMap::new(),
-        words: HashMap::new(),
+        names: FxHashMap::default(),
+        words: FxHashMap::default(),
     };
     generator.collect();
     let asked: String = names.iter().map(|name| format!(" {name}")).collect();
