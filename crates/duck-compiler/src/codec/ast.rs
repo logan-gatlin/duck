@@ -4,8 +4,6 @@
 //! exactly what was parsed: nothing is derived from the rest.
 
 use crate::codec::{Decode, DecodeError, Encode, Reader, Writer, bad, lists};
-use crate::file::FileId;
-use crate::load;
 use crate::parse::{
     Arg, Arm, BinOp, Binding, Entry, EnumDecl, Expr, ExprKind, ExternBlock, ExternFn, Field,
     FnDecl, FnSig, Ident, Item, ItemKind, Member, Module, Mutability, Param, Pattern, PatternKind,
@@ -30,7 +28,6 @@ lists!(
     Arm,
     Expr,
     Arg,
-    load::Use,
 );
 
 impl Encode for Module {
@@ -985,39 +982,11 @@ impl Decode for BinOp {
     }
 }
 
-/// A file is written by its index, as a span's is.
-impl Encode for load::Use {
-    fn encode(&self, w: &mut Writer) {
-        self.module.index().encode(w);
-        self.name.encode(w);
-        self.target.index().encode(w);
-        self.target_path.encode(w);
-        self.path.encode(w);
-        self.members.encode(w);
-        self.is_pub.encode(w);
-        self.decl.encode(w);
-    }
-}
-
-impl Decode for load::Use {
-    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
-        Ok(load::Use {
-            module: FileId::minted(usize::decode(r)?),
-            name: Decode::decode(r)?,
-            target: FileId::minted(usize::decode(r)?),
-            target_path: Decode::decode(r)?,
-            path: Decode::decode(r)?,
-            members: Decode::decode(r)?,
-            is_pub: Decode::decode(r)?,
-            decl: Decode::decode(r)?,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lex::{Span, tokenize};
+    use crate::file::FileId;
+    use crate::lex::tokenize;
     use crate::parse::parse_partial;
 
     fn parse(src: &str) -> Module {
@@ -1030,7 +999,7 @@ mod tests {
     fn bytes<T: Encode>(value: &T) -> Vec<u8> {
         let mut w = Writer::default();
         value.encode(&mut w);
-        w.0
+        w.bytes
     }
 
     fn roundtrip(src: &str) {
@@ -1228,47 +1197,7 @@ mod tests {
         1usize.encode(&mut w);
         true.encode(&mut w);
         w.tag(200);
-        let err = Module::decode(&mut Reader::new(&w.0)).unwrap_err();
+        let err = Module::decode(&mut Reader::new(&w.bytes)).unwrap_err();
         assert_eq!(err, bad("item", 200));
-    }
-
-    #[test]
-    fn a_use_roundtrips() {
-        let span = |start, end| Span {
-            file: FileId::minted(3),
-            start,
-            end,
-        };
-        let ident = |name: &str, start| Ident {
-            name: name.to_string(),
-            span: span(start, start + name.len()),
-        };
-        let uses = vec![
-            load::Use {
-                module: FileId::minted(3),
-                name: ident("length", 25),
-                target: FileId::minted(7),
-                target_path: "geo".to_string(),
-                path: vec![ident("geo", 4)],
-                members: vec![ident("len", 18)],
-                is_pub: true,
-                decl: span(0, 32),
-            },
-            load::Use {
-                module: FileId::minted(3),
-                name: ident("json", 37),
-                target: FileId::minted(9),
-                target_path: "json".to_string(),
-                path: vec![ident("json", 37)],
-                members: vec![],
-                is_pub: false,
-                decl: span(33, 41),
-            },
-        ];
-        let bytes = bytes(&uses);
-        let mut r = Reader::new(&bytes);
-        let decoded = Vec::<load::Use>::decode(&mut r).unwrap();
-        assert!(r.done());
-        assert_eq!(decoded, uses);
     }
 }

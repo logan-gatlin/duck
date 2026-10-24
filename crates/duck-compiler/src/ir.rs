@@ -14,7 +14,7 @@
 
 /// A wasm function index: [`Module::imports`] come first, then
 /// [`Module::funcs`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FuncId(pub u32);
 
 /// Index into [`Module::globals`].

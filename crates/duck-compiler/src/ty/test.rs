@@ -50,12 +50,11 @@ pub struct Tested {
 /// program: with the same memory and globals, which are as its constants
 /// left them, and without what calls its start function.
 pub fn check_tests(program: &Program, settings: &Settings) -> Result<Tested, Vec<TypeError>> {
-    let (mut ck, imports, mut funcs, _) = lower_program(program, settings, false, true);
+    let (mut ck, imports, funcs, _) = lower_program(program, settings, false, true);
     if !ck.errors.is_empty() {
         return Err(ck.errors);
     }
     let found = std::mem::take(&mut ck.tests);
-    funcs.push(test_export(&found));
     let world = ck.world.clone();
     Ok(Tested {
         module: ck.module(imports, funcs, settings),
@@ -123,7 +122,7 @@ impl Checker {
 /// The function that the module of `tests` exports as [`TEST_EXPORT`]: it
 /// calls the test whose place in `tests` it is given, and returns once that
 /// has. It traps at an index that no test has.
-fn test_export(tests: &[(Test, FuncId)]) -> ir::Func {
+pub(super) fn test_export(tests: &[(Test, FuncId)]) -> ir::Func {
     let index = Expr::Local(ir::LocalId(0));
     let call = |(place, (_, func)): (usize, &(Test, FuncId))| {
         let place = Expr::Const(Const::I32(place as i32));

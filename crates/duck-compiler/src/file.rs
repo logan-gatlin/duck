@@ -2,6 +2,8 @@ use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
+use crate::ty::Artifact;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FileId(usize);
 
@@ -42,6 +44,29 @@ pub trait FileManager {
     /// a directory, which compiles only what is used
     fn package_files(&mut self, _library: FileId) -> Vec<FileId> {
         Vec::new()
+    }
+    /// What names the package that is entered by `root` wherever it is
+    /// compiled, which the artifact of each package names those it uses by:
+    /// what tells one package from another on every machine, as a hash of
+    /// its source does. Its display name without a file manager that keeps
+    /// what packages compile to
+    fn package_name(&mut self, root: FileId) -> String {
+        self.display_name(root)
+    }
+    /// The names that a `use` leads to the file `file` by from the root of
+    /// its package, which [`FileManager::open`] opens it by again from any
+    /// file of the package. Its display name alone without a file manager
+    /// that has the files of a package in a directory
+    fn module_path(&mut self, file: FileId) -> Vec<String> {
+        vec![self.display_name(file)]
+    }
+    /// The artifact of the package that is entered by `library`, if the
+    /// package is compiled already and is as it was then: its items are
+    /// then taken from the artifact's interface, and its files aren't
+    /// read. None without a file manager that keeps what packages compile
+    /// to
+    fn compiled(&mut self, _library: FileId) -> Option<Rc<Artifact>> {
+        None
     }
     /// Attempt to read the file that a `module.include` in the file `from`
     /// names by `path`, from the directory of the package `from` is in.

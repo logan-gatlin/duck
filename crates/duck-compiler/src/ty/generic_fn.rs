@@ -40,7 +40,7 @@ pub(super) const MAX_INSTANCE_SIZE: u64 = 4096;
 pub(super) struct GenericFn {
     /// The [`Ty::Param`] of each type parameter: those a call infers, then
     /// those it gives a type.
-    params: Vec<Ty>,
+    pub(super) params: Vec<Ty>,
     /// The signature, in terms of the type parameters. A parameter that is
     /// one of them is a [`Ty::Type`].
     sig: FuncSig,
@@ -50,7 +50,7 @@ pub(super) struct GenericFn {
     /// The type of each parameter's default that has one of its own, which
     /// settles the type parameters in the parameter's type for a call that
     /// leaves the argument out. Empty until the defaults are folded.
-    default_tys: Vec<Option<Ty>>,
+    pub(super) default_tys: Vec<Option<Ty>>,
     /// Whether its declaration has an error, which its instances share.
     failed: bool,
 }
@@ -58,8 +58,8 @@ pub(super) struct GenericFn {
 /// An instance of a generic function, waiting to be lowered.
 #[derive(Clone)]
 pub(super) struct FnInstance {
-    generic: GenericFnId,
-    args: Vec<Ty>,
+    pub(super) generic: GenericFnId,
+    pub(super) args: Vec<Ty>,
     /// The instance and those whose calls led to it, innermost first.
     chain: Vec<InstanceCall>,
 }
@@ -882,7 +882,7 @@ fn f():
         let entry = DummyManager::new().entry_point();
         let tokens = tokenize(entry, src).unwrap();
         let program = Program::single(entry, parse::parse(&tokens).unwrap());
-        let mut ck = Checker::define(&program, &Settings::default(), false, false);
+        let mut ck = Checker::define(&program, &Settings::default(), false, false, false);
         // As if checking `add` as declared had found nothing wrong with it.
         assert!(ck.errors.is_empty());
         ck.lower_funcs(&program, &(0..program.items.len()));

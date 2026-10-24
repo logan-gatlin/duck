@@ -3,6 +3,8 @@
 //! a [`Reader`] of LEB128 numbers, tags and lengths. An artifact is written
 //! so, and so is the interface of a package.
 
+use rustc_hash::FxHashMap;
+
 use crate::file::FileId;
 use crate::lex::Span;
 
@@ -70,19 +72,38 @@ pub(crate) trait Decode: Sized {
     fn decode(r: &mut Reader) -> Result<Self, DecodeError>;
 }
 
-/// Bytes being written.
+/// Bytes being written. A file is written by its index among `files`,
+/// which a file that isn't there yet is added to, so that what is read
+/// back can give each file the id it has then: or by the index it was
+/// minted from, where there are no files.
 #[derive(Default)]
-pub(crate) struct Writer(pub(crate) Vec<u8>);
+pub(crate) struct Writer {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) files: Vec<FileId>,
+    file_index: FxHashMap<FileId, usize>,
+    mapped: bool,
+}
 
-/// Bytes being read.
+/// Bytes being read. A file is read as the id at its index among `files`,
+/// or as the id minted from the index where there are none.
 pub(crate) struct Reader<'b> {
     bytes: &'b [u8],
     at: usize,
+    files: &'b [FileId],
+    /// The libraries of the packages that what is read uses, by index.
+    libraries: &'b [FileId],
 }
 
 /// Why bytes aren't what they were read as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeError(pub(crate) String);
+
+impl DecodeError {
+    /// Why bytes that name `what` aren't read: it isn't there.
+    pub(crate) fn missing(what: &str) -> Self {
+        Self(format!("`{what}` is not there"))
+    }
+}
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,14 +114,39 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 impl Writer {
+    /// A writer that writes each file by its index among `files`, and
+    /// after them each other file it comes to, in the order it does.
+    pub(crate) fn mapped(files: Vec<FileId>) -> Self {
+        let file_index = files.iter().enumerate().map(|(i, f)| (*f, i)).collect();
+        Self {
+            bytes: Vec::new(),
+            files,
+            file_index,
+            mapped: true,
+        }
+    }
+
+    /// What `file` is written as.
+    fn file(&mut self, file: FileId) -> usize {
+        if !self.mapped {
+            return file.index();
+        }
+        let next = self.files.len();
+        let index = *self.file_index.entry(file).or_insert(next);
+        if index == next {
+            self.files.push(file);
+        }
+        index
+    }
+
     /// `n` in LEB128, seven bits to a byte, the least first.
     fn unsigned(&mut self, mut n: u64) {
         loop {
             let byte = (n & 0x7f) as u8;
             n >>= 7;
             match n {
-                0 => return self.0.push(byte),
-                _ => self.0.push(byte | 0x80),
+                0 => return self.bytes.push(byte),
+                _ => self.bytes.push(byte | 0x80),
             }
         }
     }
@@ -112,20 +158,57 @@ impl Writer {
             n >>= 7;
             let done = (n == 0 && byte & 0x40 == 0) || (n == -1 && byte & 0x40 != 0);
             match done {
-                true => return self.0.push(byte),
-                false => self.0.push(byte | 0x80),
+                true => return self.bytes.push(byte),
+                false => self.bytes.push(byte | 0x80),
             }
         }
     }
 
     pub(crate) fn tag(&mut self, tag: u8) {
-        self.0.push(tag);
+        self.bytes.push(tag);
     }
 }
 
 impl<'b> Reader<'b> {
     pub(crate) fn new(bytes: &'b [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            files: &[],
+            libraries: &[],
+        }
+    }
+
+    /// A reader that reads each file as the id at its index among `files`.
+    pub(crate) fn mapped(bytes: &'b [u8], files: &'b [FileId]) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            files,
+            libraries: &[],
+        }
+    }
+
+    /// The reader, reading the library of each package that what it reads
+    /// uses as the id at its index among `libraries`.
+    pub(crate) fn with_libraries(mut self, libraries: &'b [FileId]) -> Self {
+        self.libraries = libraries;
+        self
+    }
+
+    /// The library of the package written as `index`.
+    pub(crate) fn library(&self, index: usize) -> Result<FileId, DecodeError> {
+        let library = self.libraries.get(index).copied();
+        library.ok_or_else(|| DecodeError(format!("{index} is no package that is used")))
+    }
+
+    /// The file written as `index`.
+    pub(crate) fn file(&self, index: usize) -> Result<FileId, DecodeError> {
+        if self.files.is_empty() {
+            return Ok(FileId::minted(index));
+        }
+        let file = self.files.get(index).copied();
+        file.ok_or_else(|| DecodeError(format!("{index} is no file of the package")))
     }
 
     /// Whether every byte is read.
@@ -333,7 +416,7 @@ impl Decode for char {
 impl Encode for String {
     fn encode(&self, w: &mut Writer) {
         self.len().encode(w);
-        w.0.extend_from_slice(self.as_bytes());
+        w.bytes.extend_from_slice(self.as_bytes());
     }
 }
 
@@ -347,7 +430,7 @@ impl Decode for String {
 impl Encode for Vec<u8> {
     fn encode(&self, w: &mut Writer) {
         self.len().encode(w);
-        w.0.extend_from_slice(self);
+        w.bytes.extend_from_slice(self);
     }
 }
 
@@ -411,11 +494,38 @@ impl<A: Decode, B: Decode> Decode for (A, B) {
     }
 }
 
-/// A file is written by its index, which what reads the span gives a
-/// meaning to.
+impl<A: Encode, B: Encode, C: Encode> Encode for (A, B, C) {
+    fn encode(&self, w: &mut Writer) {
+        self.0.encode(w);
+        self.1.encode(w);
+        self.2.encode(w);
+    }
+}
+
+impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C) {
+    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok((A::decode(r)?, B::decode(r)?, C::decode(r)?))
+    }
+}
+
+/// A file is written as the writer writes files, and read as the reader
+/// reads them.
+impl Encode for FileId {
+    fn encode(&self, w: &mut Writer) {
+        w.file(*self).encode(w);
+    }
+}
+
+impl Decode for FileId {
+    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        let index = usize::decode(r)?;
+        r.file(index)
+    }
+}
+
 impl Encode for Span {
     fn encode(&self, w: &mut Writer) {
-        self.file.index().encode(w);
+        self.file.encode(w);
         self.start.encode(w);
         self.end.encode(w);
     }
@@ -423,9 +533,8 @@ impl Encode for Span {
 
 impl Decode for Span {
     fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
-        let file = usize::decode(r)?;
         Ok(Span {
-            file: FileId::minted(file),
+            file: Decode::decode(r)?,
             start: Decode::decode(r)?,
             end: Decode::decode(r)?,
         })

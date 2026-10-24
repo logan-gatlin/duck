@@ -133,6 +133,13 @@ impl Checker {
                 // An imported function has no body.
                 Dep::Func(id) if id.0 < self.import_count => continue,
                 Dep::Func(id) if !funcs.insert(id) => continue,
+                // One of a package that is compiled already has its body in
+                // its artifact, which linking has: what it calls is found
+                // then, and what it names is known.
+                Dep::Func(id) if self.is_foreign(id) => {
+                    work.extend(self.func_deps.get(&id).into_iter().flatten());
+                    continue;
+                }
                 Dep::Func(id) => id,
             };
             if self.lowering.contains(&id) {
@@ -264,7 +271,7 @@ impl Checker {
 }
 
 /// Adds each function that `body` calls by name to `out`.
-fn push_calls(body: &[Stmt], out: &mut Vec<Dep>) {
+pub(super) fn push_calls(body: &[Stmt], out: &mut Vec<Dep>) {
     for stmt in body {
         match stmt {
             Stmt::SetLocal(_, value) | Stmt::SetGlobal(_, value) | Stmt::Drop(value) => {

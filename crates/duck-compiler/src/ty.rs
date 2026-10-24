@@ -60,6 +60,7 @@ mod generic;
 mod generic_fn;
 mod init;
 mod inspect;
+mod interface;
 mod link;
 mod nested;
 mod opaque;
@@ -70,12 +71,13 @@ mod unions;
 mod wit;
 
 pub use crate::codec::DecodeError;
-pub use artifact::{Artifact, link};
+pub use artifact::{Artifact, link, link_refs};
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
     Action, ActionKind, Analysis, Apart, Completion, CompletionKind, Hint, HintKind, Hover,
     Parameter, Signature, Symbol, SymbolKind, Unused, UnusedKind, analyze, module_members,
 };
+pub use interface::Interface;
 
 /// The export name of the module's memory, which no item may take.
 const MEMORY_EXPORT: &str = "memory";
@@ -1089,6 +1091,14 @@ struct Checker {
     /// Where each list of what is lowered was where each package was about
     /// to be lowered, in the order they are.
     package_marks: Vec<artifact::Marks>,
+    /// What each package that is compiled already was given in place of
+    /// lowering it, by its place among the packages.
+    imported: FxHashMap<usize, interface::Imported>,
+    /// Whether the `pub` items of the entry module of a library are kept
+    /// to the program, as they are where the library is compiled to the
+    /// artifact that programs that use it link: one that is read by
+    /// whoever reads its module exports them.
+    unexported: bool,
     /// The items whose constants are being folded, innermost last.
     folding: Vec<usize>,
     /// What each item being folded and each function being lowered for one
@@ -1227,6 +1237,13 @@ enum Synth {
     /// A function declared in the body of another, which is lowered where
     /// it is declared.
     Nested,
+    /// A function that the checker made for a package that is compiled
+    /// already, whose artifact has it: a placeholder, numbered as the
+    /// artifact numbers it, which nothing lowers.
+    Foreign,
+    /// The function that the component of the tests of the program exports,
+    /// which calls the test at the index it is given.
+    Tests,
 }
 
 struct GlobalDef {
@@ -2484,7 +2501,7 @@ pub fn artifacts(
     settings: &Settings,
     files: &mut impl FileManager,
 ) -> Result<Vec<Artifact>, Vec<TypeError>> {
-    let (ck, imports, funcs, start) = lower_unlinked(program, settings, false, false);
+    let (ck, imports, funcs, start) = lower_unlinked(program, settings, false, false, false);
     match ck.errors.is_empty() {
         true => Ok(ck.artifacts(program, files, &imports, &funcs, start)),
         false => Err(ck.errors),
@@ -2509,7 +2526,7 @@ fn lower_program(
     records: bool,
     tested: bool,
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
-    let (mut ck, imports, funcs, start) = lower_unlinked(program, settings, records, tested);
+    let (mut ck, imports, funcs, start) = lower_unlinked(program, settings, records, tested, false);
     // What only running finds is found now that every function it may call
     // is lowered.
     ck.link_constants(&imports, &funcs);
@@ -2532,16 +2549,22 @@ fn lower_unlinked(
     settings: &Settings,
     records: bool,
     tested: bool,
+    unexported: bool,
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
-    let mut ck = Checker::define(program, settings, records, tested);
+    let mut ck = Checker::define(program, settings, records, tested, unexported);
     let mut start = None;
     // Each package is folded and lowered after every package it depends
     // on, as a whole: what is made of one is made of nothing that depends
     // on it, nor of another beside it. What the entry's package makes of
     // what it lowers is lowered with what it exports.
-    for package in &program.packages {
+    for (index, package) in program.packages.iter().enumerate() {
         let items = package.items.clone();
         ck.package_marks.push(ck.marks());
+        // One that is compiled already is given what it compiled to.
+        if let Some(compiled) = program.imported.iter().find(|c| c.root == package.root) {
+            ck.import_turn(program, index, compiled);
+            continue;
+        }
         ck.define_globals(program, items.clone());
         ck.check_lists(&items);
         ck.place_pattern_strings(program, &items);
@@ -2565,11 +2588,57 @@ fn lower_unlinked(
     // as a `run` that nothing defines.
     if !ck.unread && tested {
         ck.export_tests(program, &mut funcs);
+        // What runs the tests is a function of the entry's package, made
+        // last: it calls each test by its number in the program.
+        ck.synths.push(Synth::Tests);
+        ck.funcs.push(FuncSig {
+            name: crate::world::TEST_EXPORT.to_string(),
+            params: vec![(String::new(), Ty::Prim(Prim::I32))],
+            defaults: Vec::new(),
+            ret: Ty::Unit,
+        });
     } else if !ck.unread {
         ck.export_funcs(program, &mut funcs, settings.start.is_some());
     }
     funcs.extend(ck.lower_synths(program));
     (ck, imports, funcs, start)
+}
+
+/// What a program compiles to, package by package: the artifact of each,
+/// those it depends on first. Of its tests, if it is `tested`, with each
+/// test and the world of their component.
+pub struct Built {
+    pub artifacts: Vec<Artifact>,
+    pub tests: Vec<Test>,
+    pub world: World,
+}
+
+/// Compiles `program` to the [`Artifact`] of each of its packages, those it
+/// depends on first, as [`artifacts`] does: or to those of its tests, if
+/// it is `tested`, as [`check_tests`] checks them. A package that is
+/// compiled already has a placeholder in its place, as what it compiled to
+/// is linked in its stead: its artifact is the one it was compiled to.
+pub fn build(
+    program: &Program,
+    settings: &Settings,
+    files: &mut impl FileManager,
+    tested: bool,
+) -> Result<Built, Vec<TypeError>> {
+    // A library's artifact is as it is for every program that uses it,
+    // which exports nothing of it.
+    let unexported = !tested && settings.world.is_none();
+    let (mut ck, imports, funcs, start) =
+        lower_unlinked(program, settings, false, tested, unexported);
+    if !ck.errors.is_empty() {
+        return Err(ck.errors);
+    }
+    let artifacts = ck.artifacts(program, files, &imports, &funcs, start);
+    let tests = mem::take(&mut ck.tests);
+    Ok(Built {
+        artifacts,
+        tests: tests.into_iter().map(|(test, _)| test).collect(),
+        world: ck.world,
+    })
 }
 
 impl Checker {
@@ -2865,7 +2934,7 @@ impl Checker {
     /// that module. A component exports what its world does, which
     /// [`Self::export_funcs`] finds.
     fn exports(&self, item: &parse::Item) -> bool {
-        self.world.is_library() && item.is_pub && item.span.file == self.entry
+        self.world.is_library() && !self.unexported && item.is_pub && item.span.file == self.entry
     }
 
     /// The names `item` is exported as by a library: `own`, if it's a `pub`
@@ -2873,7 +2942,7 @@ impl Checker {
     fn export_names(&self, item: Item, own: Option<&str>) -> Vec<String> {
         let used = self.reexports.iter().filter(|(used, _)| *used == item);
         let used = used.map(|(_, name)| name.name.as_str());
-        let used = used.filter(|_| self.world.is_library());
+        let used = used.filter(|_| self.world.is_library() && !self.unexported);
         // The module exports its memory and its table by their names.
         let own = own.into_iter().chain(used);
         let free = own.filter(|name| ![MEMORY_EXPORT, TABLE_EXPORT].contains(name));
@@ -3586,7 +3655,13 @@ impl Checker {
     /// Declares and defines every item of `program`, which places its
     /// literals. If it `records`, the type of what is written is kept.
     /// If it is `tested`, they are items of the component of its tests.
-    fn define(program: &Program, settings: &Settings, records: bool, tested: bool) -> Self {
+    fn define(
+        program: &Program,
+        settings: &Settings,
+        records: bool,
+        tested: bool,
+        unexported: bool,
+    ) -> Self {
         let world = World::load(settings);
         let world = match tested {
             true => world.and_then(|world| world.tests(&imported_interfaces(program))),
@@ -3604,6 +3679,7 @@ impl Checker {
             includes: program.includes.clone(),
             world,
             max_pages: settings.max_pages,
+            unexported,
             ..Self::default()
         };
         let max_bytes = settings
@@ -3812,6 +3888,8 @@ impl Checker {
                 self.lower_export(id, target, &export)
             }
             Synth::Nested => unreachable!("lowered where it is declared"),
+            Synth::Foreign => unreachable!("lowered where its package was compiled"),
+            Synth::Tests => test::test_export(&self.tests),
         }
     }
 

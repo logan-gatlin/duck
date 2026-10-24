@@ -41,6 +41,7 @@ use crate::load::Program;
 use crate::world::RUN_EXPORT;
 
 use super::canonical::RETURN_AREA_ALIGN;
+use super::interface::Interface;
 use super::link::{
     Check, CheckDef, DataDef, Event, Fill, Finding, Linking, Lowered, Placing, ValueDef,
 };
@@ -57,7 +58,7 @@ const VERSION: u32 = 1;
 
 /// The package that the return area is of, among those an artifact uses:
 /// none, as it is the program's.
-const RETURN_AREA: u32 = u32::MAX;
+pub(super) const RETURN_AREA: u32 = u32::MAX;
 
 /// The binary operators, in the order of their tags.
 const BIN_OPS: [BinOp; 30] = [
@@ -116,7 +117,7 @@ pub struct Artifact {
     /// The name of the package, which another names it by.
     pub name: String,
     /// The packages it names what of, by name.
-    uses: Vec<String>,
+    pub(super) uses: Vec<String>,
     /// The files of its spans, by name.
     files: Vec<String>,
     /// How many items of the program are its own.
@@ -127,18 +128,20 @@ pub struct Artifact {
     funcs: Vec<ir::Func>,
     /// How many of `funcs` it defines.
     defined: usize,
-    globals: Vec<ir::Global>,
+    pub(super) globals: Vec<ir::Global>,
     /// What each of `globals` starts as.
     inits: Vec<Scalar>,
     /// The functions it was the first to take pointers to, in order.
-    table: Vec<FuncId>,
-    data: Vec<DataDef>,
-    values: Vec<ValueDef>,
+    pub(super) table: Vec<FuncId>,
+    pub(super) data: Vec<DataDef>,
+    pub(super) values: Vec<ValueDef>,
     checks: Vec<CheckDef>,
     events: Vec<Event>,
     /// What it names of other packages: functions, globals, data, values
     /// and items, each numbered after its own of the kind.
-    foreign: Foreigns,
+    pub(super) foreign: Foreigns,
+    /// What a program that uses the package is checked against.
+    pub(super) interface: Interface,
     /// The function the program runs, if it is the package of the entry
     /// and the program has one: of it or of a package it uses.
     start: Option<FuncId>,
@@ -150,28 +153,28 @@ pub struct Artifact {
 /// What an artifact names of other packages, by kind, each numbered after
 /// those it has of its own of the kind.
 #[derive(Debug, Clone, Default, PartialEq)]
-struct Foreigns {
-    funcs: Vec<Foreign>,
-    globals: Vec<Foreign>,
-    data: Vec<Foreign>,
-    values: Vec<Foreign>,
-    items: Vec<Foreign>,
+pub(super) struct Foreigns {
+    pub(super) funcs: Vec<Foreign>,
+    pub(super) globals: Vec<Foreign>,
+    pub(super) data: Vec<Foreign>,
+    pub(super) values: Vec<Foreign>,
+    pub(super) items: Vec<Foreign>,
 }
 
 /// What an artifact names of another package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Foreign {
+pub(super) struct Foreign {
     /// The package, by its place among those the artifact uses: or
     /// [`RETURN_AREA`].
-    package: u32,
-    kind: Kind,
+    pub(super) package: u32,
+    pub(super) kind: Kind,
     /// Its place among those of its kind there.
-    index: u32,
+    pub(super) index: u32,
 }
 
 /// What kind of thing a [`Foreign`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Kind {
+pub(super) enum Kind {
     Import,
     /// A function that a package defines, or that the checker made for it,
     /// numbered after those it defines.
@@ -186,18 +189,18 @@ enum Kind {
 /// What a package of a program has of what is lowered of the program, by
 /// where it is in each list.
 #[derive(Debug, Clone)]
-struct Share {
-    imports: Range<usize>,
-    defined: Range<usize>,
+pub(super) struct Share {
+    pub(super) imports: Range<usize>,
+    pub(super) defined: Range<usize>,
     /// Of the functions the checker made, by their place among those.
-    synths: Range<usize>,
-    globals: Range<usize>,
-    table: Range<usize>,
-    data: Range<usize>,
-    values: Range<usize>,
-    checks: Range<usize>,
-    events: Range<usize>,
-    items: Range<usize>,
+    pub(super) synths: Range<usize>,
+    pub(super) globals: Range<usize>,
+    pub(super) table: Range<usize>,
+    pub(super) data: Range<usize>,
+    pub(super) values: Range<usize>,
+    pub(super) checks: Range<usize>,
+    pub(super) events: Range<usize>,
+    pub(super) items: Range<usize>,
 }
 
 /// Where each list of what is lowered of a program was, where a package
@@ -214,7 +217,7 @@ pub(super) struct Marks {
 }
 
 /// Making the artifact of one package of a lowered program.
-struct Extract<'c> {
+pub(super) struct Extract<'c> {
     ck: &'c Checker,
     shares: &'c [Share],
     /// The name of each package.
@@ -307,7 +310,7 @@ impl Checker {
         let names: Vec<_> = program
             .packages
             .iter()
-            .map(|package| files.display_name(package.root))
+            .map(|package| package.name.clone())
             .collect();
         let shares = self.shares(program);
         let mut artifacts = Vec::new();
@@ -327,7 +330,11 @@ impl Checker {
             // what it names, which may be of another.
             let entry = program.packages[index].root == program.entry;
             let start = start.filter(|_| entry);
+            // What the interface names of other packages, the artifact
+            // names too.
+            let interface = self.interface(program, index, &mut extract);
             let mut artifact = extract.artifact(share, imports, funcs, start);
+            artifact.interface = interface;
             artifact.files = extract
                 .files
                 .iter()
@@ -380,6 +387,11 @@ impl Checker {
 }
 
 impl Extract<'_> {
+    /// What package `package` has of the program.
+    pub(super) fn share(&self, package: usize) -> &Share {
+        &self.shares[package]
+    }
+
     fn artifact(
         &mut self,
         share: &Share,
@@ -430,6 +442,7 @@ impl Extract<'_> {
             foreign: self.foreign.clone(),
             start: start.map(|id| self.func(id)),
             passed: 0,
+            interface: Interface::default(),
         }
     }
 
@@ -454,7 +467,7 @@ impl Extract<'_> {
     }
 
     /// Function `id` of the program, numbered as the artifact's.
-    fn func(&mut self, id: FuncId) -> FuncId {
+    pub(super) fn func(&mut self, id: FuncId) -> FuncId {
         let (package, kind, index) = self.func_owner(id);
         let share = &self.shares[self.package];
         let own = share.imports.len() as u32;
@@ -469,7 +482,7 @@ impl Extract<'_> {
     }
 
     /// Global `id` of the program, numbered as the artifact's.
-    fn global(&mut self, id: GlobalId) -> GlobalId {
+    pub(super) fn global(&mut self, id: GlobalId) -> GlobalId {
         let at = id.0 as usize;
         let (package, share) = self.owner(|share| &share.globals, at);
         let own = self.shares[self.package].globals.len() as u32;
@@ -514,7 +527,7 @@ impl Extract<'_> {
     }
 
     /// Item `item` of the program, numbered as the artifact's.
-    fn item(&mut self, item: usize) -> usize {
+    pub(super) fn item(&mut self, item: usize) -> usize {
         let (package, share) = self.owner(|share| &share.items, item);
         let own = self.shares[self.package].items.len();
         let index = item - share.items.start;
@@ -575,7 +588,7 @@ impl Extract<'_> {
         }
     }
 
-    fn scalar(&mut self, scalar: Scalar) -> Scalar {
+    pub(super) fn scalar(&mut self, scalar: Scalar) -> Scalar {
         match scalar {
             Scalar::Known(c) => Scalar::Known(c),
             Scalar::Linked(ty, symbol) => Scalar::Linked(ty, self.symbol(symbol)),
@@ -798,6 +811,15 @@ fn renumber_expr(expr: &mut Expr, f: &mut impl FnMut(Ref) -> Ref) {
 /// linking them, each in the file of [`Artifact::linked_files`] that its
 /// [`FileId`] is minted from the index of.
 pub fn link(artifacts: &[Artifact], settings: &Settings) -> Result<ir::Module, Vec<TypeError>> {
+    let artifacts: Vec<&Artifact> = artifacts.iter().collect();
+    link_refs(&artifacts, settings)
+}
+
+/// Links `artifacts`, as [`link`] does, wherever each is kept.
+pub fn link_refs(
+    artifacts: &[&Artifact],
+    settings: &Settings,
+) -> Result<ir::Module, Vec<TypeError>> {
     let mut names = FxHashMap::default();
     for (index, artifact) in artifacts.iter().enumerate() {
         names.entry(artifact.name.clone()).or_insert(index);
@@ -1160,10 +1182,16 @@ impl Artifact {
         &self.uses
     }
 
+    /// The interface of the package: what a program that uses it is
+    /// checked against.
+    pub fn interface(&self) -> &Interface {
+        &self.interface
+    }
+
     /// The artifact as bytes, which [`Self::decode`] reads.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::default();
-        w.0.extend_from_slice(MAGIC);
+        w.bytes.extend_from_slice(MAGIC);
         VERSION.encode(&mut w);
         self.name.encode(&mut w);
         self.uses.encode(&mut w);
@@ -1182,7 +1210,8 @@ impl Artifact {
         self.foreign.encode(&mut w);
         self.start.encode(&mut w);
         self.passed.encode(&mut w);
-        w.0
+        self.interface.encode(&mut w);
+        w.bytes
     }
 
     /// The artifact that `bytes` are, as [`Self::encode`] wrote them.
@@ -1214,6 +1243,7 @@ impl Artifact {
             foreign: Decode::decode(&mut r)?,
             start: Decode::decode(&mut r)?,
             passed: Decode::decode(&mut r)?,
+            interface: Decode::decode(&mut r)?,
         };
         match r.done() {
             true => Ok(artifact),
@@ -1259,20 +1289,6 @@ impl Encode for FxHashSet<FuncId> {
 impl Decode for FxHashSet<FuncId> {
     fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
         Ok(Vec::<FuncId>::decode(r)?.into_iter().collect())
-    }
-}
-
-impl Encode for (String, Span, Vec<Scalar>) {
-    fn encode(&self, w: &mut Writer) {
-        self.0.encode(w);
-        self.1.encode(w);
-        self.2.encode(w);
-    }
-}
-
-impl Decode for (String, Span, Vec<Scalar>) {
-    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
-        Ok((Decode::decode(r)?, Decode::decode(r)?, Decode::decode(r)?))
     }
 }
 
@@ -2239,17 +2255,30 @@ impl Decode for Foreigns {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::load;
     use crate::world::COMMAND;
 
     /// Files by name, the first the entry point: one named `@name` is the
-    /// library of dependency `name`. They are built with the settings.
-    struct Files(Vec<(&'static str, &'static str)>, Settings);
+    /// library of dependency `name`. They are built with the settings, and
+    /// a library among them that is compiled already has its artifact.
+    struct Files(
+        Vec<(&'static str, &'static str)>,
+        Settings,
+        Vec<(&'static str, Rc<Artifact>)>,
+    );
 
     impl FileManager for Files {
         fn entry_point(&mut self) -> FileId {
             FileId::minted(0)
+        }
+
+        fn compiled(&mut self, library: FileId) -> Option<Rc<Artifact>> {
+            let name = self.0[library.index()].0;
+            let compiled = self.2.iter().find(|(compiled, _)| *compiled == name);
+            compiled.map(|(_, artifact)| artifact.clone())
         }
 
         fn display_name(&mut self, id: FileId) -> String {
@@ -2336,7 +2365,7 @@ mod tests {
 
     /// A library of no world.
     fn library(files: Vec<(&'static str, &'static str)>) -> Files {
-        Files(files, Settings::default())
+        Files(files, Settings::default(), Vec::new())
     }
 
     /// A command that runs `main`.
@@ -2346,7 +2375,56 @@ mod tests {
             start: Some("main".to_string()),
             ..Settings::default()
         };
-        Files(files, settings)
+        Files(files, settings, Vec::new())
+    }
+
+    /// The module that compiling `files` package by package makes: each
+    /// library alone, and then each package that uses it with the artifact
+    /// the library compiled to, in the order they are given. The same as
+    /// compiling the whole program at once, which is asserted of the
+    /// artifacts and of the module.
+    fn separately(files: &mut Files) -> ir::Module {
+        let settings = files.settings();
+        let whole = artifacts_of(files);
+        let mut compiled: Vec<(&'static str, Rc<Artifact>)> = Vec::new();
+        for (index, (name, _)) in files.0.iter().enumerate().skip(1).rev() {
+            if !name.starts_with('@') {
+                continue;
+            }
+            let mut own = files.0.clone();
+            own.swap(0, index);
+            let mut alone = Files(own, Settings::default(), compiled.clone());
+            let artifact = crate::compile_package(&mut alone);
+            let artifact = artifact.unwrap_or_else(|e| panic!("{e:?}"));
+            let bytes = artifact.encode();
+            let artifact = Artifact::decode(&bytes).unwrap();
+            let expected = whole.iter().find(|a| a.name == *name).unwrap();
+            // Checking the whole program reaches through the bodies of the
+            // functions of other packages, which one compiled alone has
+            // nothing of until it is linked: linking reaches through them.
+            let unreached = |artifact: &Artifact| {
+                let mut artifact = artifact.clone();
+                for value in &mut artifact.values {
+                    if let Finding::Run { reached, .. } = &mut value.how {
+                        reached.clear();
+                    }
+                }
+                artifact
+            };
+            assert_eq!(
+                unreached(&artifact),
+                unreached(expected),
+                "the artifact of {name} compiled alone"
+            );
+            compiled.push((name, Rc::new(artifact)));
+        }
+        let mut with = Files(files.0.clone(), settings.clone(), compiled);
+        let module = crate::lower(&mut with).unwrap_or_else(|e| panic!("{e:?}"));
+        let program = load::load(files).unwrap();
+        assert!(!load::load(&mut with).unwrap().imported.is_empty());
+        let checked = super::super::check(&program, &settings).unwrap();
+        assert_eq!(module, checked);
+        module
     }
 
     const BASE: &str = "\
@@ -2454,6 +2532,79 @@ pub let late: fn() -> i64 = g
         let errors = linked(&mut files).unwrap_err();
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].starts_with("main \"base.at(7)\""), "{errors:?}");
+    }
+
+    #[test]
+    fn a_package_is_compiled_against_the_artifacts_of_those_it_uses() {
+        let main = "\
+use base
+pub fn main():
+    let first = base.first(base.table)
+    let k = base.Kind.big
+    let n = base.count() + first + k as i32
+    let _ = n
+";
+        separately(&mut command(vec![("main", main), ("@base", BASE)]));
+    }
+
+    #[test]
+    fn packages_are_compiled_alone_along_a_chain() {
+        let geo = "\
+pub struct Point:
+    pub x: i32
+    pub y: i32 = 10
+pub struct(T) Box:
+    pub value: T
+    pub tag: u8 = 7
+pub enum(u8) Kind:
+    small = 1
+    big
+pub fn scale(p: Point, by: i32 = 2) -> Point:
+    return Point(x: p.x * by, y: p.y * by)
+pub fn(T) wrap(x: T) -> Box(T):
+    return Box(T)(value: x)
+pub fn origin() -> opaque(Point):
+    return Point(x: 0)
+pub fn adder(n: i32) -> opaque(fn(i32) -> i32):
+    fn add(x: i32) -> i32:
+        return x + n
+    return add
+pub let unit = Point(x: 1)
+pub var calls = 0
+pub fn count() -> i32:
+    calls += 1
+    return calls
+";
+        let shapes = "\
+use geo
+pub use geo.Point
+pub enum(u8) Size:
+    use geo.Kind
+    huge
+pub let base = geo.scale(geo.unit)
+pub let boxed = geo.wrap(3)
+pub fn area(p: geo.Point) -> i32:
+    return p.x * p.y
+pub fn(F: fn(i32) -> i32) pick(f: F) -> i32:
+    return f(1)
+pub fn twice() -> i32:
+    return pick(geo.adder(2)) + geo.count()
+";
+        let main = "\
+use shapes
+use geo
+pub fn main():
+    let p = shapes.Point(x: 2)
+    let a = shapes.area(p) + shapes.area(shapes.base)
+    let b = shapes.boxed.value + geo.wrap(true).tag as i32
+    let k = shapes.Size.huge as i32 + geo.Kind.big as i32
+    let o = geo.origin()
+    let add = geo.adder(5)
+    let c = add(a) + shapes.twice() + shapes.pick(add) + (o as geo.Point).y
+    let _ = (b, k, c)
+";
+        let files = vec![("main", main), ("@shapes", shapes), ("@geo", geo)];
+        separately(&mut command(files));
     }
 
     #[test]

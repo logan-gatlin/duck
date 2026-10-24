@@ -120,6 +120,42 @@ pub fn compile(files: &mut impl FileManager) -> Result<Vec<u8>, Vec<Error>> {
     component.map_err(|e| vec![Error::Component(e)])
 }
 
+/// Compiles the package of the entry point of `files` to its [`Artifact`]:
+/// what [`link`] makes the component of with those of the packages it
+/// uses, and what a program that uses the package is checked against. A
+/// package it uses that is compiled already, which `files` have the
+/// artifact of, isn't compiled again.
+///
+/// Stops at the first stage that fails, as [`compile`] does.
+pub fn compile_package(files: &mut impl FileManager) -> Result<Artifact, Vec<Error>> {
+    let settings = files.settings();
+    let program = load::load(files)?;
+    let built = ty::build(&program, &settings, files, false);
+    let mut built = built.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
+    Ok(built.artifacts.pop().expect("the entry's package is last"))
+}
+
+/// The module of `program`, which has `settings`, linked from the artifact
+/// of each of its packages: those it has from the packages that are
+/// compiled already, and those `built` of the rest.
+fn linked(
+    program: &load::Program,
+    settings: &file::Settings,
+    built: &[Artifact],
+) -> Result<ir::Module, Vec<Error>> {
+    let artifacts: Vec<&Artifact> = program
+        .packages
+        .iter()
+        .zip(built)
+        .map(|(package, built)| {
+            let compiled = program.imported.iter().find(|c| c.root == package.root);
+            compiled.map_or(built, |compiled| &*compiled.artifact)
+        })
+        .collect();
+    let module = ty::link_refs(&artifacts, settings);
+    module.map_err(|e| e.into_iter().map(Error::Type).collect())
+}
+
 /// Compiles the entry point of `files`, and every file it uses, to the
 /// [`Artifact`] of each of its packages, those it depends on first: what
 /// [`link`] makes the component of that [`compile`] makes.
@@ -168,28 +204,49 @@ pub fn link(artifacts: &[Artifact], settings: &file::Settings) -> Result<Vec<u8>
 pub fn compile_tests(files: &mut impl FileManager) -> Result<Tests, Vec<Error>> {
     let settings = files.settings();
     let program = load::load(files)?;
-    let tested = ty::check_tests(&program, &settings);
-    let tested = tested.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
-    let component = tested.world.encode(emit::emit(&tested.module));
+    let (module, tests, world) = match program.imported.is_empty() {
+        true => {
+            let tested = ty::check_tests(&program, &settings);
+            let tested = tested.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
+            (tested.module, tested.tests, tested.world)
+        }
+        false => {
+            let built = ty::build(&program, &settings, files, true);
+            let built = built.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
+            let module = linked(&program, &settings, &built.artifacts)?;
+            (module, built.tests, built.world)
+        }
+    };
+    let component = world.encode(emit::emit(&module));
     let component = component.map_err(|e| vec![Error::Component(e)])?;
-    Ok(Tests {
-        component,
-        tests: tested.tests,
-    })
+    Ok(Tests { component, tests })
 }
 
 /// Lowers the entry point of `files`, and every file it uses, to the core
 /// module that [`compile`] makes a component of.
 pub fn lower(files: &mut impl FileManager) -> Result<ir::Module, Vec<Error>> {
-    let module = load::load(files)?;
-    ty::check(&module, &files.settings()).map_err(|e| e.into_iter().map(Error::Type).collect())
+    let settings = files.settings();
+    let program = load::load(files)?;
+    // A package that is compiled already is linked as it was compiled.
+    if !program.imported.is_empty() {
+        let built = ty::build(&program, &settings, files, false);
+        let built = built.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
+        return linked(&program, &settings, &built.artifacts);
+    }
+    ty::check(&program, &settings).map_err(|e| e.into_iter().map(Error::Type).collect())
 }
 
 /// Finds the errors [`compile`] does in the entry point of `files`, and
 /// every file it uses, without making the module of a program that has none.
 pub fn check(files: &mut impl FileManager) -> Result<(), Vec<Error>> {
-    let module = load::load(files)?;
-    let errors = ty::errors(&module, &files.settings());
+    let settings = files.settings();
+    let program = load::load(files)?;
+    if !program.imported.is_empty() {
+        let built = ty::build(&program, &settings, files, false);
+        let built = built.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
+        return linked(&program, &settings, &built.artifacts).map(|_| ());
+    }
+    let errors = ty::errors(&program, &settings);
     match errors.is_empty() {
         true => Ok(()),
         false => Err(errors.into_iter().map(Error::Type).collect()),

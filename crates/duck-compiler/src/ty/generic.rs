@@ -282,7 +282,7 @@ impl Checker {
     /// uses each of them and has no fields of its own. So a type parameter
     /// that it bounds has their fields, laid out as a type argument's are.
     /// The error type if one of `uses` is.
-    fn list_of(&mut self, uses: Vec<Ty>, site: Span) -> Ty {
+    pub(super) fn list_of(&mut self, uses: Vec<Ty>, site: Span) -> Ty {
         let Some(list) = self.list else {
             unreachable!("the list is declared before any bound is resolved")
         };

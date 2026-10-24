@@ -25,6 +25,7 @@ use crate::lex::Span;
 
 use super::artifact::{Ref, renumber};
 use super::enums::{const_bits, const_int, int_const};
+use super::evaluate::{Dep, push_calls};
 use super::{
     Cell, Checker, Fold, InstanceSite, MEMORY_EXPORT, PAGE_SIZE, Prim, Scalar, TABLE_EXPORT, TEMP,
     TypeError, TypeErrorKind, fn_ptr, fold, write_consts, zero,
@@ -581,6 +582,26 @@ impl Linking {
         let imported = program.imports.len() as u32;
         let table = &program.table[..def.table];
         let mut ids: Vec<_> = reached.iter().copied().collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        // Checking stopped at the functions of packages that were compiled
+        // already, whose bodies it had nothing of: what they call, and
+        // what that calls, is reached too, and every body is here now.
+        let mut seen: FxHashSet<FuncId> = ids.iter().copied().collect();
+        let mut next = 0;
+        while next < ids.len() {
+            let func = &program.funcs[(ids[next].0 - imported) as usize];
+            let mut calls = Vec::new();
+            push_calls(&func.body, &mut calls);
+            for call in calls {
+                if let Dep::Func(id) = call
+                    && id.0 >= imported
+                    && seen.insert(id)
+                {
+                    ids.push(id);
+                }
+            }
+            next += 1;
+        }
         ids.sort_unstable_by_key(|id| id.0);
         // A pointer to an imported function leads to the import.
         let pointed = table

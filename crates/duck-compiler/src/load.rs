@@ -11,13 +11,16 @@
 use std::fmt;
 use std::mem;
 use std::ops::Range;
+use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Error;
+use crate::codec::DecodeError;
 use crate::file::{self, FileId, FileManager, Includes, TestModule};
 use crate::lex::{self, Span, Token};
 use crate::parse::{self, Ident, Item, ItemKind, UsePath};
+use crate::ty::Artifact;
 use crate::visit::{self, Node};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +37,9 @@ pub enum UseErrorKind {
     /// A path starting with the name of both a module of the package and a
     /// dependency.
     Ambiguous(String),
+    /// A dependency that is compiled already, whose files or dependencies
+    /// are not as they were then.
+    Stale(String),
 }
 
 /// The items of every module of a program, and the names modules give what
@@ -62,6 +68,32 @@ pub struct Program {
     /// The modules of the package that `entry` is in, its test modules
     /// among them: those a test module sees all of, `pub` or not.
     pub package: FxHashSet<FileId>,
+    /// Each package that a package uses, in the order the modules of the
+    /// package first use them.
+    pub depends: Vec<Depend>,
+    /// The packages whose items are those of their artifacts' interfaces,
+    /// as they are compiled already: nothing of them is lowered again.
+    pub imported: Vec<Compiled>,
+}
+
+/// A package that a package uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Depend {
+    /// The root of the package that uses the other.
+    pub from: FileId,
+    /// The name it uses the other as.
+    pub name: String,
+    /// The library of the other, which is its root.
+    pub library: FileId,
+}
+
+/// A package that is compiled already, whose items are those of its
+/// artifact's interface.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compiled {
+    /// Its library, which is its root.
+    pub root: FileId,
+    pub artifact: Rc<Artifact>,
 }
 
 /// The items of one package of a program.
@@ -70,8 +102,16 @@ pub struct PackageItems {
     /// The module the package is reached by: the entry point, or the
     /// library of a dependency.
     pub root: FileId,
+    /// What names the package wherever it is compiled, as
+    /// [`FileManager::package_name`] gives it.
+    pub name: String,
     /// Its items, in [`Program::items`].
     pub items: Range<usize>,
+    /// Its modules, the root first, in the order they were loaded.
+    pub files: Vec<FileId>,
+    /// The path a `use` leads to each of them by from its root, as
+    /// [`FileManager::module_path`] gives it.
+    pub modules: Vec<Vec<String>>,
 }
 
 /// A name `module` gives a module, or something reached through one.
@@ -123,6 +163,8 @@ struct Loader<'f, F> {
     parsed: Option<&'f mut Parsed>,
     /// The modules loaded or being loaded, which are not loaded again.
     seen: FxHashSet<FileId>,
+    /// Those, in the order they were first seen.
+    loaded: Vec<FileId>,
     items: Vec<Item>,
     uses: Vec<Use>,
     includes: Includes,
@@ -134,7 +176,9 @@ struct Loader<'f, F> {
     roots: FxHashMap<FileId, FileId>,
     /// Each package that a package depends on, by those modules, in the
     /// order its modules first use them.
-    depends: Vec<(FileId, FileId)>,
+    depends: Vec<Depend>,
+    /// The packages whose items were taken from their artifacts.
+    imported: Vec<Compiled>,
     errors: Vec<Error>,
 }
 
@@ -148,6 +192,7 @@ impl UseErrorKind {
         match self {
             Self::NotFound(..) => "module-not-found",
             Self::Ambiguous(..) => "ambiguous-module",
+            Self::Stale(..) => "stale-artifact",
         }
     }
 }
@@ -163,6 +208,7 @@ impl fmt::Display for UseErrorKind {
                 f,
                 "`{name}` is both a module of this package and a dependency"
             ),
+            Self::Stale(why) => write!(f, "the package is not as it was compiled: {why}"),
         }
     }
 }
@@ -180,13 +226,21 @@ impl Program {
     pub fn single(entry: FileId, module: parse::Module) -> Self {
         let items = 0..module.items.len();
         Self {
-            packages: vec![PackageItems { root: entry, items }],
+            packages: vec![PackageItems {
+                root: entry,
+                name: String::new(),
+                items,
+                files: vec![entry],
+                modules: vec![Vec::new()],
+            }],
             items: module.items,
             uses: Vec::new(),
             entry,
             includes: FxHashMap::default(),
             tests: Vec::new(),
             package: FxHashSet::from_iter([entry]),
+            depends: Vec::new(),
+            imported: Vec::new(),
         }
     }
 }
@@ -232,12 +286,14 @@ impl<'f, F: FileManager> Loader<'f, F> {
             partial,
             parsed,
             seen: FxHashSet::default(),
+            loaded: vec![entry],
             items: Vec::new(),
             uses: Vec::new(),
             includes: FxHashMap::default(),
             within: Vec::new(),
             roots: FxHashMap::from_iter([(entry, entry)]),
             depends: Vec::new(),
+            imported: Vec::new(),
             errors: Vec::new(),
         };
         loader.seen.insert(entry);
@@ -252,6 +308,7 @@ impl<'f, F: FileManager> Loader<'f, F> {
         for test in &tests {
             loader.roots.entry(test.file).or_insert(entry);
             if loader.seen.insert(test.file) {
+                loader.loaded.push(test.file);
                 loader.items_of(test.file);
             }
         }
@@ -269,6 +326,8 @@ impl<'f, F: FileManager> Loader<'f, F> {
             includes: loader.includes,
             tests,
             package,
+            depends: loader.depends,
+            imported: loader.imported,
         };
         (program, loader.errors)
     }
@@ -322,9 +381,19 @@ impl<'f, F: FileManager> Loader<'f, F> {
                     .iter()
                     .take_while(|(p, _)| *p == index)
                     .count();
+            let files: Vec<_> = (self.loaded.iter().copied())
+                .filter(|file| file == root || self.roots.get(file) == Some(root))
+                .collect();
+            let modules = files
+                .iter()
+                .map(|file| self.files.module_path(*file))
+                .collect();
             packages.push(PackageItems {
                 root: *root,
+                name: self.files.package_name(*root),
                 items: start..end,
+                files,
+                modules,
             });
             start = end;
         }
@@ -343,11 +412,101 @@ impl<'f, F: FileManager> Loader<'f, F> {
         if !visited.insert(root) {
             return;
         }
-        let depends = self.depends.iter().filter(|(from, _)| *from == root);
-        for (_, dependency) in depends {
-            self.visit_package(*dependency, visited, order);
+        let depends = self.depends.iter().filter(|depend| depend.from == root);
+        for depend in depends {
+            self.visit_package(depend.library, visited, order);
         }
         order.push(root);
+    }
+
+    /// Records that the package of `root` uses the one whose library is
+    /// `library` as `name`.
+    fn depend(&mut self, root: FileId, name: &str, library: FileId) {
+        self.roots.entry(library).or_insert(library);
+        let known = self.depends.iter();
+        if !known
+            .clone()
+            .any(|d| d.from == root && d.library == library)
+        {
+            self.depends.push(Depend {
+                from: root,
+                name: name.to_string(),
+                library,
+            });
+        }
+    }
+
+    /// Loads the package that `library` enters, which is seen for the
+    /// first time: whole, from its artifact if it is compiled already, and
+    /// from its files otherwise.
+    fn enter(&mut self, library: FileId) {
+        match self.files.compiled(library) {
+            Some(artifact) => {
+                if let Err(e) = self.splice(library, artifact) {
+                    self.errors.push(Error::Use(UseError {
+                        kind: UseErrorKind::Stale(e.to_string()),
+                        span: Span {
+                            file: library,
+                            start: 0,
+                            end: 0,
+                        },
+                    }));
+                }
+            }
+            None => {
+                self.items_of(library);
+                self.load_package(library);
+            }
+        }
+    }
+
+    /// Takes the items and uses of the package that `library` enters from
+    /// `artifact`, which it is compiled to, in place of reading its files:
+    /// each file is opened for its id and nothing more, and each package it
+    /// uses is entered in turn. Nothing of it is taken if a file or a
+    /// package it names isn't there.
+    fn splice(&mut self, library: FileId, artifact: Rc<Artifact>) -> Result<(), DecodeError> {
+        let interface = artifact.interface();
+        let mut files = vec![library];
+        for path in &interface.modules[1..] {
+            let path: Vec<&str> = path.iter().map(String::as_str).collect();
+            let Some(file) = self.files.open(library, &path) else {
+                return Err(DecodeError::missing(&path.join(".")));
+            };
+            files.push(file);
+        }
+        let mut libraries = Vec::new();
+        for name in &interface.depends {
+            let Some(used) = self.files.open_package(library, name) else {
+                return Err(DecodeError::missing(name));
+            };
+            libraries.push(used);
+        }
+        let declared = interface.declared(&files, &libraries)?;
+        for file in &files[1..] {
+            self.roots.entry(*file).or_insert(library);
+            self.within.push((library, *file));
+            if self.seen.insert(*file) {
+                self.loaded.push(*file);
+            }
+        }
+        for (name, used) in interface.depends.iter().zip(libraries) {
+            self.depend(library, name, used);
+            if self.seen.insert(used) {
+                self.loaded.push(used);
+                self.enter(used);
+            }
+        }
+        self.items.extend(declared.items);
+        self.uses.extend(declared.uses);
+        for (file, path, bytes) in declared.includes {
+            self.includes.insert((file, path), Ok(bytes.into()));
+        }
+        self.imported.push(Compiled {
+            root: library,
+            artifact,
+        });
+        Ok(())
     }
 
     /// Loads every source file of the package that `root` enters, after
@@ -358,6 +517,7 @@ impl<'f, F: FileManager> Loader<'f, F> {
         for file in self.files.package_files(root) {
             self.roots.entry(file).or_insert(root);
             if self.seen.insert(file) {
+                self.loaded.push(file);
                 self.within.push((root, file));
                 self.items_of(file);
             }
@@ -501,18 +661,16 @@ impl<'f, F: FileManager> Loader<'f, F> {
             }
             // Only what its library makes `pub` is reached in a dependency.
             (None, Some(library)) => {
-                self.roots.entry(library).or_insert(library);
-                if !self.depends.contains(&(root, library)) {
-                    self.depends.push((root, library));
-                }
+                self.depend(root, names[0], library);
                 (library, 1)
             }
             (None, None) => return Err(UseErrorKind::NotFound(names.join("."))),
         };
         if self.seen.insert(target) {
-            self.items_of(target);
-            if local.is_none() {
-                self.load_package(target);
+            self.loaded.push(target);
+            match local {
+                Some(_) => self.items_of(target),
+                None => self.enter(target),
             }
         }
         let name = path.alias.as_ref().or(path.segments.last()).unwrap();

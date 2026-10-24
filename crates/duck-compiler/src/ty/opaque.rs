@@ -35,7 +35,7 @@ pub(super) struct OpaqueSite {
 
 /// A type that the result of a function hides.
 pub(super) struct OpaqueDef {
-    owner: Owner,
+    pub(super) owner: Owner,
     /// The name of the function whose result hides it.
     func: String,
     /// What bounds the type it hides, if anything does.
@@ -44,9 +44,9 @@ pub(super) struct OpaqueDef {
     /// until a `return` settles it: what a `return` gives in its place.
     hole: Ty,
     /// The type it hides, once a `return` of its function settles it.
-    hidden: Option<Ty>,
+    pub(super) hidden: Option<Ty>,
     /// How far the body of its function is lowered, which settles it.
-    state: Visit,
+    pub(super) state: Visit,
     /// Whether an error says why nothing settles it.
     reported: bool,
     /// Whether its function is `pub`.
@@ -56,6 +56,26 @@ pub(super) struct OpaqueDef {
     /// For that of an instance of a generic function, the one that the
     /// declaration's result has in its place.
     decl: Option<OpaqueId>,
+}
+
+impl OpaqueDef {
+    /// The type that function `owner`, named `func` and declared in
+    /// `module`, hides, which is `hidden`: as it was found where the
+    /// function's package was compiled.
+    pub(super) fn settled(owner: Owner, func: String, module: FileId, hidden: Ty) -> Self {
+        Self {
+            owner,
+            func,
+            bound: None,
+            hole: hidden,
+            hidden: Some(hidden),
+            state: Visit::Done,
+            reported: false,
+            is_pub: true,
+            module,
+            decl: None,
+        }
+    }
 }
 
 /// The function whose result hides a type.

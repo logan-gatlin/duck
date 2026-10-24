@@ -44,6 +44,35 @@ pub(super) struct NestedFn {
     aliases: Vec<(String, Ty)>,
 }
 
+impl NestedFn {
+    /// The tuple of what it captures, which a value of its type is laid
+    /// out as.
+    pub(super) fn held(&self) -> Ty {
+        self.held
+    }
+
+    /// A function declared in a function of a package that is compiled
+    /// already, named `name`, whose values hold `held`, and which captures
+    /// `captures`, each by name and type: what is known of it where it is
+    /// used, as its body isn't lowered again.
+    pub(super) fn foreign(name: String, held: Ty, captures: Vec<(String, Ty)>, at: Span) -> Self {
+        let captures = captures.into_iter().map(|(name, ty)| Capture {
+            name,
+            ty,
+            var: false,
+            func: false,
+            at,
+        });
+        Self {
+            name,
+            captures: captures.collect(),
+            held,
+            fns: Vec::new(),
+            aliases: Vec::new(),
+        }
+    }
+}
+
 /// A variable that a function declared in a function captures.
 #[derive(Clone)]
 pub(super) struct Capture {
