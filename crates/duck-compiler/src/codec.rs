@@ -6,6 +6,8 @@
 use crate::file::FileId;
 use crate::lex::Span;
 
+mod ast;
+
 /// Lists of what is encoded but bytes, which are encoded whole.
 macro_rules! lists {
     ($($t:ty),* $(,)?) => {
