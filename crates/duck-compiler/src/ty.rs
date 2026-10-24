@@ -69,7 +69,8 @@ mod test;
 mod unions;
 mod wit;
 
-pub use artifact::{Artifact, DecodeError, link};
+pub use crate::codec::DecodeError;
+pub use artifact::{Artifact, link};
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
     Action, ActionKind, Analysis, Apart, Completion, CompletionKind, Hint, HintKind, Hover,

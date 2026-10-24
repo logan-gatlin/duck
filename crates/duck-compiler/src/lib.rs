@@ -8,6 +8,7 @@ use crate::ty::{Artifact, InstanceSite, Test, TypeError, TypeErrorKind};
 use crate::world::{World, WorldError};
 
 pub mod bindgen;
+mod codec;
 pub mod emit;
 mod eval;
 pub mod file;
