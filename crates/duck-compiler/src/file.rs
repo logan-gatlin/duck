@@ -34,6 +34,15 @@ pub trait FileManager {
     /// that the file `from` is in. Returns `None` when there is no such
     /// dependency
     fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId>;
+    /// Every source file of the package that is entered by `library`, in
+    /// order of their paths from its root, opened, but for its test
+    /// modules: a library is compiled whole, as what it is compiled to is
+    /// kept for every program that uses it, whichever of its modules each
+    /// uses. None without a file manager that has the files of a package in
+    /// a directory, which compiles only what is used
+    fn package_files(&mut self, _library: FileId) -> Vec<FileId> {
+        Vec::new()
+    }
     /// Attempt to read the file that a `module.include` in the file `from`
     /// names by `path`, from the directory of the package `from` is in.
     /// `path` is one that [`include_path`] gives. Nothing is included

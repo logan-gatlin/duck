@@ -242,6 +242,10 @@ impl<'f, F: FileManager> Loader<'f, F> {
         };
         loader.seen.insert(entry);
         loader.items_of(entry);
+        // A library is compiled whole, as a dependency is.
+        if loader.files.settings().world.is_none() {
+            loader.load_package(entry);
+        }
         // A test module follows the modules of the package that it tests,
         // and those before it, but for one that it uses.
         let tests = loader.files.tests();
@@ -344,6 +348,20 @@ impl<'f, F: FileManager> Loader<'f, F> {
             self.visit_package(*dependency, visited, order);
         }
         order.push(root);
+    }
+
+    /// Loads every source file of the package that `root` enters, after
+    /// those that are used from it: a package that is used is compiled
+    /// whole, so that what it is compiled to is the same whichever of its
+    /// modules a program uses, and is kept once for all of them.
+    fn load_package(&mut self, root: FileId) {
+        for file in self.files.package_files(root) {
+            self.roots.entry(file).or_insert(root);
+            if self.seen.insert(file) {
+                self.within.push((root, file));
+                self.items_of(file);
+            }
+        }
     }
 
     fn items_of(&mut self, id: FileId) {
@@ -493,6 +511,9 @@ impl<'f, F: FileManager> Loader<'f, F> {
         };
         if self.seen.insert(target) {
             self.items_of(target);
+            if local.is_none() {
+                self.load_package(target);
+            }
         }
         let name = path.alias.as_ref().or(path.segments.last()).unwrap();
         self.uses.push(Use {
@@ -543,8 +564,9 @@ mod tests {
     /// Files named by the paths that use them; the first is the entry
     /// point. A file named `@name` is the library of dependency `name`,
     /// one named `#path` is what a `module.include` of `path` includes,
-    /// and one named `~path` is the test module that `path` names from the
-    /// test directory.
+    /// one named `~path` is the test module that `path` names from the
+    /// test directory, and one named `entry/path` is a file of the package
+    /// that `entry` enters that nothing uses.
     struct Memory(Vec<(&'static str, &'static str)>);
 
     impl Memory {
@@ -588,6 +610,13 @@ mod tests {
 
         fn open_package(&mut self, _from: FileId, name: &str) -> Option<FileId> {
             self.named(&format!("@{name}"))
+        }
+
+        fn package_files(&mut self, library: FileId) -> Vec<FileId> {
+            let prefix = format!("{}/", self.0[self.index(library)].0);
+            let files = self.0.iter().enumerate();
+            let files = files.filter(|(_, file)| file.0.starts_with(&prefix));
+            files.map(|(index, _)| Self::mint_file_id(index)).collect()
         }
 
         fn tests(&mut self) -> Vec<TestModule> {
@@ -634,6 +663,27 @@ mod tests {
             .iter()
             .map(|item| format!("{} {}", name(item), files.display_name(item.span.file)))
             .collect()
+    }
+
+    #[test]
+    fn a_library_is_loaded_whole() {
+        // The entry is a library, as it has no world: every file of its
+        // package is loaded, and every file of each library it uses.
+        let mut files = Memory(vec![
+            ("main", "use geo\nlet a = geo.one\n"),
+            ("@geo", "pub let one = 1\n"),
+            ("@geo/extra", "let b = 2\n"),
+            ("main/side", "let c = 3\n"),
+        ]);
+        assert_eq!(
+            items(&mut files),
+            ["one @geo", "b @geo/extra", "a main", "c main/side"]
+        );
+        let program = load(&mut files).unwrap();
+        let roots: Vec<_> = program.packages.iter().map(|p| p.items.clone()).collect();
+        assert_eq!(roots, [0..2, 2..4]);
+        assert!(program.package.contains(&files.id("main/side")));
+        assert!(!program.package.contains(&files.id("@geo/extra")));
     }
 
     #[test]

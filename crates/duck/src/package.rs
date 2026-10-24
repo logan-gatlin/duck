@@ -790,6 +790,45 @@ pub let f = module.include(\"assets/socket\")
     }
 
     #[test]
+    fn a_dependency_is_compiled_whole() {
+        let dir = TempDir::new("whole");
+        let root = dir.0.join("app");
+        let main = "use geo\nfn main():\n    let _ = geo.unit()\n";
+        dir.write(&[
+            (
+                "app/Duck.toml",
+                &format!("{COMPONENT}[dependencies]\ngeo = {{ path = \"../geo\" }}\n"),
+            ),
+            ("app/src/main.duck", main),
+            (
+                "geo/Duck.toml",
+                "[library]\nentry = \"src/lib.duck\"\n[test]\ndir = \"tests\"\n",
+            ),
+            ("geo/src/lib.duck", "pub fn unit() -> i32:\n    return 1\n"),
+            // Nothing uses it, but it is of the library.
+            (
+                "geo/src/extra.duck",
+                "fn broken() -> i32:\n    return \"no\"\n",
+            ),
+            ("geo/tests/geo_test.duck", "pub fn broken(:\n"),
+        ]);
+        let mut files = component_files(&root, false);
+        let errors = duck_compiler::compile(&mut files).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let file = files.display_name(errors[0].span().unwrap().file);
+        assert!(file.ends_with("geo/src/extra.duck"), "{file}");
+        // The library is checked whole too, as its tests are not.
+        let geo = dir.0.join("geo");
+        let packages = resolve(&geo, &no_cache(&geo)).unwrap();
+        let mut files =
+            Files::new(&packages, geo.join("src/lib.duck"), Settings::default()).unwrap();
+        let errors = duck_compiler::check(&mut files).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        dir.write(&[("geo/src/extra.duck", "fn fine() -> i32:\n    return 1\n")]);
+        assert!(duck_compiler::compile(&mut component_files(&root, false)).is_ok());
+    }
+
+    #[test]
     fn libraries_must_have_their_entry() {
         let dir = TempDir::new("no-entry");
         let root = dir.0.join("app");

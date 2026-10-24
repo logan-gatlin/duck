@@ -97,6 +97,10 @@ struct Package {
     root: PathBuf,
     /// The file other packages use, as reached from the working directory.
     library: Option<PathBuf>,
+    /// The directory of its test modules, as reached from the working
+    /// directory, if it has one: they are no part of the package as it is
+    /// compiled whole.
+    tests: Option<PathBuf>,
     /// The package each dependency is, by index.
     dependencies: Vec<(String, usize)>,
 }
@@ -122,6 +126,7 @@ impl Files {
                 dir: package.dir.clone(),
                 root: (entry.and_then(Path::parent).unwrap_or(&package.dir)).to_path_buf(),
                 library,
+                tests: (package.manifest.tests.as_ref()).map(|tests| package.dir.join(tests)),
                 dependencies: (package.dependencies.iter())
                     .map(|(name, id)| (name.clone(), *id))
                     .collect(),
@@ -441,6 +446,22 @@ impl FileManager for Files {
         let package = *package;
         let library = self.packages[package].library.clone()?;
         self.open_path(library, package)
+    }
+
+    fn package_files(&mut self, library: FileId) -> Vec<FileId> {
+        let package = self.get(library).package;
+        let Package { root, tests, .. } = self.packages[package].clone();
+        let mut paths = Vec::new();
+        if sources(&root, &mut paths).is_err() {
+            return Vec::new();
+        }
+        let sources = paths.into_iter().filter(|path| {
+            let tested = tests.as_ref().is_some_and(|tests| path.starts_with(tests));
+            !tested
+        });
+        sources
+            .filter_map(|path| self.open_path(path, package))
+            .collect()
     }
 
     fn tests(&mut self) -> Vec<TestModule> {
