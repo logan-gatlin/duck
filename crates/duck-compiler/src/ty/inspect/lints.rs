@@ -78,10 +78,14 @@ impl Analysis {
     /// one of several that are called alike, nor a name that starts with
     /// `_`, which says as much. A type parameter is among them whatever
     /// declares it: only its own declaration names it, and no function
-    /// that has one is called as another is.
+    /// that has one is called as another is. Only the files of the package
+    /// that the program is entered by are looked in, its test modules
+    /// among them: what another package declares is its own to use, and
+    /// nothing of it that isn't `pub` can be named outside it.
     pub fn unused(&self, files: &mut impl FileManager) -> Vec<Unused> {
         let mut read = |id| files.contents(id);
         let mut src = Sources::new(&mut read);
+        let own = |file: FileId| self.program.package.contains(&file);
         // Where each `use` writes a name, which is no use of what it names.
         let uses = self.program.uses.iter();
         let written =
@@ -91,7 +95,7 @@ impl Analysis {
         // which files by which names.
         let mut named: FxHashSet<Span> = FxHashSet::default();
         let mut named_as: FxHashSet<(FileId, &str, Span)> = FxHashSet::default();
-        let texts: Vec<_> = (self.files().into_iter())
+        let texts: Vec<_> = (self.files().into_iter().filter(|file| own(*file)))
             .map(|file| (file, src.file(file).to_string()))
             .collect();
         for (file, text) in &texts {
@@ -121,7 +125,7 @@ impl Analysis {
                 unused.push(Unused { name, span, kind });
             }
         };
-        for item in &self.program.items {
+        for item in self.program.items.iter().filter(|item| own(item.span.file)) {
             let variable = UnusedKind::Variable;
             let type_params: Vec<&Ident> = match &item.kind {
                 ItemKind::Fn(decl) => type_param_names(&decl.sig),
@@ -188,7 +192,8 @@ impl Analysis {
         }
         // A `use` is used by the names that stand for what it names, in the
         // file it gives the name to.
-        for used in self.program.uses.iter().filter(|used| !used.is_pub) {
+        let uses = self.program.uses.iter();
+        for used in uses.filter(|used| !used.is_pub && own(used.module)) {
             let name = &used.name;
             let item = self.item(used.module, &name.name);
             let Some(declared) = item.and_then(|item| self.item_span(item)) else {

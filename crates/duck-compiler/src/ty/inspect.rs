@@ -46,6 +46,10 @@ pub struct Analysis {
     /// order they are written: what is at a place is looked for in the one
     /// that holds it, and in no other.
     items: FxHashMap<FileId, Vec<usize>>,
+    /// The `use`s of each file, each by its place in the program's: a name
+    /// at a place is looked for among those of the file that holds it, and
+    /// not among the thousands a program's dependencies write.
+    uses: FxHashMap<FileId, Vec<usize>>,
 }
 
 /// What is written at a place.
@@ -270,11 +274,16 @@ pub fn analyze(program: Program, settings: &Settings) -> Analysis {
     for items in items.values_mut() {
         items.sort_by_key(|index| program.items[*index].span.start);
     }
+    let mut uses: FxHashMap<FileId, Vec<usize>> = FxHashMap::default();
+    for (index, used) in program.uses.iter().enumerate() {
+        uses.entry(used.module).or_default().push(index);
+    }
     Analysis {
         program,
         ck,
         start,
         items,
+        uses,
     }
 }
 
@@ -469,11 +478,19 @@ impl Analysis {
         };
         let mut read = |id| files.contents(id);
         let mut src = Sources::new(&mut read);
-        // It is written as it is declared, or as a `use` names it.
+        // It is written as it is declared, or as a `use` of it names it: by
+        // its own name, or by the last of a path that leads to it. Only a
+        // word written as one of those is looked up, as every word of a
+        // program's dependencies is too many to.
         let name = src.text(wanted);
-        let uses = self.program.uses.iter();
-        let used = uses.flat_map(|used| used.path.last().into_iter().chain([&used.name]));
-        let used: FxHashSet<&str> = used.map(|name| name.name.as_str()).collect();
+        let mut written: FxHashSet<&str> = FxHashSet::from_iter([name.as_str()]);
+        for used in &self.program.uses {
+            for name in used.path.last().into_iter().chain([&used.name]) {
+                if self.definition(used.module, name.span.start) == Some(wanted) {
+                    written.insert(name.name.as_str());
+                }
+            }
+        }
         let mut references = Vec::new();
         for file in self.files() {
             for (start, word) in names(src.file(file)) {
@@ -482,7 +499,7 @@ impl Analysis {
                     start,
                     end: start + word.len(),
                 };
-                if (word == name || used.contains(word))
+                if written.contains(word)
                     && (declared || span != wanted)
                     && self.definition(file, start) == Some(wanted)
                 {
@@ -1018,7 +1035,10 @@ impl Analysis {
     /// after the module its path leads into, and what it names.
     fn used(&self, file: FileId, offset: usize) -> Option<Found<'_>> {
         let holds = |name: &Ident| name.span.start <= offset && offset <= name.span.end;
-        let mut uses = self.program.uses.iter().filter(|used| used.module == file);
+        let uses = self.uses.get(&file).into_iter().flatten();
+        let uses = uses.map(|index| &self.program.uses[*index]);
+        // Only a `use` that the place is in names it.
+        let mut uses = uses.filter(|used| used.decl.start <= offset && offset <= used.decl.end);
         uses.find_map(|used| {
             let mut item = Item::Module(used.target);
             // The last name of the path to the module is the module's.
@@ -2398,7 +2418,8 @@ mod tests {
     use crate::load;
     use std::ops::Range;
 
-    /// Files named by the paths that use them. The first is the entry point.
+    /// Files named by the paths that use them, and the entry point of each
+    /// package by `@` and the package's name. The first is the entry point.
     struct Memory(Vec<(&'static str, &'static str)>);
 
     impl Memory {
@@ -2434,8 +2455,10 @@ mod tests {
             Some(Self::mint_file_id(index))
         }
 
-        fn open_package(&mut self, _from: FileId, _name: &str) -> Option<FileId> {
-            None
+        fn open_package(&mut self, _from: FileId, name: &str) -> Option<FileId> {
+            let entry = format!("@{name}");
+            let index = self.0.iter().position(|file| file.0 == entry)?;
+            Some(Self::mint_file_id(index))
         }
 
         fn settings(&mut self) -> Settings {
@@ -4075,6 +4098,24 @@ fn main(p: Point):
                 "main:21: Variable o",
             ]
         );
+    }
+
+    #[test]
+    fn what_another_package_declares_is_its_own_to_use() {
+        let kit = "pub fn shown():\n    pass\nfn hidden():\n    pass\nfn idle():\n    hidden()\n";
+        let main = "use kit\npub fn main():\n    kit.shown()\nfn spare():\n    pass\n";
+        let mut files = Memory(vec![("main", main), ("@kit", kit)]);
+        let analysis = used(&mut files);
+        let unused = analysis.unused(&mut files);
+        let names: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
+        assert_eq!(names, ["spare"]);
+        // The package is still looked through for what it names of the other.
+        let (file, offset) = files.at("main", "shown");
+        let (kit_file, declared) = files.at("@kit", "shown");
+        let definition = analysis.definition(file, offset).unwrap();
+        assert_eq!((definition.file, definition.start), (kit_file, declared));
+        let references = analysis.references(&mut files, file, offset, true);
+        assert_eq!(references.len(), 2);
     }
 
     #[test]
