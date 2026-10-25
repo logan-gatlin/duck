@@ -708,7 +708,8 @@ impl Analysis {
 
     /// What can follow the path of the `use` whose last name is at byte
     /// `offset` of `file`: the items of the module it names that `file`
-    /// sees.
+    /// sees. In the body of a struct, a union or an enum, where a `use`
+    /// names a type, only the types and the modules among them.
     pub fn module_items(
         &self,
         files: &mut impl FileManager,
@@ -716,15 +717,30 @@ impl Analysis {
         offset: usize,
     ) -> Vec<Completion> {
         let site = self.locate(file, offset, false);
-        let Some(Found::Used {
-            item: Item::Module(module),
-            ..
-        }) = site.found
-        else {
-            return Vec::new();
+        // In the body of a struct, a union or an enum, a `use` names a type
+        // by a path, as a field or a variant does: what it goes on with is
+        // a type, or a module that leads to one.
+        let (module, typed) = match site.found {
+            Some(Found::Used {
+                item: Item::Module(module),
+                ..
+            }) => (module, false),
+            Some(Found::Path { ref names, .. }) => match self.path(file, names) {
+                Some(Item::Module(module)) => (module, true),
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
         };
         let mut read = |id| files.contents(id);
-        self.items_of(&mut Sources::new(&mut read), file, module)
+        let items = self.items_of(&mut Sources::new(&mut read), file, module);
+        let is_type = |item: &Completion| {
+            use CompletionKind::{Enum, Module, Struct, Type, Union};
+            matches!(item.kind, Struct | Union | Enum | Type | Module)
+        };
+        match typed {
+            true => items.into_iter().filter(is_type).collect(),
+            false => items,
+        }
     }
 
     /// What can follow the `.` after the expression that the statement
@@ -4736,6 +4752,17 @@ fn main(c: bool) -> i32:
         let items = shown(analysis.module_items(&mut files, main, kit));
         assert_eq!(items[..3], ["Color", "Point", "Shape"]);
         assert_eq!(items.len(), 5);
+        // In the body of a struct, where a `use` names a type, the types
+        // among them, and a module that would lead to one.
+        let spot = "use kit\nstruct Spot:\n    use kit.Point\n    at: kit.Point\n";
+        let mut spotted = Memory(vec![("main", spot), ("kit", KIT)]);
+        let analyzed = used(&mut spotted);
+        let (main, kit) = place(&spotted, "    use kit.Point", "kit");
+        let items = shown(analyzed.module_items(&mut spotted, main, kit));
+        assert_eq!(items, ["Color", "Point", "Shape"]);
+        let (_, kit) = place(&spotted, "at: kit.Point", "kit");
+        let items = shown(analyzed.module_items(&mut spotted, main, kit));
+        assert_eq!(items, ["Color", "Point", "Shape"]);
 
         // A type that is given its type arguments has what it is declared
         // with, and a function of `module` its own parameters.

@@ -1696,6 +1696,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_path_in_the_body_of_a_struct_names_a_type() {
+        let dir = TempDir::new("paths");
+        dir.write(&[
+            (
+                "app/Duck.toml",
+                &format!("{MODULE}[dependencies]\nutil = {{ path = \"../util\" }}\n"),
+            ),
+            ("app/main.duck", "use geo\nuse util\nfn main():\n    pass\n"),
+            (
+                "app/geo.duck",
+                "pub struct Point:\n    pub x: f32\npub fn len(p: Point) -> f32:\n    return p.x\n",
+            ),
+            ("util/Duck.toml", LIBRARY),
+            (
+                "util/lib.duck",
+                "pub struct Square:\n    pub side: f32\npub fn log(x: f32):\n    pass\n",
+            ),
+        ]);
+        let cache = Cache::new(dir.0.join("no-cache"));
+        let mut project = Project::resolve(dir.0.join("app"), &cache);
+        assert_eq!(project.check(&|_| None), []);
+        let main = dir.0.join("app/main.duck");
+        let complete = |project: &mut Project, src: &str, text: &str| -> Vec<String> {
+            let buffers = |path: &Path| (path == main).then_some(src);
+            let position = position(src, src.find(text).unwrap() + text.len());
+            let suggested = project.complete(&buffers, &main, src, position, false);
+            let suggestions = suggested.suggestions.into_iter();
+            suggestions.map(|s| s.completion.name).collect()
+        };
+        // The path of a `use` goes on with what the module it names has,
+        // whether of the package's own or a dependency.
+        let src = "use geo\nuse util.\nfn main():\n    pass\n";
+        assert_eq!(complete(&mut project, src, "use util."), ["Square", "log"]);
+        let src = "use geo.\nuse util\nfn main():\n    pass\n";
+        assert_eq!(complete(&mut project, src, "use geo."), ["Point", "len"]);
+        // In the body of a struct, a path names a type: the types the
+        // module has, whether the path is a `use` or the type of a field.
+        let src = "use geo\nuse util\nstruct Spot:\n    use geo.\n";
+        assert_eq!(complete(&mut project, src, "use geo."), ["Point"]);
+        let src = "use geo\nuse util\nstruct Spot:\n    use util.\n";
+        assert_eq!(complete(&mut project, src, "use util."), ["Square"]);
+        let src = "use geo\nuse util\nstruct Spot:\n    at: util.\n";
+        assert_eq!(complete(&mut project, src, "at: util."), ["Square"]);
+        let src = "use geo\nuse util\nstruct Spot:\n    at: geo.\n    n: i32 = geo.\n";
+        assert_eq!(complete(&mut project, src, "at: geo."), ["Point"]);
+    }
+
+    #[test]
     fn what_is_asked_of_the_same_text_is_answered_of_the_same_check() {
         let (dir, mut project) = package("probes");
         let main = dir.0.join("app/main.duck");

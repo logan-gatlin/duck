@@ -104,6 +104,19 @@ pub fn completing(src: &str, offset: usize) -> Option<Completing> {
             {
                 return Some(Completing::Module);
             }
+            // In the body of a struct, a union or an enum, a path before a
+            // `.` names a type, as the type that a `use` there names, if
+            // it isn't in a default: the line is a `use` of it, which
+            // parses there as an expression doesn't.
+            let valued = tokens[..start]
+                .iter()
+                .any(|token| token.kind == TokenKind::Eq);
+            if !valued
+                && line.declares()
+                && let Some(path) = path_of(&tokens[start..dot])
+            {
+                return Some(using(&line, path));
+            }
             // Nothing comes before the `.` of a `.name`.
             let Some(receiver) = line.text(&tokens[start..dot]) else {
                 let end = tokens[dot].span.end;
@@ -141,13 +154,33 @@ fn used(line: &Line, tokens: &[Token]) -> Option<Completing> {
     if matches!(ends, Some(TokenKind::Ident(_) | TokenKind::RBrace)) {
         return None;
     }
+    Some(using(line, path))
+}
+
+/// What is being written after the names `path`, which `line` is made a
+/// `use` of, said to start at the last of them, if there are any.
+fn using(line: &Line, path: Vec<String>) -> Completing {
     let cursor = path.last().map(|last| {
         let statement = format!("use {}", path.join("."));
         let mut cursor = line.replaced(&statement);
         cursor.probe += statement.len() - last.len();
         cursor
     });
-    Some(Completing::Used(path, cursor))
+    Completing::Used(path, cursor)
+}
+
+/// The names of `tokens`, if they are a path: names with a `.` between
+/// each.
+fn path_of(tokens: &[Token]) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        match (&token.kind, i % 2) {
+            (TokenKind::Ident(name), 0) => path.push(name.clone()),
+            (TokenKind::Dot, 1) => {}
+            _ => return None,
+        }
+    }
+    (tokens.len() % 2 == 1).then_some(path)
 }
 
 /// The innermost call that byte `offset` of `src` is in the arguments of, if
@@ -341,6 +374,29 @@ impl<'s> Line<'s> {
         let mut cursor = self.replaced(&format!("{head}{name}{closed}{block}"));
         cursor.probe += probe - first.span.start;
         cursor
+    }
+
+    /// Whether the line is in the body of a struct, a union or an enum: the
+    /// nearest line above it that is indented less, and isn't blank or a
+    /// comment, declares one.
+    fn declares(&self) -> bool {
+        fn text(line: &str) -> &str {
+            line.trim_start_matches([' ', '\t'])
+        }
+        let mut above = self.src[..self.start].lines().rev().filter(|line| {
+            let text = text(line);
+            let indent = line.len() - text.len();
+            !text.is_empty() && !text.starts_with('#') && indent < self.indent.len()
+        });
+        let Some(head) = above.next().map(text) else {
+            return false;
+        };
+        let head = head.strip_prefix("pub").map_or(head, str::trim_start);
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        ["struct", "union", "enum"].iter().any(|keyword| {
+            let rest = head.strip_prefix(keyword);
+            rest.is_some_and(|rest| !rest.starts_with(word))
+        })
     }
 
     /// Whether the lines under the one the place is on are a block of it:
@@ -666,6 +722,41 @@ mod tests {
         assert_eq!(
             used("use a.{\n\tb,\n\tc.@\n}\n"),
             path("a.c", Some("use a.@c\n}\n"))
+        );
+        // In the body of a struct, a union or an enum, a `use` names a type,
+        // and so does the path before a `.` of a field or a variant: the
+        // line is a `use` of it, which parses there.
+        assert_eq!(
+            used("struct P:\n    use geo.@\n"),
+            path("geo", Some("struct P:\n    use @geo\n"))
+        );
+        assert_eq!(
+            used("pub struct(T) P:\n    x: T\n    y: geo.@\n"),
+            path("geo", Some("pub struct(T) P:\n    x: T\n    use @geo\n"))
+        );
+        assert_eq!(
+            used("union S:\n    # Round.\n    circle: geo.sub.@\nlet a = 1\n"),
+            path(
+                "geo.sub",
+                Some("union S:\n    # Round.\n    use geo.@sub\nlet a = 1\n")
+            )
+        );
+        assert_eq!(
+            used("enum(u8) C:\n    use geo.@\n"),
+            path("geo", Some("enum(u8) C:\n    use @geo\n"))
+        );
+        // Not in a default, which is a value, nor in a function.
+        assert_eq!(
+            completing_at("struct P:\n    x: f32 = geo.@\n"),
+            asked("members", "struct P:\n    @geo\n")
+        );
+        assert_eq!(
+            completing_at("fn f():\n    let x: geo.@\n"),
+            asked("members", "fn f():\n    @geo\n")
+        );
+        assert_eq!(
+            completing_at("structure = 1\n    geo.@\n"),
+            asked("members", "structure = 1\n    @geo\n")
         );
     }
 
