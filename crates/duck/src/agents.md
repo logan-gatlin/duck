@@ -88,7 +88,8 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
 - A type has a `size: uint` and an `align: uint`, as in `Point.size`,
   `(&Point).size` and `i64.align`. It is no value: `type` is only the type of
   a function's parameter, which makes it a type parameter, and of a `let`
-  that names a type.
+  that names a type. `enum` is a type parameter's bound, or the type of a
+  parameter that is one: see "Generic over enums".
 - `let Step: type = fn(i32) -> i32`: a `let` of one name, typed `type`,
   names the type it is bound to. `Step` is that type wherever a type is
   written, and no type of its own: an error says `fn(i32) -> i32`. It takes
@@ -114,8 +115,9 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   arguments, and holds others by value at most 64 deep.
 - `enum(T) Name:` makes each member a constant of any type `T`. Integer
   members count up from the one before, and other types need every value.
-  Enums support `Name.member`, `==`, `!=`, `e as T` and `for m in Name`.
-  Nothing converts a `T` to the enum.
+  Enums support `Name.member`, `==`, `!=`, `e as T`, `for m in Name` and
+  `Name.members`, an `array(Name)` of every member in declaration order,
+  unless a member is named `members`. Nothing converts a `T` to the enum.
 - `enum Name:` names no type: its members count from 0 and none is given a
   value. Its values are a `u8`, or a `u16` past 256 members, or a `u32`
   past 65536. It uses only enums that name no type either.
@@ -266,7 +268,8 @@ fn double(v: varray(i32)):
 
 - `for x in a` runs its block for each element of an array, with `x` an
   immutable copy of it. `for m in Name` runs it for each member of an enum,
-  in the order they are declared.
+  in the order they are declared, and `for m in E` for each of the type
+  argument of a type parameter that an enum or `enum` bounds.
 - The array is evaluated once, and its `ptr` and `len` are read once, before
   the first iteration. A block that changes what is iterated still runs for
   the elements that were there.
@@ -833,7 +836,8 @@ fn demo(n: &Named) -> i32:
 - A `T` has no operators, literals, fields, constructor or members: `a > b`,
   `a == b`, `0 as T`, `T(x: 1)` and `T.ok` are errors where they are written,
   whatever the function is called with. So a generic body is checked once,
-  as declared, and is right for every type argument.
+  as declared, and is right for every type argument. A `T` that an enum or
+  `enum` bounds has `==` and more: see "Generic over enums".
 - `fn(T) f(x: T)`: each call infers `T` from its arguments, so `T` is in the
   type of a parameter, or in the bound of a type parameter that is.
 - `fn f(T: type)`: each call gives `T` a type as that argument, `f(u8)` or
@@ -963,6 +967,47 @@ fn demo(r: ReadError, w: Warm) -> i32:
   variants or members, and `x as IoError` is the bound's own value. It
   builds no `T`: `T.closed` and `.closed` for a `T` are errors, as a type
   argument may have no such variant.
+
+### Generic over enums
+
+```duck
+enum Tile:
+	grass
+	water
+
+enum(string) Word:
+	one = "one"
+	two = "two"
+
+fn pick(E: enum, n: uint) -> E:      # given an enum, any at all: pick(Tile, 3)
+	let all = E.members              # an `array(E)` of every member
+	return all[n % all.len]
+
+fn(E: enum) place(e: E) -> uint:     # `E` is the enum that `e` is
+	for i, m in E:                   # each member, as of any enum
+		if m == e:                   # an enum has `==` and `!=`
+			return i
+	return 0
+
+fn demo() -> uint:
+	let w = pick(Word, 1)            # `.two`
+	return place(Tile.water) + place(w)
+```
+
+- `fn(E: enum)`, `struct(E: enum)`, `opaque(enum)`: `E` is bounded by every
+  enum, whatever the type of its values, so a type argument is an enum. `fn
+  f(E: enum)` is given one as `fn f(T: type)` is given a type: `f(Tile)`.
+- `enum` is written only so: as a bound, alone and in no list, or as the
+  type of a parameter. No value is of it.
+- In the body an `E` that an enum or `enum` bounds has `==` and `!=`, `for
+  m in E`, and `E.members`, an `array(E)` of the members of its type
+  argument in declaration order, as they are of it, whatever member the
+  type argument or its bound has named `members`. The elements are
+  constant, so every `E.members` of one enum is the same memory.
+- Nothing else of an enum is known of an `E` that `enum` bounds: it builds
+  none of its own, so `E.grass`, `.grass` and `0 as E` are errors, as are
+  `e as u8` and a `match` arm but a name, `_` or `else`. Its values come
+  from what it is given and from `E.members`, so each is a member.
 
 ## Use in a struct, union or enum
 

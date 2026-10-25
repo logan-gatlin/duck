@@ -110,7 +110,7 @@ impl Analysis {
         let written = |ty: &Ty| self.written_type(file, *ty);
         let all = |tys: &[Ty]| tys.iter().map(written).collect::<Option<Vec<_>>>();
         Some(match ty {
-            Ty::Prim(_) | Ty::Unit | Ty::Param(_) => self.ck.ty_name(ty),
+            Ty::Prim(_) | Ty::Unit | Ty::Param(_) | Ty::AnyEnum => self.ck.ty_name(ty),
             Ty::Enum(id) => {
                 let def = &self.ck.enums[id.0 as usize];
                 self.named_from(file, def.module, &def.name, Item::Enum(id))?

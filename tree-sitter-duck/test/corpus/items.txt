@@ -582,6 +582,55 @@ fn(T: mod.Head) id(T: type, x: &T) -> i32:
             (identifier)))))))
 
 ====================
+Type parameters bounded by every enum
+====================
+
+fn(E: enum) next(e: E) -> E:
+    return e
+
+fn pick(E: enum) -> opaque(enum):
+    return E.members[0]
+
+---
+
+(source_file
+  (function_declaration
+    (type_parameters
+      (bounded_type_parameter
+        (identifier)
+        (enum_type)))
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (identifier))))
+    (named_type
+      (identifier))
+    (block
+      (expression_statement
+        (return_expression
+          (identifier)))))
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (enum_type)))
+    (named_type
+      (identifier)
+      (type_arguments
+        (enum_type)))
+    (block
+      (expression_statement
+        (return_expression
+          (index_expression
+            (field_expression
+              (identifier)
+              (identifier))
+            (integer)))))))
+
+====================
 Type parameter bounded by a function type
 ====================
 

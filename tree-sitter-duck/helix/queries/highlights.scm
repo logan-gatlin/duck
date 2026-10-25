@@ -75,6 +75,7 @@
   "var"
   "struct"
   "enum"
+  (enum_type)
   "union"
 ] @keyword.storage.type
 

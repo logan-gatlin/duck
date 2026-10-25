@@ -1821,4 +1821,66 @@ pub fn named(n: i32) -> i32:
         // A function declared in a function is a type where one is given.
         assert_eq!(started.call("named", &[2]), 75);
     }
+
+    #[test]
+    fn a_function_generic_over_enums_lists_iterates_and_compares_their_members() {
+        let src = "\
+enum(u8) Warm:
+    red
+    green = 5
+enum(u8) Color:
+    use Warm
+    blue
+enum Tile:
+    grass
+    water
+    sand
+enum(string) Word:
+    one = \"one\"
+    two = \"two\"
+enum(i64) Big:
+    low = -3
+    high = 7
+struct(E: enum) Slot:
+    value: E
+let all = Big.members
+fn pick(E: enum, n: uint) -> E:
+    let members = E.members
+    return members[n % members.len]
+fn(E: enum) place(e: E) -> uint:
+    for i, m in E:
+        if m == e:
+            return i
+    return 99
+fn(C: Color) shade(c: C) -> uint:
+    var seen: uint = 0
+    for m in C:
+        seen += 1
+        if m == c:
+            break
+    return seen
+fn(E: enum) last(s: Slot(E)) -> E:
+    return E.members[E.members.len - 1]
+fn hidden() -> opaque(enum):
+    return Tile.water
+pub fn picks(n: i32) -> i32:
+    let c = pick(Color, n as uint) as u8 as i32
+    let w = pick(Word, n as uint) as string
+    return c * 10 + w.len as i32 + pick(Big, n as uint) as i64 as i32 * 100
+pub fn places() -> i32:
+    let p = place(Tile.sand) + place(Word.two) * 10 + place(Big.high) * 100
+    return (p + shade(Warm.green) * 1000 + shade(Color.blue) * 10000) as i32
+pub fn lists() -> i32:
+    let slot = Slot(Big)(value: .low)
+    let n = all.len + Tile.members.len * 10 + Color.members[1] as u8 as uint * 100
+    let compared = last(slot) == Big.high and not (hidden() != hidden())
+    return n as i32 + compared as i32 * 1000
+";
+        let mut started = Started::of(src);
+        assert_eq!(started.call("picks", &[0]), -300 + 3);
+        assert_eq!(started.call("picks", &[1]), 700 + 53);
+        assert_eq!(started.call("picks", &[2]), -300 + 63);
+        assert_eq!(started.call("places", &[]), 32112);
+        assert_eq!(started.call("lists", &[]), 1532);
+    }
 }

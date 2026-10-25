@@ -25,9 +25,9 @@ pub use lints::{Apart, Unused, UnusedKind};
 pub use symbols::{Symbol, SymbolKind};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MODULE_CONSTS, MODULE_FUNCS, MODULE_TYPES, NEVER,
-    OPAQUE, OPTION, PRIMS, Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty, TypeError,
-    VARRAY, is_builtin_type, lower_program,
+    ARRAY, ARRAY_FIELDS, Checker, EnumId, Item, MEMBERS, MODULE_CONSTS, MODULE_FUNCS, MODULE_TYPES,
+    NEVER, OPAQUE, OPTION, PRIMS, Prim, RESULT, STRING, StructId, TUPLE, TYPE, TYPE_FIELDS, Ty,
+    TypeError, VARRAY, is_builtin_type, lower_program,
 };
 
 mod actions;
@@ -1622,7 +1622,8 @@ impl Analysis {
     }
 
     /// What can follow the `.` after the type `ty`: the members of an enum
-    /// or the variants of a union, and then the fields every type has.
+    /// or the variants of a union, then the fields every type has, and the
+    /// `members` of an enum that has no member so named.
     fn type_members(&self, src: &mut Sources, ty: Ty) -> Vec<Completion> {
         let mut members = self.sum_members(src, ty);
         members.extend(TYPE_FIELDS.iter().map(|name| Completion {
@@ -1632,6 +1633,16 @@ impl Analysis {
             import: None,
             docs: String::new(),
         }));
+        let named = members.iter().any(|member| member.name == MEMBERS);
+        if self.ck.is_enum(ty) && !named {
+            members.push(Completion {
+                name: MEMBERS.to_string(),
+                kind: CompletionKind::Field,
+                detail: format!("{ARRAY}({})", self.ck.ty_name(ty)),
+                import: None,
+                docs: String::new(),
+            });
+        }
         members
     }
 
@@ -2316,7 +2327,7 @@ fn names(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// parameters of type `type`.
 fn type_param_names(sig: &FnSig) -> Vec<&Ident> {
     let inferred = sig.type_params.iter().map(|param| &param.name);
-    let given = sig.params.iter().filter(|param| param.ty.is_type());
+    let given = sig.params.iter().filter(|param| param.ty.is_kind());
     inferred.chain(given.map(|param| &param.name)).collect()
 }
 
@@ -2365,7 +2376,7 @@ fn fn_local(sig: &FnSig) -> Local<'_> {
 /// The parameters of `sig` as names of its function's body. A type
 /// parameter is a type by its name, and no variable.
 fn param_locals(sig: &FnSig) -> impl Iterator<Item = Local<'_>> {
-    let params = sig.params.iter().filter(|param| !param.ty.is_type());
+    let params = sig.params.iter().filter(|param| !param.ty.is_kind());
     params.map(|param| Local {
         name: &param.name.name,
         span: param.name.span,
@@ -2850,7 +2861,13 @@ fn f(h: i32):
     fn a_type_has_its_members_and_a_module_its_items() {
         assert_eq!(
             members("    Color\n"),
-            ["red: Color", "green: Color", "size: uint", "align: uint"]
+            [
+                "red: Color",
+                "green: Color",
+                "size: uint",
+                "align: uint",
+                "members: array(Color)"
+            ]
         );
         assert_eq!(
             members("    Shape\n"),

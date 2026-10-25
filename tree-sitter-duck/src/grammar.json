@@ -1741,6 +1741,10 @@
         {
           "type": "SYMBOL",
           "name": "todo_type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "enum_type"
         }
       ]
     },
@@ -2076,6 +2080,10 @@
     "todo_type": {
       "type": "STRING",
       "value": "todo"
+    },
+    "enum_type": {
+      "type": "STRING",
+      "value": "enum"
     },
     "block": {
       "type": "SEQ",

@@ -10,9 +10,9 @@ use crate::lex::Span;
 use crate::parse::{self, Arg, ExprKind, Ident, TypeArg, TypeKind, TypeParam};
 
 use super::{
-    ARRAY, ARRAY_FIELDS, Body, Checker, FieldDef, Item, OPAQUE, OPTION, ParamId, RESULT, StructDef,
-    StructId, TUPLE, Ty, TypeErrorKind, VARRAY, Value, Visit, is_builtin_type, module_path,
-    path_text,
+    ARRAY, ARRAY_FIELDS, Body, Checker, ENUM, FieldDef, Item, OPAQUE, OPTION, ParamId, RESULT,
+    StructDef, StructId, TUPLE, Ty, TypeErrorKind, VARRAY, Value, Visit, is_builtin_type,
+    module_path, path_text,
 };
 
 /// A use of a generic struct with type arguments.
@@ -35,8 +35,8 @@ pub(super) struct ParamDef {
     pub(super) index: usize,
     /// What its type arguments [meet](Checker::meets), once it is
     /// resolved, if the type parameter is bounded: a struct, a union, an
-    /// enum, an array, a [list](Checker::list_of) of the types that a
-    /// struct uses, or a function type, which they are
+    /// enum, [`Ty::AnyEnum`], an array, a [list](Checker::list_of) of the
+    /// types that a struct uses, or a function type, which they are
     /// [called as](Checker::called_as).
     pub(super) bound: Option<Ty>,
     /// Whether it stands for a type that a result hides, until a `return`
@@ -188,10 +188,10 @@ impl Checker {
 
     /// Resolves the bound of each of a declaration's type parameters
     /// `params` that has one, whose types are `tys`. A bound is a struct, a
-    /// union, an enum, an array or a function type, or a list of structs
-    /// and arrays, and of `params` it names only those before its own, so
-    /// that no bound leads back to itself. Any other is reported and bounds
-    /// nothing.
+    /// union, an enum, `enum`, an array or a function type, or a list of
+    /// structs and arrays, and of `params` it names only those before its
+    /// own, so that no bound leads back to itself. Any other is reported and
+    /// bounds nothing.
     pub(super) fn resolve_bounds(&mut self, params: &[TypeParam], tys: &[Ty]) {
         for (i, (param, ty)) in params.iter().zip(tys).enumerate() {
             let (Some(first), Some(last), Ty::Param(id)) =
@@ -218,11 +218,12 @@ impl Checker {
     }
 
     /// Resolves `written`, what bounds a type parameter or a type that a
-    /// result hides, spanning `span`: a struct, a union, an enum, an array
-    /// or a function type, or a list of structs and arrays. `None` after
-    /// reporting any other, which bounds nothing.
+    /// result hides, spanning `span`: a struct, a union, an enum, `enum`,
+    /// an array or a function type, or a list of structs and arrays. `None`
+    /// after reporting any other, which bounds nothing.
     pub(super) fn bound_of(&mut self, written: &[parse::Type], span: Span) -> Option<Ty> {
         match written {
+            [written] if written.is_enum() => Some(Ty::AnyEnum),
             [written] => {
                 let bound = self.resolve_ty(written);
                 if !matches!(
@@ -250,6 +251,10 @@ impl Checker {
     /// an array, as a struct uses. The error type after reporting any
     /// other.
     fn listed_ty(&mut self, written: &parse::Type) -> Ty {
+        if written.is_enum() {
+            self.error(TypeErrorKind::NotListed(ENUM.to_string()), written.span);
+            return Ty::Error;
+        }
         let ty = self.resolve_ty(written);
         if matches!(ty, Ty::Struct(_) | Ty::Array(_) | Ty::Error) && !self.is_sum(ty) {
             return ty;
@@ -337,12 +342,19 @@ impl Checker {
     /// body of a generic function is checked as declared. Any other type
     /// is itself, and so is a type parameter bounded by a function type,
     /// which says how a type argument is called and nothing of what it
-    /// holds.
+    /// holds, or by `enum`, which says only that it is an enum.
     pub(super) fn known(&self, ty: Ty) -> Ty {
         match self.bounded_by(ty) {
-            Some(Ty::Fn(_)) | None => ty,
+            Some(Ty::Fn(_) | Ty::AnyEnum) | None => ty,
             Some(bound) => bound,
         }
+    }
+
+    /// Whether a `ty` is an enum: one, or a type parameter or a type that
+    /// a result hides that an enum or `enum` bounds, which is given one.
+    pub(super) fn is_enum(&self, ty: Ty) -> bool {
+        let bound = self.bounded_by(ty);
+        matches!(ty, Ty::Enum(_)) || matches!(bound, Some(Ty::Enum(_) | Ty::AnyEnum))
     }
 
     /// What bounds a `ty`, if it is a type parameter or a type that a
@@ -395,9 +407,12 @@ impl Checker {
     /// the type itself, whose values are pointers, and the type of each
     /// function that a pointer of it points to.
     ///
+    /// `enum` bounds every enum, whatever its values.
+    ///
     /// A type parameter is bounded by what its own bound is.
     pub(super) fn meets(&self, ty: Ty, bound: Ty) -> bool {
         match bound {
+            Ty::AnyEnum => ty == Ty::Error || self.is_enum(ty),
             Ty::Fn(_) => {
                 let called = self.called_as(ty);
                 // A signature that failed to resolve is already reported.
@@ -563,6 +578,9 @@ impl Checker {
                 bound: self.ty_name(bound),
             };
             return self.error(kind, site);
+        }
+        if bound == Ty::AnyEnum {
+            return self.error(TypeErrorKind::NotAnEnum(self.ty_name(ty)), site);
         }
         let kind = self.not_used(ty, bound).unwrap_or_else(|| {
             let sum = self.is_sum(bound);

@@ -72,6 +72,7 @@
   "var"
   "struct"
   "enum"
+  (enum_type)
   "union"
   "extern"
   "pass"

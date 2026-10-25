@@ -554,16 +554,16 @@ impl<T> Entry<T> {
 
 impl FnSig {
     /// Whether it has a type parameter: one a call infers, or a parameter of
-    /// type `type`.
+    /// type `type` or `enum`.
     pub fn is_generic(&self) -> bool {
-        !self.type_params.is_empty() || self.params.iter().any(|param| param.ty.is_type())
+        !self.type_params.is_empty() || self.params.iter().any(|param| param.ty.is_kind())
     }
 
     /// The names of its type parameters: those a call infers, then its
-    /// parameters of type `type`.
+    /// parameters of type `type` or `enum`.
     pub fn type_param_names(&self) -> Vec<Ident> {
         let inferred = self.type_params.iter().map(|param| &param.name);
-        let given = self.params.iter().filter(|param| param.ty.is_type());
+        let given = self.params.iter().filter(|param| param.ty.is_kind());
         inferred
             .chain(given.map(|param| &param.name))
             .cloned()
@@ -598,9 +598,21 @@ impl Expr {
 }
 
 impl Type {
-    /// Whether it is `type`, which makes a parameter a type parameter.
+    /// Whether it is `type`, which makes a parameter a type parameter, and a
+    /// `let` a name of a type.
     pub fn is_type(&self) -> bool {
         matches!(&self.kind, TypeKind::Named(name, None) if name == "type")
+    }
+
+    /// Whether it is `type` or `enum`, either of which makes a parameter a
+    /// type parameter.
+    pub fn is_kind(&self) -> bool {
+        self.is_type() || self.is_enum()
+    }
+
+    /// Whether it is `enum`, which bounds a type parameter by the enums.
+    pub fn is_enum(&self) -> bool {
+        matches!(&self.kind, TypeKind::Named(name, None) if name == "enum")
     }
 }
 
@@ -819,7 +831,7 @@ impl<'a> Parser<'a> {
                 };
                 p.error(ParseErrorKind::GenericExport, span);
             }
-            for param in sig.params.iter().filter(|param| param.ty.is_type()) {
+            for param in sig.params.iter().filter(|param| param.ty.is_kind()) {
                 p.error(ParseErrorKind::GenericExport, param.span);
             }
             decl.interface = Some(interface.clone());
@@ -955,7 +967,7 @@ impl<'a> Parser<'a> {
             };
             self.error(ParseErrorKind::GenericExtern, span);
         }
-        for param in sig.params.iter().filter(|param| param.ty.is_type()) {
+        for param in sig.params.iter().filter(|param| param.ty.is_kind()) {
             self.error(ParseErrorKind::GenericExtern, param.span);
         }
         let import_name = if self.eat(TokenKind::Eq) {
@@ -1326,6 +1338,11 @@ impl<'a> Parser<'a> {
             TokenKind::Todo => {
                 self.bump();
                 TypeKind::Todo
+            }
+            // A keyword, which only a bound and a type parameter are.
+            TokenKind::Enum => {
+                self.bump();
+                TypeKind::Named("enum".to_string(), None)
             }
             _ => return Err(self.unexpected("type")),
         };

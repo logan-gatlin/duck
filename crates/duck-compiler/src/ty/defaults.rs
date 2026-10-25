@@ -113,7 +113,7 @@ impl Checker {
             };
             // A type parameter has none, which is reported where it's
             // declared.
-            if param.ty.is_type() {
+            if param.ty.is_kind() {
                 defaults.push(Some(DefaultValue::Failed));
                 continue;
             }

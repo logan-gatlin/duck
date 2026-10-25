@@ -263,7 +263,7 @@ impl Checker {
                 let mut members = self.members(ty).into_iter();
                 members.any(|member| self.holds_value(member))
             }
-            Ty::Type | Ty::Unit | Ty::Never | Ty::Error => false,
+            Ty::Type | Ty::AnyEnum | Ty::Unit | Ty::Never | Ty::Error => false,
             Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Fn(_) => true,
             // What stands for a type may stand for one that does.
             Ty::Param(_) | Ty::Opaque(_) => true,
@@ -516,7 +516,7 @@ impl Body<'_> {
             self.error(TypeErrorKind::NestedDefault(own()), default.span);
         }
         let inferred = decl.sig.type_params.first().map(|param| param.name.span);
-        let given = decl.sig.params.iter().find(|param| param.ty.is_type());
+        let given = decl.sig.params.iter().find(|param| param.ty.is_kind());
         if let Some(param) = inferred.or(given.map(|param| param.span)) {
             self.error(TypeErrorKind::NestedTypeParams(own()), param);
             self.bind_fn(&name.name, Ty::Error, Vec::new());

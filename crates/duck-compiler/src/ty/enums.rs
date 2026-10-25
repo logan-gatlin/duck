@@ -15,8 +15,8 @@ use crate::load::Program;
 use crate::parse::{self, EnumDecl, ExprKind, Ident, ItemKind, Pattern};
 
 use super::{
-    Body, Check, CheckDef, Checker, EnumId, Finding, Item, Label, Prim, Scalar, TYPE_FIELDS, Ty,
-    TypeErrorKind, Value, Visit, similar, zero,
+    Body, Check, CheckDef, Checker, EnumId, Finding, Item, Label, MEMBERS, Prim, Scalar,
+    TYPE_FIELDS, Ty, TypeErrorKind, Value, Visit, similar, zero,
 };
 
 pub(super) struct EnumDef {
@@ -467,13 +467,59 @@ impl Body<'_> {
         }
     }
 
+    /// The type that `expr` names, if it is an enum, and the enum whose
+    /// members its values are, if that is known: an enum named by an item
+    /// or an alias, or a type parameter that an enum or `enum` bounds,
+    /// whose members are known in each instance, and not where its
+    /// function is checked as declared.
+    pub(super) fn enum_type(&self, expr: &parse::Expr) -> Option<(Ty, Option<EnumId>)> {
+        if let Some(id) = self.enum_name(expr) {
+            return Some((Ty::Enum(id), Some(id)));
+        }
+        let ty = self.param_named(expr).filter(|ty| self.ck.is_enum(*ty))?;
+        // A type argument that a result hides is laid out as its enum.
+        match self.ck.hiding(ty) {
+            Ty::Enum(id) => Some((ty, Some(id))),
+            _ => Some((ty, None)),
+        }
+    }
+
+    /// `E.members`, where `E` names a type `ty` that is an enum, of members
+    /// `id` if they are known: an array of every member, in declaration
+    /// order. Its elements are constant, so every array of them shares
+    /// them.
+    pub(super) fn member_list(&mut self, ty: Ty, id: Option<EnumId>, span: Span) -> (Ty, Value) {
+        let list = self.ck.array_of(ty, false);
+        let (mut bytes, mut fills, mut align, mut len) = (Vec::new(), Vec::new(), 1, 0);
+        if let Some(id) = id {
+            let def = &self.ck.enums[id.0 as usize];
+            let (name, item) = (def.name.clone(), def.item);
+            if !self.folded(item, &name, span) {
+                return (Ty::Error, Value::default());
+            }
+            let elem = Ty::Enum(id);
+            let size;
+            (size, align) = self.ck.layout(elem);
+            let cells = self.ck.cells(elem);
+            let members = &self.ck.enums[id.0 as usize].members;
+            len = members.len();
+            bytes = vec![0; size as usize * len];
+            for (i, member) in members.iter().enumerate() {
+                let at = i * size as usize;
+                fills.extend(self.ck.fill_bytes(&mut bytes, at, &cells, &member.value));
+            }
+        }
+        (list, self.literal_data(bytes, fills, align, len as u64))
+    }
+
     /// `E.field`, where `E` names enum `id`: the member `field`, or else
-    /// `None` for a field of `type`, which `E` is as a value.
+    /// `None` for a field of `type`, which `E` is as a value, or for its
+    /// `members`.
     pub(super) fn enum_member(&mut self, id: EnumId, field: &Ident) -> Option<(Ty, Value)> {
         let def = &self.ck.enums[id.0 as usize];
         let (name, item) = (def.name.clone(), def.item);
         let Some(index) = def.members.iter().position(|m| m.name == field.name) else {
-            if TYPE_FIELDS.contains(&field.name.as_str()) {
+            if TYPE_FIELDS.contains(&field.name.as_str()) || field.name == MEMBERS {
                 return None;
             }
             let kind = TypeErrorKind::NoMember {
@@ -493,19 +539,23 @@ impl Body<'_> {
         Some((Ty::Enum(id), self.scalars(Ty::Enum(id), consts)))
     }
 
-    /// `for index, pattern in E`, where `E` names enum `id`: a copy of `body`
-    /// per member, in declaration order, after setting `pattern` to it and
-    /// `index` to how many come before it. Each copy is in a block that
-    /// `continue` leaves, and they're all in one that `break` leaves.
+    /// `for index, pattern in E`, where `E` names a type `ty` that is an
+    /// enum, of members `id` if they are known: a copy of `body` per member,
+    /// in declaration order, after setting `pattern` to it and `index` to
+    /// how many come before it. Each copy is in a block that `continue`
+    /// leaves, and they're all in one that `break` leaves. Where they
+    /// aren't known, as in a generic function checked as declared, the
+    /// body is checked once and copied for none.
     pub(super) fn unrolled_loop(
         &mut self,
-        id: EnumId,
+        ty: Ty,
+        id: Option<EnumId>,
         index: Option<&Pattern>,
         pattern: &Pattern,
         body: &parse::Block,
     ) -> Stmt {
         self.scopes.push(FxHashMap::default());
-        let (place, dests) = self.for_bindings(index, pattern, Ty::Enum(id));
+        let (place, dests) = self.for_bindings(index, pattern, ty);
         self.enter_round();
         // An enum may have no members to run it for.
         let skipped = self.flow.clone();
@@ -514,8 +564,12 @@ impl Body<'_> {
         self.labels.pop();
         self.end_round(skipped);
         self.scopes.pop();
-        let members = self.ck.enums[id.0 as usize].members.iter();
+        let members = match id {
+            Some(id) => &self.ck.enums[id.0 as usize].members[..],
+            None => &[],
+        };
         let copies = members
+            .iter()
             .enumerate()
             .map(|(i, member)| {
                 let sets = dests.iter().zip(&member.value);

@@ -264,6 +264,10 @@
     "named": true,
     "subtypes": [
       {
+        "type": "enum_type",
+        "named": true
+      },
+      {
         "type": "function_type",
         "named": true
       },
@@ -894,6 +898,11 @@
         ]
       }
     }
+  },
+  {
+    "type": "enum_type",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "export_block",

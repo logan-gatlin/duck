@@ -138,6 +138,9 @@ const RESULT: &str = "result";
 /// The name of the built-in type of types used as values.
 const TYPE: &str = "type";
 
+/// The bound of the type parameters whose type arguments are enums.
+const ENUM: &str = "enum";
+
 /// The name of the built-in type of what has no value.
 const NEVER: &str = "never";
 
@@ -166,6 +169,9 @@ const ARRAY_FIELDS: [&str; 2] = ["ptr", "len"];
 
 /// The fields of a `type`, in order.
 const TYPE_FIELDS: [&str; 2] = ["size", "align"];
+
+/// The field of an enum's type that lists its members.
+const MEMBERS: &str = "members";
 
 /// The most structs and unions that can be nested by value, each a field of
 /// the one before or a variant, or in a tuple or enum of one. Generics can
@@ -280,6 +286,10 @@ pub enum Ty {
     /// parameter. Its values have no scalars: a type is known as the
     /// program is compiled.
     Type,
+    /// `enum`, which bounds a type parameter whose type arguments are
+    /// enums, any at all, and so is written only as a bound or as the type
+    /// of a parameter that is one. No value is of it.
+    AnyEnum,
     /// A type parameter, which the fields of its generic struct's declaration
     /// have, and the body of its generic function's while that is checked as
     /// declared. Uses of either replace it with a type argument.
@@ -416,8 +426,14 @@ pub enum TypeErrorKind {
     /// others, too many times over, as recursion with ever larger type
     /// arguments would be.
     /// A type parameter bounded by a type that isn't a struct, a union, an
-    /// enum, an array or a function type.
+    /// enum, `enum`, an array or a function type.
     NotABound(String),
+    /// A type argument that isn't an enum, for a type parameter that `enum`
+    /// bounds.
+    NotAnEnum(String),
+    /// `enum` written as a type but where it bounds a type parameter, or is
+    /// the type of a function's parameter, which makes it a type parameter.
+    EnumOutsideBound,
     /// A type that a bound lists which isn't a struct or an array.
     NotListed(String),
     /// A bound that lists types with a field of the same name, which no
@@ -1697,6 +1713,8 @@ impl TypeErrorKind {
             Self::CannotInfer { .. } => "cannot-infer",
             Self::GenericFnType(..) => "generic-fn-type",
             Self::NotABound(..) => "not-a-bound",
+            Self::NotAnEnum(..) => "not-an-enum",
+            Self::EnumOutsideBound => "enum-outside-bound",
             Self::NotListed(..) => "not-listed",
             Self::BoundRepeats { .. } => "bound-repeats",
             Self::NotWithin { .. } => "not-within",
@@ -1908,8 +1926,14 @@ impl fmt::Display for TypeErrorKind {
             ),
             Self::NotABound(ty) => write!(
                 f,
-                "`{ty}` can't bound a type parameter; only a struct, a union, an enum, an array \
-                 or a function type can"
+                "`{ty}` can't bound a type parameter; only a struct, a union, an enum, `enum`, \
+                 an array or a function type can"
+            ),
+            Self::NotAnEnum(ty) => write!(f, "`{ty}` is no enum, and `enum` bounds only enums"),
+            Self::EnumOutsideBound => write!(
+                f,
+                "`enum` is only a bound of a type parameter, and the type of a function's \
+                 parameter, which it makes a type parameter that is given an enum"
             ),
             Self::NotListed(ty) => write!(
                 f,
@@ -3528,7 +3552,7 @@ impl Checker {
                 self.error(kind, param.name.span);
             }
             // A type parameter, which only a generic function has.
-            let ty = match param.ty.is_type() {
+            let ty = match param.ty.is_kind() {
                 true => Ty::Type,
                 false => self.resolve_ty(&param.ty),
             };
@@ -4051,6 +4075,11 @@ impl Checker {
             // The last of a name: a function declared in a function.
             None => self.type_params.iter().rfind(|(p, _)| p == name),
         };
+        // A keyword, so no item or type parameter is named it.
+        if name == ENUM {
+            self.error(TypeErrorKind::EnumOutsideBound, span);
+            return Ty::Error;
+        }
         let arity = match (param, member) {
             (Some(_), _) => Some(Arity::Plain),
             (None, Some(item)) => self.item_arity(item),
@@ -4161,8 +4190,8 @@ impl Checker {
             // Only the index of a function is stored, whatever it takes,
             // and nothing is of one that is its own type.
             Ty::Fn(_) | Ty::Func(_) => true,
-            // A type is in no value.
-            Ty::Type => false,
+            // A type is in no value, and nor is a bound.
+            Ty::Type | Ty::AnyEnum => false,
             Ty::Prim(_) | Ty::Ptr(_) | Ty::Array(_) | Ty::Unit | Ty::Error => true,
         }
     }
@@ -4417,6 +4446,7 @@ impl Checker {
             Ty::Param(id) => self.params[id.0 as usize].name.clone(),
             Ty::Opaque(id) => self.opaque_name(id),
             Ty::Type => TYPE.to_string(),
+            Ty::AnyEnum => ENUM.to_string(),
             Ty::Unit => format!("{TUPLE}()"),
             Ty::Never => NEVER.to_string(),
             Ty::Error => "{error}".to_string(),
@@ -4466,7 +4496,13 @@ impl Checker {
                     self.push_leaves(member, format!("{name}.{field}"), out);
                 }
             }
-            Ty::Param(_) | Ty::Opaque(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Param(_)
+            | Ty::Opaque(_)
+            | Ty::Type
+            | Ty::AnyEnum
+            | Ty::Unit
+            | Ty::Never
+            | Ty::Error => {}
         }
     }
 
@@ -4823,7 +4859,13 @@ impl Checker {
             Ty::Func(id) => self.held(id).map_or((0, 1), |held| self.layout(held)),
             // Never in memory, but a struct holding one still has a layout
             // that `field` asks for.
-            Ty::Param(_) | Ty::Opaque(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => (0, 1),
+            Ty::Param(_)
+            | Ty::Opaque(_)
+            | Ty::Type
+            | Ty::AnyEnum
+            | Ty::Unit
+            | Ty::Never
+            | Ty::Error => (0, 1),
         }
     }
 
@@ -4936,7 +4978,13 @@ impl Checker {
                     self.push_cells(held, offset, leaves, &when, out);
                 }
             }
-            Ty::Param(_) | Ty::Opaque(_) | Ty::Type | Ty::Unit | Ty::Never | Ty::Error => {}
+            Ty::Param(_)
+            | Ty::Opaque(_)
+            | Ty::Type
+            | Ty::AnyEnum
+            | Ty::Unit
+            | Ty::Never
+            | Ty::Error => {}
         }
     }
 
@@ -5560,7 +5608,7 @@ impl<'c> Body<'c> {
         };
         let members = match range {
             Some(_) => None,
-            None => self.enum_name(iter),
+            None => self.enum_type(iter),
         };
         // Only an element is in memory, which an integer and a member are
         // not.
@@ -5570,8 +5618,8 @@ impl<'c> Body<'c> {
         if let Some(range) = range {
             return self.range_loop(index, pattern, range, iter.span, body, out);
         }
-        if let Some(id) = members {
-            out.push(self.unrolled_loop(id, index, pattern, body));
+        if let Some((ty, id)) = members {
+            out.push(self.unrolled_loop(ty, id, index, pattern, body));
             return;
         }
         let (ty, value) = self.expr(iter, None);
@@ -6296,8 +6344,10 @@ impl<'c> Body<'c> {
                 let type_field = TYPE_FIELDS.contains(&field.name.as_str());
                 match self.param_named(inner) {
                     // The `size` and `align` of a type parameter are those of
-                    // the type, even if it's an enum with such a member.
+                    // the type, even if it's an enum with such a member, and
+                    // so are the `members` of one that is an enum.
                     Some(_) if type_field => {}
+                    Some(ty) if field.name == MEMBERS && self.ck.is_enum(ty) => {}
                     _ => {
                         let id = self.enum_name(inner);
                         if let Some(member) = id.and_then(|id| self.enum_member(id, field)) {
@@ -6307,6 +6357,11 @@ impl<'c> Body<'c> {
                             return variant;
                         }
                     }
+                }
+                if field.name == MEMBERS
+                    && let Some((ty, id)) = self.enum_type(inner)
+                {
+                    return self.member_list(ty, id, field.span);
                 }
                 // A function names its type there, which no value of it has.
                 let names_fn =
@@ -7194,9 +7249,15 @@ impl<'c> Body<'c> {
         span: Span,
     ) -> (Ty, Value) {
         let bool = Ty::Prim(Prim::Bool);
+        let is_eq = matches!(op, BinOp::Eq | BinOp::NotEq);
         let prim = match ty {
             Ty::Prim(prim) => self.ck.fixed(prim),
             Ty::Never => return never(self.seq(vec![lhs, rhs]).pre),
+            // An enum is compared as its type argument is, or as the enum
+            // that a result hides.
+            Ty::Param(_) | Ty::Opaque(_) if is_eq && self.ck.is_enum(ty) => {
+                return self.eq_values(op, self.ck.hiding(ty), lhs, rhs, span);
+            }
             // A type parameter is no type that an operator takes, and nor
             // is one that a result hides.
             Ty::Param(_) | Ty::Opaque(_) => {
@@ -7204,9 +7265,7 @@ impl<'c> Body<'c> {
             }
             // Pointers compare as unsigned addresses.
             Ty::Ptr(_) if is_comparison(op) => self.ck.fixed(Prim::Uint),
-            _ if matches!(op, BinOp::Eq | BinOp::NotEq) => {
-                return self.eq_values(op, ty, lhs, rhs, span);
-            }
+            _ if is_eq => return self.eq_values(op, ty, lhs, rhs, span),
             _ => return self.invalid_operand(binop_symbol(op), ty, span),
         };
         if matches!(op, BinOp::And | BinOp::Or) {
@@ -13188,8 +13247,64 @@ fn f(io: IoError, r: ReadError, s: Swapped, t: Retyped, h: Held, m: More, k: Clo
         );
         assert_eq!(
             NotABound("i32".into()).to_string(),
-            "`i32` can't bound a type parameter; only a struct, a union, an enum, an array \
-             or a function type can"
+            "`i32` can't bound a type parameter; only a struct, a union, an enum, `enum`, an \
+             array or a function type can"
+        );
+    }
+
+    #[test]
+    fn enum_bounds_only_enums_and_is_written_only_as_a_bound() {
+        use TypeErrorKind::*;
+        let src = "\
+enum Tile:
+    grass
+    water
+struct Head:
+    id: i32
+struct(E: enum) Slot:
+    value: E
+fn pick(E: enum) -> E:
+    return E.members[0]
+fn(E: enum) bad(e: E) -> u8:
+    let b: E = .grass
+    match e:
+        .grass:
+            pass
+        else:
+            pass
+    let c = e < e
+    return e as u8
+fn(T) plain(t: T) -> uint:
+    return T.members.len
+fn(T: (enum, Head)) listed(t: T):
+    pass
+fn f(x: enum, h: Head):
+    let y: enum = Tile.grass
+    let z = pick(i32)
+    let s = Slot(Head)(value: h)
+";
+        assert_eq!(
+            errors(src),
+            vec![
+                NotListed("enum".into()),
+                UntypedDot("grass".into()),
+                NoVariant {
+                    ty: "E".into(),
+                    variant: "grass".into()
+                },
+                InvalidOperand {
+                    op: "<",
+                    ty: "E".into()
+                },
+                InvalidCast {
+                    from: "E".into(),
+                    to: "u8".into()
+                },
+                NotAValue("T".into()),
+                EnumOutsideBound,
+                NotAnEnum("i32".into()),
+                NotAnEnum("Head".into()),
+            ]
         );
     }
 

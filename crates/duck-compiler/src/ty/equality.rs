@@ -81,6 +81,7 @@ impl Checker {
             | Ty::Param(_)
             | Ty::Opaque(_)
             | Ty::Type
+            | Ty::AnyEnum
             | Ty::Unit
             | Ty::Never
             | Ty::Error => {}

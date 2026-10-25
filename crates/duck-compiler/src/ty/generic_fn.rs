@@ -5,7 +5,8 @@
 //! A type parameter in the `(T)` after `fn` is inferred from the arguments
 //! of each call. A parameter of type `type` is a type parameter too, which
 //! each call gives a type as its argument: `fn zero(T: type) -> &T` is
-//! called as `zero(u8)`.
+//! called as `zero(u8)`. So is one of type `enum`, which `enum` bounds:
+//! `fn first(E: enum) -> E` is called as `first(Color)`.
 //!
 //! A generic function's body is checked once as declared, with its type
 //! parameters standing for themselves: types of which only the size and
@@ -130,9 +131,13 @@ impl Checker {
             let mut next = decl.sig.type_params.len();
             let mut given = Vec::new();
             for param in &decl.sig.params {
-                given.push(param.ty.is_type().then_some(next));
-                if !param.ty.is_type() {
+                given.push(param.ty.is_kind().then_some(next));
+                if !param.ty.is_kind() {
                     continue;
+                }
+                // `E: enum` is given an enum, as `enum` bounds it.
+                if let (true, Ty::Param(id)) = (param.ty.is_enum(), tys[next]) {
+                    self.params[id.0 as usize].bound = Some(Ty::AnyEnum);
                 }
                 next += 1;
                 if param.default.is_some() {

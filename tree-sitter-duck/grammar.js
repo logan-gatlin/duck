@@ -334,6 +334,7 @@ module.exports = grammar({
       $.pointer_type,
       $.function_type,
       $.todo_type,
+      $.enum_type,
     ),
 
     // The precedence keeps the `(` after `x as Name` as the type's arguments
@@ -383,6 +384,9 @@ module.exports = grammar({
 
     // A type yet to be written, which only a `todo` is of.
     todo_type: _ => 'todo',
+
+    // `enum`, which bounds a type parameter by every enum.
+    enum_type: _ => 'enum',
 
     // Statements
 

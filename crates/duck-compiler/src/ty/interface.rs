@@ -210,6 +210,7 @@ enum Written {
     Never,
     Error,
     Type,
+    AnyEnum,
     /// A struct or a union, by the item that declares it.
     Struct(usize),
     Enum(usize),
@@ -258,7 +259,7 @@ const LIST: u8 = u8::MAX;
 
 /// The version of the format of an interface, which changes whenever it
 /// does, and which its bytes start with.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 impl Interface {
     /// Its declarations, with each file as the id the program gives it:
@@ -577,6 +578,7 @@ impl Checker {
             Ty::Never => Written::Never,
             Ty::Error => Written::Error,
             Ty::Type => Written::Type,
+            Ty::AnyEnum => Written::AnyEnum,
             Ty::Struct(id) => {
                 let def = &self.structs[id.0 as usize];
                 if let Some(instance) = &def.instance {
@@ -1153,6 +1155,7 @@ impl Checker {
             Written::Never => Ty::Never,
             Written::Error => Ty::Error,
             Written::Type => Ty::Type,
+            Written::AnyEnum => Ty::AnyEnum,
             Written::Struct(item) => {
                 Ty::Struct(self.struct_of(self.foreign_item(program, package, *item)))
             }
@@ -1250,6 +1253,7 @@ fn opaques_in(written: &Written, out: &mut Vec<(FuncId, usize)>) {
         | Written::Never
         | Written::Error
         | Written::Type
+        | Written::AnyEnum
         | Written::Struct(_)
         | Written::Enum(_)
         | Written::Builtin(_)
@@ -1485,6 +1489,7 @@ impl Encode for Written {
             Self::Never => w.tag(2),
             Self::Error => w.tag(3),
             Self::Type => w.tag(4),
+            Self::AnyEnum => w.tag(16),
             Self::Struct(item) => {
                 w.tag(5);
                 item.encode(w);
@@ -1576,6 +1581,7 @@ impl Decode for Written {
             13 => Self::Func(Decode::decode(r)?),
             14 => Self::Opaque(Decode::decode(r)?, Decode::decode(r)?),
             15 => Self::Param(Decode::decode(r)?, Decode::decode(r)?),
+            16 => Self::AnyEnum,
             tag => return Err(bad("type", tag)),
         })
     }
