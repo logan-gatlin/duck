@@ -1514,7 +1514,10 @@ impl Analysis {
                 let ItemKind::Enum(decl) = &self.program.items.get(index)?.kind else {
                     return None;
                 };
-                let head = format!("enum({}) {}", decl.ty, decl.name.name);
+                let head = match &decl.ty {
+                    Some(ty) => format!("enum({ty}) {}", decl.name.name),
+                    None => format!("enum {}", decl.name.name),
+                };
                 let member = |member: &parse::Member| match &member.value {
                     Some(value) => format!("{} = {}", member.name.name, src.text(value.span)),
                     None => member.name.name.clone(),
@@ -1877,7 +1880,7 @@ impl<'p> Walk<'p> {
             ItemKind::Enum(decl) => {
                 self.site.type_params.clear();
                 self.declared(&decl.name)
-                    || self.ty(&decl.ty)
+                    || decl.ty.as_ref().is_some_and(|ty| self.ty(ty))
                     || decl.entries.iter().any(|entry| match entry {
                         Entry::Own(member) => {
                             self.named(Found::Entry(index, &member.name), &member.name)

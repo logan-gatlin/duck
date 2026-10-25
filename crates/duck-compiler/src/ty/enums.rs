@@ -1,6 +1,8 @@
 //! Enums: types whose values are a fixed list of named constants of another
 //! type. A value is stored as its member's constant, so each use of a member,
-//! like `ReturnCode.ok`, builds a fresh copy of it.
+//! like `ReturnCode.ok`, builds a fresh copy of it. An enum that names no
+//! type counts its members from 0 in the narrowest unsigned integer that
+//! counts them all.
 
 use std::mem;
 
@@ -24,9 +26,13 @@ pub(super) struct EnumDef {
     /// The item of the program that declares it.
     pub(super) item: usize,
     pub(super) is_pub: bool,
-    /// The type of every member's value. [`Ty::Error`] until resolved.
+    /// The type of every member's value. [`Ty::Error`] until resolved, which
+    /// for one that names no type is once its members are listed.
     pub(super) ty: Ty,
-    /// Where the type of the values is written.
+    /// Whether it names the type of its values, rather than counting them.
+    typed: bool,
+    /// Where the type of the values is written, or the name of one that
+    /// names none.
     ty_span: Span,
     /// The enum that each of its `use` lines names, in order, of which it
     /// [starts as](Checker::starts) the first. The error type for one that
@@ -70,7 +76,8 @@ impl Checker {
             item,
             is_pub,
             ty: Ty::Error,
-            ty_span: decl.ty.span,
+            typed: decl.ty.is_some(),
+            ty_span: decl.ty.as_ref().map_or(decl.name.span, |ty| ty.span),
             uses: Vec::new(),
             members: Vec::new(),
         });
@@ -80,11 +87,13 @@ impl Checker {
     /// Resolves the type of every enum's values, then reports enums that
     /// contain themselves and cuts each cycle by giving the offending enum
     /// the error type. Cycles through a struct are left to the struct. Then
-    /// lists every enum's members.
+    /// lists every enum's members, which gives one that names no type its.
     pub(super) fn resolve_enums(&mut self, program: &Program) {
         for (id, decl) in enum_decls(program).enumerate() {
             self.module = decl.name.span.file;
-            self.enums[id].ty = self.resolve_ty(&decl.ty);
+            if let Some(ty) = &decl.ty {
+                self.enums[id].ty = self.resolve_ty(ty);
+            }
         }
         let mut visits = vec![Visit::New; self.enums.len()];
         for id in 0..self.enums.len() {
@@ -97,8 +106,9 @@ impl Checker {
     }
 
     /// Lists the members of enum `id`, unless it has them, or is being
-    /// given them, as one that a `use` leads back to is. `visits` is how far
-    /// each enum is. Those it uses are given theirs first.
+    /// given them, as one that a `use` leads back to is, and gives it the
+    /// type that counts them if it names none. `visits` is how far each
+    /// enum is. Those it uses are given theirs first.
     fn list_members(&mut self, program: &Program, id: usize, visits: &mut [Visit]) {
         if visits[id] != Visit::New {
             return;
@@ -135,14 +145,18 @@ impl Checker {
             }
         }
         self.module = module;
+        if !self.enums[id].typed {
+            self.enums[id].ty = Ty::Prim(enum_prim(members.len()));
+        }
         self.enums[id].members = members;
         visits[id] = Visit::Done;
     }
 
     /// The enum that `use written` names in enum `id`, and the members it
     /// gives it: those of that enum, whose values have the type that its
-    /// own do, each written where the `use` is. The error type and no
-    /// members after reporting an error.
+    /// own do, or which counts them as its own does if neither names a
+    /// type, each written where the `use` is. The error type and no members
+    /// after reporting an error.
     fn used_members(
         &mut self,
         program: &Program,
@@ -170,11 +184,18 @@ impl Checker {
         }
         self.list_members(program, index, visits);
         let (expected, found) = (self.enums[id].ty, self.enums[index].ty);
-        if expected != found && expected != Ty::Error && found != Ty::Error {
-            let kind = TypeErrorKind::UseOfValues {
-                name: self.ty_name(ty),
-                expected: self.ty_name(expected),
-                found: self.ty_name(found),
+        let fails = match (self.enums[id].typed, self.enums[index].typed) {
+            (true, _) => expected != found && expected != Ty::Error && found != Ty::Error,
+            (false, typed) => typed && found != Ty::Error,
+        };
+        if fails {
+            let kind = match self.enums[id].typed {
+                true => TypeErrorKind::UseOfValues {
+                    name: self.ty_name(ty),
+                    expected: self.ty_name(expected),
+                    found: self.ty_name(found),
+                },
+                false => TypeErrorKind::UseOfTyped(self.ty_name(ty)),
             };
             self.error(kind, written.span);
             return failed;
@@ -280,6 +301,11 @@ impl Checker {
                 None
             } else {
                 match (own.and_then(|member| member.value.as_ref()), used) {
+                    (Some(_), _) if !self.enums[id.0 as usize].typed => {
+                        let kind = TypeErrorKind::ValueOfCounted(name.name.clone());
+                        self.error(kind, own.map_or(span, |member| member.span));
+                        None
+                    }
                     (Some(expr), _) => self.member_value(program, ty, expr),
                     (None, Some((from, index))) if !counts => {
                         self.used_value(program, from, index, span)
@@ -512,6 +538,16 @@ fn enum_decls(program: &Program) -> impl Iterator<Item = &EnumDecl> {
         ItemKind::Enum(decl) => Some(decl),
         _ => None,
     })
+}
+
+/// The narrowest unsigned integer that counts `count` members from 0: the
+/// type of the values of an enum that names none, and of an `enum` of WIT.
+pub(super) fn enum_prim(count: usize) -> Prim {
+    match count {
+        0..=256 => Prim::U8,
+        257..=65536 => Prim::U16,
+        _ => Prim::U32,
+    }
 }
 
 /// An integer constant of type `prim` as a number.

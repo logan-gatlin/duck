@@ -23,6 +23,7 @@ use crate::world::{ImportError, ROOT, WitFunc, WitTy, kebab};
 use std::ops::Range;
 
 use super::Scalar;
+use super::enums::enum_prim;
 use super::{Checker, FuncSig, OPTION, Prim, RESULT, Ty, TypeError, TypeErrorKind, extern_fns};
 
 /// The start of the name a handle of a resource is dropped by, before the
@@ -458,14 +459,6 @@ fn flags_prim(flags: usize) -> Prim {
 
 /// The integer that the value of an `enum` of `cases` cases is: the
 /// narrowest that counts them.
-fn enum_prim(cases: usize) -> Prim {
-    match cases {
-        0..=256 => Prim::U8,
-        257..=65536 => Prim::U16,
-        _ => Prim::U32,
-    }
-}
-
 /// What `wit` is in Duck, as an error says it.
 fn expected(wit: &WitTy) -> String {
     let prim = |prim: Prim| format!("`{}`", prim.name());

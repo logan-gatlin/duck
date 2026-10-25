@@ -54,7 +54,7 @@ use super::{
 /// What an artifact's bytes start with, and the version of their format,
 /// which changes whenever the format does.
 const MAGIC: &[u8; 8] = b"duckart\0";
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// The package that the return area is of, among those an artifact uses:
 /// none, as it is the program's.

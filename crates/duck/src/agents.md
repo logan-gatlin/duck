@@ -29,6 +29,10 @@ enum(u8) Color:
 	green = 5
 	blue                         # 6
 
+enum Tile:                       # no type: a `u8` here, counted from 0
+	grass
+	water
+
 fn area(w: f64, h: f64 = 1.0) -> f64:   # a default: a call may leave `h` out
 	return w * h
 
@@ -112,6 +116,9 @@ pub fn main():                   # no `->`: returns `tuple()`, the unit type
   members count up from the one before, and other types need every value.
   Enums support `Name.member`, `==`, `!=`, `e as T` and `for m in Name`.
   Nothing converts a `T` to the enum.
+- `enum Name:` names no type: its members count from 0 and none is given a
+  value. Its values are a `u8`, or a `u16` past 256 members, or a `u32`
+  past 65536. It uses only enums that name no type either.
 
 A `&var T` is accepted as a `&T`, and a `varray(T)` as an `array(T)`, for the
 type as a whole only: a `tuple(&var T, i32)` is not a `tuple(&T, i32)`, and a
@@ -1003,7 +1010,7 @@ fn demo(n: &Named, r: ReadError) -> i32:
 - A `use Type` line of a struct, a union or an enum stands for the fields,
   variants or members of `Type`, in order, as if they were written there.
   A struct uses a struct, a union a union, and an enum an enum whose values
-  have the type its own do. Every `use` line comes before the lines of the
+  have the type its own do, or that names no type if it names none. Every `use` line comes before the lines of the
   declaration's own.
 - A struct uses an `array(T)` or a `varray(T)` too, for its `ptr` and `len`,
   which are `pub`: see below.
@@ -1537,7 +1544,7 @@ pub fn helper():                        # only `pub`: the world has no `helper`
   the field it is in order, and a `variant` a union with as many variants,
   each holding what its case does. An `enum` is an `enum(u8)` with as many
   members, counted from 0, so none is given a value: an `enum(u16)` past
-  256 of them. `flags` are the narrowest of `u8`, `u16` and `u32` with a
+  256 of them. An enum that names no type is always one. `flags` are the narrowest of `u8`, `u16` and `u32` with a
   bit for each, from the lowest. A `list<T>` is an `array(T)` and a
   `string` an `array(u8)`, which `string` names. A `map<K, V>` is an
   `array(tuple(K, V))`, each key with its value, as it is passed: nothing

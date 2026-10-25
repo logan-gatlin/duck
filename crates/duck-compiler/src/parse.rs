@@ -158,11 +158,13 @@ pub struct Field {
     pub span: Span,
 }
 
-/// `enum(Type) Name:` and its members, whose values have type `Type`.
+/// `enum(Type) Name:` and its members, whose values have type `Type`, or
+/// `enum Name:`, whose members count from 0 in the narrowest unsigned
+/// integer that counts them all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumDecl {
     pub name: Ident,
-    pub ty: Type,
+    pub ty: Option<Type>,
     pub entries: Vec<Entry<Member>>,
 }
 
@@ -1101,9 +1103,14 @@ impl<'a> Parser<'a> {
 
     fn enum_decl(&mut self) -> PResult<EnumDecl> {
         self.expect(TokenKind::Enum)?;
-        self.expect(TokenKind::LParen)?;
-        let ty = self.ty()?;
-        self.expect(TokenKind::RParen)?;
+        let ty = match self.eat(TokenKind::LParen) {
+            true => {
+                let ty = self.ty()?;
+                self.expect(TokenKind::RParen)?;
+                Some(ty)
+            }
+            false => None,
+        };
         let name = self.ident()?;
         let mut past_uses = false;
         let entries = self.indented(|p| p.entry(&mut past_uses, false, Self::member))?;
@@ -3908,7 +3915,7 @@ enum(tuple(u8, u8)) Pair:
             })
             .collect();
         assert_eq!(decls[0].name.name, "ReturnCode");
-        assert_eq!(render_ty(&decls[0].ty), "i8");
+        assert_eq!(decls[0].ty.as_ref().map(render_ty).as_deref(), Some("i8"));
         let members: Vec<_> = decls[0].entries.iter().filter_map(Entry::own).collect();
         let values: Vec<_> = members
             .iter()
@@ -3920,11 +3927,18 @@ enum(tuple(u8, u8)) Pair:
         );
         let error = members[1];
         assert_eq!(&src[error.span.start..error.span.end], "error = 5 + 1");
-        assert_eq!(render_ty(&decls[1].ty), "tuple(u8, u8)");
+        assert_eq!(
+            decls[1].ty.as_ref().map(render_ty).as_deref(),
+            Some("tuple(u8, u8)")
+        );
+        let ItemKind::Enum(untyped) = &parse_src("enum E:\n    a\n").unwrap().items[0].kind else {
+            panic!()
+        };
+        assert_eq!(untyped.ty, None);
 
         assert_eq!(
-            errors("enum E:\n    a\n"),
-            vec![expected("`(`", TokenKind::Ident("E".into()))]
+            errors("enum E(u8):\n    a\n"),
+            vec![expected("`:`", TokenKind::LParen)]
         );
         assert_eq!(
             errors("enum(i8) E:\n    pub a\n    pass\n"),

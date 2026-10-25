@@ -308,6 +308,24 @@ pub enum(i8) ReturnCode:
         (integer)))))
 
 ====================
+Enum without a type
+====================
+
+enum Tile:
+    grass
+    water
+
+---
+
+(source_file
+  (enum_declaration
+    (identifier)
+    (enum_member
+      (identifier))
+    (enum_member
+      (identifier))))
+
+====================
 Union
 ====================
 

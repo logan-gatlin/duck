@@ -258,7 +258,7 @@ const LIST: u8 = u8::MAX;
 
 /// The version of the format of an interface, which changes whenever it
 /// does, and which its bytes start with.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 impl Interface {
     /// Its declarations, with each file as the id the program gives it:

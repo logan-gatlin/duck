@@ -298,8 +298,7 @@ impl<'a> Generator<'a> {
                     out.push('\n');
                 }
                 TypeDefKind::Enum(members) => {
-                    let value = integer(members.cases.len(), 256, 65536);
-                    out.push_str(&format!("pub enum({value}) {name}:\n"));
+                    out.push_str(&format!("pub enum {name}:\n"));
                     for case in &members.cases {
                         comment(&case.docs, "\t", out);
                         out.push_str(&format!("\t{}\n", ident(&snake(&case.name))));
@@ -703,7 +702,7 @@ world app {
             "# A point.\n#\n# Of the plane.\npub struct HostPoint:\n\tpub x: f32\n\tpub type_: u8\n",
             "pub struct OtherPoint:\n\tpub a: i32\n",
             "pub union Shape:\n\tcircle: f32\n\trect: tuple(f32, f32)\n\tempty\n",
-            "pub enum(u8) Color:\n\tred\n\tgreen\n",
+            "pub enum Color:\n\tred\n\tgreen\n",
             "pub let ACCESS_READ: u8 = 1\n# Every byte.\npub let ACCESS_WRITE_ALL: u8 = 2\n",
             "extern \"my:pkg/host@0.1.0\":\n",
             "\tpub fn file_new(path: string) -> File = \"[constructor]file\"\n",

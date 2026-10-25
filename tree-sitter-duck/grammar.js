@@ -195,9 +195,7 @@ module.exports = grammar({
     enum_declaration: $ => seq(
       optional('pub'),
       'enum',
-      '(',
-      field('type', $._type),
-      ')',
+      optional(seq('(', field('type', $._type), ')')),
       field('name', $.identifier),
       ':',
       $._newline,

@@ -377,6 +377,9 @@ pub enum TypeErrorKind {
     /// A member without a value in an enum whose values aren't integers,
     /// which count up.
     MissingValue(String),
+    /// A member given a value in an enum that names no type, whose members
+    /// count.
+    ValueOfCounted(String),
     /// A member without a value that counts past the largest integer of the
     /// enum's type.
     MemberOutOfRange {
@@ -706,6 +709,9 @@ pub enum TypeErrorKind {
         expected: String,
         found: String,
     },
+    /// A `use` in an enum that names no type of the enum `name`, which
+    /// names one.
+    UseOfTyped(String),
     /// A `use` of a field or variant `name` whose type holds a `ty` that
     /// another module declares and isn't `pub`.
     UseOfPrivate {
@@ -1681,6 +1687,7 @@ impl TypeErrorKind {
             Self::DuplicateMember(..) => "duplicate-member",
             Self::DuplicateValue { .. } => "duplicate-value",
             Self::MissingValue(..) => "missing-value",
+            Self::ValueOfCounted(..) => "value-of-counted",
             Self::MemberOutOfRange { .. } => "member-out-of-range",
             Self::NoMember { .. } => "no-member",
             Self::ExpansiveRecursion(..) => "expansive-recursion",
@@ -1764,6 +1771,7 @@ impl TypeErrorKind {
             Self::RecursiveUse(..) => "recursive-use",
             Self::UseOfOther { .. } => "use-of-other",
             Self::UseOfValues { .. } => "use-of-values",
+            Self::UseOfTyped(..) => "use-of-typed",
             Self::UseOfPrivate { .. } => "use-of-private",
             Self::PrivateField { .. } => "private-field",
             Self::PrivateInPublic { .. } => "private-in-public",
@@ -1868,6 +1876,11 @@ impl fmt::Display for TypeErrorKind {
             Self::MissingValue(name) => write!(
                 f,
                 "member `{name}` needs a value, as only members of integer enums count up"
+            ),
+            Self::ValueOfCounted(name) => write!(
+                f,
+                "member `{name}` is given a value in an enum that counts its members; \
+                 name the type of its values, as in `enum(u8)`"
             ),
             Self::MemberOutOfRange { member, ty } => {
                 write!(f, "member `{member}` counts past the largest `{ty}`")
@@ -2316,6 +2329,11 @@ impl fmt::Display for TypeErrorKind {
             } => write!(
                 f,
                 "`use` in an enum of `{expected}` takes one, and `{name}` is an enum of `{found}`"
+            ),
+            Self::UseOfTyped(name) => write!(
+                f,
+                "`use` in an enum that counts its members takes one that counts its own, \
+                 and `{name}` names the type of its values"
             ),
             Self::UseOfPrivate { name, ty } => {
                 write!(f, "`use` of `{name}`, whose type holds the private `{ty}`")
@@ -15421,6 +15439,75 @@ fn f() -> i8:
     return r as i8
 ";
         assert_eq!(body(&lower(src), "f"), "(set r 6) (return r)");
+    }
+
+    #[test]
+    fn enums_that_name_no_type_count_in_the_narrowest_unsigned_integer() {
+        let members: String = (0..257).map(|i| format!("    m{i}\n")).collect();
+        let src = format!(
+            "\
+enum Tile:
+    grass
+    water
+enum Wide:
+{members}enum More:
+    use Tile
+    sand
+enum(u8) Typed:
+    use Tile
+fn sizes() -> tuple(uint, uint, uint):
+    return (Tile.size, Wide.size, More.size)
+fn values() -> tuple(u8, u16, u8, u8):
+    return (Tile.water as u8, Wide.m256 as u16, More.sand as u8, Typed.water as u8)
+fn wider(t: Tile) -> More:
+    return t as More
+"
+        );
+        let module = lower(&src);
+        assert_eq!(body(&module, "sizes"), "(return 1 2 1)");
+        assert_eq!(body(&module, "values"), "(return 1 256 2 1)");
+        assert_eq!(body(&module, "wider"), "(return t)");
+    }
+
+    #[test]
+    fn enums_that_name_no_type_give_their_members_no_values() {
+        use TypeErrorKind::*;
+        let src = "\
+enum(u16) Typed:
+    a
+enum Tile:
+    grass = 1
+    water
+enum Uses:
+    use Typed
+enum(u16) Wider:
+    use Tile
+";
+        assert_eq!(
+            errors_at(src),
+            vec![
+                (UseOfTyped("Typed".into()), "Typed"),
+                (
+                    UseOfValues {
+                        name: "Tile".into(),
+                        expected: "u16".into(),
+                        found: "u8".into(),
+                    },
+                    "Tile"
+                ),
+                (ValueOfCounted("grass".into()), "grass = 1"),
+            ]
+        );
+        assert_eq!(
+            ValueOfCounted("grass".into()).to_string(),
+            "member `grass` is given a value in an enum that counts its members; name the \
+             type of its values, as in `enum(u8)`"
+        );
+        assert_eq!(
+            UseOfTyped("Typed".into()).to_string(),
+            "`use` in an enum that counts its members takes one that counts its own, and \
+             `Typed` names the type of its values"
+        );
     }
 
     #[test]
