@@ -68,8 +68,10 @@ struct Server<'c> {
     /// The packages last checked, by directory. They are resolved again
     /// once dropped.
     projects: HashMap<PathBuf, Project>,
-    /// The diagnostics the editor has of each file that has any.
-    published: BTreeMap<Uri, Vec<Diagnostic>>,
+    /// The diagnostics last sent of each file that the editor may have any
+    /// of, and the version of it they were of: an editor drops those of a
+    /// version it has moved on from, and has the ones before.
+    published: BTreeMap<Uri, (Option<i32>, Vec<Diagnostic>)>,
     /// Whether something changed since the diagnostics were published.
     stale: bool,
     /// Whether the editor renames a file when a change says to.
@@ -553,7 +555,8 @@ impl Server<'_> {
         if organized && !mends.iter().any(organizes) {
             mends.extend(project.organized(&buffers, &path));
         }
-        let diagnostics = self.uri_of(&path).and_then(|uri| self.published.get(&uri));
+        let published = self.uri_of(&path).and_then(|uri| self.published.get(&uri));
+        let diagnostics = published.map(|(_, diagnostics)| diagnostics);
         let action = |mend: Mend| {
             let kind = match mend.kind {
                 ActionKind::Fix => CodeActionKind::QUICKFIX,
@@ -1075,25 +1078,31 @@ impl Server<'_> {
             }
         }
 
-        let fixed = self.published.keys();
-        let fixed: Vec<Uri> = (fixed.filter(|uri| !diagnostics.contains_key(uri)))
-            .cloned()
-            .collect();
-        for uri in fixed {
-            self.send(uri, Vec::new())?;
-        }
-        for (uri, diagnostics) in diagnostics {
-            if self.published.get(&uri) != Some(&diagnostics) {
-                self.send(uri, diagnostics)?;
+        // Those of a file are sent again once the editor has another version
+        // of it, the same or not: the editor may have dropped the last,
+        // unless they were of no version.
+        let mut uris: BTreeSet<Uri> = self.published.keys().cloned().collect();
+        uris.extend(diagnostics.keys().cloned());
+        for uri in uris {
+            let diagnostics = diagnostics.remove(&uri).unwrap_or_default();
+            let mut documents = self.documents.values();
+            let version = documents.find(|d| d.uri == uri).map(|d| d.version);
+            let sent = match self.published.get(&uri) {
+                Some((sent, published)) => {
+                    (sent.is_none() || *sent == version) && *published == diagnostics
+                }
+                None => diagnostics.is_empty(),
+            };
+            if !sent {
+                self.send(uri, version, diagnostics)?;
             }
         }
         self.watch_included()
     }
 
-    /// Tells the editor that `diagnostics` are all there are for `uri`.
-    fn send(&mut self, uri: Uri, diagnostics: Vec<Diagnostic>) -> Fallible {
-        let mut documents = self.documents.values();
-        let version = documents.find(|d| d.uri == uri).map(|d| d.version);
+    /// Tells the editor that `diagnostics` are all there are for `version`
+    /// of `uri`.
+    fn send(&mut self, uri: Uri, version: Option<i32>, diagnostics: Vec<Diagnostic>) -> Fallible {
         let params = PublishDiagnosticsParams {
             uri: uri.clone(),
             diagnostics: diagnostics.clone(),
@@ -1102,10 +1111,12 @@ impl Server<'_> {
         let method = PublishDiagnostics::METHOD.to_string();
         let notification = Notification::new(method, params);
         self.connection.sender.send(notification.into())?;
-        if diagnostics.is_empty() {
+        // Those of no version are never dropped, and none are what the
+        // editor has of a file before any are sent.
+        if diagnostics.is_empty() && version.is_none() {
             self.published.remove(&uri);
         } else {
-            self.published.insert(uri, diagnostics);
+            self.published.insert(uri, (version, diagnostics));
         }
         Ok(())
     }
@@ -1489,11 +1500,62 @@ mod tests {
         editor.notify(DidCloseTextDocument::METHOD, params);
         assert_eq!(
             editor.diagnostics(&dir),
-            published("main.duck", Some(2), &[])
+            published("a.duck", None, &["0:11 unknown type `Nope`"])
         );
         assert_eq!(
             editor.diagnostics(&dir),
-            published("a.duck", None, &["0:11 unknown type `Nope`"])
+            published("main.duck", Some(2), &[])
+        );
+        editor.stop();
+    }
+
+    #[test]
+    fn diagnostics_are_sent_again_for_each_version() {
+        let dir = TempDir::new("server-version");
+        dir.write(&[
+            ("Duck.toml", MODULE),
+            ("main.duck", "pub let x: Nope = 1\n"),
+        ]);
+        let main = dir.0.join("main.duck");
+        let editor = Editor::start(&dir, json!({}));
+        let error = "0:11 unknown type `Nope`";
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("main.duck", None, &[error])
+        );
+
+        // The editor drops what is sent of a version it has moved on from,
+        // so what it has may be of a version before: the same diagnostics
+        // are sent again of the version it has now. Those of no version
+        // aren't dropped, and aren't sent again once it is open.
+        editor.open(&main, "pub let x: Nope = 1\n");
+        editor.change(&main, 2, "pub let x = 1\n");
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("main.duck", Some(2), &[])
+        );
+        editor.change(&main, 3, "pub let x = 1\n\n");
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("main.duck", Some(3), &[])
+        );
+        editor.change(&main, 4, "pub let x: Nope = 1\n");
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("main.duck", Some(4), &[error])
+        );
+        editor.change(&main, 5, "pub let x: Nope = 1\n");
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("main.duck", Some(5), &[error])
+        );
+
+        // One that isn't open is no version of it, and is never dropped.
+        let params = json!({ "textDocument": { "uri": uri(&main) } });
+        editor.notify(DidCloseTextDocument::METHOD, params);
+        assert_eq!(
+            editor.diagnostics(&dir),
+            published("main.duck", None, &[error])
         );
         editor.stop();
     }
