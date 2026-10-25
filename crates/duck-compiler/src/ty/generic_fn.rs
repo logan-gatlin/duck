@@ -43,7 +43,7 @@ pub(super) struct GenericFn {
     pub(super) params: Vec<Ty>,
     /// The signature, in terms of the type parameters. A parameter that is
     /// one of them is a [`Ty::Type`].
-    sig: FuncSig,
+    pub(super) sig: FuncSig,
     /// Which of `params` each parameter of `sig` is, if it's a type
     /// parameter.
     given: Vec<Option<usize>>,

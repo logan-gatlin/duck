@@ -59,16 +59,16 @@ pub(super) struct OpaqueDef {
 }
 
 impl OpaqueDef {
-    /// The type that function `owner`, named `func` and declared in
-    /// `module`, hides, which is `hidden`: as it was found where the
-    /// function's package was compiled.
-    pub(super) fn settled(owner: Owner, func: String, module: FileId, hidden: Ty) -> Self {
+    /// A type that function `owner`, named `func` and declared in
+    /// `module`, hides, bounded by `bound`, which what hides it settles:
+    /// as it was found where the function's package was compiled.
+    pub(super) fn settled(owner: Owner, func: String, module: FileId, bound: Option<Ty>) -> Self {
         Self {
             owner,
             func,
-            bound: None,
-            hole: hidden,
-            hidden: Some(hidden),
+            bound,
+            hole: Ty::Error,
+            hidden: None,
             state: Visit::Done,
             reported: false,
             is_pub: true,

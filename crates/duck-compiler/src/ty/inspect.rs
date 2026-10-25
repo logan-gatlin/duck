@@ -264,8 +264,22 @@ const MODULE_TYPE_TEXTS: [(&str, &str); 1] =
 const MAX_USES: usize = 64;
 
 /// Checks `program` as [`super::errors`] does, keeping what it found of it.
-pub fn analyze(program: Program, settings: &Settings) -> Analysis {
-    let (ck, ..) = lower_program(&program, settings, true, false);
+/// A program that uses packages that are compiled already is linked with
+/// their artifacts, for what fails of linking to be among its errors, with
+/// `files` to name its packages: what its constants are evaluated to is
+/// then not kept, as only the linked module has it.
+pub fn analyze(program: Program, settings: &Settings, files: &mut impl FileManager) -> Analysis {
+    let (mut ck, imports, funcs, start) = lower_program(&program, settings, true, false);
+    if !program.imported.is_empty() && ck.errors.is_empty() {
+        let artifacts = ck.artifacts(&program, files, &imports, &funcs, start);
+        if let Err(errors) = crate::linked(&program, settings, &artifacts) {
+            let errors = errors.into_iter().filter_map(|error| match error {
+                crate::Error::Type(error) => Some(error),
+                _ => None,
+            });
+            ck.errors.extend(errors);
+        }
+    }
     let start = settings.start.clone();
     let mut items: FxHashMap<FileId, Vec<usize>> = FxHashMap::default();
     for (index, item) in program.items.iter().enumerate() {
@@ -2552,7 +2566,7 @@ fn bytes(T: type, count: uint) -> uint:
     fn analysis(files: &mut Memory) -> Analysis {
         let (program, errors) = load::load_partial(files);
         assert_eq!(errors, []);
-        analyze(program, &Settings::default())
+        analyze(program, &Settings::default(), files)
     }
 
     /// What hovering the first `text` of file `name` gives: what is
@@ -3756,7 +3770,7 @@ fn pick(c: kit.Color, s: kit.Shape, wide: i64) -> i32:
     fn used(files: &mut Memory) -> Analysis {
         let (program, errors) = load::load_partial(files);
         assert_eq!(errors, []);
-        analyze(program, &Settings::default())
+        analyze(program, &Settings::default(), files)
     }
 
     #[test]
@@ -3870,7 +3884,7 @@ let of = (made, 2)
             fuel: Some(1000),
             ..Settings::default()
         };
-        let analysis = analyze(program, &settings);
+        let analysis = analyze(program, &settings, &mut files);
         let mut value = |text: &str| {
             let (file, offset) = files.at("main", text);
             analysis.hover(&mut files, file, offset).unwrap().value
@@ -4180,7 +4194,7 @@ fn main():
         let mut files = Memory(vec![("main", src)]);
         let (program, errors) = load::load_partial(&mut files);
         assert_eq!(errors, []);
-        let analysis = analyze(program, &Settings::default());
+        let analysis = analyze(program, &Settings::default(), &mut files);
         let unused = analysis.unused(&mut files);
         let names: Vec<_> = unused.iter().map(|unused| unused.name.as_str()).collect();
         assert_eq!(names, ["idle"]);
@@ -4261,7 +4275,7 @@ fn main():
     fn offered(files: &mut Memory, text: &str) -> Vec<Action> {
         let (program, errors) = load::load_partial(files);
         assert_eq!(errors, []);
-        let analysis = analyze(program, &Settings::default());
+        let analysis = analyze(program, &Settings::default(), files);
         let unused = analysis.unused(files);
         let (main, at) = files.at("main", text);
         analysis.actions(files, main, at..at + text.len(), &unused, &analysis.apart())
@@ -4342,7 +4356,7 @@ fn main(c: bool) -> i32:
 ";
         let mut files = Memory(vec![("main", main)]);
         let (program, _) = load::load_partial(&mut files);
-        let analysis = analyze(program, &Settings::default());
+        let analysis = analyze(program, &Settings::default(), &mut files);
         let show = |apart: &Apart| {
             assert_eq!(&main[apart.span.start..apart.span.end], apart.name);
             let line = main[..apart.span.start].matches('\n').count() + 1;
@@ -4614,7 +4628,7 @@ fn main(c: bool) -> i32:
         // A hint says what would be written for it.
         let (program, errors) = load::load_partial(&mut files);
         assert_eq!(errors, []);
-        let analysis = analyze(program, &Settings::default());
+        let analysis = analyze(program, &Settings::default(), &mut files);
         let (file, _) = files.at("main", "use");
         let hints = analysis.hints(file, 0..main.len());
         let types = hints.iter().filter(|hint| hint.kind == HintKind::Type);
@@ -4793,7 +4807,7 @@ let y = f(1)
         let mut files = Memory(vec![("main", main), ("broken", broken)]);
         let (program, errors) = load::load_partial(&mut files);
         assert_eq!(errors.len(), 4, "{errors:?}");
-        let analysis = analyze(program, &Settings::default());
+        let analysis = analyze(program, &Settings::default(), &mut files);
         let (file, offset) = files.at("main", "c\n");
         assert_eq!(
             shown(analysis.members(&mut files, file, offset)),

@@ -71,7 +71,7 @@ mod unions;
 mod wit;
 
 pub use crate::codec::DecodeError;
-pub use artifact::{Artifact, link, link_refs};
+pub use artifact::{Artifact, VERSION as ARTIFACT_VERSION, link, link_refs};
 pub use evaluate::DEFAULT_FUEL;
 pub use inspect::{
     Action, ActionKind, Analysis, Apart, Completion, CompletionKind, Hint, HintKind, Hover,
@@ -2528,8 +2528,11 @@ fn lower_program(
 ) -> (Checker, Vec<ir::Import>, Vec<ir::Func>, Option<FuncId>) {
     let (mut ck, imports, funcs, start) = lower_unlinked(program, settings, records, tested, false);
     // What only running finds is found now that every function it may call
-    // is lowered.
-    ck.link_constants(&imports, &funcs);
+    // is lowered: by linking the artifacts, where a package is compiled
+    // already, as the checker has placeholders for what it placed.
+    if program.imported.is_empty() {
+        ck.link_constants(&imports, &funcs);
+    }
     // An instance may only have an error that checking its declaration
     // missed because of one that is reported.
     let unchecked = |e: &TypeError| matches!(e.kind, TypeErrorKind::Unchecked { .. });
@@ -2537,8 +2540,10 @@ fn lower_program(
         ck.errors.retain(|e| !unchecked(e));
     }
     // Functions have literals too, so only now has every one been placed.
-    ck.check_data_fits();
-    ck.place_late_literals(&imports, &funcs);
+    if program.imported.is_empty() {
+        ck.check_data_fits();
+        ck.place_late_literals(&imports, &funcs);
+    }
     (ck, imports, funcs, start)
 }
 
@@ -2557,13 +2562,23 @@ fn lower_unlinked(
     // on, as a whole: what is made of one is made of nothing that depends
     // on it, nor of another beside it. What the entry's package makes of
     // what it lowers is lowered with what it exports.
+    // The items of the packages that are compiled already, whose generic
+    // functions are yet to be checked as declared.
+    let mut imported: Vec<Range<usize>> = Vec::new();
     for (index, package) in program.packages.iter().enumerate() {
         let items = package.items.clone();
         ck.package_marks.push(ck.marks());
         // One that is compiled already is given what it compiled to.
         if let Some(compiled) = program.imported.iter().find(|c| c.root == package.root) {
             ck.import_turn(program, index, compiled);
+            imported.push(items);
             continue;
+        }
+        // What is placed for the generic functions of those is this
+        // package's, as their instances are.
+        for items in imported.drain(..) {
+            ck.place_pattern_strings(program, &items);
+            ck.check_generic_fns(program, &items);
         }
         ck.define_globals(program, items.clone());
         ck.check_lists(&items);

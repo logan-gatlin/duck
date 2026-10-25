@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use duck_compiler::file::{
     FileId, FileManager, IncludeError, Included, Settings, TestModule, Wit, WitFile,
 };
+use duck_compiler::ty::Artifact;
 
 use crate::package::{self, Packages};
 
@@ -55,6 +56,12 @@ pub struct Files {
     /// Each path that a file was asked for by to include, as it is written,
     /// whether or not a file is there.
     include_paths: Vec<String>,
+    /// What names each package wherever it is compiled, by index, where
+    /// something does: the hash of its source, as [`crate::artifacts`]
+    /// keeps what it compiles to by.
+    names: HashMap<usize, String>,
+    /// What each package that is compiled already compiled to, by index.
+    compiled: HashMap<usize, Rc<Artifact>>,
 }
 
 /// The files that `module.include` names, each as it was last read: one
@@ -112,15 +119,26 @@ impl Files {
         entry_point: impl AsRef<Path>,
         settings: Settings,
     ) -> io::Result<Self> {
+        Self::of(packages, 0, entry_point, settings)
+    }
+
+    /// The files of `packages`, starting at `entry_point`, a file of the
+    /// package at `built`, which is the one being built.
+    pub fn of(
+        packages: &Packages,
+        built: usize,
+        entry_point: impl AsRef<Path>,
+        settings: Settings,
+    ) -> io::Result<Self> {
         let entry_point = entry_point.as_ref();
         let packages = packages.iter().enumerate().map(|(index, package)| {
             let library = package.manifest.library.as_ref();
             let library = library.map(|library| package.dir.join(&library.entry));
             // The package being built is entered by the entry point, and its
             // dependencies by their libraries.
-            let entry = match index {
-                0 => Some(entry_point),
-                _ => library.as_deref(),
+            let entry = match index == built {
+                true => Some(entry_point),
+                false => library.as_deref(),
             };
             Package {
                 dir: package.dir.clone(),
@@ -142,9 +160,21 @@ impl Files {
             settings,
             cache: IncludeCache::default(),
             include_paths: Vec::new(),
+            names: HashMap::new(),
+            compiled: HashMap::new(),
         };
-        files.read(entry_point.to_path_buf(), 0)?;
+        files.read(entry_point.to_path_buf(), built)?;
         Ok(files)
+    }
+
+    /// Names the package at `index` `name` wherever it is compiled, and
+    /// gives it what it compiled to, if it is compiled already: its files
+    /// are then only opened, and nothing of it is compiled again.
+    pub fn with_compiled(&mut self, index: usize, name: String, artifact: Option<Rc<Artifact>>) {
+        self.names.insert(index, name);
+        if let Some(artifact) = artifact {
+            self.compiled.insert(index, artifact);
+        }
     }
 
     /// The files with the tests of the package being built: each source
@@ -356,8 +386,21 @@ pub fn sources(path: &Path, sources: &mut Vec<PathBuf>) -> io::Result<()> {
 /// on, with what each of them uses. So the WIT a library needs is the
 /// library's own to have.
 pub fn wit(packages: &Packages) -> io::Result<Wit> {
-    let mut wit = wit_in(&packages.root().dir)?;
-    for package in packages.iter().skip(1) {
+    wit_of(packages, 0)
+}
+
+/// The WIT of the package at `built` of `packages`, as [`wit`] gives that
+/// of the first: the one being built.
+pub fn wit_of(packages: &Packages, built: usize) -> io::Result<Wit> {
+    let own = packages
+        .iter()
+        .nth(built)
+        .expect("the package is among them");
+    let mut wit = wit_in(&own.dir)?;
+    for (index, package) in packages.iter().enumerate() {
+        if index == built {
+            continue;
+        }
         let Wit { package, deps } = wit_in(&package.dir)?;
         wit.deps
             .extend(Some(package).filter(|files| !files.is_empty()));
@@ -369,7 +412,7 @@ pub fn wit(packages: &Packages) -> io::Result<Wit> {
 /// The WIT of the package in `dir`: the files of its [`WIT_DIR`], and those
 /// of each package under [`WIT_DEPS`] there, in order of their names. A
 /// package without the directory has none.
-fn wit_in(dir: &Path) -> io::Result<Wit> {
+pub(crate) fn wit_in(dir: &Path) -> io::Result<Wit> {
     let dir = dir.join(WIT_DIR);
     if !dir.is_dir() {
         return Ok(Wit::default());
@@ -446,6 +489,29 @@ impl FileManager for Files {
         let package = *package;
         let library = self.packages[package].library.clone()?;
         self.open_path(library, package)
+    }
+
+    fn package_name(&mut self, root: FileId) -> String {
+        let package = self.get(root).package;
+        match self.names.get(&package) {
+            Some(name) => name.clone(),
+            None => self.display_name(root),
+        }
+    }
+
+    fn module_path(&mut self, file: FileId) -> Vec<String> {
+        let file = self.get(file);
+        let root = &self.packages[file.package].root;
+        let path = file.path.strip_prefix(root).unwrap_or(&file.path);
+        let path = path.with_extension("");
+        path.iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn compiled(&mut self, library: FileId) -> Option<Rc<Artifact>> {
+        let package = self.get(library).package;
+        self.compiled.get(&package).cloned()
     }
 
     fn package_files(&mut self, library: FileId) -> Vec<FileId> {

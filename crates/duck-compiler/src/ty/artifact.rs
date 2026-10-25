@@ -54,7 +54,7 @@ use super::{
 /// What an artifact's bytes start with, and the version of their format,
 /// which changes whenever the format does.
 const MAGIC: &[u8; 8] = b"duckart\0";
-const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
 
 /// The package that the return area is of, among those an artifact uses:
 /// none, as it is the program's.
@@ -121,7 +121,7 @@ pub struct Artifact {
     /// The files of its spans, by name.
     files: Vec<String>,
     /// How many items of the program are its own.
-    items: usize,
+    pub(super) items: usize,
     imports: Vec<ir::Import>,
     /// The functions it defines, and after those the functions the checker
     /// made for it, in the order they were made.
@@ -315,14 +315,19 @@ impl Checker {
         let shares = self.shares(program);
         let mut artifacts = Vec::new();
         for (index, share) in shares.iter().enumerate() {
+            // Its files are its package's, in their order, so that where an
+            // error of linking is can be told from which package's file it
+            // is in.
+            let own_files = program.packages[index].files.clone();
+            let file_index = own_files.iter().enumerate().map(|(i, f)| (*f, i)).collect();
             let mut extract = Extract {
                 ck: self,
                 shares: &shares,
                 names: &names,
                 package: index,
                 uses: Vec::new(),
-                files: Vec::new(),
-                file_index: FxHashMap::default(),
+                files: own_files,
+                file_index,
                 foreign: Foreigns::default(),
                 foreign_index: FxHashMap::default(),
             };

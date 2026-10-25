@@ -234,6 +234,10 @@ impl Checker {
             let (_, decl) = fn_decls(program).nth(func).expect("it is defined");
             let target = FuncId(self.import_count + func as u32);
             let sig = self.funcs[target.0 as usize].clone();
+            // One of a package that is compiled already is in that
+            // package's artifact, which exports nothing: a function of this
+            // package's that calls it is exported in its place.
+            let foreign = self.is_foreign(target);
             // What allocates for the host is no function of the world's,
             // and is called with four wasm values for one.
             let Some(function) = self.world.export(interface, name) else {
@@ -242,7 +246,16 @@ impl Checker {
                 if !taken.eq(address.repeat(4)) || self.val_types(sig.ret) != address {
                     self.error(TypeErrorKind::Realloc, decl.sig.name.span);
                 }
-                funcs[func].exports.push(export);
+                if !foreign {
+                    funcs[func].exports.push(export);
+                    continue;
+                }
+                self.funcs.push(FuncSig {
+                    name: format!("export {}", sig.name),
+                    defaults: Vec::new(),
+                    ..sig
+                });
+                self.synths.push(Synth::Export(target, export));
                 continue;
             };
             self.check_signature(&decl.sig, &sig, &function, false);
@@ -251,7 +264,7 @@ impl Checker {
             // One that takes or gives more than wasm values hold is called
             // by a function that passes the rest in memory, as the host has
             // it.
-            if passing.params.is_none() && passing.result.is_none() {
+            if passing.params.is_none() && passing.result.is_none() && !foreign {
                 funcs[func].exports.push(export);
                 continue;
             }

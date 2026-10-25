@@ -7,9 +7,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Once;
 use std::time::SystemTime;
 
+use duck::artifacts;
 use duck::files::{self, Files, IncludeCache};
 use duck::git::Cache;
 use duck::manifest::{self, COMPONENT, ENTRY, LIBRARY, MANIFEST, ManifestError};
@@ -18,8 +20,8 @@ use duck_compiler::file::{FileId, FileManager, Included, Settings, TestModule};
 use duck_compiler::lex::Span;
 use duck_compiler::load::Parsed;
 use duck_compiler::ty::{
-    self, ActionKind, Analysis, Apart, Completion, CompletionKind, HintKind, Signature, Symbol,
-    SymbolKind, TypeErrorKind, Unused,
+    self, ActionKind, Analysis, Apart, Artifact, Completion, CompletionKind, HintKind, Signature,
+    Symbol, SymbolKind, TypeErrorKind, Unused,
 };
 use duck_compiler::world::WorldError;
 use duck_compiler::{Error, load};
@@ -54,6 +56,10 @@ pub struct Project {
     /// The files that the builds include, as each was last read: one that
     /// hasn't been written since isn't read again for every check.
     includes: IncludeCache,
+    /// What the packages that the package uses compiled to, which it is
+    /// checked against: nothing of them is compiled again while they are
+    /// as they were.
+    store: artifacts::Store,
 }
 
 /// The files of a build, and what checking them found. Of a build with
@@ -245,6 +251,7 @@ impl Project {
             probes: Vec::new(),
             parsed: HashMap::new(),
             includes: IncludeCache::default(),
+            store: artifacts::Store::from_env(),
         }
     }
 
@@ -989,7 +996,19 @@ impl Project {
             // test directory that can't be read is checked as none.
             let tested = table == COMPONENT || component.is_none();
             let tests = manifest.tests.as_ref().filter(|_| tested);
-            let files = Files::new(packages, self.root.join(entry), settings);
+            let entry_path = self.root.join(entry);
+            let prepared =
+                artifacts::prepare(packages, 0, &entry_path, settings.clone(), &self.store);
+            let files = match prepared {
+                Ok(files) => Ok(files),
+                // A package it uses that doesn't compile is checked with
+                // this one, from its source, for every error to be found
+                // where it is.
+                Err(artifacts::Failed::Compile { .. }) => {
+                    Files::new(packages, &entry_path, settings)
+                }
+                Err(artifacts::Failed::Read { error, .. }) => Err(error),
+            };
             let files = files.map(|files| {
                 let with_tests = tests.map(|dir| files.clone().with_tests(self.root.join(dir)));
                 with_tests.and_then(Result::ok).unwrap_or(files)
@@ -1013,6 +1032,8 @@ impl Project {
                     }));
                     found
                 }
+                // A package it uses that doesn't compile has its errors
+                // reported in its own files.
                 Err(e) => {
                     let message = format!("cannot read {}: {e}", entry.display());
                     let path = manifest_path.clone();
@@ -1085,25 +1106,41 @@ impl Overlay<'_, '_> {
                 return (vec![Problem::in_manifest(path, message, CRASH_CODE)], None);
             }
         };
-        let problems = errors.iter().map(|error| {
+        (self.placed(&errors, manifest_path), analysis)
+    }
+
+    /// Each of `errors` as a problem: where in the files it is, or in the
+    /// manifest at `manifest_path` if it's in no file.
+    fn placed(&mut self, errors: &[Error], manifest_path: &Path) -> Vec<Problem> {
+        let mut problems = Vec::new();
+        for error in errors {
             let message = error.to_string();
             let code = error.code();
             let Some(span) = error.span() else {
                 let key = asked_by(error);
-                return Problem::at_key(manifest_path.to_path_buf(), key, message, code);
+                problems.push(Problem::at_key(
+                    manifest_path.to_path_buf(),
+                    key,
+                    message,
+                    code,
+                ));
+                continue;
             };
-            let notes = error.instances().iter().map(|site| Note {
-                place: self.place(site.span),
-                message: format!("required by `{}` here", site.name),
-            });
-            Problem {
-                notes: notes.collect(),
+            let mut notes = Vec::new();
+            for site in error.instances() {
+                notes.push(Note {
+                    place: self.place(site.span),
+                    message: format!("required by `{}` here", site.name),
+                });
+            }
+            problems.push(Problem {
+                notes,
                 place: self.place(span),
                 message,
                 code,
-            }
-        });
-        (problems.collect(), analysis)
+            });
+        }
+        problems
     }
 
     /// Loads and type checks the files, as [`duck_compiler::compile`] does
@@ -1116,11 +1153,11 @@ impl Overlay<'_, '_> {
         let settings = self.settings();
         if !errors.is_empty() {
             let settings = brief(settings);
-            let analyze = AssertUnwindSafe(|| ty::analyze(program, &settings));
+            let analyze = AssertUnwindSafe(|| ty::analyze(program, &settings, self));
             let analysis = panic::catch_unwind(analyze).ok();
             return (errors, analysis.map(|analysis| (analysis, false)));
         }
-        let analysis = ty::analyze(program, &settings);
+        let analysis = ty::analyze(program, &settings, self);
         let errors = analysis.errors().iter().cloned().map(Error::Type);
         (errors.collect(), Some((analysis, true)))
     }
@@ -1156,6 +1193,22 @@ impl FileManager for Overlay<'_, '_> {
 
     fn open_package(&mut self, from: FileId, name: &str) -> Option<FileId> {
         self.files.open_package(from, name)
+    }
+
+    fn package_files(&mut self, library: FileId) -> Vec<FileId> {
+        self.files.package_files(library)
+    }
+
+    fn package_name(&mut self, root: FileId) -> String {
+        self.files.package_name(root)
+    }
+
+    fn module_path(&mut self, file: FileId) -> Vec<String> {
+        self.files.module_path(file)
+    }
+
+    fn compiled(&mut self, library: FileId) -> Option<Rc<Artifact>> {
+        self.files.compiled(library)
     }
 
     fn tests(&mut self) -> Vec<TestModule> {

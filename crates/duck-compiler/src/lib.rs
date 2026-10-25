@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::file::FileManager;
+use crate::file::{FileId, FileManager};
 use crate::lex::{LexError, Span};
 use crate::load::UseError;
 use crate::parse::ParseError;
@@ -138,7 +138,7 @@ pub fn compile_package(files: &mut impl FileManager) -> Result<Artifact, Vec<Err
 /// The module of `program`, which has `settings`, linked from the artifact
 /// of each of its packages: those it has from the packages that are
 /// compiled already, and those `built` of the rest.
-fn linked(
+pub(crate) fn linked(
     program: &load::Program,
     settings: &file::Settings,
     built: &[Artifact],
@@ -153,7 +153,21 @@ fn linked(
         })
         .collect();
     let module = ty::link_refs(&artifacts, settings);
-    module.map_err(|e| e.into_iter().map(Error::Type).collect())
+    // An error of linking is in a file of the artifacts, numbered as they
+    // are laid end to end: each artifact's are its package's, in order.
+    let files: Vec<FileId> = (program.packages.iter())
+        .flat_map(|package| package.files.iter().copied())
+        .collect();
+    let placed = |mut error: TypeError| {
+        if let Some(span) = &mut error.span {
+            span.file = files[span.file.index()];
+        }
+        for site in &mut error.instances {
+            site.span.file = files[site.span.file.index()];
+        }
+        Error::Type(error)
+    };
+    module.map_err(|e| e.into_iter().map(placed).collect())
 }
 
 /// Compiles the entry point of `files`, and every file it uses, to the
@@ -220,6 +234,23 @@ pub fn compile_tests(files: &mut impl FileManager) -> Result<Tests, Vec<Error>> 
     let component = world.encode(emit::emit(&module));
     let component = component.map_err(|e| vec![Error::Component(e)])?;
     Ok(Tests { component, tests })
+}
+
+/// Lowers the entry point of `files`, every file it uses, and each of its
+/// test modules to the core module that [`compile_tests`] makes a
+/// component of.
+pub fn lower_tests(files: &mut impl FileManager) -> Result<ir::Module, Vec<Error>> {
+    let settings = files.settings();
+    let program = load::load(files)?;
+    if program.imported.is_empty() {
+        let tested = ty::check_tests(&program, &settings);
+        return tested
+            .map(|tested| tested.module)
+            .map_err(|e| e.into_iter().map(Error::Type).collect());
+    }
+    let built = ty::build(&program, &settings, files, true);
+    let built = built.map_err(|e| e.into_iter().map(Error::Type).collect::<Vec<_>>())?;
+    linked(&program, &settings, &built.artifacts)
 }
 
 /// Lowers the entry point of `files`, and every file it uses, to the core

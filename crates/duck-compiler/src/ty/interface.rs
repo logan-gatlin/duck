@@ -58,8 +58,9 @@ lists!(
     (FuncId, Vec<Option<DefaultRecord>>),
     Option<Written>,
     (String, Written),
-    (usize, Vec<Option<Written>>),
-    (FuncId, Vec<Written>),
+    GenericDefaults,
+    OpaqueRecord,
+    (FuncId, Vec<OpaqueRecord>),
     (FileId, String, Vec<u8>),
     DepRecord,
     (usize, Vec<DepRecord>),
@@ -109,12 +110,12 @@ pub(super) struct Results {
     /// The default of each parameter of each function that has one, by the
     /// function.
     param_defaults: Vec<(FuncId, Vec<Option<DefaultRecord>>)>,
-    /// The type of each default of each generic function that has one of
-    /// its own.
-    generic_defaults: Vec<(usize, Vec<Option<Written>>)>,
+    /// The default of each parameter of each generic function that has one,
+    /// folded, and the type of each that has one of its own.
+    generic_defaults: Vec<GenericDefaults>,
     /// The types that the result of each function hides, by the function,
-    /// in the order of the result.
-    opaques: Vec<(FuncId, Vec<Written>)>,
+    /// in the order of the result, each with what bounds it.
+    opaques: Vec<(FuncId, Vec<OpaqueRecord>)>,
     /// What the constants of each item name, and what the body of each
     /// function names: the functions whose pointers they take and the
     /// items whose constants they read, which code run for a constant that
@@ -122,6 +123,16 @@ pub(super) struct Results {
     item_deps: Vec<(usize, Vec<DepRecord>)>,
     func_deps: Vec<(FuncId, Vec<DepRecord>)>,
 }
+
+/// A type that the result of a function hides, and what bounds it.
+#[derive(Debug, Clone, PartialEq)]
+struct OpaqueRecord {
+    hidden: Written,
+    bound: Option<Written>,
+}
+
+/// A type that a result hides, and what bounds it, as the checker has them.
+type Hidden = (Ty, Option<Ty>);
 
 /// What a constant or a body names: see [`Dep`].
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +143,10 @@ enum DepRecord {
 
 /// The value of a member of an enum, and whether it is known.
 type Member = (Vec<Scalar>, bool);
+
+/// The defaults of a generic function, by its item: each parameter's,
+/// folded, and the type of each that has one of its own.
+type GenericDefaults = (usize, Vec<Option<DefaultRecord>>, Vec<Option<Written>>);
 
 /// A function the checker made for a package, as its artifact has it.
 #[derive(Debug, Clone, PartialEq)]
@@ -215,10 +230,12 @@ enum Written {
     Param(usize, usize),
 }
 
-/// A generic declaration that an instance is of.
+/// A generic declaration that an instance is of: an item's, a built-in
+/// union by its place among them, or the built-in list.
 #[derive(Debug, Clone, PartialEq)]
 enum Base {
     Decl(usize),
+    Builtin(u8),
     List,
 }
 
@@ -415,10 +432,16 @@ impl Checker {
                     let id = self.generic_fn_items.iter().position(|i| *i == index);
                     let generic =
                         &self.generic_fns[id.expect("every generic function is declared")];
-                    if generic.default_tys.iter().any(Option::is_some) {
-                        let tys = generic.default_tys.iter();
-                        let tys = tys.map(|ty| ty.map(|ty| self.written(ty, extract)));
-                        results.generic_defaults.push((local, tys.collect()));
+                    if generic.sig.defaults.iter().any(Option::is_some) {
+                        let mut defaults = Vec::new();
+                        for folded in &generic.sig.defaults {
+                            defaults.push(folded.as_ref().map(|d| default(extract, d)));
+                        }
+                        let mut tys = Vec::new();
+                        for ty in &generic.default_tys {
+                            tys.push(ty.map(|ty| self.written(ty, extract)));
+                        }
+                        results.generic_defaults.push((local, defaults, tys));
                     }
                 }
                 _ => {}
@@ -475,7 +498,7 @@ impl Checker {
         // The types the results of its functions hide, by function, in the
         // order of the result: those of instances of generic functions are
         // the instances', which are functions the checker made.
-        let mut hidden: Vec<(FuncId, Vec<Ty>)> = Vec::new();
+        let mut hidden: Vec<(FuncId, Vec<Hidden>)> = Vec::new();
         for def in self.opaques.iter() {
             let func = match &def.owner {
                 Owner::Func(id) => *id,
@@ -496,13 +519,19 @@ impl Checker {
                 continue;
             };
             match hidden.iter_mut().find(|(id, _)| *id == func) {
-                Some((_, tys)) => tys.push(ty),
-                None => hidden.push((func, vec![ty])),
+                Some((_, tys)) => tys.push((ty, def.bound)),
+                None => hidden.push((func, vec![(ty, def.bound)])),
             }
         }
         for (func, tys) in hidden {
-            let tys = tys.iter().map(|ty| self.written(*ty, extract)).collect();
-            results.opaques.push((extract.func(func), tys));
+            let mut records = Vec::new();
+            for (hidden, bound) in tys {
+                records.push(OpaqueRecord {
+                    hidden: self.written(hidden, extract),
+                    bound: bound.map(|bound| self.written(bound, extract)),
+                });
+            }
+            results.opaques.push((extract.func(func), records));
         }
         let dep = |extract: &mut Extract, dep: &Dep| match dep {
             Dep::Func(id) => DepRecord::Func(extract.func(*id)),
@@ -551,9 +580,14 @@ impl Checker {
             Ty::Struct(id) => {
                 let def = &self.structs[id.0 as usize];
                 if let Some(instance) = &def.instance {
-                    let base = match self.list == Some(instance.generic) {
-                        true => Base::List,
-                        false => {
+                    let builtin = self
+                        .builtin_unions
+                        .iter()
+                        .position(|b| *b == instance.generic);
+                    let base = match (self.list == Some(instance.generic), builtin) {
+                        (true, _) => Base::List,
+                        (false, Some(at)) => Base::Builtin(at as u8),
+                        (false, None) => {
                             let item = self.structs[instance.generic.0 as usize].item;
                             Base::Decl(extract.item(item))
                         }
@@ -702,6 +736,35 @@ impl Checker {
             self.table_indices.entry(func).or_insert(next);
             self.table.push(func);
         }
+        // What its functions' results hide: each is there before anything
+        // names it, as the signature of a function the checker made may,
+        // and is settled once every one is.
+        let mut settled = Vec::new();
+        for (func, hidden) in &results.opaques {
+            let func = self.foreign_func(program, package, *func);
+            let owner = Owner::Func(func);
+            for (at, record) in hidden.iter().enumerate() {
+                let mut same = (0..self.opaques.len()).filter(|i| self.opaques[*i].owner == owner);
+                let id = match same.nth(at) {
+                    Some(id) => id,
+                    None => {
+                        let name = self.funcs[func.0 as usize].name.clone();
+                        let bound = record.bound.as_ref();
+                        let bound = bound.map(|bound| self.adopt(program, package, bound, site));
+                        let def = OpaqueDef::settled(owner.clone(), name, root, bound);
+                        self.opaques.push(def);
+                        self.opaques.len() - 1
+                    }
+                };
+                settled.push((id, &record.hidden));
+            }
+        }
+        // One that hides a type that names another is settled after it,
+        // as making an instance of what it hides checks what that hides.
+        let mut done = vec![false; settled.len()];
+        for at in 0..settled.len() {
+            self.settle_hidden(program, package, &settled, &mut done, at, site);
+        }
         // The functions the checker made for it, as it found them.
         for (local, record) in results.synths.iter().enumerate() {
             let id = self.imported[&package].synths[local];
@@ -743,26 +806,6 @@ impl Checker {
                     self.wrappers.insert(import, id);
                 }
                 SynthKind::Other => {}
-            }
-        }
-        // What its functions' results hide.
-        for (func, hidden) in &results.opaques {
-            let func = self.foreign_func(program, package, *func);
-            let owner = Owner::Func(func);
-            for (at, written) in hidden.iter().enumerate() {
-                let ty = self.adopt(program, package, written, site);
-                let mut same = (0..self.opaques.len()).filter(|i| self.opaques[*i].owner == owner);
-                match same.nth(at) {
-                    Some(id) => {
-                        self.opaques[id].hidden = Some(ty);
-                        self.opaques[id].state = Visit::Done;
-                    }
-                    None => {
-                        let name = self.funcs[func.0 as usize].name.clone();
-                        let def = OpaqueDef::settled(owner.clone(), name, root, ty);
-                        self.opaques.push(def);
-                    }
-                }
             }
         }
         // Its constants, as checking found them.
@@ -814,13 +857,21 @@ impl Checker {
             });
             self.funcs[func.0 as usize].defaults = defaults.collect();
         }
-        for (local, tys) in &results.generic_defaults {
+        for (local, defaults, tys) in &results.generic_defaults {
             let index = items.start + local;
             let id = self.generic_fn_items.iter().position(|i| *i == index);
             let id = id.expect("every generic function is declared");
-            let tys = tys.iter();
-            let tys = tys.map(|ty| ty.as_ref().map(|ty| self.adopt(program, package, ty, site)));
-            self.generic_fns[id].default_tys = tys.collect();
+            let defaults = defaults.iter();
+            let defaults = defaults.map(|d| {
+                d.as_ref()
+                    .map(|d| self.foreign_default(program, package, d))
+            });
+            self.generic_fns[id].sig.defaults = defaults.collect();
+            let mut adopted = Vec::new();
+            for ty in tys {
+                adopted.push(ty.as_ref().map(|ty| self.adopt(program, package, ty, site)));
+            }
+            self.generic_fns[id].default_tys = adopted;
         }
         // Nothing of it is folded or lowered: its constants are found, and
         // its functions are the artifact's. What they name is known, for
@@ -862,15 +913,49 @@ impl Checker {
             );
             self.normally.insert(id);
         }
-        // What is checked of a package wherever it is compiled: that its
-        // generic functions hold together as declared, and that what it
-        // imports is what the world of this program gives.
+        // What is checked of a package wherever it is compiled: that what
+        // it imports is what the world of this program gives. Its generic
+        // functions are checked as declared in the turn of the next package
+        // that is compiled, as what that places is that package's: nothing
+        // more may be numbered as this package's than its artifact has.
         self.check_lists(&items);
-        self.place_pattern_strings(program, &items);
-        self.check_generic_fns(program, &items);
         if !self.unread {
             self.check_imports(program, &items);
         }
+    }
+
+    /// Settles opaque type `at` of `settled`, the opaque types of package
+    /// `package` with what each hides as written, after those that what it
+    /// hides names.
+    fn settle_hidden(
+        &mut self,
+        program: &Program,
+        package: usize,
+        settled: &[(usize, &Written)],
+        done: &mut [bool],
+        at: usize,
+        site: Span,
+    ) {
+        if done[at] {
+            return;
+        }
+        done[at] = true;
+        let (id, written) = settled[at];
+        let mut named = Vec::new();
+        opaques_in(written, &mut named);
+        for (func, index) in named {
+            let func = self.foreign_func(program, package, func);
+            let owner = Owner::Func(func);
+            let mut same = (0..self.opaques.len()).filter(|i| self.opaques[*i].owner == owner);
+            if let Some(other) = same.nth(index)
+                && let Some(before) = settled.iter().position(|(id, _)| *id == other)
+            {
+                self.settle_hidden(program, package, settled, done, before, site);
+            }
+        }
+        let ty = self.adopt(program, package, written, site);
+        self.opaques[id].hidden = Some(ty);
+        self.opaques[id].state = Visit::Done;
     }
 
     /// Whether function `id` is one of a package that is compiled already,
@@ -1083,6 +1168,10 @@ impl Checker {
                     .collect();
                 match base {
                     Base::List => self.list_of(args, site),
+                    Base::Builtin(at) => {
+                        let generic = self.builtin_unions[*at as usize];
+                        self.instantiate(generic, args, site)
+                    }
                     Base::Decl(item) => {
                         let generic = self.struct_of(self.foreign_item(program, package, *item));
                         self.instantiate(generic, args, site)
@@ -1140,6 +1229,32 @@ impl Checker {
                 }
             }
         }
+    }
+}
+
+/// Adds each opaque type that `written` names, by its function and its
+/// place in the result, to `out`.
+fn opaques_in(written: &Written, out: &mut Vec<(FuncId, usize)>) {
+    match written {
+        Written::Opaque(func, at) => out.push((*func, *at)),
+        Written::Instance(_, args) | Written::Tuple(args) => {
+            args.iter().for_each(|arg| opaques_in(arg, out));
+        }
+        Written::Ptr(inner, _) | Written::Array(inner, _) => opaques_in(inner, out),
+        Written::Fn(params, ret) => {
+            params.iter().for_each(|param| opaques_in(param, out));
+            opaques_in(ret, out);
+        }
+        Written::Prim(_)
+        | Written::Unit
+        | Written::Never
+        | Written::Error
+        | Written::Type
+        | Written::Struct(_)
+        | Written::Enum(_)
+        | Written::Builtin(_)
+        | Written::Func(_)
+        | Written::Param(..) => {}
     }
 }
 
@@ -1202,6 +1317,22 @@ impl Decode for Results {
             opaques: Decode::decode(r)?,
             item_deps: Decode::decode(r)?,
             func_deps: Decode::decode(r)?,
+        })
+    }
+}
+
+impl Encode for OpaqueRecord {
+    fn encode(&self, w: &mut Writer) {
+        self.hidden.encode(w);
+        self.bound.encode(w);
+    }
+}
+
+impl Decode for OpaqueRecord {
+    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(Self {
+            hidden: Decode::decode(r)?,
+            bound: Decode::decode(r)?,
         })
     }
 }
@@ -1370,6 +1501,10 @@ impl Encode for Written {
                         w.tag(1);
                         item.encode(w);
                     }
+                    Base::Builtin(at) => {
+                        w.tag(2);
+                        at.encode(w);
+                    }
                 }
                 args.encode(w);
             }
@@ -1428,6 +1563,7 @@ impl Decode for Written {
                 let base = match r.tag()? {
                     0 => Base::List,
                     1 => Base::Decl(Decode::decode(r)?),
+                    2 => Base::Builtin(Decode::decode(r)?),
                     tag => return Err(bad("generic", tag)),
                 };
                 Self::Instance(base, Decode::decode(r)?)

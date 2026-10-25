@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use duck::artifacts;
 use duck::files::{self, Files};
 use duck::manifest::{DEFAULT_TEST_DIR, MANIFEST, Manifest};
 use duck::package::Packages;
@@ -148,13 +149,21 @@ fn build() -> ExitCode {
         (None, None) => unreachable!("every manifest has a component or a library"),
     };
     let entry = root.join(entry);
-    let mut files = match Files::new(&packages, &entry, settings) {
+    let store = artifacts::Store::from_env();
+    let mut files = match artifacts::prepare(&packages, 0, &entry, settings, &store) {
         Ok(files) => files,
-        Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
+        Err(failed) => return unprepared(failed),
     };
+    // A library compiles to what the packages that use it link: kept, so
+    // that none of them compiles it again.
     let compiled = match &manifest.component {
         Some(_) => duck_compiler::compile(&mut files).map(Some),
-        None => duck_compiler::check(&mut files).map(|()| None),
+        None => duck_compiler::compile_package(&mut files).map(|artifact| {
+            if let Ok(key) = artifacts::key_of(&packages, 0) {
+                store.write(&key, &artifact);
+            }
+            None
+        }),
     };
     let bytes = match compiled {
         Ok(bytes) => bytes,
@@ -202,9 +211,10 @@ fn run(args: Vec<String>) -> ExitCode {
         ));
     }
     let entry = root.join(&component.entry);
-    let mut files = match Files::new(&packages, &entry, settings) {
+    let store = artifacts::Store::from_env();
+    let mut files = match artifacts::prepare(&packages, 0, &entry, settings, &store) {
         Ok(files) => files,
-        Err(e) => return fail(format_args!("cannot read {}: {e}", entry.display())),
+        Err(failed) => return unprepared(failed),
     };
     let compiled = match duck_compiler::compile(&mut files) {
         Ok(compiled) => compiled,
@@ -249,12 +259,14 @@ fn test(filters: &[String], skip: &[String], list: bool) -> ExitCode {
     };
     let entry = root.join(entry);
     let dir = root.join(dir);
-    let files = Files::new(&packages, &entry, settings)
-        .map_err(|e| (&entry, e))
-        .and_then(|files| files.with_tests(dir.clone()).map_err(|e| (&dir, e)));
-    let mut files = match files {
+    let store = artifacts::Store::from_env();
+    let files = match artifacts::prepare(&packages, 0, &entry, settings, &store) {
         Ok(files) => files,
-        Err((path, e)) => return fail(format_args!("cannot read {}: {e}", path.display())),
+        Err(failed) => return unprepared(failed),
+    };
+    let mut files = match files.with_tests(dir.clone()) {
+        Ok(files) => files,
+        Err(e) => return fail(format_args!("cannot read {}: {e}", dir.display())),
     };
     // A package without a test module has nothing to compile for one.
     if files.tests().is_empty() {
@@ -388,6 +400,20 @@ fn resolve() -> Result<(PathBuf, Packages), ExitCode> {
     };
     let packages = package::resolve(&root, &git::Cache::from_env()).map_err(fail)?;
     Ok((root, packages))
+}
+
+/// Reports why the packages a package uses aren't all compiled.
+fn unprepared(failed: artifacts::Failed) -> ExitCode {
+    match failed {
+        artifacts::Failed::Compile {
+            mut files,
+            errors,
+            manifest,
+        } => report(&errors, &mut files, &manifest),
+        artifacts::Failed::Read { path, error } => {
+            fail(format_args!("cannot read {}: {error}", path.display()))
+        }
+    }
 }
 
 /// Prints each of `errors` with where in `files` it is, or with the manifest
