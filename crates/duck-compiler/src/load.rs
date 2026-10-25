@@ -636,21 +636,26 @@ impl<'f, F: FileManager> Loader<'f, F> {
     /// Loads the module `path` leads into, and gives what it names its name
     /// in the module `from`, whose `use` the item `decl` is.
     fn use_path(&mut self, from: FileId, decl: &Item, path: &UsePath) -> Result<(), UseErrorKind> {
-        let names: Vec<_> = path.segments.iter().map(|s| s.name.as_str()).collect();
-        // The module is the file furthest along the path, and the names
-        // after it are found by the type checker.
-        let local = (1..=names.len())
-            .rev()
-            .find_map(|len| Some((self.files.open(from, &names[..len])?, len)));
-        // A test module shares what is in its test directory, which only a
-        // path that no module of the package is along is looked for from:
-        // one named as a module of the package is, as the module it tests,
-        // names that module.
-        let local = local.or_else(|| {
-            let mut lens = (1..=names.len()).rev();
-            lens.find_map(|len| Some((self.files.open_test(from, &names[..len])?, len)))
-        });
-        let dependency = self.files.open_package(from, names[0]);
+        let mut segments = path.segments.clone();
+        let mut names: Vec<_> = segments.iter().map(|s| s.name.clone()).collect();
+        let (mut local, mut dependency) = self.find_module(from, &names);
+        // A path that neither has starts with a name that a `use` above it
+        // gives, and goes on from what that names: it is as if written
+        // with that path in place of the name.
+        if local.is_none() && dependency.is_none() {
+            let mut bound = self.uses.iter().rev();
+            let bound = bound.find(|used| used.module == from && used.name.name == names[0]);
+            if let Some(bound) = bound {
+                let span = segments[0].span;
+                let named = bound.path.iter().chain(&bound.members).map(|ident| Ident {
+                    name: ident.name.clone(),
+                    span,
+                });
+                segments = named.chain(segments[1..].iter().cloned()).collect();
+                names = segments.iter().map(|s| s.name.clone()).collect();
+                (local, dependency) = self.find_module(from, &names);
+            }
+        }
         let root = self.roots.get(&from).copied().unwrap_or(from);
         let (target, len) = match (local, dependency) {
             (Some(_), Some(_)) => return Err(UseErrorKind::Ambiguous(names[0].to_string())),
@@ -661,7 +666,7 @@ impl<'f, F: FileManager> Loader<'f, F> {
             }
             // Only what its library makes `pub` is reached in a dependency.
             (None, Some(library)) => {
-                self.depend(root, names[0], library);
+                self.depend(root, &names[0], library);
                 (library, 1)
             }
             (None, None) => return Err(UseErrorKind::NotFound(names.join("."))),
@@ -679,12 +684,39 @@ impl<'f, F: FileManager> Loader<'f, F> {
             name: name.clone(),
             target,
             target_path: names[..len].join("."),
-            path: path.segments[..len].to_vec(),
-            members: path.segments[len..].to_vec(),
+            path: segments[..len].to_vec(),
+            members: segments[len..].to_vec(),
             is_pub: decl.is_pub,
             decl: decl.span,
         });
         Ok(())
+    }
+
+    /// The module furthest along the path `names` from the module `from`,
+    /// if one of its package is, with how many of the names lead to it;
+    /// and the library of the dependency the path starts with, if it
+    /// starts with one. The names after a module are found by the type
+    /// checker.
+    #[allow(clippy::type_complexity)]
+    fn find_module(
+        &mut self,
+        from: FileId,
+        names: &[String],
+    ) -> (Option<(FileId, usize)>, Option<FileId>) {
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let local = (1..=names.len())
+            .rev()
+            .find_map(|len| Some((self.files.open(from, &names[..len])?, len)));
+        // A test module shares what is in its test directory, which only a
+        // path that no module of the package is along is looked for from:
+        // one named as a module of the package is, as the module it tests,
+        // names that module.
+        let local = local.or_else(|| {
+            let mut lens = (1..=names.len()).rev();
+            lens.find_map(|len| Some((self.files.open_test(from, &names[..len])?, len)))
+        });
+        let dependency = self.files.open_package(from, names[0]);
+        (local, dependency)
     }
 }
 
@@ -1484,6 +1516,37 @@ extern:
         ]);
         let module = lower(&mut files);
         assert_eq!(module.globals[0].init, Const::I32(5));
+    }
+
+    #[test]
+    fn a_use_goes_on_from_a_name_that_a_use_above_it_gives() {
+        // Whether the name is given a module of the package, a dependency,
+        // or an item of either, the path is as if written with the path
+        // that was given the name in its place.
+        let mut files = Memory(vec![
+            (
+                "main",
+                "use geo as g\nuse g.Point\nuse g.sub as s\nuse s.one\nuse dep as d\nuse d.two\nuse d.deeper.three\nuse d.deeper as deep\nuse deep.three as four\npub let n = Point().x + one + two + three + four\n",
+            ),
+            ("geo", "pub struct Point:\n    pub x: i32 = 1\n"),
+            ("geo.sub", "pub let one = 2\n"),
+            ("@dep", "pub use deeper\npub let two = 3\n"),
+            ("deeper", "pub let three = 4\n"),
+        ]);
+        let module = lower(&mut files);
+        assert_eq!(module.globals[0].init, Const::I32(14));
+        // A name given below, or by nothing, leads nowhere.
+        let mut files = Memory(vec![
+            ("main", "use g.Point\nuse geo as g\nuse h.one\nlet a = 1\n"),
+            ("geo", "pub struct Point:\n    pub x: i32 = 1\n"),
+        ]);
+        assert_eq!(
+            errors(&mut files),
+            [
+                "main \"g.Point\": cannot find `g.Point` in this package or its dependencies",
+                "main \"h.one\": cannot find `h.one` in this package or its dependencies",
+            ]
+        );
     }
 
     #[test]

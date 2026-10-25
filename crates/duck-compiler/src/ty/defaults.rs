@@ -45,6 +45,23 @@ impl Checker {
             let field = &mut self.structs.untracked()[id.0 as usize].fields[index];
             (field.default, field.default_ty) = (default, default_ty);
         }
+        // A field that a `use Type as name` makes has the defaults of the
+        // type's fields for its own, if every one has a default: it is what
+        // the type's constructor makes of nothing.
+        for used in decl.entries.iter().filter_map(parse::Entry::used) {
+            let Some(name) = &used.name else {
+                continue;
+            };
+            let fields = &self.structs[id.0 as usize].fields;
+            let Some(index) = fields.iter().position(|def| def.span == used.span) else {
+                continue;
+            };
+            let default = match fields[index].ty {
+                Ty::Struct(of) => self.struct_default(program, of, name.span),
+                _ => None,
+            };
+            self.structs.untracked()[id.0 as usize].fields[index].default = default;
+        }
         for field in decl.entries.iter().filter_map(parse::Entry::own) {
             let Some(expr) = &field.default else {
                 continue;
@@ -186,6 +203,32 @@ impl Checker {
         let consts = consts.filter(|consts| folded && valued(consts));
         let folded = consts.is_some();
         (consts, own.filter(|_| folded))
+    }
+
+    /// The value that the constructor of struct `of` makes of no arguments,
+    /// as the default of a field of that type, if every field of `of` has
+    /// a default of its own, which are folded first. `Failed` if one
+    /// failed, and `None` if one has none, which the field then has none
+    /// either.
+    fn struct_default(
+        &mut self,
+        program: &Program,
+        of: StructId,
+        span: Span,
+    ) -> Option<DefaultValue> {
+        let def = &self.structs[of.0 as usize];
+        let (item, name) = (def.item, def.name.clone());
+        if !self.folded(Some(program), item, &name, span) {
+            return Some(DefaultValue::Failed);
+        }
+        let mut scalars = Vec::new();
+        for index in 0..self.structs[of.0 as usize].fields.len() {
+            match self.field_default(of, index)? {
+                DefaultValue::Folded(consts) => scalars.extend(consts.iter().cloned()),
+                DefaultValue::Failed | DefaultValue::Pending => return Some(DefaultValue::Failed),
+            }
+        }
+        Some(DefaultValue::Folded(scalars))
     }
 
     /// The default of field `index` of struct `id`. An instance of a generic

@@ -1092,11 +1092,12 @@ impl Checker {
         }
         // Until it has its fields, it counts for nothing in what holds it.
         self.structs[index].depth = Some(0);
-        let mut uses = self.structs[generic.0 as usize].uses.clone();
+        let declared = self.structs[generic.0 as usize].uses.clone();
+        let mut uses = declared.clone();
         for used in &mut uses {
             *used = self.substitute(*used, &args, site);
         }
-        self.structs[index].uses = uses;
+        self.structs[index].uses = uses.clone();
         let mut fields = self.structs[generic.0 as usize].fields.clone();
         let mut too_deep = false;
         for field in &mut fields {
@@ -1105,6 +1106,14 @@ impl Checker {
             // doesn't have.
             too_deep |= ty == Ty::Error && field.ty != Ty::Error;
             field.ty = ty;
+            // A field of the struct a `use` names is one of that struct as
+            // the type arguments make it, which it is laid out as.
+            if let Some((used, at)) = field.used
+                && let Some(i) = declared.iter().position(|ty| *ty == Ty::Struct(used))
+                && let Ty::Struct(instance) = uses[i]
+            {
+                field.used = Some((instance, at));
+            }
         }
         let def = &mut self.structs[index];
         def.fields = fields;

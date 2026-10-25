@@ -7,8 +7,8 @@ use crate::codec::{Decode, DecodeError, Encode, Reader, Writer, bad, lists};
 use crate::parse::{
     Arg, Arm, BinOp, Binding, Entry, EnumDecl, Expr, ExprKind, ExternBlock, ExternFn, Field,
     FnDecl, FnSig, Ident, Item, ItemKind, Member, Module, Mutability, Param, Pattern, PatternKind,
-    Stmt, StmtKind, StructDecl, Type, TypeArg, TypeKind, TypeParam, UnaryOp, UnionDecl, Use,
-    UsePath, Variant,
+    Stmt, StmtKind, StructDecl, Type, TypeArg, TypeKind, TypeParam, TypeUse, UnaryOp, UnionDecl,
+    Use, UsePath, Variant,
 };
 
 lists!(
@@ -281,11 +281,31 @@ impl<T: Encode> Encode for Entry<T> {
                 w.tag(0);
                 own.encode(w);
             }
-            Entry::Use(ty) => {
+            Entry::Use(used) => {
                 w.tag(1);
-                ty.encode(w);
+                used.encode(w);
             }
         }
+    }
+}
+
+impl Encode for TypeUse {
+    fn encode(&self, w: &mut Writer) {
+        self.ty.encode(w);
+        self.name.encode(w);
+        self.is_pub.encode(w);
+        self.span.encode(w);
+    }
+}
+
+impl Decode for TypeUse {
+    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(TypeUse {
+            ty: Decode::decode(r)?,
+            name: Decode::decode(r)?,
+            is_pub: Decode::decode(r)?,
+            span: Decode::decode(r)?,
+        })
     }
 }
 
@@ -1041,6 +1061,8 @@ mod tests {
             "pub struct(T, U = u8) Vec:\n\
              \tuse varray(T)\n\
              \tuse geo.Box(&T)\n\
+             \tpub use Meta as meta\n\
+             \tuse Tag as tag\n\
              \tpub cap: uint = 0\n\
              \tname: Name(A, T: B)\n\
              \tempty: Name()\n\

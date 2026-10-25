@@ -68,8 +68,11 @@ impl Analysis {
                     symbols.extend(fns.map(child(SymbolKind::Function)));
                 }
                 ItemKind::Struct(decl) => {
-                    let fields = decl.entries.iter().filter_map(Entry::own);
-                    let fields = fields.map(|field| (&field.name, field.span));
+                    // A `use` that names a field is one.
+                    let fields = decl.entries.iter().filter_map(|entry| match entry {
+                        Entry::Own(field) => Some((&field.name, field.span)),
+                        Entry::Use(used) => used.name.as_ref().map(|name| (name, used.span)),
+                    });
                     let fields = fields.map(child(SymbolKind::Field)).collect();
                     symbols.push(symbol(&decl.name, SymbolKind::Struct, fields));
                 }

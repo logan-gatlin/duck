@@ -3147,14 +3147,38 @@ impl Checker {
             let field = match entry {
                 parse::Entry::Own(field) => field,
                 parse::Entry::Use(used) => {
-                    let (ty, used_fields) = self.used_fields(program, id, used, visits);
+                    let (ty, used_fields) = self.used_fields(program, id, &used.ty, visits);
                     self.structs[id].uses.push(ty);
+                    // `use Type as name` is a field of the type in place of
+                    // its fields, laid out as they would be: the struct
+                    // starts as the type does either way.
+                    if let Some(name) = &used.name {
+                        if self.structs[id].is_pub && used.is_pub {
+                            self.check_public(ty, used.ty.span, &name.name);
+                        }
+                        if fields.iter().any(|f| f.name == name.name) {
+                            let kind = TypeErrorKind::DuplicateField(name.name.clone());
+                            self.error(kind, name.span);
+                            continue;
+                        }
+                        fields.push(FieldDef {
+                            name: name.name.clone(),
+                            ty,
+                            is_pub: used.is_pub,
+                            bare: false,
+                            default: Some(DefaultValue::Pending),
+                            default_ty: None,
+                            used: None,
+                            span: used.span,
+                        });
+                        continue;
+                    }
                     for field in used_fields {
                         if self.structs[id].is_pub && field.is_pub {
-                            self.check_public(field.ty, used.span, &field.name);
+                            self.check_public(field.ty, used.ty.span, &field.name);
                         }
                         if fields.iter().any(|f| f.name == field.name) {
-                            self.error(TypeErrorKind::DuplicateField(field.name), used.span);
+                            self.error(TypeErrorKind::DuplicateField(field.name), used.ty.span);
                             continue;
                         }
                         fields.push(field);
@@ -4787,16 +4811,44 @@ impl Checker {
 
     /// Member offsets, size, and alignment of a struct, tuple or array, laid
     /// out as C would: members in order, each at a multiple of its alignment,
-    /// and the whole padded to a multiple of the largest.
+    /// and the whole padded to a multiple of the largest. The fields that a
+    /// `use` gives a struct take the place that a field of the struct it
+    /// names would, each where it is in that struct: `use Type` and
+    /// `use Type as name` are laid out alike, and a struct starts as the
+    /// type its first `use` names however it uses it.
     fn aggregate_layout(&self, ty: Ty) -> (Vec<u32>, u32, u32) {
         let (mut size, mut align) = (0u32, 1);
         let mut offsets = Vec::new();
-        for member in self.members(ty) {
-            let (member_size, member_align) = self.layout(member);
-            size = size.next_multiple_of(member_align);
-            offsets.push(size);
-            size += member_size;
-            align = align.max(member_align);
+        let fields = match ty {
+            Ty::Struct(id) => &self.structs[id.0 as usize].fields[..],
+            _ => &[],
+        };
+        // The struct whose fields are being laid out, and where it starts.
+        let mut group: Option<(StructId, u32)> = None;
+        for (index, member) in self.members(ty).into_iter().enumerate() {
+            let used = fields.get(index).and_then(|field| field.used);
+            let Some((of, at)) = used else {
+                group = None;
+                let (member_size, member_align) = self.layout(member);
+                size = size.next_multiple_of(member_align);
+                offsets.push(size);
+                size += member_size;
+                align = align.max(member_align);
+                continue;
+            };
+            let (within, of_size, of_align) = self.aggregate_layout(Ty::Struct(of));
+            let start = match group {
+                Some((same, start)) if same == of => start,
+                _ => {
+                    size = size.next_multiple_of(of_align);
+                    let start = size;
+                    size += of_size;
+                    align = align.max(of_align);
+                    group = Some((of, start));
+                    start
+                }
+            };
+            offsets.push(start + within.get(at).copied().unwrap_or(0));
         }
         (offsets, size.next_multiple_of(align), align)
     }
@@ -12364,14 +12416,13 @@ fn f(b: &Both, d: &var Deep) -> u64:
         // whatever else the type argument has after them.
         assert_eq!(
             body(&module, "size(Deep)"),
-            "(return (I64.Add (I64.Load offset=8 x) (I32.ExtendS (I32.Load offset=0 x))))"
+            "(return (I64.Add (I64.Load offset=16 x) (I32.ExtendS (I32.Load offset=0 x))))"
         );
         assert_eq!(
             body(&module, "tail(Deep)"),
-            "(I32.Store8 offset=20 x 1) (set h x) (return (I32.And (I32.Add \
-             (I32.Load8U offset=20 x) (call flag(Deep) (I32.Load offset=0 x) \
-             (I32.Load8U offset=4 x) (I32.Load8U offset=5 x) (I64.Load offset=8 x) \
-             (I32.Load offset=16 x) (I32.Load8U offset=20 x))) 255))"
+            "(I32.Store8 offset=32 x 1) (set h x) (return (I32.And (I32.Add (I32.Load8U offset=32 x) \
+             (call flag(Deep) (I32.Load offset=0 x) (I32.Load8U offset=4 x) (I32.Load8U offset=8 x) \
+             (I64.Load offset=16 x) (I32.Load offset=24 x) (I32.Load8U offset=32 x))) 255))"
         );
         // It is what the first type it lists is, and so meets its bound.
         assert_eq!(
@@ -19098,9 +19149,9 @@ fn size() -> uint:
              (return (I32.Add (I32.Add (I32.Add (I32.Add (I32.Load offset=0 n) m.tag) \
              (call id(Named) n)) (I32.Load offset=0 h)) (call id(Deep) d)))"
         );
-        // The fields are its own, laid out where the `use` is: no `Head` is
-        // within either.
-        assert_eq!(body(&module, "size"), "(return (I32.Add 8 12))");
+        // The fields are its own, laid out where the `use` is as a `Head`
+        // would be, padding and all: `len` comes after the 8 bytes of one.
+        assert_eq!(body(&module, "size"), "(return (I32.Add 12 12))");
 
         // Only a struct whose first `use` names it starts as `Head` does:
         // not one that uses it later, nor one with fields like its own. And
@@ -19135,6 +19186,96 @@ fn g(l: &Last, n: Named, a: &Alike) -> i32:
         assert_eq!(
             not_used.to_string(),
             "`Alike` has the fields of `Head`, but doesn't `use` it first"
+        );
+    }
+
+    #[test]
+    fn a_use_named_is_a_field_that_the_struct_starts_as_all_the_same() {
+        use TypeErrorKind::*;
+        let decls = "\
+struct Head:
+    id: i32
+    tag: u8 = 7
+struct Named:
+    use Head
+    len: u8
+    wide: i64
+struct Headed:
+    use Head as head
+    len: u8
+    wide: i64
+pub struct Point:
+    x: f32 = 0.0
+    y: f32 = 0.0
+pub struct Placed:
+    pub use Point as at
+    use Head as head
+struct(T) Box:
+    v: T
+struct(T) Boxed:
+    use Box(T) as inner
+    n: u8 = 1
+fn(T: Head) id(x: &T) -> i32:
+    return x.id
+";
+        let src = format!(
+            "{decls}\
+fn f(h: &Headed, n: &Named, b: &Boxed(i32)) -> i32:
+    let m = Headed(head: Head(id: 1), len: 2, wide: 3)
+    let p = Placed(head: Head(id: 4))
+    let k = h as &Head
+    let q = b as &Box(i32)
+    let v = Boxed(i32)(inner: Box(i32)(v: 5))
+    return m.head.id + m.head.tag as i32 + id(h) + k.id + p.at.x as i32 + q.v + b.inner.v + v.n as i32
+fn sizes() -> uint:
+    return Headed.size + Named.size + Placed.size
+fn lens(h: &Headed, n: &Named) -> u8:
+    return h.len + n.len
+"
+        );
+        let module = lower(&src);
+        // The field is of the type, with its default if every field of the
+        // type has one, and the struct starts as the type does.
+        assert_eq!(
+            body(&module, "f"),
+            "(set m.head.id 1) (set m.head.tag 7) (set m.len 2) (set m.wide 3i64) \
+             (set p.at.x 0f32) (set p.at.y 0f32) (set p.head.id 4) (set p.head.tag 7) \
+             (set k h) (set q b) (set v.inner.v 5) (set v.n 1) \
+             (return (I32.Add (I32.Add (I32.Add (I32.Add (I32.Add (I32.Add (I32.Add m.head.id m.head.tag) \
+             (call id(Headed) h)) (I32.Load offset=0 k)) (F32.TruncSatS(I32) p.at.x)) (I32.Load offset=0 q)) \
+             (I32.Load offset=0 b)) v.n))"
+        );
+        // `use Type` and `use Type as name` are laid out alike.
+        assert_eq!(
+            body(&module, "sizes"),
+            "(return (I32.Add (I32.Add 24 24) 16))"
+        );
+        assert_eq!(
+            body(&module, "lens"),
+            "(return (I32.And (I32.Add (I32.Load8U offset=8 h) (I32.Load8U offset=8 n)) 255))"
+        );
+
+        // The field is required where the type's fields don't all have
+        // defaults, and is named once.
+        let src = format!(
+            "{decls}\
+struct Twice:
+    use Head
+    use Point as tag
+struct Again:
+    use Point as at
+    at: i32
+fn g() -> Placed:
+    return Placed()
+"
+        );
+        assert_eq!(
+            errors_at(&src),
+            vec![
+                (DuplicateField("tag".into()), "tag"),
+                (DuplicateField("at".into()), "at"),
+                (MissingArg("head".into()), "Placed()"),
+            ]
         );
     }
 
@@ -19769,7 +19910,7 @@ fn call(n: Named, p: &Named) -> i32:
         assert_eq!(
             body(&module, "made"),
             "(call make [0] -> []) (set tmp0 (I32.Load offset=0 0)) (set tmp1 (I32.Load8U offset=4 0)) \
-             (set tmp2 (I32.Load8U offset=5 0)) (set tmp3 (I64.Load offset=8 0)) (return tmp0 tmp1)"
+             (set tmp2 (I32.Load8U offset=8 0)) (set tmp3 (I64.Load offset=16 0)) (return tmp0 tmp1)"
         );
         // A pointer to it is one to what it starts as, and writes it if it
         // wrote the whole.

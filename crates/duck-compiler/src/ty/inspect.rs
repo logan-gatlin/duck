@@ -1233,10 +1233,15 @@ impl Analysis {
             entries: &'p [Entry<T>],
             name: impl Fn(&'p T) -> &'p Ident,
         ) -> (Vec<&'p Ident>, Vec<&'p parse::Type>) {
-            let own = entries.iter().filter_map(Entry::own).map(name);
+            // A `use` that names a field is one of the declaration's own,
+            // and gives it none of the type's.
+            let own = entries.iter().filter_map(|entry| match entry {
+                Entry::Own(own) => Some(name(own)),
+                Entry::Use(used) => used.name.as_ref(),
+            });
             let used = entries.iter().filter_map(|entry| match entry {
-                Entry::Use(ty) => Some(ty),
-                Entry::Own(_) => None,
+                Entry::Use(used) if used.name.is_none() => Some(&used.ty),
+                _ => None,
             });
             (own.collect(), used.collect())
         }
@@ -1849,7 +1854,11 @@ impl<'p> Walk<'p> {
                                 || self.ty(&field.ty)
                                 || field.default.as_ref().is_some_and(|d| self.expr(d))
                         }
-                        Entry::Use(ty) => self.ty(ty),
+                        Entry::Use(used) => {
+                            let name = used.name.as_ref();
+                            name.is_some_and(|name| self.named(Found::Entry(index, name), name))
+                                || self.ty(&used.ty)
+                        }
                     })
             }
             ItemKind::Union(decl) => {
@@ -1862,7 +1871,7 @@ impl<'p> Walk<'p> {
                             self.named(Found::Entry(index, &variant.name), &variant.name)
                                 || variant.ty.as_ref().is_some_and(|ty| self.ty(ty))
                         }
-                        Entry::Use(ty) => self.ty(ty),
+                        Entry::Use(used) => self.ty(&used.ty),
                     })
             }
             ItemKind::Enum(decl) => {
@@ -1874,7 +1883,7 @@ impl<'p> Walk<'p> {
                             self.named(Found::Entry(index, &member.name), &member.name)
                                 || member.value.as_ref().is_some_and(|v| self.expr(v))
                         }
-                        Entry::Use(ty) => self.ty(ty),
+                        Entry::Use(used) => self.ty(&used.ty),
                     })
             }
             ItemKind::Binding(binding) => {
@@ -2433,7 +2442,13 @@ fn decl_text<T>(head: String, entries: &[Entry<T>], mut own: impl FnMut(&T) -> S
         text += "\n\t";
         text += &match entry {
             Entry::Own(entry) => own(entry),
-            Entry::Use(ty) => format!("use {ty}"),
+            Entry::Use(used) => {
+                let is_pub = if used.is_pub { "pub " } else { "" };
+                match &used.name {
+                    Some(name) => format!("{is_pub}use {} as {}", used.ty, name.name),
+                    None => format!("use {}", used.ty),
+                }
+            }
         };
     }
     if entries.is_empty() {

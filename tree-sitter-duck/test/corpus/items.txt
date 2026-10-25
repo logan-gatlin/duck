@@ -351,6 +351,8 @@ Use in a struct, a union and an enum
 struct(T) Named:
     use Head
     use geo.Box(&T)
+    pub use Meta as meta
+    use Tag as tag
     pub name: array(u8)
 
 union Wide:
@@ -380,6 +382,14 @@ enum(u8) Color:
             (pointer_type
               (named_type
                 (identifier)))))))
+    (type_use
+      (named_type
+        (identifier))
+      (identifier))
+    (type_use
+      (named_type
+        (identifier))
+      (identifier))
     (field_declaration
       (identifier)
       (named_type

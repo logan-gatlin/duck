@@ -166,20 +166,20 @@ impl Checker {
             let variant = match entry {
                 parse::Entry::Own(variant) => variant,
                 parse::Entry::Use(used) => {
-                    let (ty, used_variants) = self.used_fields(program, id, used, visits);
+                    let (ty, used_variants) = self.used_fields(program, id, &used.ty, visits);
                     self.structs[id].uses.push(ty);
                     for variant in used_variants {
                         if self.structs[id].is_pub {
-                            self.check_public(variant.ty, used.span, &variant.name);
+                            self.check_public(variant.ty, used.ty.span, &variant.name);
                         }
                         if variants.iter().any(|v| v.name == variant.name) {
                             let kind = TypeErrorKind::DuplicateVariant(variant.name);
-                            self.error(kind, used.span);
+                            self.error(kind, used.ty.span);
                             continue;
                         }
                         variants.push(variant);
                         if variants.len() > MAX_VARIANTS {
-                            extra.get_or_insert(used.span);
+                            extra.get_or_insert(used.ty.span);
                         }
                     }
                     continue;

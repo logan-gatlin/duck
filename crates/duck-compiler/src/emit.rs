@@ -797,7 +797,8 @@ pub fn set(n: &var Named, len: u8):
     n.len = len
 ";
         let bytes = emit_src(src);
-        // `len` follows `tag` in the padding a nested `Head` would end with.
+        // The fields of `Head` take the place a `Head` would, padding and
+        // all: `len` follows it, not `tag`.
         let get = func_wat(&bytes, "get");
         let loads: Vec<_> = get.lines().filter(|l| l.contains("load")).collect();
         assert_eq!(
@@ -805,12 +806,12 @@ pub fn set(n: &var Named, len: u8):
             [
                 "    i32.load",
                 "    i32.load8_u offset=4",
-                "    i32.load8_u offset=5",
-                "    i64.load offset=8",
+                "    i32.load8_u offset=8",
+                "    i64.load offset=16",
             ]
         );
         assert!(get.contains("(param $n i32) (result i32 i32 i32 i64)"));
-        assert!(func_wat(&bytes, "set").contains("i32.store8 offset=5"));
+        assert!(func_wat(&bytes, "set").contains("i32.store8 offset=8"));
     }
 
     #[test]

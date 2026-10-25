@@ -130,7 +130,20 @@ pub enum Entry<T> {
     Own(T),
     /// `use Type`: those of another struct, union or enum, in its place.
     /// Every one comes before the declaration's own.
-    Use(Type),
+    Use(TypeUse),
+}
+
+/// A `use` line of a struct, a union or an enum: `use Type`, or in a
+/// struct, `use Type as name`, which is a field `name` of the type in
+/// place of its fields, laid out as they would be.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeUse {
+    pub ty: Type,
+    /// The name of the field that `use Type as name` makes.
+    pub name: Option<Ident>,
+    /// Whether that field is `pub`.
+    pub is_pub: bool,
+    pub span: Span,
 }
 
 /// A `name: Type` or `name: Type = default` struct field, optionally marked
@@ -450,6 +463,8 @@ pub enum ParseErrorKind {
     UseAfterItem,
     /// A `use` after a field, variant or member of the declaration's own.
     UseAfterEntry,
+    /// A `use Type as name` in a union or an enum, which only a struct has.
+    NamedUse,
     /// A function in an `extern` block with type parameters.
     GenericExtern,
     /// A function in a `pub "interface":` block with type parameters.
@@ -523,6 +538,14 @@ impl<T> Entry<T> {
         match self {
             Self::Own(own) => Some(own),
             Self::Use(_) => None,
+        }
+    }
+
+    /// The `use` that the entry is, if it's one.
+    pub fn used(&self) -> Option<&TypeUse> {
+        match self {
+            Self::Own(_) => None,
+            Self::Use(used) => Some(used),
         }
     }
 }
@@ -636,6 +659,7 @@ impl ParseErrorKind {
             Self::PubExtern => "pub-extern",
             Self::UseAfterItem => "use-after-item",
             Self::UseAfterEntry => "use-after-entry",
+            Self::NamedUse => "named-use",
             Self::GenericExtern => "generic-extern",
             Self::GenericExport => "generic-export",
             Self::PipeWithoutPlaceholder => "pipe-without-placeholder",
@@ -662,6 +686,11 @@ impl fmt::Display for ParseErrorKind {
             Self::UseAfterEntry => write!(
                 f,
                 "`use` must come before the fields, variants or members of the declaration's own"
+            ),
+            Self::NamedUse => write!(
+                f,
+                "only a struct names what it uses: `use Type as name` is a field of the \
+                 struct, where a union or an enum has the variants or members of the type"
             ),
             Self::GenericExtern => {
                 write!(
@@ -956,7 +985,7 @@ impl<'a> Parser<'a> {
                 p.expect(TokenKind::Newline)?;
                 return Ok(None);
             }
-            p.entry(&mut past_uses, Self::field).map(Some)
+            p.entry(&mut past_uses, true, Self::field).map(Some)
         })?;
         Ok(StructDecl {
             name,
@@ -967,15 +996,47 @@ impl<'a> Parser<'a> {
 
     /// A line of a struct's, a union's or an enum's body: `use Type`, or
     /// what `own` parses. `past_uses` is whether a line before it was the
-    /// declaration's own, which a `use` is reported for coming after.
+    /// declaration's own, which a `use` is reported for coming after. A
+    /// struct's `use` may be `named`, `use Type as name`, and then may be
+    /// `pub`.
     fn entry<T>(
         &mut self,
         past_uses: &mut bool,
+        named: bool,
         own: impl FnOnce(&mut Self) -> PResult<T>,
     ) -> PResult<Entry<T>> {
         let start = self.peek().span;
+        let is_pub = self.at(TokenKind::Pub) && self.peek_second().kind == TokenKind::Use;
+        if is_pub {
+            self.bump();
+        }
         let entry = match self.eat(TokenKind::Use) {
-            true => Entry::Use(self.ty()?),
+            true => {
+                let ty = self.ty()?;
+                let name = match (named, is_pub) {
+                    // A `pub use` names the field that is `pub`.
+                    (true, true) => Some(self.expect(TokenKind::As).and(self.ident())?),
+                    (true, false) => match self.eat(TokenKind::As) {
+                        true => Some(self.ident()?),
+                        false => None,
+                    },
+                    (false, _) => {
+                        if self.at(TokenKind::As) {
+                            let at = self.peek().span;
+                            self.bump();
+                            self.ident()?;
+                            self.error(ParseErrorKind::NamedUse, self.span_from(at));
+                        }
+                        None
+                    }
+                };
+                Entry::Use(TypeUse {
+                    ty,
+                    name,
+                    is_pub,
+                    span: self.span_from(start),
+                })
+            }
             false => Entry::Own(own(self)?),
         };
         match entry {
@@ -1045,7 +1106,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen)?;
         let name = self.ident()?;
         let mut past_uses = false;
-        let entries = self.indented(|p| p.entry(&mut past_uses, Self::member))?;
+        let entries = self.indented(|p| p.entry(&mut past_uses, false, Self::member))?;
         Ok(EnumDecl { name, ty, entries })
     }
 
@@ -1065,7 +1126,7 @@ impl<'a> Parser<'a> {
         let params = self.type_params()?;
         let name = self.ident()?;
         let mut past_uses = false;
-        let entries = self.indented(|p| p.entry(&mut past_uses, Self::variant))?;
+        let entries = self.indented(|p| p.entry(&mut past_uses, false, Self::variant))?;
         Ok(UnionDecl {
             name,
             params,
@@ -3497,6 +3558,8 @@ fn f():
 struct Named:
     use Head
     use geo.Box(&T)
+    pub use Meta as meta
+    use Tag as tag
     pub name: array(u8)
 union Wide:
     use option(i32)
@@ -3510,7 +3573,14 @@ enum(u8) Color:
             fn render<T>(entry: &Entry<T>, own: impl Fn(&T) -> &Ident) -> String {
                 match entry {
                     Entry::Own(entry) => own(entry).name.clone(),
-                    Entry::Use(ty) => format!("use {}", render_ty(ty)),
+                    Entry::Use(used) => {
+                        let is_pub = if used.is_pub { "pub " } else { "" };
+                        let name = match &used.name {
+                            Some(name) => format!(" as {}", name.name),
+                            None => String::new(),
+                        };
+                        format!("{is_pub}use {}{name}", render_ty(&used.ty))
+                    }
                 }
             }
             match &item.kind {
@@ -3522,22 +3592,41 @@ enum(u8) Color:
         };
         assert_eq!(
             entries(&module.items[0]),
-            ["use Head", "use geo.Box(&T)", "name"]
+            [
+                "use Head",
+                "use geo.Box(&T)",
+                "pub use Meta as meta",
+                "use Tag as tag",
+                "name"
+            ]
         );
         assert_eq!(entries(&module.items[1]), ["use option(i32)", "other"]);
         assert_eq!(entries(&module.items[2]), ["use Warm", "red"]);
         let ItemKind::Struct(named) = &module.items[0].kind else {
             panic!()
         };
-        let Entry::Use(ty) = &named.entries[1] else {
+        let Entry::Use(used) = &named.entries[1] else {
             panic!()
         };
-        assert_eq!(&src[ty.span.start..ty.span.end], "geo.Box(&T)");
+        assert_eq!(&src[used.ty.span.start..used.ty.span.end], "geo.Box(&T)");
+        let Entry::Use(used) = &named.entries[2] else {
+            panic!()
+        };
+        assert_eq!(&src[used.span.start..used.span.end], "pub use Meta as meta");
 
-        // `pub` is each field's own, and a `use` names one type.
+        // A `pub use` names the field it makes `pub`, and a `use` names one
+        // type. Only a struct names what it uses.
         assert_eq!(
             errors("struct S:\n    pub use Head\n"),
-            vec![expected("identifier", TokenKind::Use)]
+            vec![expected("`as`", TokenKind::Newline)]
+        );
+        assert_eq!(
+            errors("union U:\n    use Other as inner\n    own\n"),
+            vec![ParseErrorKind::NamedUse]
+        );
+        assert_eq!(
+            errors("enum(u8) E:\n    use Warm as warm\n    cold\n"),
+            vec![ParseErrorKind::NamedUse]
         );
         assert_eq!(
             errors("struct S:\n    use A, B\n"),

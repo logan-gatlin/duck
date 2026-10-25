@@ -231,10 +231,13 @@ module.exports = grammar({
     ),
 
     // `use Type` in a struct, a union or an enum: the fields, variants or
-    // members of another, before its own.
+    // members of another, before its own. In a struct, `use Type as name`
+    // is a field of the type instead, which may be `pub`.
     type_use: $ => seq(
+      optional('pub'),
       'use',
       field('type', $._type),
+      optional(seq('as', field('name', $.identifier))),
       $._newline,
     ),
 

@@ -122,11 +122,11 @@ impl Checker {
                     span: member.span,
                 }),
                 parse::Entry::Use(used) => {
-                    let (ty, used_members) = self.used_members(program, id, used, visits);
+                    let (ty, used_members) = self.used_members(program, id, &used.ty, visits);
                     self.enums[id].uses.push(ty);
                     for member in used_members {
                         if members.iter().any(|m| m.name == member.name) {
-                            self.error(TypeErrorKind::DuplicateMember(member.name), used.span);
+                            self.error(TypeErrorKind::DuplicateMember(member.name), used.ty.span);
                             continue;
                         }
                         members.push(member);
